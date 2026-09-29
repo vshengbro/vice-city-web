@@ -1781,6 +1781,7 @@ void main() {
     lit = mix(lit, u_sky_color, fog);
 
     out_color = vec4(linear_to_srgb(lit), 1.0);
+    out_color = vec4(linear_to_srgb(lit), 1.0);
 }
 "#;
 
@@ -2016,12 +2017,19 @@ impl RenderTarget {
         Ok(texture)
     }
 
-    /// 分配一张深度纹理(R32F)。
+    /// 分配一张深度纹理(DEPTH_COMPONENT24)。
     ///
-    /// 用 `R32F` 而不是 `DEPTH_COMPONENT24`:16/24 bit 的深度纹理在
-    /// 320 m 远的正交视锥上量化步长约 0.00002(够用),但 SwiftShader 上
-    /// 采样 `DEPTH_COMPONENT24` 会走一条慢得多的慢路径;R32F 顺带
-    /// 让我们能在片元着色器里直接 `texture().r` 读到,不必用比较采样。
+    /// **必须是 `DEPTH_COMPONENT24`,不能是 `R32F` 颜色纹理。**
+    /// `R32F` 只有通过 `EXT_color_buffer_float` 才是**可渲染**格式,
+    /// 而即便扩展存在,把它挂到 `DEPTH_ATTACHMENT` 上也只在部分实现里
+    /// 被接受 —— 实测这台机器的 WebGL2(SwiftShader)直接判
+    /// `INCOMPLETE_ATTACHMENT`(36054),于是 `checkFramebufferStatus`
+    /// 说「不完整」,而更糟的是清除与绘制都静默失效:
+    /// `glClear` 不写入、每个 draw call 被丢弃,画面全黑。
+    ///
+    /// 阴影 pass 用的是「手动比较」(`texture(u_shadow_map, uv).r` 再和
+    /// 片元深度比),所以换成 `DEPTH_COMPONENT24` 不需要改采样方式 ——
+    /// 采样回来的仍然是单个 `.r` 分量。
     ///
     /// # Arguments
     ///
@@ -2032,6 +2040,7 @@ impl RenderTarget {
     /// # Returns
     ///
     /// - `Result<WebGlTexture, String>` - 分配好的深度纹理。
+    ///
     fn create_depth_texture(
         context: &WebGl2RenderingContext,
         width: i32,
@@ -2045,12 +2054,12 @@ impl RenderTarget {
             .tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
                 WebGl2RenderingContext::TEXTURE_2D,
                 0,
-                WebGl2RenderingContext::R32F as i32,
+                WebGl2RenderingContext::DEPTH_COMPONENT24 as i32,
                 width,
                 height,
                 0,
-                WebGl2RenderingContext::RED,
-                WebGl2RenderingContext::FLOAT,
+                WebGl2RenderingContext::DEPTH_COMPONENT,
+                WebGl2RenderingContext::UNSIGNED_INT,
                 None,
             )
             .map_err(|_| CREATE_TEXTURE_FAILED.to_string())?;
