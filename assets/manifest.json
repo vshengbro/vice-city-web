@@ -3,18 +3,22 @@
   "generator": "tools/blender/build_assets.py",
   "up_axis": "Y",
   "unit": "meter",
-  "asset_count": 70,
-  "tri_count": 73562,
+  "asset_count": 99,
+  "tri_count": 133151,
   "categories": [
+    "animal",
     "beach",
     "building",
     "marker",
     "misc",
+    "nature",
     "palm",
     "pedestrian",
     "pickup",
     "prop",
+    "road",
     "sign",
+    "terrain",
     "vehicle",
     "weapon"
   ],
@@ -23,18 +27,18 @@
       "id": "bldg_deco_pink",
       "category": "building",
       "file": "bldg_deco_pink.json",
-      "tri_count": 2328,
-      "part_count": 16,
+      "tri_count": 2680,
+      "part_count": 31,
       "bounds": {
         "min": [
-          -6.08,
+          -6.09,
           0.0,
-          -5.08
+          -5.09
         ],
         "max": [
-          6.08,
-          20.01,
-          6.49
+          6.09,
+          20.02,
+          6.63
         ]
       }
     },
@@ -42,18 +46,18 @@
       "id": "bldg_deco_teal",
       "category": "building",
       "file": "bldg_deco_teal.json",
-      "tri_count": 2820,
-      "part_count": 16,
+      "tri_count": 2920,
+      "part_count": 27,
       "bounds": {
         "min": [
-          -5.58,
+          -5.59,
           0.0,
-          -4.58
+          -4.59
         ],
         "max": [
-          5.58,
-          33.61,
-          5.99
+          5.59,
+          33.62,
+          6.13
         ]
       }
     },
@@ -61,18 +65,18 @@
       "id": "bldg_cream_block",
       "category": "building",
       "file": "bldg_cream_block.json",
-      "tri_count": 2868,
-      "part_count": 14,
+      "tri_count": 3020,
+      "part_count": 28,
       "bounds": {
         "min": [
-          -9.18,
+          -9.2,
           0.0,
-          -5.68
+          -5.7
         ],
         "max": [
-          9.18,
-          16.61,
-          6.99
+          9.2,
+          16.62,
+          7.13
         ]
       }
     },
@@ -80,18 +84,18 @@
       "id": "bldg_mint_shop",
       "category": "building",
       "file": "bldg_mint_shop.json",
-      "tri_count": 1152,
-      "part_count": 14,
+      "tri_count": 1808,
+      "part_count": 29,
       "bounds": {
         "min": [
-          -5.18,
+          -5.2,
           0.0,
-          -4.18
+          -4.2
         ],
         "max": [
-          5.18,
-          13.21,
-          5.49
+          5.2,
+          13.22,
+          5.63
         ]
       }
     },
@@ -99,18 +103,18 @@
       "id": "bldg_coral_hall",
       "category": "building",
       "file": "bldg_coral_hall.json",
-      "tri_count": 1992,
-      "part_count": 16,
+      "tri_count": 2516,
+      "part_count": 31,
       "bounds": {
         "min": [
-          -7.08,
+          -7.09,
           0.0,
-          -6.08
+          -6.09
         ],
         "max": [
-          7.08,
-          16.61,
-          7.49
+          7.09,
+          16.62,
+          7.63
         ]
       }
     },
@@ -118,18 +122,18 @@
       "id": "bldg_apricot_motel",
       "category": "building",
       "file": "bldg_apricot_motel.json",
-      "tri_count": 1368,
-      "part_count": 14,
+      "tri_count": 1736,
+      "part_count": 28,
       "bounds": {
         "min": [
-          -8.18,
+          -8.2,
           0.0,
-          -4.68
+          -4.7
         ],
         "max": [
-          8.18,
-          9.81,
-          5.99
+          8.2,
+          9.62,
+          6.13
         ]
       }
     },
@@ -137,18 +141,18 @@
       "id": "bldg_lilac_tower",
       "category": "building",
       "file": "bldg_lilac_tower.json",
-      "tri_count": 3240,
-      "part_count": 16,
+      "tri_count": 3556,
+      "part_count": 29,
       "bounds": {
         "min": [
-          -4.83,
+          -4.84,
           0.0,
-          -4.33
+          -4.34
         ],
         "max": [
-          4.83,
-          43.81,
-          5.74
+          4.84,
+          42.62,
+          5.88
         ]
       }
     },
@@ -156,18 +160,18 @@
       "id": "bldg_aqua_arcade",
       "category": "building",
       "file": "bldg_aqua_arcade.json",
-      "tri_count": 2856,
-      "part_count": 14,
+      "tri_count": 3248,
+      "part_count": 30,
       "bounds": {
         "min": [
-          -7.68,
+          -7.7,
           0.0,
-          -6.18
+          -6.2
         ],
         "max": [
-          7.68,
-          20.01,
-          7.49
+          7.7,
+          20.02,
+          7.63
         ]
       }
     },
@@ -175,18 +179,18 @@
       "id": "bldg_sand_midrise",
       "category": "building",
       "file": "bldg_sand_midrise.json",
-      "tri_count": 2712,
-      "part_count": 16,
+      "tri_count": 3176,
+      "part_count": 31,
       "bounds": {
         "min": [
-          -6.58,
+          -6.59,
           0.0,
-          -5.08
+          -5.09
         ],
         "max": [
-          6.58,
-          23.41,
-          6.49
+          6.59,
+          23.42,
+          6.63
         ]
       }
     },
@@ -194,18 +198,18 @@
       "id": "bldg_white_landmark",
       "category": "building",
       "file": "bldg_white_landmark.json",
-      "tri_count": 3300,
-      "part_count": 16,
+      "tri_count": 3500,
+      "part_count": 27,
       "bounds": {
         "min": [
-          -6.33,
+          -6.34,
           0.0,
-          -6.33
+          -6.34
         ],
         "max": [
-          6.33,
-          37.01,
-          7.74
+          6.34,
+          37.02,
+          7.88
         ]
       }
     },
@@ -213,18 +217,18 @@
       "id": "bldg_pink_terrace",
       "category": "building",
       "file": "bldg_pink_terrace.json",
-      "tri_count": 2916,
-      "part_count": 16,
+      "tri_count": 3420,
+      "part_count": 31,
       "bounds": {
         "min": [
-          -7.08,
+          -7.09,
           0.0,
-          -5.08
+          -5.09
         ],
         "max": [
-          7.08,
-          26.81,
-          6.49
+          7.09,
+          26.82,
+          6.63
         ]
       }
     },
@@ -232,18 +236,56 @@
       "id": "bldg_teal_loft",
       "category": "building",
       "file": "bldg_teal_loft.json",
-      "tri_count": 1920,
-      "part_count": 14,
+      "tri_count": 2032,
+      "part_count": 27,
       "bounds": {
         "min": [
-          -10.18,
+          -8.7,
           0.0,
-          -4.68
+          -4.7
         ],
         "max": [
-          10.18,
-          13.21,
-          5.99
+          8.7,
+          13.22,
+          6.13
+        ]
+      }
+    },
+    {
+      "id": "bldg_loft_showcase",
+      "category": "building",
+      "file": "bldg_loft_showcase.json",
+      "tri_count": 504,
+      "part_count": 8,
+      "bounds": {
+        "min": [
+          -6.1,
+          0.0,
+          -5.1
+        ],
+        "max": [
+          6.1,
+          7.15,
+          5.1
+        ]
+      }
+    },
+    {
+      "id": "bldg_shop_showcase",
+      "category": "building",
+      "file": "bldg_shop_showcase.json",
+      "tri_count": 516,
+      "part_count": 9,
+      "bounds": {
+        "min": [
+          -5.1,
+          0.0,
+          -4.6
+        ],
+        "max": [
+          5.1,
+          7.15,
+          5.15
         ]
       }
     },
@@ -251,18 +293,18 @@
       "id": "car_sedan",
       "category": "vehicle",
       "file": "car_sedan.json",
-      "tri_count": 2068,
-      "part_count": 7,
+      "tri_count": 4220,
+      "part_count": 9,
       "bounds": {
         "min": [
-          -2.305,
+          -2.283,
           0.0,
-          -0.902333
+          -0.925581
         ],
         "max": [
-          2.305,
+          2.283,
           1.45,
-          0.902333
+          0.925581
         ]
       }
     },
@@ -270,18 +312,18 @@
       "id": "car_coupe",
       "category": "vehicle",
       "file": "car_coupe.json",
-      "tri_count": 1724,
-      "part_count": 7,
+      "tri_count": 3972,
+      "part_count": 9,
       "bounds": {
         "min": [
-          -2.245,
+          -2.215,
           0.0,
-          -0.91125
+          -0.918442
         ],
         "max": [
-          2.3,
+          2.234,
           1.3,
-          0.91125
+          0.918442
         ]
       }
     },
@@ -289,18 +331,18 @@
       "id": "truck_pickup",
       "category": "vehicle",
       "file": "truck_pickup.json",
-      "tri_count": 1916,
-      "part_count": 8,
+      "tri_count": 4316,
+      "part_count": 10,
       "bounds": {
         "min": [
-          -2.585,
+          -2.704,
           0.0,
-          -0.984182
+          -0.995794
         ],
         "max": [
-          2.585,
+          2.66,
           1.78,
-          0.984182
+          0.995794
         ]
       }
     },
@@ -308,18 +350,18 @@
       "id": "car_police",
       "category": "vehicle",
       "file": "car_police.json",
-      "tri_count": 2476,
-      "part_count": 9,
+      "tri_count": 4756,
+      "part_count": 13,
       "bounds": {
         "min": [
-          -2.305,
+          -2.283,
           0.0,
-          -0.902333
+          -0.925581
         ],
         "max": [
-          2.305,
-          1.527,
-          0.902333
+          2.283,
+          1.589,
+          0.925581
         ]
       }
     },
@@ -327,18 +369,189 @@
       "id": "car_taxi",
       "category": "vehicle",
       "file": "car_taxi.json",
-      "tri_count": 2260,
-      "part_count": 9,
+      "tri_count": 4500,
+      "part_count": 12,
       "bounds": {
         "min": [
-          -2.305,
+          -2.283,
           0.0,
-          -0.904133
+          -0.927212
         ],
         "max": [
-          2.305,
-          1.54,
-          0.904133
+          2.283,
+          1.599,
+          0.927212
+        ]
+      }
+    },
+    {
+      "id": "bus_city",
+      "category": "vehicle",
+      "file": "bus_city.json",
+      "tri_count": 5164,
+      "part_count": 12,
+      "bounds": {
+        "min": [
+          -5.905,
+          0.0,
+          -1.315
+        ],
+        "max": [
+          5.91,
+          3.26,
+          1.307667
+        ]
+      }
+    },
+    {
+      "id": "wep_tank",
+      "category": "vehicle",
+      "file": "wep_tank.json",
+      "tri_count": 2336,
+      "part_count": 6,
+      "bounds": {
+        "min": [
+          -3.158888,
+          0.0,
+          -3.56
+        ],
+        "max": [
+          2.934317,
+          2.75,
+          3.5
+        ]
+      }
+    },
+    {
+      "id": "ship_destroyer",
+      "category": "vehicle",
+      "file": "ship_destroyer.json",
+      "tri_count": 1064,
+      "part_count": 8,
+      "bounds": {
+        "min": [
+          -8.0,
+          0.8,
+          -70.05
+        ],
+        "max": [
+          8.0,
+          27.0,
+          70.05
+        ]
+      }
+    },
+    {
+      "id": "yacht_sailboat",
+      "category": "vehicle",
+      "file": "yacht_sailboat.json",
+      "tri_count": 806,
+      "part_count": 7,
+      "bounds": {
+        "min": [
+          -1.74,
+          0.26,
+          -5.54
+        ],
+        "max": [
+          1.74,
+          13.25,
+          5.5
+        ]
+      }
+    },
+    {
+      "id": "ship_cruise",
+      "category": "vehicle",
+      "file": "ship_cruise.json",
+      "tri_count": 5784,
+      "part_count": 8,
+      "bounds": {
+        "min": [
+          -16.75,
+          1.6,
+          -130.0
+        ],
+        "max": [
+          16.75,
+          59.5,
+          130.0
+        ]
+      }
+    },
+    {
+      "id": "veh_airplane",
+      "category": "vehicle",
+      "file": "veh_airplane.json",
+      "tri_count": 1292,
+      "part_count": 18,
+      "bounds": {
+        "min": [
+          -4.02,
+          0.0,
+          -3.73
+        ],
+        "max": [
+          4.02,
+          2.439232,
+          3.61
+        ]
+      }
+    },
+    {
+      "id": "veh_jet",
+      "category": "vehicle",
+      "file": "veh_jet.json",
+      "tri_count": 1476,
+      "part_count": 18,
+      "bounds": {
+        "min": [
+          -4.52,
+          0.0,
+          -5.19
+        ],
+        "max": [
+          4.52,
+          3.467275,
+          6.38
+        ]
+      }
+    },
+    {
+      "id": "veh_boat",
+      "category": "vehicle",
+      "file": "veh_boat.json",
+      "tri_count": 1392,
+      "part_count": 14,
+      "bounds": {
+        "min": [
+          -1.150263,
+          0.0,
+          -3.08
+        ],
+        "max": [
+          1.059998,
+          1.45,
+          3.017882
+        ]
+      }
+    },
+    {
+      "id": "veh_helicopter",
+      "category": "vehicle",
+      "file": "veh_helicopter.json",
+      "tri_count": 1520,
+      "part_count": 17,
+      "bounds": {
+        "min": [
+          -4.786184,
+          0.0,
+          -7.1
+        ],
+        "max": [
+          4.786184,
+          3.222415,
+          5.336184
         ]
       }
     },
@@ -346,18 +559,18 @@
       "id": "ped_suit",
       "category": "pedestrian",
       "file": "ped_suit.json",
-      "tri_count": 632,
+      "tri_count": 1752,
       "part_count": 13,
       "bounds": {
         "min": [
-          -0.297207,
+          -0.315614,
           0.0,
-          -0.11
+          -0.124
         ],
         "max": [
-          0.297207,
-          1.74972,
-          0.2675
+          0.31213,
+          1.74998,
+          0.378
         ]
       }
     },
@@ -365,18 +578,18 @@
       "id": "ped_dress",
       "category": "pedestrian",
       "file": "ped_dress.json",
-      "tri_count": 760,
+      "tri_count": 1920,
       "part_count": 15,
       "bounds": {
         "min": [
-          -0.312,
+          -0.316,
           0.0,
-          -0.304178
+          -0.308077
         ],
         "max": [
-          0.312,
-          1.72,
-          0.304178
+          0.316,
+          1.71957,
+          0.321
         ]
       }
     },
@@ -384,18 +597,18 @@
       "id": "ped_overalls",
       "category": "pedestrian",
       "file": "ped_overalls.json",
-      "tri_count": 848,
+      "tri_count": 2264,
       "part_count": 17,
       "bounds": {
         "min": [
-          -0.341585,
+          -0.358422,
           0.0,
-          -0.132
+          -0.136
         ],
         "max": [
-          0.341585,
-          1.77216,
-          0.29746
+          0.358064,
+          1.7732,
+          0.42
         ]
       }
     },
@@ -403,18 +616,18 @@
       "id": "ped_streetwear",
       "category": "pedestrian",
       "file": "ped_streetwear.json",
-      "tri_count": 840,
-      "part_count": 16,
+      "tri_count": 2264,
+      "part_count": 17,
       "bounds": {
         "min": [
-          -0.385853,
+          -0.408013,
           0.0,
-          -0.213
+          -0.218
         ],
         "max": [
-          0.385853,
+          0.399671,
           1.764,
-          0.30816
+          0.438
         ]
       }
     },
@@ -422,7 +635,7 @@
       "id": "prop_streetlight",
       "category": "prop",
       "file": "prop_streetlight.json",
-      "tri_count": 644,
+      "tri_count": 784,
       "part_count": 5,
       "bounds": {
         "min": [
@@ -431,8 +644,8 @@
           -0.3
         ],
         "max": [
-          1.88,
-          4.790244,
+          1.9,
+          6.5,
           0.3
         ]
       }
@@ -441,18 +654,18 @@
       "id": "prop_trafficlight",
       "category": "prop",
       "file": "prop_trafficlight.json",
-      "tri_count": 524,
-      "part_count": 7,
+      "tri_count": 1088,
+      "part_count": 9,
       "bounds": {
         "min": [
-          -0.24,
+          -0.32,
           0.0,
           -0.24
         ],
         "max": [
-          1.64,
-          4.32,
-          0.341492
+          1.53,
+          4.6,
+          0.341269
         ]
       }
     },
@@ -460,18 +673,18 @@
       "id": "prop_palm_planter",
       "category": "prop",
       "file": "prop_palm_planter.json",
-      "tri_count": 1232,
+      "tri_count": 1868,
       "part_count": 7,
       "bounds": {
         "min": [
-          -1.546873,
+          -1.678084,
           0.0,
-          -1.715615
+          -1.625835
         ],
         "max": [
-          1.633036,
-          2.7475,
-          1.708556
+          1.574844,
+          2.7675,
+          1.472862
         ]
       }
     },
@@ -479,18 +692,18 @@
       "id": "prop_bench",
       "category": "prop",
       "file": "prop_bench.json",
-      "tri_count": 288,
+      "tri_count": 600,
       "part_count": 3,
       "bounds": {
         "min": [
           -0.93,
           0.0,
-          -0.32
+          -0.33
         ],
         "max": [
           0.93,
           0.96,
-          0.325
+          0.335
         ]
       }
     },
@@ -498,7 +711,7 @@
       "id": "prop_trash_bin",
       "category": "prop",
       "file": "prop_trash_bin.json",
-      "tri_count": 464,
+      "tri_count": 552,
       "part_count": 3,
       "bounds": {
         "min": [
@@ -509,7 +722,7 @@
         "max": [
           0.33,
           1.145,
-          0.385
+          0.38
         ]
       }
     },
@@ -517,7 +730,7 @@
       "id": "prop_dumpster",
       "category": "prop",
       "file": "prop_dumpster.json",
-      "tri_count": 552,
+      "tri_count": 740,
       "part_count": 5,
       "bounds": {
         "min": [
@@ -536,7 +749,7 @@
       "id": "prop_mailbox",
       "category": "prop",
       "file": "prop_mailbox.json",
-      "tri_count": 604,
+      "tri_count": 832,
       "part_count": 6,
       "bounds": {
         "min": [
@@ -546,7 +759,7 @@
         ],
         "max": [
           0.3725,
-          1.795,
+          1.81,
           0.39
         ]
       }
@@ -555,7 +768,7 @@
       "id": "prop_newsstand",
       "category": "prop",
       "file": "prop_newsstand.json",
-      "tri_count": 516,
+      "tri_count": 1260,
       "part_count": 5,
       "bounds": {
         "min": [
@@ -565,7 +778,7 @@
         ],
         "max": [
           1.17,
-          3.12,
+          3.13,
           1.36
         ]
       }
@@ -574,8 +787,8 @@
       "id": "prop_phone_booth",
       "category": "prop",
       "file": "prop_phone_booth.json",
-      "tri_count": 388,
-      "part_count": 7,
+      "tri_count": 1126,
+      "part_count": 8,
       "bounds": {
         "min": [
           -0.62,
@@ -584,7 +797,7 @@
         ],
         "max": [
           0.62,
-          2.94,
+          2.97,
           0.65
         ]
       }
@@ -593,7 +806,7 @@
       "id": "prop_fire_hydrant",
       "category": "prop",
       "file": "prop_fire_hydrant.json",
-      "tri_count": 796,
+      "tri_count": 792,
       "part_count": 5,
       "bounds": {
         "min": [
@@ -612,7 +825,7 @@
       "id": "prop_manhole_cover",
       "category": "prop",
       "file": "prop_manhole_cover.json",
-      "tri_count": 312,
+      "tri_count": 408,
       "part_count": 4,
       "bounds": {
         "min": [
@@ -622,7 +835,7 @@
         ],
         "max": [
           0.38,
-          0.03,
+          0.038,
           0.38
         ]
       }
@@ -631,7 +844,7 @@
       "id": "prop_traffic_cone",
       "category": "prop",
       "file": "prop_traffic_cone.json",
-      "tri_count": 216,
+      "tri_count": 248,
       "part_count": 3,
       "bounds": {
         "min": [
@@ -650,12 +863,12 @@
       "id": "prop_construction_barrier",
       "category": "prop",
       "file": "prop_construction_barrier.json",
-      "tri_count": 276,
+      "tri_count": 580,
       "part_count": 5,
       "bounds": {
         "min": [
           -1.15,
-          -0.000992,
+          0.0,
           -0.21
         ],
         "max": [
@@ -669,18 +882,18 @@
       "id": "prop_parking_meter",
       "category": "prop",
       "file": "prop_parking_meter.json",
-      "tri_count": 236,
+      "tri_count": 472,
       "part_count": 4,
       "bounds": {
         "min": [
           -0.115,
           0.0,
-          -0.115613
+          -0.115855
         ],
         "max": [
           0.115,
-          1.390772,
-          0.119271
+          1.391743,
+          0.120483
         ]
       }
     },
@@ -840,18 +1053,18 @@
       "id": "palm_tall",
       "category": "palm",
       "file": "palm_tall.json",
-      "tri_count": 2200,
-      "part_count": 6,
+      "tri_count": 2446,
+      "part_count": 7,
       "bounds": {
         "min": [
-          -2.685309,
+          -2.392834,
           0.0,
-          -2.501191
+          -1.939081
         ],
         "max": [
-          3.943809,
-          8.988567,
-          3.985438
+          4.374584,
+          9.290566,
+          4.367547
         ]
       }
     },
@@ -859,18 +1072,18 @@
       "id": "palm_short",
       "category": "palm",
       "file": "palm_short.json",
-      "tri_count": 1584,
-      "part_count": 5,
+      "tri_count": 1892,
+      "part_count": 6,
       "bounds": {
         "min": [
-          -2.595264,
+          -2.956389,
           0.0,
-          -2.838354
+          -2.431588
         ],
         "max": [
-          2.046203,
-          4.500591,
-          2.451208
+          2.0144,
+          6.528604,
+          2.476073
         ]
       }
     },
@@ -878,18 +1091,322 @@
       "id": "palm_bushy",
       "category": "palm",
       "file": "palm_bushy.json",
-      "tri_count": 2296,
+      "tri_count": 2708,
+      "part_count": 7,
+      "bounds": {
+        "min": [
+          -3.065933,
+          0.0,
+          -3.438204
+        ],
+        "max": [
+          3.099132,
+          6.405192,
+          1.845367
+        ]
+      }
+    },
+    {
+      "id": "terrain_mountain",
+      "category": "terrain",
+      "file": "terrain_mountain.json",
+      "tri_count": 488,
+      "part_count": 2,
+      "bounds": {
+        "min": [
+          -31.453442,
+          0.0,
+          -25.6464
+        ],
+        "max": [
+          31.453442,
+          29.8,
+          29.1536
+        ]
+      }
+    },
+    {
+      "id": "grass_patch",
+      "category": "nature",
+      "file": "grass_patch.json",
+      "tri_count": 152,
+      "part_count": 3,
+      "bounds": {
+        "min": [
+          -0.435641,
+          0.0,
+          -0.444295
+        ],
+        "max": [
+          0.438742,
+          0.603911,
+          0.432047
+        ]
+      }
+    },
+    {
+      "id": "flower_cluster",
+      "category": "nature",
+      "file": "flower_cluster.json",
+      "tri_count": 392,
+      "part_count": 4,
+      "bounds": {
+        "min": [
+          -0.19671,
+          0.0,
+          -0.213557
+        ],
+        "max": [
+          0.086612,
+          0.513,
+          0.186702
+        ]
+      }
+    },
+    {
+      "id": "animal_dog",
+      "category": "animal",
+      "file": "animal_dog.json",
+      "tri_count": 450,
       "part_count": 6,
       "bounds": {
         "min": [
-          -3.212701,
+          -0.105,
           0.0,
-          -3.735417
+          -0.390732
         ],
         "max": [
-          3.003187,
-          6.005047,
-          2.380533
+          0.11,
+          0.529,
+          0.521
+        ]
+      }
+    },
+    {
+      "id": "animal_bird",
+      "category": "animal",
+      "file": "animal_bird.json",
+      "tri_count": 273,
+      "part_count": 6,
+      "bounds": {
+        "min": [
+          -0.414,
+          0.0,
+          -0.204
+        ],
+        "max": [
+          0.414,
+          0.183,
+          0.203217
+        ]
+      }
+    },
+    {
+      "id": "animal_cat",
+      "category": "animal",
+      "file": "animal_cat.json",
+      "tri_count": 446,
+      "part_count": 6,
+      "bounds": {
+        "min": [
+          -0.072416,
+          0.0,
+          -0.302239
+        ],
+        "max": [
+          0.077,
+          0.321502,
+          0.289
+        ]
+      }
+    },
+    {
+      "id": "animal_fish",
+      "category": "animal",
+      "file": "animal_fish.json",
+      "tri_count": 200,
+      "part_count": 6,
+      "bounds": {
+        "min": [
+          -0.126,
+          -0.15,
+          -0.3
+        ],
+        "max": [
+          0.126,
+          0.172,
+          0.242
+        ]
+      }
+    },
+    {
+      "id": "road_asphalt",
+      "category": "road",
+      "file": "road_asphalt.json",
+      "tri_count": 100,
+      "part_count": 3,
+      "bounds": {
+        "min": [
+          -6.0,
+          0.0,
+          -6.0
+        ],
+        "max": [
+          6.0,
+          0.023,
+          6.0
+        ]
+      }
+    },
+    {
+      "id": "road_sidewalk",
+      "category": "road",
+      "file": "road_sidewalk.json",
+      "tri_count": 122,
+      "part_count": 2,
+      "bounds": {
+        "min": [
+          -6.0,
+          0.0,
+          -6.0
+        ],
+        "max": [
+          6.0,
+          0.2,
+          6.0
+        ]
+      }
+    },
+    {
+      "id": "road_lane_line",
+      "category": "road",
+      "file": "road_lane_line.json",
+      "tri_count": 36,
+      "part_count": 1,
+      "bounds": {
+        "min": [
+          -0.075,
+          0.0,
+          -3.0
+        ],
+        "max": [
+          0.075,
+          0.012,
+          3.0
+        ]
+      }
+    },
+    {
+      "id": "road_lane_line_yellow",
+      "category": "road",
+      "file": "road_lane_line_yellow.json",
+      "tri_count": 24,
+      "part_count": 1,
+      "bounds": {
+        "min": [
+          -0.2,
+          0.0,
+          -3.0
+        ],
+        "max": [
+          0.2,
+          0.012,
+          3.0
+        ]
+      }
+    },
+    {
+      "id": "road_crosswalk",
+      "category": "road",
+      "file": "road_crosswalk.json",
+      "tri_count": 84,
+      "part_count": 1,
+      "bounds": {
+        "min": [
+          -3.0,
+          0.0,
+          -2.0
+        ],
+        "max": [
+          3.0,
+          0.012,
+          2.0
+        ]
+      }
+    },
+    {
+      "id": "road_grass",
+      "category": "road",
+      "file": "road_grass.json",
+      "tri_count": 58,
+      "part_count": 3,
+      "bounds": {
+        "min": [
+          -4.0,
+          0.0,
+          -4.0
+        ],
+        "max": [
+          4.0,
+          0.023,
+          4.0
+        ]
+      }
+    },
+    {
+      "id": "road_sand",
+      "category": "road",
+      "file": "road_sand.json",
+      "tri_count": 68,
+      "part_count": 3,
+      "bounds": {
+        "min": [
+          -4.0,
+          0.0,
+          -4.0
+        ],
+        "max": [
+          4.0,
+          0.021,
+          4.0
+        ]
+      }
+    },
+    {
+      "id": "road_manhole_decal",
+      "category": "road",
+      "file": "road_manhole_decal.json",
+      "tri_count": 108,
+      "part_count": 1,
+      "bounds": {
+        "min": [
+          -0.45,
+          0.0,
+          -0.45
+        ],
+        "max": [
+          0.45,
+          0.02,
+          0.45
+        ]
+      }
+    },
+    {
+      "id": "road_drain_grate",
+      "category": "road",
+      "file": "road_drain_grate.json",
+      "tri_count": 26,
+      "part_count": 2,
+      "bounds": {
+        "min": [
+          -0.3,
+          0.0,
+          -0.2
+        ],
+        "max": [
+          0.3,
+          0.03,
+          0.2
         ]
       }
     },
@@ -1087,18 +1604,18 @@
       "id": "wep_pistol",
       "category": "weapon",
       "file": "wep_pistol.json",
-      "tri_count": 252,
-      "part_count": 3,
+      "tri_count": 1188,
+      "part_count": 4,
       "bounds": {
         "min": [
-          -0.017,
-          -0.052806,
-          -0.056
+          -0.022,
+          -0.072627,
+          -0.063
         ],
         "max": [
-          0.017,
-          0.094,
-          0.151
+          0.018,
+          0.096,
+          0.154
         ]
       }
     },
@@ -1106,18 +1623,18 @@
       "id": "wep_smg",
       "category": "weapon",
       "file": "wep_smg.json",
-      "tri_count": 304,
+      "tri_count": 1316,
       "part_count": 3,
       "bounds": {
         "min": [
-          -0.02,
-          -0.139406,
-          -0.158
+          -0.03,
+          -0.141107,
+          -0.159
         ],
         "max": [
-          0.02,
-          0.122,
-          0.298
+          0.023,
+          0.134,
+          0.301
         ]
       }
     },
@@ -1125,17 +1642,17 @@
       "id": "wep_shotgun",
       "category": "weapon",
       "file": "wep_shotgun.json",
-      "tri_count": 432,
+      "tri_count": 1500,
       "part_count": 3,
       "bounds": {
         "min": [
-          -0.025,
-          -0.0569,
-          -0.306692
+          -0.0266,
+          -0.058181,
+          -0.306796
         ],
         "max": [
-          0.025,
-          0.095078,
+          0.026,
+          0.1,
           0.438
         ]
       }
@@ -1144,17 +1661,17 @@
       "id": "wep_rocket_launcher",
       "category": "weapon",
       "file": "wep_rocket_launcher.json",
-      "tri_count": 692,
+      "tri_count": 2484,
       "part_count": 3,
       "bounds": {
         "min": [
-          -0.101393,
-          -0.060866,
-          -0.27276
+          -0.106,
+          -0.062602,
+          -0.275118
         ],
         "max": [
-          0.101393,
-          0.179,
+          0.106,
+          0.214,
           0.721
         ]
       }
@@ -1163,18 +1680,18 @@
       "id": "wep_bat",
       "category": "weapon",
       "file": "wep_bat.json",
-      "tri_count": 360,
+      "tri_count": 752,
       "part_count": 3,
       "bounds": {
         "min": [
-          -0.036,
+          -0.052,
           -0.171,
-          -0.036
+          -0.049455
         ],
         "max": [
-          0.036,
-          0.57,
-          0.036
+          0.052,
+          0.572,
+          0.049455
         ]
       }
     },
@@ -1182,7 +1699,7 @@
       "id": "wep_grenade",
       "category": "weapon",
       "file": "wep_grenade.json",
-      "tri_count": 468,
+      "tri_count": 760,
       "part_count": 3,
       "bounds": {
         "min": [
@@ -1201,18 +1718,18 @@
       "id": "pickup_armor_vest",
       "category": "pickup",
       "file": "pickup_armor_vest.json",
-      "tri_count": 396,
+      "tri_count": 864,
       "part_count": 4,
       "bounds": {
         "min": [
-          -0.218,
+          -0.224,
           -0.2755,
-          -0.1075
+          -0.109
         ],
         "max": [
-          0.218,
+          0.224,
           0.2755,
-          0.1075
+          0.109
         ]
       }
     },
@@ -1220,18 +1737,18 @@
       "id": "pickup_health_pack",
       "category": "pickup",
       "file": "pickup_health_pack.json",
-      "tri_count": 208,
+      "tri_count": 652,
       "part_count": 3,
       "bounds": {
         "min": [
           -0.15,
-          -0.1,
-          -0.061
+          -0.102,
+          -0.063
         ],
         "max": [
           0.15,
-          0.1,
-          0.061
+          0.102,
+          0.063
         ]
       }
     },
@@ -1239,16 +1756,16 @@
       "id": "pickup_ammo_box",
       "category": "pickup",
       "file": "pickup_ammo_box.json",
-      "tri_count": 244,
+      "tri_count": 644,
       "part_count": 4,
       "bounds": {
         "min": [
-          -0.174,
+          -0.175,
           -0.084,
           -0.1145
         ],
         "max": [
-          0.174,
+          0.175,
           0.084,
           0.1145
         ]
@@ -1258,17 +1775,17 @@
       "id": "pickup_cash_stack",
       "category": "pickup",
       "file": "pickup_cash_stack.json",
-      "tri_count": 156,
+      "tri_count": 392,
       "part_count": 2,
       "bounds": {
         "min": [
           -0.16286,
-          -0.05145,
+          -0.05295,
           -0.14188
         ],
         "max": [
           0.16286,
-          0.05145,
+          0.05295,
           0.14188
         ]
       }
@@ -1277,18 +1794,18 @@
       "id": "pickup_o2_tank",
       "category": "pickup",
       "file": "pickup_o2_tank.json",
-      "tri_count": 700,
+      "tri_count": 964,
       "part_count": 3,
       "bounds": {
         "min": [
-          -0.0735,
+          -0.074,
           -0.321754,
-          -0.0735
+          -0.076
         ],
         "max": [
-          0.0735,
+          0.074,
           0.321754,
-          0.0735
+          0.076
         ]
       }
     },
@@ -1296,18 +1813,56 @@
       "id": "pickup_flare_pack",
       "category": "pickup",
       "file": "pickup_flare_pack.json",
-      "tri_count": 612,
+      "tri_count": 752,
       "part_count": 3,
       "bounds": {
         "min": [
           -0.123,
-          -0.078,
+          -0.0835,
           -0.138
         ],
         "max": [
           0.123,
-          0.078,
+          0.0835,
           0.138
+        ]
+      }
+    },
+    {
+      "id": "pickup_rocket_round",
+      "category": "pickup",
+      "file": "pickup_rocket_round.json",
+      "tri_count": 876,
+      "part_count": 3,
+      "bounds": {
+        "min": [
+          -0.151,
+          -0.215,
+          -0.15
+        ],
+        "max": [
+          0.151,
+          0.215,
+          0.15
+        ]
+      }
+    },
+    {
+      "id": "pickup_grenade_case",
+      "category": "pickup",
+      "file": "pickup_grenade_case.json",
+      "tri_count": 540,
+      "part_count": 3,
+      "bounds": {
+        "min": [
+          -0.139,
+          -0.0775,
+          -0.111
+        ],
+        "max": [
+          0.139,
+          0.0775,
+          0.111
         ]
       }
     },

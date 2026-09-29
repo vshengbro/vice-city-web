@@ -5,11 +5,28 @@ vertical pilasters, horizontal string courses, stepped setbacks, balcony
 parapets, a roof parapet, rooftop water tank + AC units, and a blank neon sign
 backing board.  Colour and proportions vary per variant.
 
+The runtime shader is ``base * (ambient + light * max(dot(n, l), 0))`` -- no
+texture, no specular.  The only three ways a surface can become interesting are
+therefore a different NORMAL, a different ALBEDO, or emissive, and that is the
+organising principle of this file:
+
+* every large facade volume is a ``chamfer_box`` (28 tris instead of 12), so
+  each arris catches the directional light on all four sides;
+* colour is ZONED per part and per face -- dark plinth, trim string courses, a
+  lighter upper storey block, deep blue-grey glass, warm emissive windows and
+  a concrete roof that is markedly darker than the painted walls;
+* windows are REAL RECESSES: a cream frame ring standing proud of the wall
+  with the glass set back behind its reveals, rather than a sticker on a wall;
+* the roof carries clutter (bulkhead, aerials, vent, dishes) so the skyline
+  is not a row of flat lids.
+
 Origin is the centre of the ground footprint at z = 0 (so the JSON export puts
 the building base exactly on y = 0).  ``-Y`` is the street-facing front.
-"""
 
-import math
+Footprint half-extent is a hard engine constraint: ``src/game.rs`` culls any
+building whose half-extent exceeds ``BUILDING_FOOTPRINT_GUARD = 11.0``, so no
+variant may exceed 10.5 m.
+"""
 
 from .. import core as C
 
@@ -30,48 +47,192 @@ PALETTE = {
 CONCRETE = (0.72, 0.70, 0.66)
 CONCRETE_DK = (0.55, 0.53, 0.50)
 ROOF = (0.42, 0.44, 0.47)
-GLASS = (0.16, 0.32, 0.42)
-GLASS_LIT = (0.98, 0.86, 0.52)
+ROOF_DK = (0.33, 0.35, 0.38)
+GLASS = (0.13, 0.26, 0.35)
+GLASS_LIT = (1.00, 0.86, 0.50)
 TRIM = (0.98, 0.96, 0.90)
 AWNING = (0.93, 0.25, 0.36)
 METAL = (0.62, 0.64, 0.66)
 METAL_DK = (0.38, 0.40, 0.42)
+DOOR = (0.15, 0.19, 0.25)
+TANK_A = (0.68, 0.57, 0.44)
+TANK_B = (0.54, 0.44, 0.33)
+
+# How far the window surround stands proud of the wall, and how far the glass
+# sits back from that surround's face.  The 8 cm step is what turns a decal
+# into a hole: the sill faces up, the lintel faces down, and both catch light.
+FRAME_PROUD = 0.09
+GLASS_SET = 0.015
 
 
 def _shrub(color, k=1.0):
     return tuple(min(1.0, c * k) for c in color)
 
 
+def _lit_at(f, i, face, mod=11, thresh=2):
+    """Scattered, low-density lit-window mask (roughly ``thresh/mod`` of all)."""
+    return ((f * 7 + i * 3 + face * 5 + 1) % mod) < thresh
+
+
+# --------------------------------------------------------------------------
+# window assembly
+# --------------------------------------------------------------------------
+
+def _annulus(m, y, x0, x1, z0, z1, ow, oh, color, flip):
+    """A flat rectangular ring (a picture-frame border) in the plane ``y``.
+
+    4 quads = 8 triangles for a border that reads as a moulded surround.  It
+    is an open shell, so the owning Part must declare ``outward``.
+    """
+    outer = ((x0 - ow, z0 - oh), (x1 + ow, z0 - oh),
+             (x1 + ow, z1 + oh), (x0 - ow, z1 + oh))
+    inner = ((x0, z0), (x1, z0), (x1, z1), (x0, z1))
+    for j in range(4):
+        a = outer[j]
+        b = outer[(j + 1) % 4]
+        c = inner[(j + 1) % 4]
+        d = inner[j]
+        pts = ((a[0], y, a[1]), (b[0], y, b[1]),
+               (c[0], y, c[1]), (d[0], y, d[1]))
+        if flip:
+            m.quad(pts[0], pts[3], pts[2], pts[1], color)
+        else:
+            m.quad(pts[0], pts[1], pts[2], pts[3], color)
+
+
+def _reveal(m, x0, x1, z, y_a, y_b, color, up):
+    """One window reveal: the jamb face between the frame ring and the glass.
+
+    The quad lies in the plane ``z`` and is emitted so its normal points ``up``
+    (a sill) or down (a lintel).  Four of these per window give the recess its
+    shadowed inner walls.
+    """
+    a = (x0, y_a, z)
+    b = (x1, y_a, z)
+    c = (x1, y_b, z)
+    d = (x0, y_b, z)
+    if (y_b > y_a) == bool(up):
+        m.quad(a, b, c, d, color)
+    else:
+        m.quad(a, d, c, b, color)
+
+
+def _banded_cylinder(m, r, h, seg, center, col_a, col_b, caps=True):
+    """A barrel built stave by stave, alternating two shades.
+
+    ``C.cylinder`` takes a single colour, and a roof tank whose staves are one
+    flat value is exactly the "white model" tell.  Emitting the side quads by
+    hand costs the same 20 triangles and buys the banding.  Flat shaded on
+    purpose: the seams are the read, and a 10-sided faceted barrel is honest
+    about being built from boards.
+    """
+    cx, cy, cz = center
+    ring = C.circle(r, seg)
+    lo = [(cx + px, cy + py, cz - h * 0.5) for (px, py) in ring]
+    hi = [(cx + px, cy + py, cz + h * 0.5) for (px, py) in ring]
+    for j in range(seg):
+        j2 = (j + 1) % seg
+        m.quad(lo[j], lo[j2], hi[j2], hi[j], col_a if j % 2 == 0 else col_b)
+    if caps:
+        # Register the ring points once more so the cap fans can index them,
+        # exactly as cylinder()/loft() do -- duplicate POSITIONS would leave
+        # the cap rim used by exactly one face each, i.e. a T-junction.
+        base = len(m.pos)
+        for p in lo:
+            m.pos.append(p)
+        tbase = len(m.pos)
+        for p in hi:
+            m.pos.append(p)
+        cb = len(m.pos)
+        m.pos.append((cx, cy, cz - h * 0.5))
+        ct = len(m.pos)
+        m.pos.append((cx, cy, cz + h * 0.5))
+        for j in range(seg):
+            j2 = (j + 1) % seg
+            m.tri_idx(base + j2, base + j, cb, col_b)
+            m.tri_idx(tbase + j, tbase + j2, ct, col_b)
+    return m
+
+
+class _Slots(object):
+    """Tiny 2D rejection test so roof clutter never interpenetrates.
+
+    Every candidate is a footprint rectangle; the first one that collides with
+    an already-placed footprint is simply dropped.  On the wide roofs all the
+    clutter fits; on a slimmest setback tower a dish may lose, which is the
+    right trade against a dish growing through a water tank.
+    """
+
+    def __init__(self):
+        self.taken = []
+
+    def free(self, x, y, hx, hy):
+        for (tx, ty, thx, thy) in self.taken:
+            if (abs(x - tx) < hx + thx) and (abs(y - ty) < hy + thy):
+                return False
+        self.taken.append((x, y, hx, hy))
+        return True
+
+
+# --------------------------------------------------------------------------
+
 def building(asset_id, key, width, depth, floors, floor_h=3.4,
              setbacks=(), pilasters=4, balcony_rows=(), cornice=True,
-             ground_accent=True, base_color=None, trim=None):
+             ground_accent=True, base_color=None, trim=None,
+             win_pitch=3.05, bal_pitch=4.6,
+             lit_mod=11, lit_thresh=2, upper_floor=0, clutter=True,
+             rear_recess=False, ac_units=3):
     """Assemble one Art Deco building.
 
     ``setbacks`` is a sequence of ``(height_above_ground, scale)`` -- above the
     given height the footprint shrinks to ``scale`` of its original half-extent,
     which produces the classic stepped tower silhouette.
+
+    The remaining keyword arguments tune detail density.  They exist so the
+    category can spend its triangle budget where it buys the most, and so a
+    12-storey tower and a 2-storey motel do not ship the same amount of
+    geometry for the same silhouette.
     """
     a = C.Asset(asset_id, "building")
     wall = base_color or PALETTE[key]
     trim_c = trim or TRIM
 
-    def half_at(z):
-        """Footprint half-extents at height z, after any setbacks."""
+    def scale_at(z):
+        """Footprint scale at height z, after any setbacks."""
         s = 1.0
         for h, sc in setbacks:
             if z >= h:
                 s = min(s, sc)
-        return width * 0.5 * s, depth * 0.5 * s
+        return s
+
+    def top_scale():
+        s = 1.0
+        for _h, sc in setbacks:
+            s = min(s, sc)
+        return s
 
     total_h = floors * floor_h
 
     # ---- main shaft ------------------------------------------------------
+    # Chamfered: the four vertical arrises of a 12 m wall are what stop it
+    # rendering as one dead value under a single directional light.  The +z
+    # face is the concrete roof -- markedly darker than the painted wall.
     shaft = a.part("shaft", base_color=wall)
-    lo = 0.0
-    hi = total_h
-    C.box(shaft.mesh, (width, depth, total_h), center=(0, 0, total_h * 0.5),
-          color=wall, colors={"-z": CONCRETE_DK})
-    _ = (lo, hi, half_at)
+    C.chamfer_box(shaft.mesh, (width, depth, total_h),
+                  center=(0, 0, total_h * 0.5), color=wall, bevel=0.07,
+                  colors={"+z": ROOF})
+
+    # lighter upper storey block on the tall variants: a colour zone, not
+    # geometry.  It wraps the shaft by 2 cm so the two never share a plane.
+    if upper_floor > 0:
+        z0 = upper_floor * floor_h
+        if z0 < total_h - 0.5:
+            up_c = _shrub(wall, 1.09)
+            up = a.part("upper_walls", base_color=up_c)
+            C.chamfer_box(up.mesh,
+                          (width + 0.04, depth + 0.04, total_h + 0.02 - z0),
+                          center=(0, 0, (total_h + 0.02 + z0) * 0.5),
+                          color=up_c, bevel=0.05, colors={"+z": ROOF})
 
     # vertical pilasters -- the signature Deco fluting.
     # All pilasters share ONE part: they are the same colour and material, and
@@ -81,25 +242,28 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
         t = (i + 0.5) / pilasters - 0.5          # -0.5 .. +0.5
         x = t * width * 0.94
         w = width * 0.030
-        d = 0.14
-        C.box(pil.mesh, (w, depth + d, total_h * 0.94),
-              center=(x, 0, total_h * 0.47), color=_shrub(wall, 1.06))
+        C.chamfer_box(pil.mesh, (w, depth + 0.16, total_h * 0.94),
+                      center=(x, 0, total_h * 0.47), color=_shrub(wall, 1.06),
+                      bevel=0.035)
     a.add(pil)
 
-    # horizontal string courses every floor (one shared part)
+    # horizontal string courses every floor (one shared part).  The lighter
+    # top face and darker soffit are free face_colors; the chamfer is what
+    # actually makes the band read from a distance.
     courses = C.Part("courses", base_color=trim_c)
-    for f in range(floors):
+    for f in range(1, floors):
         z = f * floor_h
-        sc = 1.0
-        for h, s in setbacks:
-            if z >= h:
-                sc = min(sc, s)
-        w2, d2 = width * sc, depth * sc
-        C.box(courses.mesh, (w2 + 0.16, d2 + 0.16, 0.16), center=(0, 0, z),
-              color=trim_c)
+        s = scale_at(z)
+        w2, d2 = width * s, depth * s
+        C.chamfer_box(courses.mesh, (w2 + 0.18, d2 + 0.18, 0.18),
+                      center=(0, 0, z), color=trim_c, bevel=0.05,
+                      colors={"+z": _shrub(trim_c, 1.06),
+                              "-z": _shrub(trim_c, 0.82)})
+    if courses.mesh.faces:
+        a.add(courses)
 
     # ---- setback shoulders: the exposed roof of each lower step ----------
-    setback_slab = C.Part("setback_slabs", base_color=ROOF)
+    setback_slab = C.Part("setback_slabs", base_color=CONCRETE)
     terrace_rail = C.Part("terrace_rails", base_color=CONCRETE)
     for h, s in sorted(setbacks):
         prev = 1.0
@@ -112,178 +276,340 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
         w_in, d_in = width * s, depth * s
         slab_w = (w_out + w_in) * 0.5
         slab_d = (d_out + d_in) * 0.5
-        C.box(setback_slab.mesh, (slab_w, slab_d, 0.22), center=(0, 0, h - 0.11),
-              color=ROOF)
+        C.chamfer_box(setback_slab.mesh, (slab_w, slab_d, 0.24),
+                      center=(0, 0, h - 0.12), color=CONCRETE, bevel=0.06,
+                      colors={"+z": ROOF_DK, "-z": CONCRETE_DK})
         # a small parapet wall around the exposed terrace
-        pw = (w_out - w_in) * 0.5
         for sgn in (-1, 1):
-            C.box(terrace_rail.mesh, (w_out, 0.16, 0.52),
-                  center=(0, sgn * (d_out * 0.5 - 0.08), h + 0.26),
-                  color=CONCRETE)
-            C.box(terrace_rail.mesh, (0.16, d_out - 0.32, 0.52),
-                  center=(sgn * (w_out * 0.5 - 0.08), 0, h + 0.26),
-                  color=CONCRETE)
-        del pw
+            C.box(terrace_rail.mesh, (w_out, 0.18, 0.52),
+                  center=(0, sgn * (d_out * 0.5 - 0.09), h + 0.26),
+                  color=CONCRETE, colors={"+z": _shrub(CONCRETE, 1.12)})
+            C.box(terrace_rail.mesh, (0.18, d_out - 0.36, 0.52),
+                  center=(sgn * (w_out * 0.5 - 0.09), 0, h + 0.26),
+                  color=CONCRETE, colors={"+z": _shrub(CONCRETE, 1.12)})
 
     if setback_slab.mesh.faces:
         a.add(setback_slab)
         a.add(terrace_rail)
 
-    # ---- windows ---------------------------------------------------------
-    win_rows = []
+    # ---- windows: real recesses, not decals -----------------------------
+    # Glass lives in one of two parts so the lit subset can carry an emissive
+    # and glow at night; the frame ring, the sills and the lintels are three
+    # more, each an open shell with a single declared outward direction.
+    windows = C.Part("windows", base_color=GLASS, roughness=0.25)
+    window_lit = C.Part("window_lit", base_color=GLASS_LIT, roughness=0.25,
+                        emissive=(0.90, 0.74, 0.40))
+    # An annulus is a single-plane open shell, so each side needs its own
+    # Part: one reference direction cannot describe a ring facing -Y and a
+    # ring facing +Y in the same part.
+    frames = C.Part("window_frames", base_color=trim_c,
+                    outward=("dir", (0.0, -1.0, 0.0)))
+    frames_rear = C.Part("window_rear_frames", base_color=trim_c,
+                         outward=("dir", (0.0, 1.0, 0.0)))
+    sills = C.Part("window_sills", base_color=trim_c,
+                   outward=("dir", (0.0, 0.0, 1.0)))
+    lintels = C.Part("window_lintels", base_color=_shrub(trim_c, 0.86),
+                     outward=("dir", (0.0, 0.0, -1.0)))
+    windows_side = C.Part("windows_side", base_color=GLASS, roughness=0.25)
+    window_side_lit = C.Part("window_side_lit", base_color=GLASS_LIT,
+                             roughness=0.25, emissive=(0.90, 0.74, 0.40))
+
+    ww, wh = 1.10, 1.62
+    fw = 0.13                                    # frame border width
     for f in range(floors):
         z = f * floor_h + floor_h * 0.5
-        sc = 1.0
-        for h, s in setbacks:
-            if z >= h:
-                sc = min(sc, s)
-        win_rows.append((f, z, sc))
-
-    windows = C.Part("windows", base_color=GLASS, roughness=0.25)
-    windows_side = C.Part("windows_side", base_color=GLASS, roughness=0.25)
-    for f, z, sc in win_rows:
-        w2, d2 = width * sc, depth * sc
-        cols = max(2, int(round(w2 / 2.4)))
+        s = scale_at(z)
+        w2, d2 = width * s, depth * s
+        cols = max(2, int(round(w2 * 0.84 / win_pitch)))
         for cidx in range(cols):
             t = (cidx + 0.5) / cols - 0.5
-            x = t * w2 * 0.86
-            # south (front, -Y) and north (+Y) facades.
-            # All windows of an asset share ONE part: per-instance parts would
-            # all share the name "window" and collide when a renderer binds
-            # materials by name.  Lit and unlit windows differ only by face
-            # colour, which face_colors already expresses.
-            for sgn in (-1, 1):
-                lit = ((f + cidx * 3 + (1 if sgn < 0 else 5)) % 7) < 2
-                col = GLASS_LIT if lit else GLASS
-                ww, wh = 1.05, 1.55
-                y = sgn * (d2 * 0.5 + 0.03)
-                C.box(windows.mesh, (ww, 0.10, wh), center=(x, y, z),
-                      color=col,
-                      colors={"+y" if sgn > 0 else "-y": col})
-            # east/west ends
-            for sgn in (-1, 1):
-                C.box(windows_side.mesh, (0.10, 0.9, 1.45),
-                      center=(sgn * (w2 * 0.5 + 0.03), t * d2 * 0.7, z),
-                      color=GLASS)
+            x = t * w2 * 0.84
+            # south (front, -Y) and north (+Y) facades.  Every window of an
+            # asset shares ONE of the five parts above; per-instance parts
+            # would all share a name and collide when a renderer binds
+            # materials by name.
+            for fi, sgn in enumerate((-1, 1)):
+                y_wall = sgn * d2 * 0.5
+                y_f = y_wall + sgn * FRAME_PROUD
+                # The glass sits BEHIND the wall plane, inside the reveal.
+                # Sign matters: `sgn` is -1 for the street facade, so a
+                # positive inset has to move the pane TOWARD the building
+                # centre, which is `-sgn * GLASS_SET`.  Using `+sgn` (the
+                # obvious spelling) pushes the pane 15 mm PROUD of the wall
+                # and the whole recess collapses into a sticker -- which is
+                # exactly what the first QA render showed.
+                y_g = y_wall - sgn * GLASS_SET
+                lit = _lit_at(f, cidx, fi, lit_mod, lit_thresh)
+                # glass: a solid panel whose outer face is GLASS_SET behind the
+                # wall, i.e. FRAME_PROUD - GLASS_SET behind the frame ring.
+                gp = window_lit if lit else windows
+                gc = GLASS_LIT if lit else GLASS
+                # The glass extends 0.12 m further INWARD from y_g, i.e. in
+                # direction -sgn, so the centre is y_g - sgn * 0.06.  (Getting
+                # this sign wrong re-projects the pane back out of the wall.)
+                C.box(gp.mesh, (ww, 0.12, wh),
+                      center=(x, y_g - sgn * 0.06, z), color=gc)
+                if sgn > 0 and not rear_recess:
+                    continue
+                ring = frames_rear if sgn > 0 else frames
+                _annulus(ring.mesh, y_f, x - ww * 0.5, x + ww * 0.5,
+                         z - wh * 0.5, z + wh * 0.5, fw, fw, trim_c,
+                         flip=(sgn > 0))
+                _reveal(sills.mesh, x - ww * 0.5, x + ww * 0.5, z - wh * 0.5,
+                        y_f, y_g, trim_c, up=True)
+                _reveal(lintels.mesh, x - ww * 0.5, x + ww * 0.5,
+                        z + wh * 0.5, y_f, y_g, _shrub(trim_c, 0.86), up=False)
+            # east/west ends -- one recessed light per storey per end
+            for fi2, sx in enumerate((-1, 1)):
+                lit = _lit_at(f, 3 + fi2, sx, lit_mod, lit_thresh)
+                sp = window_side_lit if lit else windows_side
+                sc = GLASS_LIT if lit else GLASS
+                C.box(sp.mesh, (0.12, 0.90, 1.42),
+                      center=(sx * (w2 * 0.5 - 0.02), 0.0, z), color=sc)
 
-    a.add(windows)
-    a.add(windows_side)
+    for p in (windows, window_lit, frames, frames_rear, sills, lintels,
+              windows_side, window_side_lit):
+        if p.mesh.faces:
+            a.add(p)
 
     # ---- balcony parapets ------------------------------------------------
-    balconies = C.Part("balconies", base_color=trim_c)
-    for f in balcony_rows:
-        z0 = f * floor_h + floor_h * 0.18
-        sc = 1.0
-        for h, s in setbacks:
-            if z0 >= h:
-                sc = min(sc, s)
-        w2, d2 = width * sc, depth * sc
-        n_bal = max(2, int(round(w2 / 3.2)))
-        for i in range(n_bal):
-            t = (i + 0.5) / n_bal - 0.5
-            x = t * w2 * 0.84
-            y = -(d2 * 0.5 + 0.42)
-            # one shared "balcony" part for the whole building
-            C.box(balconies.mesh, (2.1, 0.84, 0.10), center=(x, y, z0),
-                  color=trim_c)
-            C.box(balconies.mesh, (2.1, 0.10, 0.78),
-                  center=(x, y - 0.37, z0 + 0.44), color=trim_c)
-            C.box(balconies.mesh, (0.10, 0.84, 0.78),
-                  center=(x - 1.0, y, z0 + 0.44), color=trim_c)
-            C.box(balconies.mesh, (0.10, 0.84, 0.78),
-                  center=(x + 1.0, y, z0 + 0.44), color=trim_c)
-
     if balcony_rows:
+        balconies = C.Part("balconies", base_color=trim_c)
+        rail_dk = _shrub(trim_c, 0.80)
+        for f in balcony_rows:
+            z0 = f * floor_h + floor_h * 0.18
+            s = scale_at(z0)
+            w2, d2 = width * s, depth * s
+            n_bal = max(1, int(round(w2 * 0.84 / bal_pitch)))
+            for i in range(n_bal):
+                t = (i + 0.5) / n_bal - 0.5
+                x = t * w2 * 0.84
+                y = -(d2 * 0.5 + 0.44)
+                # slab with a darker soffit so the ledge reads from below
+                C.box(balconies.mesh, (2.2, 0.92, 0.12),
+                      center=(x, y, z0), color=trim_c,
+                      colors={"-z": _shrub(trim_c, 0.58),
+                              "+z": _shrub(trim_c, 0.92)})
+                # low solid parapet
+                C.box(balconies.mesh, (2.2, 0.11, 0.62),
+                      center=(x, y - 0.405, z0 + 0.37), color=trim_c,
+                      colors={"-z": rail_dk, "+z": _shrub(trim_c, 1.05)})
+                for sx in (-1, 1):
+                    C.box(balconies.mesh, (0.11, 0.92, 0.62),
+                          center=(x + sx * 1.045, y, z0 + 0.37), color=trim_c,
+                          colors={"-z": rail_dk, "+z": _shrub(trim_c, 1.05)})
         a.add(balconies)
 
-    # ---- ground floor: awning + shopfront band ---------------------------
+    # ---- ground floor: dark plinth, shopfront band, real entrance -------
     if ground_accent:
-        # height 0.85 centred at height/2 -> bottom exactly on z = 0.  A centre
-        # of 0.42 sinks the band's bottom 5 mm below the ground plane, which the
-        # verifier catches on every building.
-        band_h = 0.85
-        band = C.Part("ground_band", base_color=_shrub(wall, 0.72))
-        C.box(band.mesh, (width + 0.10, depth + 0.10, band_h),
-              center=(0, 0, band_h * 0.5), color=_shrub(wall, 0.72))
+        # A 1.2 m plinth in a much darker shade of the wall.  Free: one part,
+        # one chamfered box, and it stops the base of the building from being
+        # the same value as the top of the building.
+        band_h = 1.20
+        plinth_c = _shrub(wall, 0.58)
+        band = C.Part("ground_band", base_color=plinth_c)
+        C.chamfer_box(band.mesh, (width + 0.12, depth + 0.12, band_h),
+                      center=(0, 0, band_h * 0.5), color=plinth_c, bevel=0.05,
+                      colors={"+z": _shrub(plinth_c, 1.18)})
         a.add(band)
 
+        y_wall = -depth * 0.5
+
+        # entrance: a dark doorway set back inside a trim surround, reached by
+        # two steps, under a canopy on two posts.
+        ent = C.Part("entrance", base_color=DOOR)
+        C.box(ent.mesh, (1.52, 0.16, 2.46),
+              center=(0, y_wall - 0.07, 1.23), color=DOOR)
+        for sx in (-1, 1):
+            C.box(ent.mesh, (0.24, 0.30, 2.82),
+                  center=(sx * 0.88, y_wall - 0.15, 1.41), color=trim_c,
+                  colors={"-z": _shrub(trim_c, 0.78)})
+        C.box(ent.mesh, (2.00, 0.30, 0.32),
+              center=(0, y_wall - 0.15, 2.66), color=trim_c,
+              colors={"-z": _shrub(trim_c, 0.70), "+z": _shrub(trim_c, 1.06)})
+        # steps -- the lowest one's bottom face is exactly on z = 0
+        C.box(ent.mesh, (2.90, 1.05, 0.17),
+              center=(0, y_wall - 0.55, 0.085), color=CONCRETE,
+              colors={"+z": _shrub(CONCRETE, 1.12)})
+        C.box(ent.mesh, (2.40, 0.55, 0.34),
+              center=(0, y_wall - 0.30, 0.17), color=CONCRETE,
+              colors={"+z": _shrub(CONCRETE, 1.12)})
+        a.add(ent)
+
+        # canopy on two posts (this is the part the engine used to hang the
+        # neon sign from, so the name stays).
         aw = C.Part("awning", base_color=AWNING)
-        C.box(aw.mesh, (width * 0.46, 1.5, 0.16),
-              center=(0, -(depth * 0.5 + 0.72), 2.35), color=AWNING)
-        C.box(aw.mesh, (width * 0.46, 0.10, 0.42),
-              center=(0, -(depth * 0.5 + 1.44), 2.13), color=AWNING)
+        C.chamfer_box(aw.mesh, (3.40, 1.50, 0.16),
+                      center=(0, y_wall - 0.85, 2.95), color=AWNING,
+                      bevel=0.05, colors={"-z": _shrub(AWNING, 0.70)})
+        C.box(aw.mesh, (3.40, 0.10, 0.34),
+              center=(0, y_wall - 1.58, 2.76), color=_shrub(AWNING, 0.86))
+        for sx in (-1, 1):
+            C.box(aw.mesh, (0.13, 0.13, 2.88),
+                  center=(sx * 1.48, y_wall - 1.42, 1.44), color=TRIM,
+                  colors={"-z": _shrub(TRIM, 0.70)})
         a.add(aw)
 
-    # ---- roof: parapet, water tank, AC units, sign backing ---------------
-    top_s = 1.0
-    for _h, s in setbacks:
-        top_s = min(top_s, s)
-    rw, rd = width * top_s, depth * top_s
-
-    par = C.Part("parapet", base_color=trim_c)
-    ph = 0.75
-    for sgn in (-1, 1):
-        C.box(par.mesh, (rw + 0.24, 0.18, ph),
-              center=(0, sgn * (rd * 0.5 + 0.03), total_h + ph * 0.5),
-              color=trim_c)
-        C.box(par.mesh, (0.18, rd - 0.30, ph),
-              center=(sgn * (rw * 0.5 + 0.03), 0, total_h + ph * 0.5),
-              color=trim_c)
-    a.add(par)
+    # ---- roof: cornice, deck, parapet + coping, tank, AC, clutter --------
+    rw, rd = width * top_scale(), depth * top_scale()
+    cornice_top = total_h
 
     if cornice:
         cor = C.Part("cornice", base_color=trim_c)
-        C.box(cor.mesh, (rw + 0.36, rd + 0.36, 0.22),
-              center=(0, 0, total_h + 0.11), color=trim_c)
+        C.chamfer_box(cor.mesh, (rw + 0.40, rd + 0.40, 0.22),
+                      center=(0, 0, total_h + 0.11), color=trim_c, bevel=0.06,
+                      colors={"+z": ROOF})
         a.add(cor)
+        cornice_top = total_h + 0.22
 
-    # rooftop water tank on a steel frame.  The barrel is smooth-shaded, so it
-    # lives in its OWN part -- a Part carries a single `flat` flag, and mixing a
-    # smooth loft with flat primitives in one part makes the flat ones inherit
-    # averaged normals they must not have.
-    tank_r = min(rw, rd) * 0.22
-    tx = rw * 0.24
-    ty = rd * 0.16
-    tz = total_h + 0.22
+    # roof deck: a raised dark pad.  Every top-facing horizontal surface on
+    # the building -- this, the setback slab tops and the shaft cap -- is
+    # concrete grey, several stops darker than any painted wall.
+    deck = C.Part("roof_deck", base_color=ROOF_DK)
+    C.chamfer_box(deck.mesh, (rw + 0.16, rd + 0.16, 0.14),
+                  center=(0, 0, cornice_top + 0.07), color=ROOF_DK, bevel=0.05)
+    a.add(deck)
+    deck_top = cornice_top + 0.14
+
+    par = C.Part("parapet", base_color=trim_c)
+    ph = 0.66
+    for sgn in (-1, 1):
+        C.box(par.mesh, (rw + 0.28, 0.18, ph),
+              center=(0, sgn * (rd * 0.5 + 0.05), cornice_top + ph * 0.5),
+              color=trim_c)
+        C.box(par.mesh, (0.18, rd - 0.24, ph),
+              center=(sgn * (rw * 0.5 + 0.05), 0, cornice_top + ph * 0.5),
+              color=trim_c)
+    a.add(par)
+
+    # two-tone roofline: a lighter coping cap over the darker parapet so the
+    # silhouette has a bright edge instead of stopping dead.
+    cap = C.Part("parapet_cap", base_color=_shrub(TRIM, 1.0))
+    cap_c = _shrub(trim_c, 1.04)
+    for sgn in (-1, 1):
+        C.chamfer_box(cap.mesh, (rw + 0.40, 0.30, 0.12),
+                      center=(0, sgn * (rd * 0.5 + 0.05),
+                              cornice_top + ph + 0.06),
+                      color=cap_c, bevel=0.04)
+        C.chamfer_box(cap.mesh, (0.30, rd - 0.02, 0.12),
+                      center=(sgn * (rw * 0.5 + 0.05), 0,
+                              cornice_top + ph + 0.06),
+                      color=cap_c, bevel=0.04)
+    a.add(cap)
+
+    # rooftop water tank on a steel frame, banded stave by stave
+    tank_r = min(rw, rd) * 0.21
+    tx = rw * 0.22
+    ty = rd * 0.15
+    tz = deck_top
     legs = C.Part("tank_legs", base_color=METAL_DK, metallic=0.5)
     for sx in (-1, 1):
         for sy in (-1, 1):
-            C.box(legs.mesh, (0.10, 0.10, 0.95),
-                  center=(tx + sx * tank_r * 0.62, ty + sy * tank_r * 0.62,
-                          tz + 0.47), color=METAL_DK)
+            C.box(legs.mesh, (0.11, 0.11, 0.92),
+                  center=(tx + sx * tank_r * 0.60, ty + sy * tank_r * 0.60,
+                          tz + 0.46), color=METAL_DK,
+                  colors={"+z": _shrub(METAL_DK, 1.30)})
     a.add(legs)
 
-    tank = C.Part("water_tank", base_color=(0.62, 0.52, 0.40), roughness=0.85,
-                  flat=False)
-    C.cylinder(tank.mesh, tank_r, 1.5, 10, center=(tx, ty, tz + 0.95 + 0.75),
-               color=(0.62, 0.52, 0.40), smooth=True)
+    tank = C.Part("water_tank", base_color=TANK_A, roughness=0.85)
+    _banded_cylinder(tank.mesh, tank_r, 1.42, 10,
+                     (tx, ty, tz + 1.63), TANK_A, TANK_B)
     a.add(tank)
 
     tank_lid = C.Part("water_tank_lid", base_color=(0.48, 0.40, 0.32),
                       roughness=0.85)
-    C.cone(tank_lid.mesh, tank_r * 1.04, 0.34, 10,
-           center=(tx, ty, tz + 0.95 + 1.5 + 0.17), color=(0.48, 0.40, 0.32))
+    C.cone(tank_lid.mesh, tank_r * 1.06, 0.32, 10,
+           center=(tx, ty, tz + 2.50), color=(0.48, 0.40, 0.32))
     a.add(tank_lid)
 
-    # rooftop AC condensers
+    # rooftop AC condensers -- chamfered so the light breaks on their edges
     acs = C.Part("ac_units", base_color=METAL)
-    for i in range(3):
-        ax = -rw * 0.28 + i * rw * 0.26
-        ay = -rd * 0.22
-        C.box(acs.mesh, (1.15, 0.95, 0.80), center=(ax, ay, tz + 0.40),
-              color=METAL)
-        C.cylinder(acs.mesh, 0.30, 0.10, 8,
-                   center=(ax, ay, tz + 0.85), color=METAL_DK)
+    n_ac = ac_units if rw > 7.0 else max(1, ac_units - 1)
+    for i in range(n_ac):
+        ax = -rw * 0.28 + i * rw * 0.30
+        ay = -rd * 0.28
+        C.chamfer_box(acs.mesh, (1.15, 0.95, 0.80),
+                      center=(ax, ay, tz + 0.40), color=METAL, bevel=0.05,
+                      colors={"+z": _shrub(METAL, 0.80)})
+        C.cylinder(acs.mesh, 0.30, 0.10, 6, center=(ax, ay, tz + 0.85),
+                   color=METAL_DK)
     a.add(acs)
 
-    # blank neon sign backing board on the front facade (signs attach to this)
+    if clutter:
+        # Reserve the footprints the fixed roof furniture already owns, then
+        # place the loose clutter into whatever is left.  Candidates that do
+        # not fit are dropped rather than pushed into a neighbour.
+        slots = _Slots()
+        for (px, py, phx, phy) in ((rw * 0.22, rd * 0.14, tank_r * 1.2,
+                                    tank_r * 1.2),
+                                   (-rw * 0.28, -rd * 0.28, 0.60, 0.48),
+                                   (-rw * 0.28 + rw * 0.60, -rd * 0.28,
+                                    0.60, 0.48),
+                                   (-rw * 0.28 + rw * 1.20, -rd * 0.28,
+                                    0.60, 0.48)):
+            slots.taken.append((px, py, phx, phy))
+
+        # stair bulkhead / roof access hut -- the tall silhouette element
+        hx, hy = -rw * 0.22, rd * 0.16
+        if slots.free(hx, hy, 1.16, 0.94):
+            hut = C.Part("roof_hut", base_color=_shrub(wall, 0.80))
+            C.chamfer_box(hut.mesh, (2.20, 1.80, 2.05),
+                          center=(hx, hy, deck_top + 1.03),
+                          color=_shrub(wall, 0.80), bevel=0.06, colors={"+z": ROOF})
+            a.add(hut)
+            hut_cap = C.Part("roof_hut_cap", base_color=trim_c)
+            C.chamfer_box(hut_cap.mesh, (2.40, 2.00, 0.14),
+                          center=(hx, hy, deck_top + 2.12), color=trim_c, bevel=0.04)
+            a.add(hut_cap)
+
+        # vent stack: a short pipe with a cowl
+        vx, vy = -rw * 0.36, rd * 0.40
+        if slots.free(vx, vy, 0.28, 0.28):
+            vents = C.Part("roof_vents", base_color=METAL_DK, metallic=0.4)
+            C.cylinder(vents.mesh, 0.17, 0.92, 6, center=(vx, vy, deck_top + 0.46),
+                       color=METAL_DK)
+            C.cylinder(vents.mesh, 0.26, 0.10, 6, center=(vx, vy, deck_top + 0.97),
+                       color=_shrub(METAL_DK, 1.25))
+            a.add(vents)
+
+        # two TV aerials
+        aer = C.Part("roof_aerials", base_color=METAL, metallic=0.6)
+        for (ax, ay, ah) in ((rw * 0.36, -rd * 0.40, 1.85),
+                             (rw * 0.40, -rd * 0.26, 1.35)):
+            if not slots.free(ax, ay, 0.34, 0.34):
+                continue
+            C.cylinder(aer.mesh, 0.035, ah, 4,
+                       center=(ax, ay, deck_top + ah * 0.5), color=METAL)
+            C.box(aer.mesh, (0.05, 0.62, 0.05),
+                  center=(ax, ay, deck_top + ah * 0.84), color=METAL)
+        if aer.mesh.faces:
+            a.add(aer)
+
+        # satellite dishes on short masts
+        dish = C.Part("roof_dishes", base_color=_shrub(TRIM, 0.92))
+        for (dx, dy) in ((-rw * 0.42, -rd * 0.18), (rw * 0.04, rd * 0.40)):
+            if not slots.free(dx, dy, 0.46, 0.46):
+                continue
+            C.box(dish.mesh, (0.10, 0.10, 0.34),
+                  center=(dx, dy, deck_top + 0.17), color=METAL_DK)
+            C.cone(dish.mesh, 0.44, 0.13, 7, center=(dx, dy, deck_top + 0.42),
+                   color=_shrub(TRIM, 0.92), radius_top=0.13)
+        if dish.mesh.faces:
+            a.add(dish)
+
+    # blank neon sign backing board on the front facade (signs attach to this).
+    # Mounted on whichever setback band contains this height, so on a ziggurat
+    # the board lands on the wall it is actually in front of.
     sb = C.Part("sign_board", base_color=METAL_DK, roughness=0.8)
-    sb_w = min(rw * 0.52, 4.2)
-    sb_y = -(rd * 0.5 + 0.12)
-    sb_z = total_h * 0.72
-    C.box(sb.mesh, (sb_w, 0.22, 2.1), center=(0, sb_y, sb_z), color=METAL_DK)
+    sb_z = total_h * 0.74
+    sbs = scale_at(sb_z)
+    sb_w = min(width * sbs * 0.52, 4.2)
+    sb_y = -(depth * sbs * 0.5 + 0.14)
+    C.chamfer_box(sb.mesh, (sb_w, 0.24, 2.10), center=(0, sb_y, sb_z),
+                  color=METAL_DK, bevel=0.05,
+                  colors={"-y": _shrub(METAL_DK, 0.62)})
     for sgn in (-1, 1):
-        C.box(sb.mesh, (0.10, 0.34, 0.10),
+        C.box(sb.mesh, (0.10, 0.36, 0.10),
               center=(sgn * sb_w * 0.42, sb_y + 0.02, sb_z - 0.95),
               color=METAL_DK)
     a.add(sb)
@@ -301,65 +627,78 @@ def build_all():
     # 1. classic pastel Deco hotel, 5 storeys, mild setback
     out.append(building(
         "bldg_deco_pink", "pink", 12.0, 10.0, 5,
-        setbacks=((11.0, 0.78),), pilasters=5, balcony_rows=(1, 2, 3, 4)))
+        setbacks=((11.0, 0.78),), pilasters=5, balcony_rows=(1, 2, 3, 4),
+        lit_mod=9, lit_thresh=2, upper_floor=3, bal_pitch=4.0))
 
     # 2. tall teal tower with a pronounced ziggurat top
     out.append(building(
         "bldg_deco_teal", "teal", 11.0, 9.0, 9,
         setbacks=((14.0, 0.82), (23.0, 0.62), (27.0, 0.44)), pilasters=4,
-        balcony_rows=(2, 4, 6)))
+        balcony_rows=(2, 4, 6), upper_floor=6, bal_pitch=4.0))
 
     # 3. wide cream apartment block, 4 storeys, no setback
     out.append(building(
         "bldg_cream_block", "cream", 18.0, 11.0, 4,
-        pilasters=7, balcony_rows=(1, 2, 3)))
+        pilasters=7, balcony_rows=(1, 2, 3), win_pitch=3.2, bal_pitch=3.6,
+        lit_mod=13, lit_thresh=3))
 
     # 4. mint corner shop, 3 storeys
     out.append(building(
         "bldg_mint_shop", "mint", 10.0, 8.0, 3,
-        pilasters=4, balcony_rows=(2,)))
+        pilasters=4, balcony_rows=(2,), win_pitch=2.9, bal_pitch=4.6,
+        rear_recess=True))
 
     # 5. coral art-deco hall with a single setback and awning
     out.append(building(
         "bldg_coral_hall", "coral", 14.0, 12.0, 4,
-        setbacks=((9.5, 0.80),), pilasters=5, balcony_rows=(1, 3)))
+        setbacks=((9.5, 0.80),), pilasters=5, balcony_rows=(1, 3),
+        win_pitch=3.1, bal_pitch=4.4, rear_recess=True))
 
-    # 6. apricot low-rise motel block, 2 storeys
+    # 6. apricot low-rise motel block, 2 storeys -- the short end of the range
     out.append(building(
-        "bldg_apricot_motel", "apricot", 16.0, 9.0, 2,
-        pilasters=6, balcony_rows=(1,)))
+        "bldg_apricot_motel", "apricot", 16.0, 9.0, 2, floor_h=3.3,
+        pilasters=6, balcony_rows=(1,), win_pitch=3.6, bal_pitch=7.0,
+        lit_mod=9, lit_thresh=1))
 
-    # 7. lilac slim high-rise, 12 storeys, double setback
+    # 7. lilac slim high-rise, 12 storeys, double setback -- the tall end
     out.append(building(
-        "bldg_lilac_tower", "lilac", 9.5, 8.5, 12,
+        "bldg_lilac_tower", "lilac", 9.5, 8.5, 12, floor_h=3.3,
         setbacks=((20.0, 0.85), (32.0, 0.70)), pilasters=4,
-        balcony_rows=(3, 5, 7, 9, 11)))
+        balcony_rows=(3, 5, 7, 9, 11), upper_floor=8, win_pitch=3.1,
+        bal_pitch=4.2, lit_mod=11, lit_thresh=2, ac_units=2))
 
     # 8. aqua aquarium-style block with deep balconies
     out.append(building(
         "bldg_aqua_arcade", "aqua", 15.0, 12.0, 5,
-        pilasters=6, balcony_rows=(1, 2, 3, 4)))
+        pilasters=6, balcony_rows=(1, 2, 3, 4), upper_floor=3,
+        win_pitch=3.1, bal_pitch=3.8, rear_recess=True))
 
     # 9. sand-coloured 6-storey mid-rise
     out.append(building(
         "bldg_sand_midrise", "sand", 13.0, 10.0, 6,
-        setbacks=((13.0, 0.88),), pilasters=5, balcony_rows=(2, 3, 4, 5)))
+        setbacks=((13.0, 0.88),), pilasters=5, balcony_rows=(2, 3, 4, 5),
+        upper_floor=4, win_pitch=3.0, bal_pitch=3.8, lit_mod=13, lit_thresh=3))
 
     # 10. white deco landmark with a ziggurat crown
     out.append(building(
         "bldg_white_landmark", "white", 12.5, 12.5, 10,
         setbacks=((16.0, 0.85), (26.0, 0.66), (31.0, 0.46)), pilasters=4,
-        balcony_rows=(2, 4, 6, 8)))
+        balcony_rows=(2, 4, 6, 8), upper_floor=7, win_pitch=3.2,
+        bal_pitch=4.0, lit_mod=9, lit_thresh=2))
 
     # 11. pink twin-setback 7 storey
     out.append(building(
         "bldg_pink_terrace", "pink", 14.0, 10.0, 7,
         setbacks=((10.0, 0.86), (19.0, 0.68)), pilasters=5,
-        balcony_rows=(1, 3, 5)))
+        balcony_rows=(1, 3, 5), upper_floor=5, win_pitch=3.1, bal_pitch=4.2,
+        rear_recess=True))
 
-    # 12. teal industrial-loft, 3 storeys, wide and shallow
+    # 12. teal industrial-loft, 3 storeys, wide and shallow.  Width is held at
+    # 17 m (8.5 m half-extent) so the whole asset stays clear of the engine's
+    # 11.0 m footprint guard; the 20 m version was culled from the city.
     out.append(building(
-        "bldg_teal_loft", "teal", 20.0, 9.0, 3,
-        pilasters=8, balcony_rows=(2,)))
+        "bldg_teal_loft", "teal", 17.0, 9.0, 3,
+        pilasters=7, balcony_rows=(2,), win_pitch=3.5, bal_pitch=6.6,
+        lit_mod=7, lit_thresh=1))
 
     return out

@@ -9,22 +9,33 @@ tools/blender/
 ├── build_assets.py        entry point -- writes assets/*.json + manifest.json
 ├── render_previews.py     renders assets/preview/*.png with Blender EEVEE
 ├── verify_assets.py       asserts every schema invariant; non-zero on failure
+├── test_kernel.py         kernel self-tests (runs outside Blender)
+├── check_window_recess.py proves building glass is set BACK, not stuck on
+├── report_sizes.py        every asset's real dimensions + proportion audit
 ├── negative_control.py    proves the verifier actually rejects bad geometry
 ├── README.md              this file
 └── vcw/
     ├── CONTRACT.md        authoring contract for adding a new category
     ├── core.py            geometry kernel (pure Python, no bpy)
     ├── export.py          asset -> Y-up JSON, with invariant enforcement
-    ├── test_kernel.py     60+ kernel self-tests (runs outside Blender)
     └── builders/
-        ├── buildings.py   12   Art Deco / pastel Miami
-        ├── vehicles.py     5   sedan, coupe, pickup, police, taxi
+        ├── buildings.py   14   Art Deco / pastel Miami
+        ├── vehicles.py    14   road cars, city bus, aircraft, boats
         ├── pedestrians.py  4   suit, dress, overalls, streetwear (rigged)
-        ├── props.py      12   street furniture
+        ├── props.py      14   street furniture
         ├── signs.py       8   neon signs
         ├── palms.py       3   tall, short, bushy
-        ├── misc.py        8   beach props + helicopter/helipad/graffiti
-        └── weapons.py     6   4 guns + 2 pickups
+        ├── roads.py       9   tiling road / pavement / ground surfaces
+        ├── misc.py        6   beach props + helicopter/helipad/graffiti
+        ├── weapons.py     6   4 guns + bat + grenade
+        ├── markers.py     2   objective flame, coin ring
+        ├── pickups.py     8   vest, medkit, ammo, cash, O2, flare, rocket
+        ├── animals.py     4   dog, cat, bird, fish
+        ├── military.py    2   military hardware
+        ├── watercraft.py  4   boat, yacht, ships
+        ├── nature.py      2   grass patch, flower cluster
+        ├── interior.py    2   interior fit-out
+        └── terrain.py     1   mountain piece
 ```
 
 ## Requirements
@@ -52,25 +63,53 @@ $BL --background --python tools/blender/verify_assets.py
 
 All three exit `0` on success. Each prints a per-asset table and a totals block.
 
+### Checks that do not need Blender
+
+```bash
+cd tools/blender
+python3 vcw/test_kernel.py         # geometry-kernel assertions
+python3 check_window_recess.py     # building glass is recessed, not a decal
+python3 report_sizes.py            # every asset's real size + proportion audit
+python3 negative_control.py        # the verifier rejects deliberately broken input
+```
+
+`check_window_recess.py` exists because of a real bug this pipeline shipped
+once: the glass was placed with `y_wall + sgn * GLASS_SET`, which for the street
+facade (`sgn = -1`) puts the pane 15 mm **proud** of the wall. The recess
+collapses into a flat sticker and it still passes every schema check, because
+nothing in the schema knows what a recess is. It only showed up when someone
+looked at the render. It is now a gate.
+
+`report_sizes.py` prints every asset's bounds in human units and diffs the
+31 that have a real-world reference size against it (31/31 currently pass).
+
 ### Current state
 
 | | |
 |---|---|
-| Assets | 58 across 10 categories |
-| Triangles | 68,140 (budget: 150,000) |
-| Parts | 447 |
-| Vertices | 199,291 |
-| JSON on disk | ~10.1 MB |
-| Previews | 10 PNGs, all non-blank |
+| Assets | **99** across 15 categories |
+| Triangles | **133,151** (budget: 180,000) |
+| Parts | 857 |
+| Vertices | 395,098 |
+| JSON on disk | ~21.6 MB |
+| Previews | 12 PNGs, all non-blank (pixel std 0.059-0.198) |
+
+Triangles by category:
+
+| Category | Assets | Triangles | | Category | Assets | Triangles |
+|---|---|---|---|---|---|---|
+| `vehicle` | 14 | 42,598 | | `pickup` | 8 | 5,684 |
+| `building` | 14 | 34,632 | | `sign` | 8 | 5,760 |
+| `prop` | 14 | 11,350 | | `road` | 9 | 626 |
+| `pedestrian` | 4 | 8,200 | | `animal` | 4 | 1,369 |
+| `weapon` | 6 | 8,000 | | `beach` | 4 | 1,568 |
+| `palm` | 3 | 7,046 | | `marker` | 2 | 1,728 |
+| `misc` | 6 | 3,558 | | `nature` | 2 | 544 |
+| | | | | `terrain` | 1 | 488 |
 
 ## Tests that need no Blender
 
-```bash
-cd tools/blender/vcw && python3 test_kernel.py      # 60+ geometry assertions
-cd tools/blender        && python3 negative_control.py
-```
-
-`test_kernel.py` covers signed volume (outward winding), watertightness,
+`vcw/test_kernel.py` covers signed volume (outward winding), watertightness,
 absolute positioning, flat-vs-smooth normal behaviour, and the Y-up export
 matrix. `negative_control.py` deliberately inverts parts and confirms the
 verifier rejects them — without it, "the verifier passes" could just mean "the
@@ -142,7 +181,26 @@ for a in <name>.build_all():
 "
 ```
 
-Budget: ≤ 8,000 triangles per asset; the whole set must stay under 150,000.
+Budget: ≤ 8,000 triangles per asset; the whole set must stay under 180,000.
+
+### Backward compatibility with the game
+
+Two things in `src/` constrain what you may change, and both fail **silently**
+if you get them wrong:
+
+* **Asset ids** are referenced by string literal in `src/const.rs` and
+  `src/game.rs`. Renaming an asset makes the placement list silently drop it.
+* **The 13 pedestrian part names** (`torso`, `head`, `hair`, `upper_arm_L` …
+  `shoe_R`, defined in `src/const.rs`) drive the walk cycle.
+  `push_player_part()` looks each one up **by name** and returns `usize::MAX`
+  if it is missing. A pedestrian asset that drops or renames a rig part loses
+  that limb at runtime with no error. Adding *extra* parts is safe -- they are
+  simply never bound to a batch.
+
+Also leave the rest of a part's dimensions alone where the game measures them:
+`BUILDING_FOOTPRINT_GUARD`, `PED_SCREEN_PROBE_HEIGHT` and
+`CHAR_VISIBLE_MAX_SCREEN_PCT` all reject or mis-cull geometry outside expected
+ranges. `report_sizes.py` exists to catch size drift before it ships.
 
 ## Blender 4.5 API notes
 

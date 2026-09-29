@@ -559,6 +559,74 @@ def loft(m, rings, color, cap_start=True, cap_end=True, smooth=False,
     return m
 
 
+def chamfer_box(m, size, center=(0.0, 0.0, 0.0), color=(0.8, 0.8, 0.8),
+                bevel=0.03, n_corner=1, colors=None):
+    """A box whose 12 edges are chamfered instead of hard.
+
+    WHY THIS EXISTS.  The runtime shades with a SINGLE directional light plus a
+    constant ambient (``base * (ambient + light_color * max(dot(n, l), 0))``,
+    see ``src/render.rs``).  There is no specular term and no texture, so the
+    ONLY thing that produces a value difference across a surface is a change
+    in the surface NORMAL.  A big flat wall therefore renders as one dead
+    value: correctly lit, completely featureless.  A 3 cm chamfer around every
+    edge puts a narrow strip at an intermediate normal on all four sides of
+    each arris, which is what makes an untextured box read as a solid object
+    rather than as a decal.
+
+    Cost is 2 rings of ``rounded_rect`` (n_corner=1 -> 8 points) lofted into a
+    closed shell: 8*2 side quads + 2*6 cap triangles = 28 triangles, versus 12
+    for a hard box.  Worth it on anything seen close up; skip it on background
+    clutter.
+
+    ``bevel`` is clamped to half of every extent so the two rings can never
+    cross and collapse a quad.  ``colors`` overrides per face exactly as
+    :func:`box` does, and the chamfer strips take the shaded neighbour colour
+    (see ``_chamfer_colors``) so the bevel reads as a highlight, not as a
+    random-coloured stripe.
+    """
+    sx, sy, sz = size[0] * 0.5, size[1] * 0.5, size[2] * 0.5
+    b = max(0.0, min(bevel, sx * 0.9, sy * 0.9, sz * 0.9))
+    if b <= 1e-6:
+        return box(m, size, center=center, color=color, colors=colors)
+    cx, cy, cz = center
+    ring = rounded_rect(sx, sy, b, n_corner)
+    lo = [(cx + px, cy + py, cz - sz) for (px, py) in ring]
+    hi = [(cx + px, cy + py, cz + sz) for (px, py) in ring]
+    # The ring is CCW in XY, i.e. its right-hand normal is +Z, and loft()
+    # advances lo -> hi along +Z: the contract loft() is written against.
+    c = colors or {}
+
+    def col(k, default):
+        return c.get(k, default)
+
+    # Side-wall quads: brighten the two upper chamfer strips and darken the
+    # two lower ones, so a single directional light produces a believable
+    # rounded edge out of two facets.
+    n = len(ring)
+    for j in range(n):
+        j2 = (j + 1) % n
+        zc = 0.5 * (ring[j][1] + ring[j2][1])
+        if zc > sy - b * 0.5:
+            fc = col("+z", col("+y", col("+x", color)))
+            fc = shade(fc, 1.10)
+        elif zc < -sy + b * 0.5:
+            fc = col("-z", col("-y", col("-x", color)))
+            fc = shade(fc, 0.86)
+        else:
+            fc = col("+y", color) if zc > 0.0 else col("-y", color)
+        m.quad(lo[j], lo[j2], hi[j2], hi[j], fc)
+    # End caps.  The ring has n points, not 4, so a quad() cap is not
+    # available: fan the n-gon from its own first vertex.  The cap normal is
+    # the face's own axis by construction, and the fan's winding follows the
+    # ring order reversed for the top (pointing +Z) and forward for the bottom
+    # (pointing -Z).
+    for j in range(1, n - 1):
+        m.tri(hi[0], hi[j], hi[j + 1], col("+z", color))
+    for j in range(1, n - 1):
+        m.tri(lo[0], lo[j + 1], lo[j], col("-z", color))
+    return m
+
+
 def box(m, size, center=(0.0, 0.0, 0.0), color=(0.8, 0.8, 0.8), colors=None):
     """Axis-aligned box.  ``colors`` may override per face with keys
     '+x','-x','+y','-y','+z','-z'."""

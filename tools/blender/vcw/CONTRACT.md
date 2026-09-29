@@ -4,7 +4,90 @@ Read this before writing a builder. It is the contract every category already
 satisfies — follow it and your file will be picked up without touching anything
 else.
 
-## Shape of a builder module
+## 0. The four rules the ENGINE imposes on you
+
+These are not style. Breaking one is a SILENT failure in `src/` — the asset
+still loads, the build still exits 0, and the thing simply is not in the game.
+
+1. **Never rename or remove an asset `id`.** `src/game.rs` looks every
+   placement up by literal id string. A missing id is pushed onto a `failed`
+   vector and logged; the prop is then skipped with `let ... else { continue }`.
+   Nothing surfaces to the player. `ped_suit` is special-cased: if it vanishes,
+   `spawn_player_traffic_pickups` never runs and **the player is invisible**.
+2. **Never rename a `ped_suit` part name.** `PLAYER_PARTS` in `src/game.rs`
+   matches all 13 by exact string to drive the walk cycle, and
+   `joint_pivot` derives the rotation axis from each part's own local bbox. A
+   name that no longer matches yields `usize::MAX` and that limb silently
+   disappears. The 13 are:
+   `torso, head, hair, upper_arm_L, lower_arm_L, upper_arm_R, lower_arm_R,
+   upper_leg_L, lower_leg_L, upper_leg_R, lower_leg_R, shoe_L, shoe_R`
+   Extra parts on a pedestrian are harmless (only `ped_suit` is split by name),
+   so **add detail inside those 13 parts**, or as new clearly-named extras.
+3. **Every asset in `GROUND_CATEGORIES` must rest exactly on z = 0** — verify
+   checks `bounds.min[1] >= -0.001`. Buildings, props, palms, vehicles, signs.
+4. **`BUILDING_FOOTPRINT_GUARD = 11.0` (src/game.rs).** A building whose
+   footprint half-extent exceeds 11 m is **silently culled from the city
+   layout** and never placed. Max legal half-extent is 11.0 m; stay under 10.5.
+
+## 1. What the runtime actually shades with
+
+`src/render.rs`, both the WebGL fragment shader and the CPU `shade_face`:
+
+```text
+base   = albedo * tint                     // per-vertex colour × per-instance tint
+lit    = base * (ambient + light_color * max(dot(normal, light_dir), 0))
+       + base * emissive * emissive_gain
+color  = tonemap(lit)                      // hue-preserving Reinhard, then sRGB
+color  = mix(color, sky_color, fog)        // smoothstep over 90-460 m
+```
+
+**There is no specular term, no texture, no PBR, and no reflection.** So the
+only things that can make two adjacent polygons look different are:
+
+* **a different normal** — this is why `chamfer_box` exists. A large flat wall
+  renders as one dead value. A 3 cm chamfer puts a strip at an intermediate
+  normal on all four sides of every arris and is what makes an untextured box
+  read as a solid. It costs 28 triangles instead of 12 and is the single
+  cheapest quality win in this pipeline.
+* **a different albedo** — `face_colors` is free. Zone your materials.
+* **emissive** — cheap, and the whole night look depends on it. Anything that
+  glows gets BOTH a solid `base_color` and a non-zero `emissive`, so it still
+  reads when the runtime scales the glow down.
+
+`roughness` and `metallic` are exported and validated but **never read by the
+runtime**. Set them for documentation; do not spend triangles chasing them.
+
+Consequence: "make it look less like a white model" means *add normal breaks
+and colour zones*, not add triangles uniformly.
+
+## 2. Triangle budget — think in INSTANTIATED triangles
+
+The per-asset cap of 8,000 is the easy constraint. The binding one is how many
+times the engine instances each asset (counts below are derived from the
+placement loops in `src/game.rs`, `CITY_HALF = 150`, 4 street lines):
+
+| prefix | placements | share of all instantiated tris |
+|---|---|---|
+| `bldg_` | 135 (many culled) | ~46% |
+| `palm_` | 106 | ~30% |
+| `prop_streetlight` | 72 | ~6.5% |
+| `ped_` | 56 | ~6% |
+| `prop_trafficlight` | 64 | ~4.7% |
+| `sign_` | 36 | ~3.6% |
+| `car_` / `truck_` | traffic fleet | <1% |
+| weapons, pickups, markers, misc, beach | ~1-9 | <1% |
+
+**Buildings and palms are ~76% of the world's triangles.** So:
+
+* Detail belongs where instantiation count is LOW and the camera is CLOSE —
+  vehicles, `ped_suit`, weapons, pickups, markers, signs, street furniture.
+* Buildings and palms get **chamfers and colour zones**, which are nearly free,
+  and must NOT get a big raw triangle increase. Their count is multiplied by
+  100+.
+* Spend the "free" budget on assets the engine instantiates only a handful of
+  times.
+
+## 3. Shape of a builder module
 
 File: `tools/blender/vcw/builders/<category>.py`
 Exports exactly one function: `build_all() -> list[core.Asset]`
@@ -36,8 +119,8 @@ authoring `-Y`.
 ## `core` primitives you should use
 
 Vectors: `add sub mul dot cross normalize length lerp shade mix_color`
-Shapes: `box cylinder cone sphere torus tube loft section_rings rounded_rect
-        circle ribbon`
+Shapes: `box chamfer_box cylinder cone sphere torus tube loft section_rings
+        rounded_rect circle ribbon`
 Parts: `Part Asset mirror_x rotate_z translate_part recolor_faces
        recolor_faces_where`
 Checks: `signed_volume is_closed has_smooth_geometry`
@@ -55,6 +138,8 @@ C.sphere(m, radius, seg_u=10, seg_v=6, center=(0,0,0), color=col,
 C.torus(m, R, r, seg_u=12, seg_v=6, center=(0,0,0), color=col, axis='Z')
 C.tube(m, path, radius, seg=6, color=col, caps=True, smooth=False)
 C.loft(m, rings, color, cap_start=True, cap_end=True, smooth=False)
+C.chamfer_box(m, size, center=(0,0,0), color=col, bevel=0.03, n_corner=1,
+              colors={'+x':..,'-z':..,..})   # 28 tris, edges catch the light
 C.rounded_rect(hx, hy, r, n=4)   # CCW 2D profile in XY
 C.ribbon(m, pts, width, up=(0,0,1), color=col)
 ```
@@ -93,8 +178,21 @@ submesh with its own material at render time.
 - Prefer one `Part` holding many triangles over many single-triangle parts.
   A building has 132 parts and that is already more than it needs — reuse a
   single part and switch `face_colors` when faces differ only in colour.
+- Remember section 2: the budget that matters is
+  `tri_count x placements`. Adding 500 triangles to a palm costs 53,000 in the
+  world; adding 500 to a pistol costs 500.
 
 ## Verify before you claim it works
+
+Fastest loop, no Blender needed (the kernel is pure stdlib):
+
+```bash
+cd tools/blender
+python3 test_kernel.py          # kernel unit tests + exports EVERY asset
+```
+
+That test already runs the full export contract over every builder, so a green
+run means every asset is geometrically valid. To inspect your own category:
 
 ```bash
 cd tools/blender

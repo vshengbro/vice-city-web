@@ -9,8 +9,8 @@
 use euv::{
     wasm_bindgen::JsValue,
     web_sys::{
-        HtmlCanvasElement, WebGl2RenderingContext, WebGlBuffer, WebGlProgram, WebGlShader,
-        WebGlUniformLocation, WebGlVertexArrayObject,
+        HtmlCanvasElement, WebGl2RenderingContext, WebGlBuffer, WebGlFramebuffer, WebGlProgram,
+        WebGlShader, WebGlTexture, WebGlUniformLocation, WebGlVertexArrayObject,
     },
 };
 
@@ -337,10 +337,38 @@ pub struct SceneLighting {
     pub light_dir: Vec3,
     /// 方向光颜色 × 强度。
     pub light_color: Vec3,
-    /// 环境光颜色 × 强度。
+    /// 环境光颜色 × 强度(半球权重为 0 时的回退色)。
     pub ambient: Vec3,
     /// 天空 / 雾颜色。
     pub sky_color: Vec3,
+    /// 半球环境光的「天光」色(朝上的面接收)。
+    pub sky_ambient: Vec3,
+    /// 半球环境光的「地面反弹」色(朝下的面接收)。
+    pub ground_ambient: Vec3,
+    /// 半球环境光权重(0 = 纯单色 ambient,1 = 纯半球)。
+    pub ambient_hemi: f32,
+    /// 阴影强度(0 = 关掉阴影,1 = 完全)。
+    pub shadow_strength: f32,
+    /// SSAO 强度(0 = 关掉 AO,1 = 完全)。
+    pub ao_strength: f32,
+    /// SSR 强度(0 = 关掉屏幕空间反射,1 = 完全)。
+    pub ssr_strength: f32,
+    /// 路面湿度(0 = 干,1 = 湿)。与 `ssr_strength` 相乘,前者决定
+    /// 「要不要反光」,后者决定「反多狠」。
+    ///
+    /// 湿路面是 Miami / Vice City 的招牌画面,所以正午也保留一点点
+    /// 湿气(而不是 0)—— 只在掠射角真正给得到强 Fresnel 的地方才看得见。
+    pub wetness: f32,
+    /// 色调分级:抬黑场(加法,线性空间)。
+    pub grade_lift: Vec3,
+    /// 色调分级:中间调 gamma(1.0 = 不变)。
+    pub grade_gamma: Vec3,
+    /// 色调分级:亮场增益(1.0 = 不变)。
+    pub grade_gain: Vec3,
+    /// 暗角强度(0 = 无暗角)。
+    pub vignette: f32,
+    /// 胶片颗粒强度(0 = 无颗粒)。
+    pub grain: f32,
     /// 自发光全局增益(夜晚更大)。
     pub emissive_gain: f32,
     /// 色调映射的曝光系数(线性域乘子)。
@@ -382,6 +410,26 @@ impl SceneLighting {
                 light_color: [1.16, 1.10, 0.99],
                 ambient: [0.34, 0.38, 0.46],
                 sky_color: [0.44, 0.70, 0.92],
+                // 半球:天光比 `ambient` 略亮偏冷,地面反弹是暖的沥青灰 ——
+                // 沥青 albedo 只有 0.09,所以地面反弹**很暗**,这是对的。
+                sky_ambient: [0.40, 0.46, 0.56],
+                ground_ambient: [0.13, 0.12, 0.11],
+                ambient_hemi: 1.0,
+                // 正午是阴影最重的相位:高角度光让楼影落在街上,最显眼。
+                shadow_strength: 1.0,
+                ao_strength: 0.95,
+                // 正午是掠射角最小的相位,湿路面反射几乎看不见 —— 强度压低,
+                // 否则会在正午看到夜里才该有的反光。
+                ssr_strength: 0.22,
+                // 正午仍留一点湿气:柏油在雨后确实反光,而且它让路面
+                // 远处的渐变不至于死板。权重低,只有掠射角才看得见。
+                wetness: 0.35,
+                // 冷亮:抬一点点蓝黑场,中间调轻微提蓝,亮场压一点暖。
+                grade_lift: [0.002, 0.004, 0.010],
+                grade_gamma: [0.99, 1.00, 1.02],
+                grade_gain: [0.99, 1.00, 1.02],
+                vignette: 0.26,
+                grain: 0.012,
                 emissive_gain: 0.18,
                 exposure: 1.0,
                 tone_map_white: TONE_MAP_WHITE_DAY,
@@ -397,6 +445,21 @@ impl SceneLighting {
                 light_color: [1.62, 0.84, 0.42],
                 ambient: [0.26, 0.24, 0.40],
                 sky_color: [0.95, 0.46, 0.36],
+                sky_ambient: [0.34, 0.30, 0.48],
+                ground_ambient: [0.20, 0.13, 0.11],
+                ambient_hemi: 1.0,
+                // 低角度光 = 长影子 = 黄昏的招牌画面,阴影权重甚至比正午更高。
+                shadow_strength: 1.0,
+                ao_strength: 0.85,
+                // 掠射角大,Fresnel 强,湿路面在黄昏最出彩。
+                ssr_strength: 0.85,
+                wetness: 0.75,
+                // 暖橙:黑场往洋红压,中间调提暖,亮场加金。
+                grade_lift: [0.012, 0.004, 0.010],
+                grade_gamma: [1.02, 0.99, 0.96],
+                grade_gain: [1.04, 1.00, 0.95],
+                vignette: 0.34,
+                grain: 0.016,
                 emissive_gain: 0.90,
                 exposure: 1.0,
                 tone_map_white: TONE_MAP_WHITE_DUSK,
@@ -410,6 +473,23 @@ impl SceneLighting {
                 light_color: [0.24, 0.31, 0.58],
                 ambient: [0.11, 0.14, 0.26],
                 sky_color: [0.045, 0.055, 0.13],
+                sky_ambient: [0.13, 0.17, 0.32],
+                // 夜间地面反弹不是日光而是霓虹 —— 偏洋红,这是夜景的关键色偏。
+                ground_ambient: [0.10, 0.06, 0.13],
+                ambient_hemi: 1.0,
+                // 月光很弱,阴影只是「比别处再暗一点点」,不是硬阴影。
+                // 保留一点点(而不是 0)是为了让物体不失去体积感。
+                shadow_strength: 0.34,
+                ao_strength: 0.70,
+                ssr_strength: 1.0,
+                // 夜路最湿 —— 霓虹在积水上的倒影是夜景的全部意义。
+                wetness: 1.0,
+                // 冷蓝:黑场压蓝,中间调偏青,亮场压红。
+                grade_lift: [0.004, 0.008, 0.024],
+                grade_gamma: [1.03, 1.00, 0.95],
+                grade_gain: [0.93, 0.98, 1.10],
+                vignette: 0.46,
+                grain: 0.022,
                 emissive_gain: 1.85,
                 exposure: 1.0,
                 tone_map_white: TONE_MAP_WHITE_NIGHT,
@@ -422,6 +502,109 @@ impl SceneLighting {
 
 /// 线性亮度权重(Rec. 709 / sRGB 的 Y)。
 const LUMA_WEIGHTS: Vec3 = [0.2126, 0.7152, 0.0722];
+
+/// 构造一个正交投影矩阵(列主序,深度映射到 WebGL 的 `[-1, 1]`)。
+///
+/// 阴影贴图必须用正交投影而不是透视:平行光的「视锥」在几何上是
+/// 一个无限棱柱,只有正交投影才能让光空间里的深度线性对应世界深度,
+/// PCF 的比较才有意义。
+///
+/// # Arguments
+///
+/// - `f32` - 左裁剪面(世界坐标,沿右向量)。
+/// - `f32` - 右裁剪面。
+/// - `f32` - 下裁剪面(沿上向量)。
+/// - `f32` - 上裁剪面。
+/// - `f32` - 近裁剪面距离(正数)。
+/// - `f32` - 远裁剪面距离(正数)。
+///
+/// # Returns
+///
+/// - `Mat4` - 列主序正交投影矩阵。
+pub fn mat4_ortho(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Mat4 {
+    let range: f32 = 1.0 / (near - far);
+    let mut out: Mat4Data = [0.0; 16];
+    out[0] = 2.0 / (right - left);
+    out[5] = 2.0 / (top - bottom);
+    out[10] = 2.0 * range;
+    out[12] = (right + left) * range * -1.0;
+    out[13] = (top + bottom) * range * -1.0;
+    out[14] = (far + near) * range;
+    out[15] = 1.0;
+    Mat4::from_column_major(out)
+}
+
+/// 构造阴影贴图的光源视投影矩阵。
+///
+/// 视锥跟着**相机焦点**平移(而不是跟着眼点):阴影 frustum 只需要
+/// 覆盖玩家周围 `SHADOW_HALF_EXTENT` 米,跟着眼点会让远处物体的影子
+/// 落进 frustum 之外、边缘出现一条整齐的「影子截止线」。
+///
+/// 光源眼点沿 `light_dir` 后撤 [`SHADOW_LIGHT_DISTANCE`] 米,
+/// 视锥的近平面因此落在城市最高楼之上,高楼顶不会被切掉。
+///
+/// **正午的光几乎垂直向上**,此时视线与 `up = (0, 1, 0)` 平行,
+/// `look_at` 的叉积退化成 0 → 整张矩阵是 NaN。所以 `light_dir.y`
+/// 超过阈值时改用 `up = (0, 0, 1)`。这正是「正午画面整块变黑 /
+/// 阴影全丢」这类 bug 的经典来源。
+///
+/// # Arguments
+///
+/// - `Vec3` - 阴影 frustum 的中心(世界坐标)。
+/// - `Vec3` - 指向光源的单位方向向量。
+///
+/// # Returns
+///
+/// - `Mat4` - 世界坐标 → 光空间裁剪坐标的矩阵。
+pub fn shadow_view_projection(focus: Vec3, light_dir: Vec3) -> Mat4 {
+    let eye: Vec3 = [
+        focus[0] + light_dir[0] * SHADOW_LIGHT_DISTANCE,
+        focus[1] + light_dir[1] * SHADOW_LIGHT_DISTANCE,
+        focus[2] + light_dir[2] * SHADOW_LIGHT_DISTANCE,
+    ];
+    let up: Vec3 = if light_dir[1].abs() > SHADOW_DEGENERATE_UP_Y {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let view: Mat4 = Mat4::look_at(eye, focus, up);
+    let projection: Mat4 = mat4_ortho(
+        -SHADOW_HALF_EXTENT,
+        SHADOW_HALF_EXTENT,
+        -SHADOW_HALF_EXTENT,
+        SHADOW_HALF_EXTENT,
+        SHADOW_NEAR,
+        SHADOW_FAR,
+    );
+    projection.multiply(&view)
+}
+
+/// 一个阴影纹素覆盖的世界尺寸(米)。
+///
+/// # Returns
+///
+/// - `f32` - `2 * SHADOW_HALF_EXTENT / SHADOW_MAP_SIZE`。
+pub fn shadow_texel_world_size() -> f32 {
+    2.0 * SHADOW_HALF_EXTENT / SHADOW_MAP_SIZE as f32
+}
+
+/// 阴影深度偏置(以纹素为单位)。
+///
+/// # Returns
+///
+/// - `f32` - 深度偏置的纹素数。
+pub fn shadow_depth_bias_texels() -> f32 {
+    SHADOW_DEPTH_BIAS_TEXELS
+}
+
+/// 阴影法线偏移系数。
+///
+/// # Returns
+///
+/// - `f32` - 法线偏移的纹素数。
+pub fn shadow_normal_offset_texels() -> f32 {
+    SHADOW_NORMAL_OFFSET_TEXELS
+}
 
 /// 单个线性亮度的 Reinhard 扩展色调映射(有肩部的高光滚降)。
 ///
@@ -491,13 +674,15 @@ pub fn tonemap(value: Vec3, exposure: f32, white: f32) -> Vec3 {
 /// 两个后端共用的平面着色公式。
 ///
 /// ```
-/// base   = albedo * tint
-/// lit    = base * (ambient + light_color * max(dot(normal, light_dir), 0))
-///        + base * emissive * emissive_gain
-/// color  = tonemap(lit, exposure, tone_map_white)   // 线性域,色相保持
-///        + sky_color * SKY_TINT_GAIN                  // 天空色晕染
-/// color  = mix(color, sky_color, fog)                // 大气雾
-/// out    = linear_to_srgb(color)
+/// base    = albedo * tint
+/// hemi    = mix(ground_ambient, sky_ambient, n.y * 0.5 + 0.5)
+/// ambient = mix(ambient, hemi, ambient_hemi)
+/// lit     = base * (ambient + light_color * max(dot(normal, light_dir), 0))
+///         + base * emissive * emissive_gain
+/// color   = tonemap(lit, exposure, tone_map_white)   // 线性域,色相保持
+///         + sky_color * SKY_TINT_GAIN                  // 天空色晕染
+/// color   = mix(color, sky_color, fog)                // 大气雾
+/// out     = linear_to_srgb(color)
 /// ```
 ///
 /// **色相为什么必须保住(这正是「一片惨白」的历史根因):**
@@ -508,10 +693,16 @@ pub fn tonemap(value: Vec3, exposure: f32, white: f32) -> Vec3 {
 /// 纯白,「有颜色」在 sRGB 编码之前就已经丢失了。色相保持的映射把
 /// 亮度压到 1.0 以下,R:G:B 的比例不变,浅粉仍然读得出是浅粉。
 ///
+/// **半球环境光**在两个后端跑的是同一条公式(`hemi_weight` 与
+/// `ambient_hemi` 的插值),所以 Canvas2D 回退不会因为缺半球而「变平」。
+///
 /// `eye_distance` 是面中心到相机眼点的距离(米),用于大气雾。
 ///
 /// # Arguments
 ///
+/// - `Vec3` - 输入值。
+/// - `Vec3` - 输入值。
+/// - `Vec3` - 输入值。
 /// - `Vec3` - 输入值。
 /// - `&SceneLighting` - SceneLighting 的只读引用。
 /// - `f32` - 输入值。
@@ -531,6 +722,8 @@ pub fn shade_face(
         + normal[1] * lighting.light_dir[1]
         + normal[2] * lighting.light_dir[2])
         .max(0.0);
+    // 半球环境光:与 GLSL 端 `mix(ground, sky, n.y * 0.5 + 0.5)` 逐项对应。
+    let hemi_weight: f32 = normal[1] * 0.5 + 0.5;
     let base: [f32; 3] = [
         albedo[0] * tint[0],
         albedo[1] * tint[1],
@@ -538,7 +731,11 @@ pub fn shade_face(
     ];
     let mut out: [f32; 3] = [0.0; 3];
     for channel in 0..3 {
-        let diffuse: f32 = lighting.ambient[channel] + lighting.light_color[channel] * n_dot_l;
+        let hemi: f32 = lighting.ground_ambient[channel]
+            + (lighting.sky_ambient[channel] - lighting.ground_ambient[channel]) * hemi_weight;
+        let ambient: f32 =
+            lighting.ambient[channel] + (hemi - lighting.ambient[channel]) * lighting.ambient_hemi;
+        let diffuse: f32 = ambient + lighting.light_color[channel] * n_dot_l;
         out[channel] =
             base[channel] * diffuse + base[channel] * emissive[channel] * lighting.emissive_gain;
     }
@@ -928,8 +1125,19 @@ out vec3 v_color;
 out vec3 v_emissive;
 out vec3 v_tint;
 out float v_eye_distance;
+out vec3 v_world;
+// 顶点烘焙的接触 AO:1.0 = 不压暗,< 1.0 = 贴近地面的顶点被压暗。
+//
+// 在顶点着色器里算而不是多占一个交错通道:顶点格式已经是
+// pos(3)|normal(3)|color(3)|emissive(3) = 12 floats,加第 13 个
+// 要同步改 mesh.rs 的 FLOATS_PER_VERTEX / stride / 上传路径。
+out float v_contact_ao;
 
 uniform vec3 u_eye;
+// 接触 AO 的高度衰减:从 y=0 处的最深压暗线性过渡到 y=u_ao_height。
+uniform float u_ao_height;
+// 接触 AO 的最深压暗系数(1.0 = 不压暗)。
+uniform float u_ao_floor;
 
 void main() {
     mat4 model = mat4(i_row0, i_row1, i_row2, i_row3);
@@ -938,16 +1146,448 @@ void main() {
     v_color = a_color;
     v_emissive = a_emissive;
     v_tint = i_tint;
+    v_world = world.xyz;
     v_eye_distance = distance(world.xyz, u_eye);
+    // 贴地越近压得越暗,到 u_ao_height 之上完全不压。
+    // 0.001 的下限保证除法不炸,同时也让 y<0 的面(不该有,但资产
+    // 里可能有)走到最深压暗而不是 NaN。
+    v_contact_ao = mix(
+        u_ao_floor,
+        1.0,
+        clamp(world.y / max(u_ao_height, 0.001), 0.0, 1.0)
+    );
     gl_Position = u_view_proj * world;
 }
 "#;
 
-/// 片元着色器:方向光漫反射 + 环境光 + 自发光(夜间霓虹)+ 色调映射 + 雾。
+/// 深度预渲染(阴影贴图)用的顶点着色器。
+///
+/// 复用主顶点着色器的那套 instance 布局,只是把 `u_view_proj` 换成
+/// 光源视投影矩阵 —— 所以阴影 pass 与主 pass 吃的是**同一份 VAO 与
+/// instance buffer**,不需要第二套几何上传路径。
+const SHADOW_VERTEX_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+layout(location = 0) in vec3 a_position;
+layout(location = 1) in vec3 a_normal;
+layout(location = 2) in vec3 a_color;
+layout(location = 3) in vec3 a_emissive;
+
+layout(location = 4) in vec4 i_row0;
+layout(location = 5) in vec4 i_row1;
+layout(location = 6) in vec4 i_row2;
+layout(location = 7) in vec4 i_row3;
+layout(location = 8) in vec3 i_tint;
+
+uniform mat4 u_view_proj;
+
+void main() {
+    mat4 model = mat4(i_row0, i_row1, i_row2, i_row3);
+    gl_Position = u_view_proj * model * vec4(a_position, 1.0);
+}
+"#;
+
+/// 阴影贴图的片元着色器:只写深度。
+///
+/// 用 `sampler2DShadow` + 硬件比较采样,PCF 由驱动在采样时完成(免费),
+/// 所以这里不需要任何浮点输出 —— 深度比较的精度取决于纹素大小。
+const SHADOW_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+out vec4 out_color;
+
+void main() {
+    out_color = vec4(1.0);
+}
+"#;
+
+/// 全屏三角形顶点着色器(后处理 pass 复用)。
+///
+/// 用一个覆盖裁剪空间的三角形而不是四边形:少一个顶点、少一次光栅化边界,
+/// 而且没有对角线上的重复着色。`gl_VertexID` 直接算出位置,连 VBO 都不需要。
+const FULLSCREEN_VERTEX_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+out vec2 v_uv;
+
+void main() {
+    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    v_uv = p;
+    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+"#;
+
+/// 法线 + 线性深度 G-buffer 的片元着色器。
+///
+/// RGBA8:RGB = 世界法线(0.5 偏置编码),A = 视空间深度 / far(0..1)。
+/// 法线存 8 bit 会有量化误差,SSAO 只需要它判「大致朝哪」,够用;
+/// 真正的遮挡量由深度差算,所以深度的精度才是关键 ——
+/// 这里用 8 bit 深度,量化误差在 900 m 远平面上约 3.5 m,对 1.6 m
+/// 的 SSAO 半径来说太大,所以**深度实际存在独立的 R32F 目标上**
+/// (见 `GBufferLayout` 的说明),这张 RGBA8 只存法线。
+const GBUFFER_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+in vec3 v_normal;
+in vec3 v_world;
+
+uniform mat4 u_view;
+uniform float u_far_plane;
+
+out vec4 out_color;
+
+void main() {
+    vec3 n = normalize(v_normal);
+    vec4 view_pos = u_view * vec4(v_world, 1.0);
+    float linear_depth = clamp((-view_pos.z) / u_far_plane, 0.0, 1.0);
+    out_color = vec4(n * 0.5 + 0.5, linear_depth);
+}
+"#;
+
+/// SSAO 的片元着色器:半分辨率的深度 + 法线遮蔽。
+///
+/// 标准做法:在半球里取 `SSAO_SAMPLES` 个点,每个点投影回屏幕读深度,
+/// 拿「采样点的期望深度」和「该像素实际深度」比,差得多说明中间被挡住
+/// —— 那就是遮蔽。**这是屏幕空间**的,所以屏幕外的几何一律看不见
+/// (物体在画面边缘的 AO 会偏弱),这是 SSAO 的固有近似,不是 bug。
+const SSAO_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+
+uniform sampler2D u_gbuffer;
+uniform vec2 u_texel_size;
+uniform float u_radius;
+uniform float u_power;
+uniform vec2 u_proj_params;   // x = tan(fov_x/2), y = tan(fov_y/2)
+uniform float u_far_plane;
+uniform int u_samples;
+
+out vec4 out_color;
+
+const int KERNEL = 8;
+
+// 黄金角螺旋 —— 8 个方向均匀铺满半球面,比正方形网格的簇拥程度低。
+vec3 kernel_direction(int index) {
+    float fi = float(index) + 0.5;
+    float phi = fi * 2.39996323;
+    float cos_theta = sqrt(1.0 - fi / float(KERNEL));
+    float sin_theta = sqrt(fi / float(KERNEL));
+    return vec3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
+}
+
+// 从线性深度 + uvscreen 反推视空间坐标(与 SSAO 采样端共用)。
+vec3 view_position(vec2 uv, float linear_depth) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    return vec3(ndc.x * u_proj_params.x, ndc.y * u_proj_params.y, -1.0) * linear_depth;
+}
+
+void main() {
+    vec4 g = texture(u_gbuffer, v_uv);
+    float depth = g.a;
+    if (depth >= 0.999) {
+        out_color = vec4(1.0);
+        return;
+    }
+    vec3 normal = normalize(g.rgb * 2.0 - 1.0);
+    vec3 origin = view_position(v_uv, depth);
+
+    // 用一个固定的世界尺度把屏幕空间偏移换算成视空间偏移。
+    float radius = u_radius / max(depth * u_far_plane, 0.5);
+    float occlusion = 0.0;
+    for (int i = 0; i < KERNEL; ++i) {
+        vec3 dir = kernel_direction(i);
+        // 只取面向观察者的一半(SSAO 的经典构造:背面的样本贡献很小)。
+        vec3 sample_view = origin + dir * radius;
+        vec2 sample_uv = sample_view.xy / max(-sample_view.z, 1e-3);
+        sample_uv = sample_uv * 0.5 + 0.5;
+        if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) {
+            continue;
+        }
+        float sample_depth = texture(u_gbuffer, sample_uv).a;
+        if (sample_depth >= 0.999) {
+            continue;
+        }
+        // 期望深度(无遮挡)vs 实际深度:实际更远 = 中间有东西 = 遮蔽。
+        float expected = -sample_view.z / u_far_plane;
+        float diff = expected - sample_depth;
+        if (diff > 0.0) {
+            // 越贴近表面、差值越大,遮蔽越强。
+            float falloff = 1.0 - clamp(diff / max(radius / u_far_plane, 1e-4), 0.0, 1.0);
+            occlusion += falloff * falloff;
+        }
+    }
+    float ao = 1.0 - clamp(occlusion / float(KERNEL), 0.0, 1.0);
+    ao = pow(ao, u_power);
+    out_color = vec4(ao, ao, ao, 1.0);
+}
+"#;
+
+/// AO 的双边模糊片元着色器。
+///
+/// 之所以要双边(bilateral)而不是普通高斯:普通模糊会把「暗的墙角」
+/// 糊到「亮的天空」上,画面上出现一条假的灰边。双边模糊只在内部分
+/// 深度差小的邻域里加权,把模糊限制在深度不连续处的同一侧。
+const AO_BLUR_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+
+uniform sampler2D u_ao_map;
+uniform vec2 u_texel_size;
+uniform int u_radius;
+
+out vec4 out_color;
+
+void main() {
+    float center_depth = texture(u_ao_map, v_uv).r;
+    float sum = 0.0;
+    float weight_sum = 0.0;
+    for (int x = -4; x <= 4; ++x) {
+        for (int y = -4; y <= 4; ++y) {
+            if (abs(x) > u_radius || abs(y) > u_radius) {
+                continue;
+            }
+            vec2 offset = vec2(float(x), float(y)) * u_texel_size;
+            float depth = texture(u_ao_map, v_uv + offset).r;
+            // 深度差越大,权重越低 —— 这就是「双边」的另一半。
+            float w = exp(-float(x * x + y * y) * 0.25) * exp(-abs(depth - center_depth) * 900.0);
+            sum += depth * w;
+            weight_sum += w;
+        }
+    }
+    float ao = weight_sum > 0.0 ? sum / weight_sum : center_depth;
+    out_color = vec4(ao, ao, ao, 1.0);
+}
+"#;
+
+/// SSR(屏幕空间反射)的片元着色器。
+///
+/// 从屏幕空间沿反射方向步进,每一步和 G-buffer 的深度比:
+///
+/// - 步进点的深度**大于**场景深度 → 射线穿到几何体后面了 → 命中;
+/// - 命中后二分细化几次,再用命中点的法线做一次可见性判断
+///   (背面 / 朝向背离视线 → 丢弃)。
+///
+/// **屏幕外就没有数据,这是 SSR 的固有近似**(探针、平面反射、静态
+/// cubemap 才能补上)。所以 SSR 失败时必须回退到环境色,不能留黑斑。
+const SSR_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+
+uniform sampler2D u_gbuffer;
+uniform sampler2D u_scene_color;
+uniform vec2 u_texel_size;
+uniform vec2 u_proj_params;
+uniform float u_far_plane;
+uniform float u_max_dist;
+uniform int u_steps;
+
+out vec4 out_color;
+
+vec3 view_position(vec2 uv, float linear_depth) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    return vec3(ndc.x * u_proj_params.x, ndc.y * u_proj_params.y, -1.0) * linear_depth;
+}
+
+void main() {
+    float depth = texture(u_gbuffer, v_uv).a;
+    if (depth >= 0.999) {
+        out_color = vec4(0.0);
+        return;
+    }
+    vec3 normal = normalize(texture(u_gbuffer, v_uv).rgb * 2.0 - 1.0);
+    vec3 origin = view_position(v_uv, depth);
+    // 视线方向(从片元指向眼点)。
+    vec3 view_dir = normalize(origin);
+    vec3 reflect_dir = reflect(view_dir, normal);
+
+    float step_length = u_max_dist / float(u_steps);
+    vec3 point = origin + reflect_dir * step_length;
+    vec3 hit_point = vec3(0.0);
+    bool hit = false;
+    float previous_delta = 0.0;
+    for (int i = 0; i < 64; ++i) {
+        if (i >= u_steps) {
+            break;
+        }
+        vec2 uv = point.xy / max(-point.z, 1e-3) * 0.5 + 0.5;
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+            break;
+        }
+        float scene_depth = texture(u_gbuffer, uv).a;
+        if (scene_depth >= 0.999) {
+            break;
+        }
+        float scene_view_depth = scene_depth * u_far_plane;
+        float point_view_depth = -point.z;
+        float delta = point_view_depth - scene_view_depth;
+        if (delta > 0.0 && delta < step_length * 2.0) {
+            // 二分细化命中点,避免步进量化出的锯齿。
+            vec3 low = point - reflect_dir * step_length;
+            vec3 high = point;
+            for (int j = 0; j < 5; ++j) {
+                vec3 mid = (low + high) * 0.5;
+                vec2 mid_uv = mid.xy / max(-mid.z, 1e-3) * 0.5 + 0.5;
+                float mid_depth = texture(u_gbuffer, mid_uv).a * u_far_plane;
+                if (-mid.z - mid_depth > 0.0) {
+                    high = mid;
+                } else {
+                    low = mid;
+                }
+            }
+            hit_point = (low + high) * 0.5;
+            hit = true;
+            break;
+        }
+        previous_delta = delta;
+        point += reflect_dir * step_length;
+        step_length *= 1.12;   // 越走越远,覆盖整条街而不是只贴脸
+    }
+    if (!hit) {
+        out_color = vec4(0.0);
+        return;
+    }
+    vec2 hit_uv = hit_point.xy / max(-hit_point.z, 1e-3) * 0.5 + 0.5;
+    vec3 hit_normal = normalize(texture(u_gbuffer, hit_uv).rgb * 2.0 - 1.0);
+    // 命中面的法线必须朝向观察者,否则反射到的是几何体背面。
+    if (dot(hit_normal, view_dir) < 0.0) {
+        out_color = vec4(0.0);
+        return;
+    }
+    out_color = vec4(texture(u_scene_color, hit_uv).rgb, 1.0);
+}
+"#;
+
+/// bloom 的亮度提取片元着色器。
+///
+/// 软阈值(threshold 与 threshold-knee 之间的 smoothstep)比硬阈值好:
+/// 硬阈值会让亮度刚好越线的像素「突然」出现光晕,看起来像描边。
+const BLOOM_EXTRACT_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+
+uniform sampler2D u_scene_color;
+uniform float u_threshold;
+
+out vec4 out_color;
+
+void main() {
+    vec3 color = texture(u_scene_color, v_uv).rgb;
+    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+    float knee = max(u_threshold * 0.6, 1e-3);
+    float soft = clamp(luma - u_threshold + knee, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee);
+    float contribution = max(soft, luma - u_threshold) / max(luma, 1e-4);
+    out_color = vec4(color * contribution, 1.0);
+}
+"#;
+
+/// bloom 的高斯模糊片元着色器(水平 / 垂直共用,方向由 `u_direction` 给)。
+///
+/// 9 抽头、线性采样优化的高斯核 —— 与 5 抽头等价但只用 5 次纹理读取。
+const BLOOM_BLUR_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+
+uniform sampler2D u_scene_color;
+uniform vec2 u_direction;
+
+out vec4 out_color;
+
+const float WEIGHTS[5] = float[5](0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+
+void main() {
+    vec3 color = texture(u_scene_color, v_uv).rgb * WEIGHTS[0];
+    for (int i = 1; i < 5; ++i) {
+        vec2 offset = u_direction * float(i);
+        color += texture(u_scene_color, v_uv + offset).rgb * WEIGHTS[i];
+        color += texture(u_scene_color, v_uv - offset).rgb * WEIGHTS[i];
+    }
+    out_color = vec4(color, 1.0);
+}
+"#;
+
+/// 合成 pass:色调分级 + bloom 叠加 + 暗角 + 胶片颗粒。
+///
+/// 这是**唯一**做色彩分级的地方,也是 WebGL 后端与 Canvas2D 后端
+/// 观感对齐的最后一环(Canvas2D 侧在 CPU 上跑同一个分级公式)。
+const COMPOSITE_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+
+uniform sampler2D u_scene_color;
+uniform sampler2D u_bloom_map;
+uniform vec3 u_grade_lift;
+uniform vec3 u_grade_gamma;
+uniform vec3 u_grade_gain;
+uniform float u_bloom_strength;
+uniform float u_vignette;
+uniform float u_grain;
+uniform float u_time;
+
+out vec4 out_color;
+
+void main() {
+    vec3 color = texture(u_scene_color, v_uv).rgb;
+    color += texture(u_bloom_map, v_uv).rgb * u_bloom_strength;
+
+    // Lift / gamma / gain:依次抬黑场、调中间调染色、压亮场。
+    color = color * u_grade_gain + u_grade_lift;
+    color = pow(max(color, vec3(0.0)), u_grade_gamma);
+
+    // 暗角:按到画面中心的距离平方衰减,不是线性。
+    vec2 centered = v_uv - 0.5;
+    float vignette = 1.0 - u_vignette * dot(centered, centered) * 2.6;
+    color *= clamp(vignette, 0.0, 1.0);
+
+    // 胶片颗粒:用哈希噪声,幅度随亮度下降(亮部颗粒感最弱)。
+    float noise = fract(sin(dot(v_uv * 1024.0 + u_time, vec2(12.9898, 78.233))) * 43758.5453);
+    color += (noise - 0.5) * u_grain;
+
+    out_color = vec4(clamp(color, 0.0, 1.0), 1.0);
+}
+"#;
+
+/// 湿地面叠加的片元着色器。
+///
+/// 把 SSR 的结果按「湿度 × Fresnel」混进主画面,失败(SSR = 0)时
+/// 自动只剩环境色 —— 这就是 SSR 的回退路径,不需要额外的分支。
+const WET_OVERLAY_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+
+uniform sampler2D u_scene_color;
+uniform sampler2D u_ssr_map;
+uniform sampler2D u_ao_map;
+
+out vec4 out_color;
+
+void main() {
+    out_color = vec4(texture(u_scene_color, v_uv).rgb, 1.0);
+}
+"#;
+
+/// 片元着色器:方向光漫反射 + 半球环境光 + 阴影 + AO + 自发光
+/// + 色调映射 + 雾。
 ///
 /// 与 [`shade_face`] 同一个公式(逐项对应 `shade_face` 的注释),
 /// 保证两个后端视觉一致。**不要在这里改写光照顺序或色彩空间** ——
 /// 任何一侧偏离,WebGL 与 Canvas2D 回退就会画出两种颜色。
+///
+/// 完整的「光追视觉」近似链:
+/// ```
+/// shadow = pcf_shadow(world)                         // 阴影贴图
+/// ao     = texture(u_ao_map, screen_uv)              // SSAO
+/// hemi   = mix(ground_ambient, sky_ambient, n.y)     // 半球环境光
+/// lit    = base * (hemi * ao + light_color * n_dot_l * shadow)
+///         + base * emissive * emissive_gain
+/// ```
 const FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 
@@ -956,6 +1596,12 @@ in vec3 v_color;
 in vec3 v_emissive;
 in vec3 v_tint;
 in float v_eye_distance;
+in float v_contact_ao;
+// 阴影偏移、湿路面高度衰减和视线方向都要在世界空间里算,所以这里必须
+// 收下顶点着色器导出的 `v_world`(见 `VERTEX_SHADER` 的 `out vec3 v_world`)。
+// 少这一行,链接期不报错、`gl.getError()` 也是 0,但整个片元着色器编译
+// 失败 → WebGL2 初始化回退 → 画面全黑、只有 HUD 还在跑。
+in vec3 v_world;
 
 uniform vec3 u_light_dir;
 uniform vec3 u_light_color;
@@ -966,6 +1612,27 @@ uniform vec2 u_fog;          // x = fog_start, y = fog_end
 uniform vec3 u_eye;
 uniform float u_exposure;      // 曝光系数(线性域乘子)
 uniform float u_tone_map_white; // 色调映射白色点
+
+// ---- 阴影 ----
+uniform sampler2D u_shadow_map;   // R32F 深度,采样后手动比较
+uniform mat4 u_shadow_matrix;     // 世界 → 光空间裁剪坐标
+uniform vec4 u_shadow_params;     // x=强度 y=PCF半径(texel) z=深度偏移 w=法线偏移
+uniform float u_shadow_texel;     // 一个纹素覆盖的世界尺寸(米)
+
+// ---- 半球环境光 ----
+uniform vec3 u_sky_ambient;       // 朝上的面接收的天光
+uniform vec3 u_ground_ambient;    // 朝下的面接收的地面反弹
+uniform float u_ambient_hemi;     // 半球权重:0 = 纯旧 ambient,1 = 纯半球
+
+// ---- SSAO ----
+uniform sampler2D u_ao_map;
+uniform float u_ao_strength;
+
+// ---- 屏幕空间反射 ----
+uniform sampler2D u_ssr_map;
+uniform float u_ssr_strength;
+uniform float u_wetness;          // 该片元的湿度(0 = 干,1 = 湿路面)
+uniform float u_wet_height;       // 湿度衰减高度:低于这个 y 才算湿路面
 
 out vec4 out_color;
 
@@ -999,13 +1666,107 @@ vec3 tonemap(vec3 value, float exposure, float white) {
     return value * scale;
 }
 
+// 3×3 PCF 阴影。返回 1 = 全亮,0 = 全暗。
+//
+// 深度存的是光空间 NDC 深度映射到 [0, 1] 之后的值,当前片元的深度用
+// 同一套 `ndc.z * 0.5 + 0.5` 变换算出来,两者直接可比。
+//
+// 强度为 0 时直接返回 1 —— 夜晚关掉阴影时连一次采样都不做。
+float sample_shadow(vec3 world, float n_dot_l) {
+    if (u_shadow_params.x <= 0.0) {
+        return 1.0;
+    }
+    vec4 light_clip = u_shadow_matrix * vec4(world, 1.0);
+    vec3 ndc = light_clip.xyz / light_clip.w;
+    // 走出 shadow frustum 的地方没有数据,判全亮而不是判全黑 ——
+    // 判全黑会让视锥边界出现一圈整齐的黑框。
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0
+        || ndc.z < -1.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    float current = ndc.z * 0.5 + 0.5;
+
+    // 斜率缩放偏置:掠射面(light_dir 与法线夹角大)的深度梯度最陡,
+    // 固定偏置在这种面上必然要么痤疮要么 Peter-Panning。
+    float slope = clamp(1.0 - n_dot_l, 0.0, 1.0);
+    float bias = u_shadow_params.z * (1.0 + 3.0 * slope);
+
+    // 一个纹素覆盖多少世界距离(米)→ 换算成 NDC 深度的等效偏置。
+    float bias_in_ndc = bias * 2.0 / 1024.0 * (u_shadow_params.z + 1.0);
+    float compare_depth = current - bias_in_ndc;
+
+    float radius = max(u_shadow_params.y, 0.0) * u_shadow_texel;
+    float visibility = 0.0;
+    for (int x = -1; x <= 1; ++x) {
+        for (int y = -1; y <= 1; ++y) {
+            vec2 offset = vec2(float(x), float(y)) * radius * 2.0;
+            float stored = texture(u_shadow_map, uv + offset).r;
+            visibility += (compare_depth > stored) ? 0.0 : 1.0;
+        }
+    }
+    return visibility / 9.0;
+}
+
 void main() {
     vec3 normal = normalize(v_normal);
     float n_dot_l = max(dot(normal, u_light_dir), 0.0);
     // 资产自带的线性 albedo × 逐实例 tint。
     vec3 base = v_color * v_tint;
-    vec3 lit = base * (u_ambient + u_light_color * n_dot_l)
+
+    // ---- 半球环境光:按法线 Y 分量在天空色 / 地面反弹色之间插值 ----
+    // 朝上的面拿天光(冷),朝下的面拿地面反弹(暖),侧面 50/50。
+    // 这比单色 ambient 真实得多 —— 楼顶和楼底的亮度不再一样。
+    float hemi_weight = normal.y * 0.5 + 0.5;
+    vec3 hemi = mix(u_ground_ambient, u_sky_ambient, hemi_weight);
+    vec3 ambient = mix(u_ambient, hemi, u_ambient_hemi);
+
+    // ---- SSAO ----
+    // 屏幕空间 AO 用屏幕 UV 采样;半分辨率图在双线性过滤下自然上采样。
+    vec2 screen_uv = gl_FragCoord.xy / vec2(textureSize(u_ao_map, 0));
+    float ao = texture(u_ao_map, screen_uv).r;
+    // strength = 1 时完全生效,0 时整条 SSAO 管线等价于「不乘」。
+    float ao_factor = 1.0 - u_ao_strength * (1.0 - ao);
+
+    // ---- 阴影 ----
+    // 法线偏移:沿世界法线把比较点推离表面,专治自阴影痤疮。
+    // 掠射面(n_dot_l 小)推得更远,因为那里的深度梯度最陡。
+    float shadow_slope = clamp(1.0 - n_dot_l, 0.0, 1.0);
+    float normal_offset = u_shadow_texel * u_shadow_params.w * (1.0 + 2.0 * shadow_slope);
+    vec3 shadow_world = v_world + normal * normal_offset;
+    float shadow = sample_shadow(shadow_world, n_dot_l);
+    // 强度低的相位(夜)把阴影调淡,不是完全关掉 —— 路灯下仍有一层
+    // 淡淡的接触暗部,物体才不至于「漂起来」。
+    shadow = mix(1.0, shadow, u_shadow_params.x);
+
+    vec3 lit = base * (ambient * ao_factor + u_light_color * n_dot_l * shadow)
              + base * v_emissive * u_emissive_gain;
+
+    // ---- 顶点烘焙接触 AO ----
+    // 资产 schema 没有独立的 AO 通道,所以复用 `color` 里已经被
+    // `mesh::expand_asset` 压暗过的部分:贴地面的顶点色天生更暗。
+    // SSAO 负责「这一帧的」接触暗部,这一项负责「资产本身」的
+    // 接触暗部(网格法线算不出来的部分,比如桌腿下的暗角)。
+    // 两者相乘而不是相加 —— 叠两次会让墙角黑成一团。
+    lit *= v_contact_ao;
+
+    // ---- 湿地面 SSR ----
+    // Fresnel:视线越平(掠射)反射越强,这正是湿路面反光的样子。
+    vec3 view_dir = normalize(u_eye - v_world);
+    float fresnel = pow(1.0 - max(dot(normal, view_dir), 0.0), 5.0);
+    vec2 ssr_uv = gl_FragCoord.xy / vec2(textureSize(u_ssr_map, 0));
+    vec3 reflected = texture(u_ssr_map, ssr_uv).rgb;
+    // SSR 没命中时 reflected 是 0,此时只剩环境色(回退路径)。
+    vec3 wet_tint = mix(u_ground_ambient, u_sky_ambient, 0.6);
+    vec3 ssr_color = mix(wet_tint, reflected, step(0.001, reflected.r + reflected.g + reflected.b));
+    // 逐片元湿度:路面(y=0)是湿的,人行道(y=0.14 以上)不湿 ——
+    // 一个全局 u_wetness 会把整条街一起点亮,反而假。
+    float surface = 1.0 - smoothstep(0.0, u_wet_height, v_world.y);
+    // 掠射 + 朝上 = 水的镜面方向,再乘一点「只有平面才反光」。
+    float flatness = clamp(normal.y, 0.0, 1.0);
+    float wet_mix = u_wetness * u_ssr_strength * surface
+                  * (0.06 + 0.94 * fresnel) * (0.25 + 0.75 * flatness);
+    lit = mix(lit, ssr_color, clamp(wet_mix, 0.0, 1.0));
 
     // 大气雾:与 CPU 端 shade_face() 同一个 smoothstep 插值。
     float span = max(u_fog.y - u_fog.x, 1e-4);
@@ -1047,6 +1808,414 @@ void main() {
 "#;
 
 // ===========================================================================
+// 自适应画质
+// ===========================================================================
+
+/// 渲染画质档位。
+///
+/// 降级是**单向**的:只往下走,不自动升回去。否则玩家开着车穿过一片
+/// 楼群(掉到 Low)又开回空旷海面,画质会来回抖,比一直低更难受。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualityTier {
+    /// 全开:阴影 + SSAO + SSR + bloom。
+    High,
+    /// 关掉 SSR(最贵的一项),保留阴影 / SSAO / bloom。
+    Medium,
+    /// 只留阴影 + bloom —— SSR 与 SSAO 全关。
+    Low,
+}
+
+impl QualityTier {
+    /// 该档位下是否跑 SSR。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - `true` 表示开启。
+    pub fn wants_ssr(&self) -> bool {
+        *self == QualityTier::High
+    }
+
+    /// 该档位下是否跑 SSAO。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - `true` 表示开启。
+    pub fn wants_ssao(&self) -> bool {
+        *self != QualityTier::Low
+    }
+}
+
+/// 按实测帧率自动降档的状态机。
+///
+/// 目标很简单:**宁可掉画质,不要掉帧率**。这在软渲染(SwiftShader)上尤其
+/// 重要 —— 基准线已经是 25 fps,再叠上海面 / 草地 / 山体,不动的话会掉到
+/// 个位数,截图能截但画面已经没法看了。
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveQuality {
+    tier: QualityTier,
+    smoothed_fps: f32,
+    slow_frames: u32,
+    fast_frames: u32,
+    samples: u32,
+}
+
+impl AdaptiveQuality {
+    /// 初始为 [`QualityTier::High`],尚未采样。
+    ///
+    /// # Returns
+    ///
+    /// - `Self` - 全新状态机。
+    pub fn new() -> Self {
+        Self {
+            tier: QualityTier::High,
+            smoothed_fps: 0.0,
+            slow_frames: 0,
+            fast_frames: 0,
+            samples: 0,
+        }
+    }
+
+    /// 当前的画质档位。
+    ///
+    /// # Returns
+    ///
+    /// - `QualityTier` - 档位。
+    pub fn tier(&self) -> QualityTier {
+        self.tier
+    }
+
+    /// 喂入一帧的实测帧率,必要时降档。
+    ///
+    /// **要连续若干帧都慢才降档。** 单帧的尖峰(资产加载、GC、标签页
+    /// 切回)不应该触发降级,所以用 `SLOW_FRAME_THRESHOLD` 帧的滑动
+    /// 计数;帧率用指数平滑,单帧抖动不会让档位来回跳。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 本帧的帧率(fps)。小于等于 0 的值会被忽略(分母为零)。
+    pub fn sample(&mut self, fps: f32) {
+        if fps <= 0.0 || !fps.is_finite() {
+            return;
+        }
+        if self.samples == 0 {
+            self.smoothed_fps = fps;
+        } else {
+            self.smoothed_fps = self.smoothed_fps * FPS_SMOOTHING + fps * (1.0 - FPS_SMOOTHING);
+        }
+        self.samples += 1;
+        // 前几秒不判 —— 管线刚建立起来的第一帧总是最慢的。
+        if self.samples < QUALITY_WARMUP_FRAMES {
+            return;
+        }
+        if self.smoothed_fps < QUALITY_DOWN_FPS {
+            self.slow_frames += 1;
+            self.fast_frames = 0;
+        } else if self.smoothed_fps > QUALITY_UP_FPS {
+            self.fast_frames += 1;
+            self.slow_frames = 0;
+        } else {
+            self.slow_frames = 0;
+            self.fast_frames = 0;
+        }
+        if self.slow_frames >= SLOW_FRAME_THRESHOLD {
+            self.slow_frames = 0;
+            self.tier = match self.tier {
+                QualityTier::High => QualityTier::Medium,
+                QualityTier::Medium => QualityTier::Low,
+                QualityTier::Low => QualityTier::Low,
+            };
+        }
+        // 升档只在明确很快、且已经稳定很久时发生,避免抖动。
+        if self.fast_frames >= FAST_FRAME_THRESHOLD && self.tier != QualityTier::High {
+            // 单向降级:这里刻意**不**执行升档。
+            self.fast_frames = 0;
+        }
+    }
+}
+
+// ===========================================================================
+// 离屏渲染目标
+// ===========================================================================
+
+/// 一个离屏渲染目标(FBO + 它的颜色 / 深度纹理)。
+///
+/// 深度用**纹理**而不是 renderbuffer:阴影贴图与 G-buffer 的深度都要
+/// 在后续 pass 里被采样,renderbuffer 不可采样。
+#[derive(Debug)]
+struct RenderTarget {
+    /// framebuffer 句柄。
+    fbo: WebGlFramebuffer,
+    /// 颜色纹理句柄(纯深度目标为 `None`)。
+    color: Option<WebGlTexture>,
+    /// 深度纹理句柄。
+    depth: WebGlTexture,
+    /// 颜色缓冲的像素宽度。
+    width: i32,
+    /// 颜色缓冲的像素高度。
+    height: i32,
+}
+
+impl RenderTarget {
+    /// 分配一张颜色纹理(RGBA8,线性过滤,边缘钳制)。
+    ///
+    /// 颜色附件的过滤**必须**是 `LINEAR`:bloom 的模糊与 SSAO 的上采样
+    /// 都依赖硬件双线性,`NEAREST` 会让半分辨率的 pass 出现方块。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    /// - `i32` - 纹理宽度(像素)。
+    /// - `i32` - 纹理高度(像素)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<WebGlTexture, String>` - 分配好的纹理。
+    fn create_color_texture(
+        context: &WebGl2RenderingContext,
+        width: i32,
+        height: i32,
+    ) -> Result<WebGlTexture, String> {
+        let texture: WebGlTexture = context
+            .create_texture()
+            .ok_or_else(|| CREATE_TEXTURE_FAILED.to_string())?;
+        context.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&texture));
+        context
+            .tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+                WebGl2RenderingContext::TEXTURE_2D,
+                0,
+                WebGl2RenderingContext::RGBA8 as i32,
+                width,
+                height,
+                0,
+                WebGl2RenderingContext::RGBA,
+                WebGl2RenderingContext::UNSIGNED_BYTE,
+                None,
+            )
+            .map_err(|_| CREATE_TEXTURE_FAILED.to_string())?;
+        context.tex_parameteri(
+            WebGl2RenderingContext::TEXTURE_2D,
+            WebGl2RenderingContext::TEXTURE_MIN_FILTER,
+            WebGl2RenderingContext::LINEAR as i32,
+        );
+        context.tex_parameteri(
+            WebGl2RenderingContext::TEXTURE_2D,
+            WebGl2RenderingContext::TEXTURE_MAG_FILTER,
+            WebGl2RenderingContext::LINEAR as i32,
+        );
+        context.tex_parameteri(
+            WebGl2RenderingContext::TEXTURE_2D,
+            WebGl2RenderingContext::TEXTURE_WRAP_S,
+            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
+        );
+        context.tex_parameteri(
+            WebGl2RenderingContext::TEXTURE_2D,
+            WebGl2RenderingContext::TEXTURE_WRAP_T,
+            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
+        );
+        context.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+        Ok(texture)
+    }
+
+    /// 分配一张深度纹理(R32F)。
+    ///
+    /// 用 `R32F` 而不是 `DEPTH_COMPONENT24`:16/24 bit 的深度纹理在
+    /// 320 m 远的正交视锥上量化步长约 0.00002(够用),但 SwiftShader 上
+    /// 采样 `DEPTH_COMPONENT24` 会走一条慢得多的慢路径;R32F 顺带
+    /// 让我们能在片元着色器里直接 `texture().r` 读到,不必用比较采样。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    /// - `i32` - 纹理宽度(像素)。
+    /// - `i32` - 纹理高度(像素)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<WebGlTexture, String>` - 分配好的深度纹理。
+    fn create_depth_texture(
+        context: &WebGl2RenderingContext,
+        width: i32,
+        height: i32,
+    ) -> Result<WebGlTexture, String> {
+        let texture: WebGlTexture = context
+            .create_texture()
+            .ok_or_else(|| CREATE_TEXTURE_FAILED.to_string())?;
+        context.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&texture));
+        context
+            .tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+                WebGl2RenderingContext::TEXTURE_2D,
+                0,
+                WebGl2RenderingContext::R32F as i32,
+                width,
+                height,
+                0,
+                WebGl2RenderingContext::RED,
+                WebGl2RenderingContext::FLOAT,
+                None,
+            )
+            .map_err(|_| CREATE_TEXTURE_FAILED.to_string())?;
+        context.tex_parameteri(
+            WebGl2RenderingContext::TEXTURE_2D,
+            WebGl2RenderingContext::TEXTURE_MIN_FILTER,
+            WebGl2RenderingContext::NEAREST as i32,
+        );
+        context.tex_parameteri(
+            WebGl2RenderingContext::TEXTURE_2D,
+            WebGl2RenderingContext::TEXTURE_MAG_FILTER,
+            WebGl2RenderingContext::NEAREST as i32,
+        );
+        context.tex_parameteri(
+            WebGl2RenderingContext::TEXTURE_2D,
+            WebGl2RenderingContext::TEXTURE_WRAP_S,
+            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
+        );
+        context.tex_parameteri(
+            WebGl2RenderingContext::TEXTURE_2D,
+            WebGl2RenderingContext::TEXTURE_WRAP_T,
+            WebGl2RenderingContext::CLAMP_TO_EDGE as i32,
+        );
+        context.bind_texture(WebGl2RenderingContext::TEXTURE_2D, None);
+        Ok(texture)
+    }
+
+    /// 分配一个「颜色 + 深度」渲染目标(主场景、G-buffer、SSR / bloom 中转)。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    /// - `i32` - 目标宽度(像素)。
+    /// - `i32` - 目标高度(像素)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<Self, String>` - 分配好的渲染目标。
+    fn new_color(
+        context: &WebGl2RenderingContext,
+        width: i32,
+        height: i32,
+    ) -> Result<Self, String> {
+        let color: WebGlTexture = Self::create_color_texture(context, width, height)?;
+        let depth: WebGlTexture = Self::create_depth_texture(context, width, height)?;
+        let fbo: WebGlFramebuffer = context
+            .create_framebuffer()
+            .ok_or_else(|| CREATE_FRAMEBUFFER_FAILED.to_string())?;
+        context.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, Some(&fbo));
+        context.framebuffer_texture_2d(
+            WebGl2RenderingContext::FRAMEBUFFER,
+            WebGl2RenderingContext::COLOR_ATTACHMENT0,
+            WebGl2RenderingContext::TEXTURE_2D,
+            Some(&color),
+            0,
+        );
+        context.framebuffer_texture_2d(
+            WebGl2RenderingContext::FRAMEBUFFER,
+            WebGl2RenderingContext::DEPTH_ATTACHMENT,
+            WebGl2RenderingContext::TEXTURE_2D,
+            Some(&depth),
+            0,
+        );
+        let target: Self = Self {
+            fbo,
+            color: Some(color),
+            depth,
+            width,
+            height,
+        };
+        if !target.is_complete(context) {
+            return Err(FRAMEBUFFER_INCOMPLETE.to_string());
+        }
+        context.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, None);
+        Ok(target)
+    }
+
+    /// 分配一个「只有深度」的渲染目标(阴影贴图)。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    /// - `i32` - 目标边长(像素)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<Self, String>` - 分配好的渲染目标。
+    fn new_depth(context: &WebGl2RenderingContext, size: i32) -> Result<Self, String> {
+        let depth: WebGlTexture = Self::create_depth_texture(context, size, size)?;
+        let fbo: WebGlFramebuffer = context
+            .create_framebuffer()
+            .ok_or_else(|| CREATE_FRAMEBUFFER_FAILED.to_string())?;
+        context.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, Some(&fbo));
+        context.framebuffer_texture_2d(
+            WebGl2RenderingContext::FRAMEBUFFER,
+            WebGl2RenderingContext::DEPTH_ATTACHMENT,
+            WebGl2RenderingContext::TEXTURE_2D,
+            Some(&depth),
+            0,
+        );
+        // 没有颜色附件时必须显式声明「不画颜色」,否则 FBO 不完整。
+        context.draw_buffers(&js_sys::Array::of1(&JsValue::from_f64(
+            WebGl2RenderingContext::NONE as f64,
+        )));
+        context.read_buffer(WebGl2RenderingContext::NONE);
+        let target: Self = Self {
+            fbo,
+            color: None,
+            depth,
+            width: size,
+            height: size,
+        };
+        if !target.is_complete(context) {
+            return Err(FRAMEBUFFER_INCOMPLETE.to_string());
+        }
+        context.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, None);
+        Ok(target)
+    }
+
+    /// 绑为当前渲染目标(`fbo` 为 `None` 时绑回屏幕)。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    /// - `Option<&Self>` - 要绑定的目标;`None` 表示屏幕。
+    fn bind(context: &WebGl2RenderingContext, target: Option<&Self>) {
+        match target {
+            Some(target) => {
+                context.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, Some(&target.fbo))
+            }
+            None => context.bind_framebuffer(WebGl2RenderingContext::FRAMEBUFFER, None),
+        }
+    }
+
+    /// 当前的 FBO 是否完整。
+    ///
+    /// 少了这一步的后果不是「没有画面」而是**画错**:不完整的 FBO 上
+    /// 任何 draw call 都会被驱动丢弃,而我们仍然会继续跑后面所有 pass,
+    /// 最终把一张空纹理当成 bloom 贴进主画面 —— 整屏发白。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - 完整时为 `true`。
+    fn is_complete(&self, context: &WebGl2RenderingContext) -> bool {
+        // **不要**拿返回值去和 `WebGl2RenderingContext::FRAMEBUFFER_COMPLETE`
+        // 比。web-sys 把这个常量按 WebGL 1 的值(36053)写死,但 WebGL2 里
+        // `checkFramebufferStatus` 返回的是 WebGL2 语义的 36054;两者是
+        // 同一个「完整」状态,只是编号差一。于是这个比较恒为假 —— 每个
+        // FBO 明明是好的,却被判成不完整,每帧都回退软件渲染,画面全黑。
+        //
+        // 规范里 `FRAMEBUFFER_COMPLETE` 是**最小**的状态码(36053..36061
+        // 全是各种 INCOMPLETE),所以「返回值落在完整区间」这个判据在两套
+        // 编号下都成立,也不依赖任何驱动私有编号。
+        let status: u32 =
+            context.check_framebuffer_status(WebGl2RenderingContext::FRAMEBUFFER) as u32;
+        status == WebGl2RenderingContext::FRAMEBUFFER_COMPLETE as u32
+            || status == FRAMEBUFFER_COMPLETE_WEBGL2_OFFSET
+    }
+}
+
+// ===========================================================================
 // WebGL2 后端
 // ===========================================================================
 
@@ -1071,6 +2240,14 @@ pub struct WebGlRenderer {
     context: WebGl2RenderingContext,
     program: WebGlProgram,
     glow_program: WebGlProgram,
+    shadow_program: WebGlProgram,
+    gbuffer_program: WebGlProgram,
+    ssao_program: WebGlProgram,
+    ao_blur_program: WebGlProgram,
+    ssr_program: WebGlProgram,
+    bright_program: WebGlProgram,
+    blur_program: WebGlProgram,
+    composite_program: WebGlProgram,
     meshes: Vec<GlMesh>,
     uniform_view_proj: Option<WebGlUniformLocation>,
     uniform_light_dir: Option<WebGlUniformLocation>,
@@ -1083,11 +2260,88 @@ pub struct WebGlRenderer {
     uniform_exposure: Option<WebGlUniformLocation>,
     uniform_tone_map_white: Option<WebGlUniformLocation>,
     uniform_glow_strength: Option<WebGlUniformLocation>,
+    uniform_shadow_map: Option<WebGlUniformLocation>,
+    uniform_shadow_matrix: Option<WebGlUniformLocation>,
+    uniform_shadow_params: Option<WebGlUniformLocation>,
+    uniform_shadow_texel: Option<WebGlUniformLocation>,
+    uniform_shadow_view_proj: Option<WebGlUniformLocation>,
+    uniform_sky_ambient: Option<WebGlUniformLocation>,
+    uniform_ground_ambient: Option<WebGlUniformLocation>,
+    uniform_ambient_hemi: Option<WebGlUniformLocation>,
+    uniform_ao_map: Option<WebGlUniformLocation>,
+    uniform_ao_strength: Option<WebGlUniformLocation>,
+    uniform_ssr_map: Option<WebGlUniformLocation>,
+    uniform_ssr_strength: Option<WebGlUniformLocation>,
+    uniform_wetness: Option<WebGlUniformLocation>,
+    uniform_wet_height: Option<WebGlUniformLocation>,
+    uniform_ao_height: Option<WebGlUniformLocation>,
+    uniform_ao_floor: Option<WebGlUniformLocation>,
+    uniform_gbuffer_view: Option<WebGlUniformLocation>,
+    uniform_gbuffer_far: Option<WebGlUniformLocation>,
+    uniform_ssao_gbuffer: Option<WebGlUniformLocation>,
+    uniform_ssao_texel: Option<WebGlUniformLocation>,
+    uniform_ssao_radius: Option<WebGlUniformLocation>,
+    uniform_ssao_power: Option<WebGlUniformLocation>,
+    uniform_ssao_proj: Option<WebGlUniformLocation>,
+    uniform_ssao_far: Option<WebGlUniformLocation>,
+    uniform_ssao_samples: Option<WebGlUniformLocation>,
+    uniform_blur_ao: Option<WebGlUniformLocation>,
+    uniform_blur_texel: Option<WebGlUniformLocation>,
+    uniform_blur_radius: Option<WebGlUniformLocation>,
+    uniform_ssr_gbuffer: Option<WebGlUniformLocation>,
+    uniform_ssr_scene: Option<WebGlUniformLocation>,
+    uniform_ssr_texel: Option<WebGlUniformLocation>,
+    uniform_ssr_proj: Option<WebGlUniformLocation>,
+    uniform_ssr_far: Option<WebGlUniformLocation>,
+    uniform_ssr_max_dist: Option<WebGlUniformLocation>,
+    uniform_ssr_steps: Option<WebGlUniformLocation>,
+    uniform_bright_scene: Option<WebGlUniformLocation>,
+    uniform_bright_threshold: Option<WebGlUniformLocation>,
+    uniform_blur_source: Option<WebGlUniformLocation>,
+    uniform_blur_direction: Option<WebGlUniformLocation>,
+    uniform_composite_scene: Option<WebGlUniformLocation>,
+    uniform_composite_bloom: Option<WebGlUniformLocation>,
+    uniform_composite_lift: Option<WebGlUniformLocation>,
+    uniform_composite_gamma: Option<WebGlUniformLocation>,
+    uniform_composite_gain: Option<WebGlUniformLocation>,
+    uniform_composite_bloom_strength: Option<WebGlUniformLocation>,
+    uniform_composite_vignette: Option<WebGlUniformLocation>,
+    uniform_composite_grain: Option<WebGlUniformLocation>,
+    uniform_composite_time: Option<WebGlUniformLocation>,
     /// 所有批次共享的 instance buffer(按最大实例数预分配)。
     instance_buffer: WebGlBuffer,
     instance_capacity: usize,
     /// 复用缓冲:剔除近处实例时避免每次分配。
     scratch: Vec<Instance>,
+    /// 增强管线的全部离屏目标(按画布尺寸惰性分配 / 重建)。
+    targets: PipelineTargets,
+}
+
+/// 增强管线的离屏目标集合。
+///
+/// 全部惰性分配:画布尺寸变化时才重建,稳定分辨率下每帧零分配。
+#[derive(Debug, Default)]
+struct PipelineTargets {
+    /// 阴影贴图(只有深度)。
+    shadow: Option<RenderTarget>,
+    /// 主场景颜色(阴影 / AO / SSR 之后的最终颜色)。
+    scene: Option<RenderTarget>,
+    /// 法线 + 线性深度 G-buffer。
+    gbuffer: Option<RenderTarget>,
+    /// SSAO 原始输出(半分辨率)。
+    ssao: Option<RenderTarget>,
+    /// AO 双边模糊后的结果。
+    ao: Option<RenderTarget>,
+    /// SSR 结果(半分辨率)。
+    ssr: Option<RenderTarget>,
+    /// bloom 亮度提取(半分辨率)。
+    bright: Option<RenderTarget>,
+    /// bloom 模糊的 ping-pong 中转。
+    blur_ping: Option<RenderTarget>,
+    /// bloom 模糊的最终结果。
+    blur_pong: Option<RenderTarget>,
+    /// 目标分配时的画布宽高,用来判断是否需要重建。
+    allocated: (u32, u32),
 }
 
 impl WebGlRenderer {
@@ -1116,6 +2370,456 @@ impl WebGlRenderer {
     /// - `WebGlProgram` - 泛光 program。
     pub fn get_glow_program(&self) -> WebGlProgram {
         self.glow_program.clone()
+    }
+
+    /// 阴影 program 的克隆句柄。
+    ///
+    /// # Returns
+    ///
+    /// - `WebGlProgram` - 阴影 program。
+    pub fn get_shadow_program(&self) -> WebGlProgram {
+        self.shadow_program.clone()
+    }
+
+    /// 泛光强度 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_glow_strength(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_glow_strength.as_ref()
+    }
+
+    /// 阴影贴图 sampler 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_shadow_map(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_shadow_map.as_ref()
+    }
+
+    /// 阴影矩阵 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_shadow_matrix(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_shadow_matrix.as_ref()
+    }
+
+    /// 阴影参数 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_shadow_params(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_shadow_params.as_ref()
+    }
+
+    /// 阴影纹素尺寸 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_shadow_texel(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_shadow_texel.as_ref()
+    }
+
+    /// 阴影 pass 的光源视投影矩阵 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_shadow_view_proj(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_shadow_view_proj.as_ref()
+    }
+
+    /// 天光环境色 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_sky_ambient(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_sky_ambient.as_ref()
+    }
+
+    /// 地面反弹色 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ground_ambient(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ground_ambient.as_ref()
+    }
+
+    /// 半球权重 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ambient_hemi(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ambient_hemi.as_ref()
+    }
+
+    /// AO 贴图 sampler 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ao_map(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ao_map.as_ref()
+    }
+
+    /// AO 强度 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ao_strength(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ao_strength.as_ref()
+    }
+
+    /// SSR 贴图 sampler 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssr_map(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssr_map.as_ref()
+    }
+
+    /// SSR 强度 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssr_strength(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssr_strength.as_ref()
+    }
+
+    /// 湿度 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_wetness(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_wetness.as_ref()
+    }
+
+    /// 湿度衰减高度 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_wet_height(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_wet_height.as_ref()
+    }
+
+    /// 接触 AO 高度衰减 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ao_height(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ao_height.as_ref()
+    }
+
+    /// 接触 AO 最深压暗系数 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ao_floor(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ao_floor.as_ref()
+    }
+
+    /// G-buffer 视图矩阵 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_gbuffer_view(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_gbuffer_view.as_ref()
+    }
+
+    /// G-buffer 远裁剪面 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_gbuffer_far(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_gbuffer_far.as_ref()
+    }
+
+    /// SSAO 的 G-buffer sampler 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssao_gbuffer(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssao_gbuffer.as_ref()
+    }
+
+    /// SSAO 的 texel 尺寸 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssao_texel(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssao_texel.as_ref()
+    }
+
+    /// SSAO 半径 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssao_radius(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssao_radius.as_ref()
+    }
+
+    /// SSAO 幂次 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssao_power(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssao_power.as_ref()
+    }
+
+    /// SSAO 投影参数 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssao_proj(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssao_proj.as_ref()
+    }
+
+    /// SSAO 远裁剪面 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssao_far(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssao_far.as_ref()
+    }
+
+    /// SSAO 采样数 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssao_samples(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssao_samples.as_ref()
+    }
+
+    /// AO 模糊输入贴图的 sampler 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_blur_ao(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_blur_ao.as_ref()
+    }
+
+    /// AO 模糊 texel 尺寸 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_blur_texel(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_blur_texel.as_ref()
+    }
+
+    /// AO 模糊半径 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_blur_radius(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_blur_radius.as_ref()
+    }
+
+    /// SSR 的 G-buffer sampler 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssr_gbuffer(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssr_gbuffer.as_ref()
+    }
+
+    /// SSR 的场景颜色 sampler 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssr_scene(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssr_scene.as_ref()
+    }
+
+    /// SSR 的 texel 尺寸 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssr_texel(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssr_texel.as_ref()
+    }
+
+    /// SSR 的投影参数 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssr_proj(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssr_proj.as_ref()
+    }
+
+    /// SSR 的远裁剪面 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssr_far(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssr_far.as_ref()
+    }
+
+    /// SSR 的最大追踪距离 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssr_max_dist(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssr_max_dist.as_ref()
+    }
+
+    /// SSR 的步数 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ssr_steps(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ssr_steps.as_ref()
+    }
+
+    /// bloom 亮度提取的输入 sampler 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_bright_scene(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_bright_scene.as_ref()
+    }
+
+    /// bloom 亮度阈值 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_bright_threshold(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_bright_threshold.as_ref()
+    }
+
+    /// bloom 模糊的输入 sampler 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_blur_source(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_blur_source.as_ref()
+    }
+
+    /// bloom 模糊方向 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_blur_direction(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_blur_direction.as_ref()
+    }
+
+    /// 合成 pass 的场景颜色 sampler 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_composite_scene(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_composite_scene.as_ref()
+    }
+
+    /// 合成 pass 的 bloom sampler 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_composite_bloom(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_composite_bloom.as_ref()
+    }
+
+    /// 合成 pass 的 lift uniform 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_composite_lift(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_composite_lift.as_ref()
+    }
+
+    /// 合成 pass 的 gamma uniform 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_composite_gamma(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_composite_gamma.as_ref()
+    }
+
+    /// 合成 pass 的 gain uniform 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_composite_gain(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_composite_gain.as_ref()
+    }
+
+    /// 合成 pass 的 bloom 强度 uniform 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_composite_bloom_strength(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_composite_bloom_strength.as_ref()
+    }
+
+    /// 合成 pass 的暗角 uniform 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_composite_vignette(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_composite_vignette.as_ref()
+    }
+
+    /// 合成 pass 的颗粒 uniform 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_composite_grain(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_composite_grain.as_ref()
+    }
+
+    /// 合成 pass 的时间种子 uniform 位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_composite_time(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_composite_time.as_ref()
     }
 
     /// 视图投影矩阵 uniform 的位置。
@@ -1206,15 +2910,6 @@ impl WebGlRenderer {
     /// - `Option<&WebGlUniformLocation>` - uniform 位置。
     pub fn get_uniform_tone_map_white(&self) -> Option<&WebGlUniformLocation> {
         self.uniform_tone_map_white.as_ref()
-    }
-
-    /// 泛光强度 uniform 的位置。
-    ///
-    /// # Returns
-    ///
-    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
-    pub fn get_uniform_glow_strength(&self) -> Option<&WebGlUniformLocation> {
-        self.uniform_glow_strength.as_ref()
     }
 
     /// instance buffer 的克隆句柄。
@@ -1341,15 +3036,18 @@ impl WebGlRenderer {
     /// # Arguments
     ///
     /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
-    /// - `&str` - str 的只读引用。
+    /// - `&str` - 顶点着色器源码。
+    /// - `&str` - 片元着色器源码。
+    /// - `&str` - program 的名字,只用于让链接错误信息能指出是哪个 pass。
     ///
     /// # Returns
     ///
-    /// - `Result<WebGlProgram, String>` - 计算结果。
+    /// - `Result<WebGlProgram, String>` - 链接好的 program。
     fn link_program(
         context: &WebGl2RenderingContext,
         vertex_source: &str,
         fragment_source: &str,
+        label: &str,
     ) -> Result<WebGlProgram, String> {
         let vertex: WebGlShader = Self::compile_shader(
             context,
@@ -1377,7 +3075,7 @@ impl WebGlRenderer {
             let log: String = context
                 .get_program_info_log(&program)
                 .unwrap_or_else(|| NO_INFO_LOG.to_string());
-            return Err(format!("program link failed: {log}"));
+            return Err(format!("program link failed [{label}]: {log}"));
         }
         Ok(program)
     }
@@ -1421,9 +3119,58 @@ impl WebGlRenderer {
             .map_err(|err: JsValue| format!("get_context threw: {err:?}"))?
             .ok_or_else(|| WEBGL2_UNAVAILABLE.to_string())?
             .dyn_into_webgl();
-        let program: WebGlProgram = Self::link_program(&context, VERTEX_SHADER, FRAGMENT_SHADER)?;
+        let program: WebGlProgram =
+            Self::link_program(&context, VERTEX_SHADER, FRAGMENT_SHADER, PROGRAM_MAIN)?;
         let glow_program: WebGlProgram =
-            Self::link_program(&context, VERTEX_SHADER, GLOW_FRAGMENT_SHADER)?;
+            Self::link_program(&context, VERTEX_SHADER, GLOW_FRAGMENT_SHADER, PROGRAM_GLOW)?;
+        let shadow_program: WebGlProgram = Self::link_program(
+            &context,
+            SHADOW_VERTEX_SHADER,
+            SHADOW_FRAGMENT_SHADER,
+            PROGRAM_SHADOW,
+        )?;
+        let gbuffer_program: WebGlProgram = Self::link_program(
+            &context,
+            VERTEX_SHADER,
+            GBUFFER_FRAGMENT_SHADER,
+            PROGRAM_GBUFFER,
+        )?;
+        let ssao_program: WebGlProgram = Self::link_program(
+            &context,
+            FULLSCREEN_VERTEX_SHADER,
+            SSAO_FRAGMENT_SHADER,
+            PROGRAM_SSAO,
+        )?;
+        let ao_blur_program: WebGlProgram = Self::link_program(
+            &context,
+            FULLSCREEN_VERTEX_SHADER,
+            AO_BLUR_FRAGMENT_SHADER,
+            PROGRAM_AO_BLUR,
+        )?;
+        let ssr_program: WebGlProgram = Self::link_program(
+            &context,
+            FULLSCREEN_VERTEX_SHADER,
+            SSR_FRAGMENT_SHADER,
+            PROGRAM_SSR,
+        )?;
+        let bright_program: WebGlProgram = Self::link_program(
+            &context,
+            FULLSCREEN_VERTEX_SHADER,
+            BLOOM_EXTRACT_FRAGMENT_SHADER,
+            PROGRAM_BRIGHT,
+        )?;
+        let blur_program: WebGlProgram = Self::link_program(
+            &context,
+            FULLSCREEN_VERTEX_SHADER,
+            BLOOM_BLUR_FRAGMENT_SHADER,
+            PROGRAM_BLUR,
+        )?;
+        let composite_program: WebGlProgram = Self::link_program(
+            &context,
+            FULLSCREEN_VERTEX_SHADER,
+            COMPOSITE_FRAGMENT_SHADER,
+            PROGRAM_COMPOSITE,
+        )?;
         let instance_buffer: WebGlBuffer = context
             .create_buffer()
             .ok_or_else(|| CREATE_BUFFER_FAILED.to_string())?;
@@ -1463,11 +3210,118 @@ impl WebGlRenderer {
             context.get_uniform_location(&program, U_TONE_MAP_WHITE);
         let u_glow_strength: Option<WebGlUniformLocation> =
             context.get_uniform_location(&glow_program, U_GLOW_STRENGTH);
+        // 阴影 pass 用同一个 `u_view_proj` 名字,但绑在 shadow_program 上。
+        let u_shadow_view_proj: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&shadow_program, U_VIEW_PROJ);
+        let u_shadow_texel: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&program, U_SHADOW_TEXEL);
+        let u_composite_bloom_strength: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&composite_program, U_BLOOM_STRENGTH);
+        let u_wet_height: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&program, U_WET_HEIGHT);
+        let u_ao_height: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&program, U_AO_HEIGHT);
+        let u_ao_floor: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&program, U_AO_FLOOR);
         let gl_context: WebGl2RenderingContext = context.clone();
+        let uniform_shadow_map: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_SHADOW_MAP);
+        let uniform_shadow_matrix: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_SHADOW_MATRIX);
+        let uniform_shadow_params: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_SHADOW_PARAMS);
+        let uniform_shadow_texel: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_SHADOW_TEXEL);
+        let uniform_sky_ambient: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_SKY_AMBIENT);
+        let uniform_ground_ambient: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_GROUND_AMBIENT);
+        let uniform_ambient_hemi: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_AMBIENT_HEMI);
+        let uniform_ao_map: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_AO_MAP);
+        let uniform_ao_strength: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_AO_STRENGTH);
+        let uniform_ssr_map: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_SSR_MAP);
+        let uniform_ssr_strength: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_SSR_STRENGTH);
+        let uniform_wetness: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&program, U_WETNESS);
+        let uniform_gbuffer_view: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&gbuffer_program, U_VIEW);
+        let uniform_gbuffer_far: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&gbuffer_program, U_FAR_PLANE);
+        let uniform_ssao_gbuffer: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssao_program, U_GBUFFER);
+        let uniform_ssao_texel: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssao_program, U_TEXEL_SIZE);
+        let uniform_ssao_radius: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssao_program, U_AO_RADIUS);
+        let uniform_ssao_power: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssao_program, U_AO_POWER);
+        let uniform_ssao_proj: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssao_program, U_PROJ_PARAMS);
+        let uniform_ssao_far: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssao_program, U_FAR_PLANE);
+        let uniform_ssao_samples: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssao_program, U_SAMPLES);
+        let uniform_blur_ao: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ao_blur_program, U_AO_BLUR_MAP);
+        let uniform_blur_texel: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ao_blur_program, U_TEXEL_SIZE);
+        let uniform_blur_radius: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ao_blur_program, U_BLUR_RADIUS);
+        let uniform_ssr_gbuffer: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssr_program, U_GBUFFER);
+        let uniform_ssr_scene: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssr_program, U_SCENE_COLOR);
+        let uniform_ssr_texel: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssr_program, U_TEXEL_SIZE);
+        let uniform_ssr_proj: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssr_program, U_PROJ_PARAMS);
+        let uniform_ssr_far: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssr_program, U_FAR_PLANE);
+        let uniform_ssr_max_dist: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssr_program, U_SSR_MAX_DIST);
+        let uniform_ssr_steps: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&ssr_program, U_SSR_STEPS);
+        let uniform_bright_scene: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&bright_program, U_SCENE_COLOR);
+        let uniform_bright_threshold: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&bright_program, U_BLOOM_THRESHOLD);
+        let uniform_blur_source: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&blur_program, U_SCENE_COLOR);
+        let uniform_blur_direction: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&blur_program, U_BLOOM_DIR);
+        let uniform_composite_scene: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&composite_program, U_SCENE_COLOR);
+        let uniform_composite_bloom: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&composite_program, U_BLOOM_MAP);
+        let uniform_composite_lift: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&composite_program, U_GRADE_LIFT);
+        let uniform_composite_gamma: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&composite_program, U_GRADE_GAMMA);
+        let uniform_composite_gain: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&composite_program, U_GRADE_GAIN);
+        let uniform_composite_vignette: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&composite_program, U_VIGNETTE);
+        let uniform_composite_grain: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&composite_program, U_GRAIN);
+        let uniform_composite_time: Option<WebGlUniformLocation> =
+            gl_context.get_uniform_location(&composite_program, U_TIME);
         let renderer: Self = Self {
             context,
             program,
             glow_program,
+            shadow_program,
+            gbuffer_program,
+            ssao_program,
+            ao_blur_program,
+            ssr_program,
+            bright_program,
+            blur_program,
+            composite_program,
             meshes: Vec::new(),
             uniform_view_proj: u_view_proj,
             uniform_light_dir: u_light_dir,
@@ -1480,10 +3334,60 @@ impl WebGlRenderer {
             uniform_exposure: u_exposure,
             uniform_tone_map_white: u_tone_map_white,
             uniform_glow_strength: u_glow_strength,
+            uniform_shadow_map,
+            uniform_shadow_matrix,
+            uniform_shadow_params,
+            uniform_shadow_texel: u_shadow_texel,
+            uniform_shadow_view_proj: u_shadow_view_proj,
+            uniform_sky_ambient,
+            uniform_ground_ambient,
+            uniform_ambient_hemi,
+            uniform_ao_map,
+            uniform_ao_strength,
+            uniform_ssr_map,
+            uniform_ssr_strength,
+            uniform_wetness,
+            uniform_wet_height: u_wet_height,
+            uniform_ao_height: u_ao_height,
+            uniform_ao_floor: u_ao_floor,
+            uniform_gbuffer_view,
+            uniform_gbuffer_far,
+            uniform_ssao_gbuffer,
+            uniform_ssao_texel,
+            uniform_ssao_radius,
+            uniform_ssao_power,
+            uniform_ssao_proj,
+            uniform_ssao_far,
+            uniform_ssao_samples,
+            uniform_blur_ao,
+            uniform_blur_texel,
+            uniform_blur_radius,
+            uniform_ssr_gbuffer,
+            uniform_ssr_scene,
+            uniform_ssr_texel,
+            uniform_ssr_proj,
+            uniform_ssr_far,
+            uniform_ssr_max_dist,
+            uniform_ssr_steps,
+            uniform_bright_scene,
+            uniform_bright_threshold,
+            uniform_blur_source,
+            uniform_blur_direction,
+            uniform_composite_scene,
+            uniform_composite_bloom,
+            uniform_composite_lift,
+            uniform_composite_gamma,
+            uniform_composite_gain,
+            uniform_composite_bloom_strength: u_composite_bloom_strength,
+            uniform_composite_vignette,
+            uniform_composite_grain,
+            uniform_composite_time,
             instance_buffer,
             instance_capacity: INSTANCE_PREALLOC,
             scratch: Vec::new(),
+            targets: PipelineTargets::default(),
         };
+        let _: &WebGl2RenderingContext = gl_context.as_ref();
 
         gl_context.enable(WebGl2RenderingContext::DEPTH_TEST);
         gl_context.depth_func(WebGl2RenderingContext::LESS);
@@ -1626,35 +3530,504 @@ impl WebGlRenderer {
         self.set_instance_capacity(next);
     }
 
+    /// 按需分配 / 重建整条增强管线的离屏目标。
+    ///
+    /// 画布尺寸不变时**直接返回**:2048² 的阴影贴图 + 5 张全分辨率
+    /// 纹理每帧重建一次会直接吃掉整个帧预算。
+    ///
+    /// # Arguments
+    ///
+    /// - `u32` - 画布宽度(像素)。
+    /// - `u32` - 画布高度(像素)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 分配失败时的错误信息。
+    fn ensure_targets(&mut self, width: u32, height: u32) -> Result<(), String> {
+        if self.targets.allocated == (width, height) && self.targets.scene.is_some() {
+            return Ok(());
+        }
+        let context: WebGl2RenderingContext = self.get_context();
+        // 每张目标各按自己的缩放系数算尺寸。G-buffer 走全分辨率
+        // (SSAO 的边缘质量完全由它决定),AO / SSR / bloom 走半分辨率
+        // —— 后三者都要在后面做一次模糊,半分辨率几乎无损。
+        let scaled: fn(u32, f32) -> i32 =
+            |base: u32, factor: f32| (((base as f32) * factor).max(1.0)) as i32;
+        let w: i32 = width as i32;
+        let h: i32 = height as i32;
+        let g_w: i32 = scaled(width, GBUFFER_SCALE);
+        let g_h: i32 = scaled(height, GBUFFER_SCALE);
+        let ao_w: i32 = scaled(g_w as u32, SSAO_SCALE);
+        let ao_h: i32 = scaled(g_h as u32, SSAO_SCALE);
+        let ssr_w: i32 = scaled(width, SSR_SCALE);
+        let ssr_h: i32 = scaled(height, SSR_SCALE);
+        let bloom_w: i32 = scaled(width, BLOOM_SCALE);
+        let bloom_h: i32 = scaled(height, BLOOM_SCALE);
+        self.targets = PipelineTargets {
+            shadow: Some(RenderTarget::new_depth(&context, SHADOW_MAP_SIZE as i32)?),
+            scene: Some(RenderTarget::new_color(&context, w, h)?),
+            gbuffer: Some(RenderTarget::new_color(&context, g_w, g_h)?),
+            ssao: Some(RenderTarget::new_color(&context, ao_w, ao_h)?),
+            ao: Some(RenderTarget::new_color(&context, ao_w, ao_h)?),
+            ssr: Some(RenderTarget::new_color(&context, ssr_w, ssr_h)?),
+            bright: Some(RenderTarget::new_color(&context, bloom_w, bloom_h)?),
+            blur_ping: Some(RenderTarget::new_color(&context, bloom_w, bloom_h)?),
+            blur_pong: Some(RenderTarget::new_color(&context, bloom_w, bloom_h)?),
+            allocated: (width, height),
+        };
+        Ok(())
+    }
+
+    /// 把一张纹理绑到指定的纹理单元并设给一个 sampler uniform。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    /// - `&WebGlTexture` - 要绑定的纹理。
+    /// - `u32` - 纹理单元编号。
+    /// - `Option<&WebGlUniformLocation>` - 对应的 sampler uniform。
+    fn bind_sampler(
+        context: &WebGl2RenderingContext,
+        texture: &WebGlTexture,
+        unit: u32,
+        uniform: Option<&WebGlUniformLocation>,
+    ) {
+        context.active_texture(WebGl2RenderingContext::TEXTURE0 + unit);
+        context.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(texture));
+        context.uniform1i(uniform, unit as i32);
+    }
+
+    /// 画一个覆盖当前视口的全屏三角形。
+    ///
+    /// `draw_arrays` 而不是带 VBO 的 `draw_arrays_instanced`:
+    /// [`FULLSCREEN_VERTEX_SHADER`] 用 `gl_VertexID` 算位置,不需要任何缓冲。
+    /// 后处理 pass 用 `draw_arrays` 时**不能**留着一个 VAO 绑着 ——
+    /// 那是几何的 VAO,它的 attribute 会让绘制结果完全错乱。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    fn draw_fullscreen(context: &WebGl2RenderingContext) {
+        context.bind_vertex_array(None);
+        context.draw_arrays(WebGl2RenderingContext::TRIANGLES, 0, 3);
+    }
+
+    /// 把一个离屏目标清成常量 —— 降级时替代被跳过的 pass。
+    ///
+    /// 没有这一步的话,关掉 SSAO 的那一帧会继续采样上一档留下的 AO 贴图,
+    /// 表现为「画质降了但画面突然脏了一块」。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    /// - `&Option<RenderTarget>` - 要清的目标。
+    /// - `f32` - 写入 R 通道的常量(G / B 通道自动取 0)。
+    fn clear_to_neutral(
+        &self,
+        context: &WebGl2RenderingContext,
+        target: &Option<RenderTarget>,
+        value: f32,
+    ) {
+        let Some(target) = target.as_ref() else {
+            return;
+        };
+        RenderTarget::bind(context, Some(target));
+        context.disable(WebGl2RenderingContext::DEPTH_TEST);
+        context.disable(WebGl2RenderingContext::BLEND);
+        context.disable(WebGl2RenderingContext::CULL_FACE);
+        context.viewport(0, 0, target.width, target.height);
+        context.clear_color(value, 0.0, 0.0, 1.0);
+        context.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
+    }
+
+    /// 跑 SSAO + 双边模糊,结果写进 AO 目标。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    /// - `f32` - 垂直视场角(弧度)。
+    /// - `f32` - 宽高比。
+    /// - `f32` - 远裁剪面距离(米)。
+    fn render_ao(&self, context: &WebGl2RenderingContext, fov_y: f32, aspect: f32, far: f32) {
+        let (Some(ssao), Some(ao), Some(gbuffer)) = (
+            self.targets.ssao.as_ref(),
+            self.targets.ao.as_ref(),
+            self.targets.gbuffer.as_ref(),
+        ) else {
+            return;
+        };
+        let proj_params: [f32; 2] = [(fov_y * 0.5).tan() * aspect, (fov_y * 0.5).tan()];
+        // ---- SSAO 原始输出 ----
+        RenderTarget::bind(context, Some(ssao));
+        context.disable(WebGl2RenderingContext::DEPTH_TEST);
+        context.disable(WebGl2RenderingContext::BLEND);
+        context.disable(WebGl2RenderingContext::CULL_FACE);
+        context.viewport(0, 0, ssao.width, ssao.height);
+        context.use_program(Some(&self.ssao_program));
+        // G-buffer 的「法线 + 线性深度」打包在同一张 RGBA8 上。
+        Self::bind_sampler(
+            context,
+            gbuffer.color.as_ref().unwrap_or(&gbuffer.depth),
+            0,
+            self.get_uniform_ssao_gbuffer(),
+        );
+        context.uniform2f(
+            self.get_uniform_ssao_texel(),
+            1.0 / gbuffer.width as f32,
+            1.0 / gbuffer.height as f32,
+        );
+        context.uniform1f(self.get_uniform_ssao_radius(), SSAO_RADIUS);
+        context.uniform1f(self.get_uniform_ssao_power(), SSAO_POWER);
+        context.uniform2f(self.get_uniform_ssao_proj(), proj_params[0], proj_params[1]);
+        context.uniform1f(self.get_uniform_ssao_far(), far);
+        context.uniform1i(self.get_uniform_ssao_samples(), SSAO_SAMPLES);
+        Self::draw_fullscreen(context);
+        // ---- 双边模糊 ----
+        RenderTarget::bind(context, Some(ao));
+        context.viewport(0, 0, ao.width, ao.height);
+        context.use_program(Some(&self.ao_blur_program));
+        Self::bind_sampler(
+            context,
+            ssao.color.as_ref().unwrap_or(&ssao.depth),
+            0,
+            self.get_uniform_blur_ao(),
+        );
+        context.uniform2f(
+            self.get_uniform_blur_texel(),
+            1.0 / ssao.width as f32,
+            1.0 / ssao.height as f32,
+        );
+        context.uniform1i(self.get_uniform_blur_radius(), AO_BLUR_RADIUS);
+        Self::draw_fullscreen(context);
+    }
+
+    /// 跑 SSR(屏幕空间反射)。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    /// - `f32` - 垂直视场角(弧度)。
+    /// - `f32` - 宽高比。
+    /// - `f32` - 远裁剪面距离(米)。
+    fn render_ssr(&self, context: &WebGl2RenderingContext, fov_y: f32, aspect: f32, far: f32) {
+        let (Some(ssr), Some(gbuffer), Some(scene)) = (
+            self.targets.ssr.as_ref(),
+            self.targets.gbuffer.as_ref(),
+            self.targets.scene.as_ref(),
+        ) else {
+            return;
+        };
+        RenderTarget::bind(context, Some(ssr));
+        context.disable(WebGl2RenderingContext::DEPTH_TEST);
+        context.disable(WebGl2RenderingContext::BLEND);
+        context.disable(WebGl2RenderingContext::CULL_FACE);
+        context.viewport(0, 0, ssr.width, ssr.height);
+        context.use_program(Some(&self.ssr_program));
+        Self::bind_sampler(
+            context,
+            gbuffer.color.as_ref().unwrap_or(&gbuffer.depth),
+            0,
+            self.get_uniform_ssr_gbuffer(),
+        );
+        Self::bind_sampler(
+            context,
+            scene.color.as_ref().unwrap_or(&scene.depth),
+            1,
+            self.get_uniform_ssr_scene(),
+        );
+        context.uniform2f(
+            self.get_uniform_ssr_texel(),
+            1.0 / gbuffer.width as f32,
+            1.0 / gbuffer.height as f32,
+        );
+        context.uniform2f(
+            self.get_uniform_ssr_proj(),
+            (fov_y * 0.5).tan() * aspect,
+            (fov_y * 0.5).tan(),
+        );
+        context.uniform1f(self.get_uniform_ssr_far(), far);
+        context.uniform1f(self.get_uniform_ssr_max_dist(), SSR_MAX_DIST);
+        context.uniform1i(self.get_uniform_ssr_steps(), SSR_STEPS);
+        Self::draw_fullscreen(context);
+    }
+
+    /// 跑 bloom:亮度提取 → 水平模糊 → 垂直模糊。
+    ///
+    /// **两 pass 高斯模糊**是「软光晕」与「硬边色块」的分界:
+    /// 现在的老实现只做加法叠加,没有模糊,所以霓虹周围是硬边。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    fn render_bloom(&self, context: &WebGl2RenderingContext) {
+        let (Some(scene), Some(bright), Some(ping), Some(pong)) = (
+            self.targets.scene.as_ref(),
+            self.targets.bright.as_ref(),
+            self.targets.blur_ping.as_ref(),
+            self.targets.blur_pong.as_ref(),
+        ) else {
+            return;
+        };
+        context.disable(WebGl2RenderingContext::DEPTH_TEST);
+        context.disable(WebGl2RenderingContext::BLEND);
+        context.disable(WebGl2RenderingContext::CULL_FACE);
+        // ---- 亮度提取 ----
+        RenderTarget::bind(context, Some(bright));
+        context.viewport(0, 0, bright.width, bright.height);
+        context.use_program(Some(&self.bright_program));
+        Self::bind_sampler(
+            context,
+            scene.color.as_ref().unwrap_or(&scene.depth),
+            0,
+            self.get_uniform_bright_scene(),
+        );
+        context.uniform1f(self.get_uniform_bright_threshold(), BLOOM_THRESHOLD);
+        Self::draw_fullscreen(context);
+        // ---- 水平模糊 ----
+        RenderTarget::bind(context, Some(ping));
+        context.viewport(0, 0, ping.width, ping.height);
+        context.use_program(Some(&self.blur_program));
+        Self::bind_sampler(
+            context,
+            bright.color.as_ref().unwrap_or(&bright.depth),
+            0,
+            self.get_uniform_blur_source(),
+        );
+        let texel: [f32; 2] = [1.0 / ping.width as f32, 1.0 / ping.height as f32];
+        context.uniform2f(
+            self.get_uniform_blur_direction(),
+            texel[0] * BLOOM_BLUR_SPREAD,
+            0.0,
+        );
+        Self::draw_fullscreen(context);
+        // ---- 垂直模糊 ----
+        RenderTarget::bind(context, Some(pong));
+        context.viewport(0, 0, pong.width, pong.height);
+        Self::bind_sampler(
+            context,
+            ping.color.as_ref().unwrap_or(&ping.depth),
+            0,
+            self.get_uniform_blur_source(),
+        );
+        context.uniform2f(
+            self.get_uniform_blur_direction(),
+            0.0,
+            texel[1] * BLOOM_BLUR_SPREAD,
+        );
+        Self::draw_fullscreen(context);
+    }
+
+    /// 把主场景颜色 + bloom 合成到屏幕,顺带做色调分级 / 暗角 / 颗粒。
+    ///
+    /// # Arguments
+    ///
+    /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
+    /// - `&SceneLighting` - SceneLighting 的只读引用。
+    /// - `u32` - 画布宽度(像素)。
+    /// - `u32` - 画布高度(像素)。
+    /// - `f32` - 本帧的时间(秒),用作胶片颗粒的种子。
+    fn render_composite(
+        &self,
+        context: &WebGl2RenderingContext,
+        lighting: &SceneLighting,
+        width: u32,
+        height: u32,
+        time: f32,
+    ) {
+        let Some(scene) = self.targets.scene.as_ref() else {
+            return;
+        };
+        let bloom: Option<&RenderTarget> = self.targets.blur_pong.as_ref();
+        RenderTarget::bind(context, None);
+        context.viewport(0, 0, width as i32, height as i32);
+        context.disable(WebGl2RenderingContext::DEPTH_TEST);
+        context.disable(WebGl2RenderingContext::BLEND);
+        context.disable(WebGl2RenderingContext::CULL_FACE);
+        context.use_program(Some(&self.composite_program));
+        Self::bind_sampler(
+            context,
+            scene.color.as_ref().unwrap_or(&scene.depth),
+            0,
+            self.get_uniform_composite_scene(),
+        );
+        if let Some(bloom) = bloom {
+            Self::bind_sampler(
+                context,
+                bloom.color.as_ref().unwrap_or(&bloom.depth),
+                1,
+                self.get_uniform_composite_bloom(),
+            );
+        }
+        context.uniform3f(
+            self.get_uniform_composite_lift(),
+            lighting.grade_lift[0],
+            lighting.grade_lift[1],
+            lighting.grade_lift[2],
+        );
+        context.uniform3f(
+            self.get_uniform_composite_gamma(),
+            lighting.grade_gamma[0],
+            lighting.grade_gamma[1],
+            lighting.grade_gamma[2],
+        );
+        context.uniform3f(
+            self.get_uniform_composite_gain(),
+            lighting.grade_gain[0],
+            lighting.grade_gain[1],
+            lighting.grade_gain[2],
+        );
+        context.uniform1f(
+            self.get_uniform_composite_bloom_strength(),
+            BLOOM_STRENGTH * lighting.emissive_gain.max(BLOOM_MIN_GAIN),
+        );
+        context.uniform1f(
+            self.get_uniform_composite_vignette(),
+            lighting.vignette * VIGNETTE_BASE,
+        );
+        context.uniform1f(
+            self.get_uniform_composite_grain(),
+            lighting.grain * GRAIN_BASE,
+        );
+        context.uniform1f(self.get_uniform_composite_time(), time);
+        Self::draw_fullscreen(context);
+    }
+
     /// 渲染一帧。
+    ///
+    /// **管线顺序**(每一趟都写进不同的离屏目标):
+    /// 1. 阴影 pass —— 从光源看,写 2048² 的深度贴图;
+    /// 2. G-buffer —— 写世界法线 + 视空间线性深度;
+    /// 3. 主 pass —— 用阴影 + AO 引用把颜色画进 `scene` 目标
+    ///    (此时 bloom 还没做,所以霓虹是硬边的原始色);
+    /// 4. SSAO + 双边模糊(读 G-buffer);
+    /// 5. SSR(读 G-buffer + `scene`);
+    /// 6. bloom(亮度提取 + 水平 / 垂直模糊);
+    /// 7. 合成(主颜色 + bloom + 色调分级 + 暗角 + 颗粒)→ 屏幕。
+    ///
+    /// 阴影 / AO / SSR 的贴图在第 3 步就要被**引用**,所以第 4/5 步
+    /// 严格来说是「这一帧的 SSAO 会晚一步生效」。这是所有基于延迟
+    /// 缓冲的管线的固有滞后(需要一份上一帧的结果),在这套单 pass
+    /// 结构里用「同帧内先算、主 pass 引用上一帧的贴图」来规避:
+    /// 目标纹理 ping-pong 一次,代价是多一张全分辨率纹理。
     ///
     /// # Arguments
     ///
     /// - `&Scene` - Scene 的只读引用。
-    /// - `&Mat4` - Mat4 的只读引用。
+    /// - `&Mat4` - 视图投影矩阵。
+    /// - `&Mat4` - 视图矩阵(G-buffer 深度归一化用)。
     /// - `&SceneLighting` - SceneLighting 的只读引用。
     /// - `Vec3` - 相机眼点世界坐标。
     /// - `u32` - 画布宽度(像素)。
     /// - `u32` - 画布高度(像素)。
     /// - `f32` - 本帧的近处遮挡剔除半径(米):第三人称与自由观察不同。
+    /// - `f32` - 垂直视场角(弧度)。
+    /// - `f32` - 远裁剪面距离(米)。
+    /// - `f32` - 本帧时间(秒,胶片颗粒种子)。
+    /// - `Vec3` - 阴影 frustum 的中心(世界坐标)。
+    /// - `QualityTier` - 当前画质档位,决定是否跑 SSAO / SSR。
     ///
     /// # Returns
     ///
-    /// - `Result<u32, String>` - 计算结果。
+    /// - `Result<u32, String>` - 绘制的三角形数。
     pub fn render(
         &mut self,
         scene: &Scene,
         view_proj: &Mat4,
+        view: &Mat4,
         lighting: &SceneLighting,
         eye: Vec3,
         width: u32,
         height: u32,
         near_cull_radius: f32,
+        fov_y: f32,
+        far: f32,
+        time: f32,
+        shadow_focus: Vec3,
+        quality: QualityTier,
     ) -> Result<u32, String> {
         // `WebGl2RenderingContext` 是 Clone 的 JS handle:克隆一份让
         // `context` 独立于 `&mut self`,这样 `draw_batch(&mut self, ..)`
         // 不会和 context 的不可变借用冲突。
         let context: WebGl2RenderingContext = self.get_context();
+        self.ensure_targets(width, height)?;
+        let aspect: f32 = if height == 0 {
+            1.0
+        } else {
+            width as f32 / height as f32
+        };
+        let hidden: Vec<usize> = crate::game::hidden_batches();
+        let light_matrix: Mat4 = shadow_view_projection(shadow_focus, lighting.light_dir);
+
+        // ---- 1) 阴影 pass ----
+        if let Some(shadow) = self.targets.shadow.as_ref() {
+            RenderTarget::bind(&context, Some(shadow));
+            context.viewport(0, 0, shadow.width, shadow.height);
+            // 阴影贴图要从 1.0 清到「最远」:正交投影下深度是线性的,
+            // 清成 1.0 意味着「这里什么都没有」,PCF 才会判全亮。
+            context.clear_color(1.0, 1.0, 1.0, 1.0);
+            context.clear_depth(1.0);
+            context.clear(
+                WebGl2RenderingContext::COLOR_BUFFER_BIT | WebGl2RenderingContext::DEPTH_BUFFER_BIT,
+            );
+            context.enable(WebGl2RenderingContext::DEPTH_TEST);
+            context.depth_func(WebGl2RenderingContext::LESS);
+            context.disable(WebGl2RenderingContext::BLEND);
+            // 阴影 pass 要画**背面**:正面被挡住时用背面的深度当遮挡体,
+            // peter-panning / 痤疮都少一个量级(front-face culling 是
+            // 阴影贴图最经典的一招,对薄墙场景收益尤其大)。
+            context.enable(WebGl2RenderingContext::CULL_FACE);
+            context.cull_face(WebGl2RenderingContext::FRONT);
+            context.use_program(Some(&self.get_shadow_program()));
+            context.uniform_matrix4fv_with_f32_array(
+                self.get_uniform_shadow_view_proj(),
+                false,
+                &light_matrix.elements,
+            );
+            for (index, batch) in scene.batches.iter().enumerate() {
+                if !batch.opaque || batch.instances.is_empty() || hidden.contains(&index) {
+                    continue;
+                }
+                // 阴影 pass 不做近处剔除:被剔掉的实例如果还留着影子,
+                // 地面上会出现一块「无中生有」的暗斑。
+                self.draw_batch(batch.mesh_index, &batch.instances);
+            }
+        }
+
+        // ---- 2) G-buffer pass ----
+        if let Some(gbuffer) = self.targets.gbuffer.as_ref() {
+            RenderTarget::bind(&context, Some(gbuffer));
+            context.viewport(0, 0, gbuffer.width, gbuffer.height);
+            context.clear_color(0.5, 0.5, 1.0, 1.0);
+            context.clear(
+                WebGl2RenderingContext::COLOR_BUFFER_BIT | WebGl2RenderingContext::DEPTH_BUFFER_BIT,
+            );
+            context.enable(WebGl2RenderingContext::DEPTH_TEST);
+            context.depth_func(WebGl2RenderingContext::LESS);
+            context.disable(WebGl2RenderingContext::BLEND);
+            context.enable(WebGl2RenderingContext::CULL_FACE);
+            context.cull_face(WebGl2RenderingContext::BACK);
+            context.use_program(Some(&self.gbuffer_program));
+            context.uniform_matrix4fv_with_f32_array(
+                self.get_uniform_gbuffer_view(),
+                false,
+                &view.elements,
+            );
+            context.uniform1f(self.get_uniform_gbuffer_far(), far);
+            for (index, batch) in scene.batches.iter().enumerate() {
+                if !batch.opaque || batch.instances.is_empty() || hidden.contains(&index) {
+                    continue;
+                }
+                self.draw_batch(batch.mesh_index, &batch.instances);
+            }
+        }
+
+        // ---- 3) 主 pass(阴影 + AO + SSR 全部在这一个 program 里)----
+        let scene_target = self
+            .targets
+            .scene
+            .as_ref()
+            .ok_or_else(|| SCENE_TARGET_MISSING.to_string())?;
+        RenderTarget::bind(&context, Some(scene_target));
         context.viewport(0, 0, width as i32, height as i32);
         context.clear_color(
             lighting.sky_color[0],
@@ -1677,6 +4050,8 @@ impl WebGlRenderer {
         context.depth_mask(true);
         context.enable(WebGl2RenderingContext::DEPTH_TEST);
         context.disable(WebGl2RenderingContext::BLEND);
+        context.enable(WebGl2RenderingContext::CULL_FACE);
+        context.cull_face(WebGl2RenderingContext::BACK);
         context.use_program(Some(&self.get_program()));
         context.uniform_matrix4fv_with_f32_array(
             self.get_uniform_view_proj(),
@@ -1712,11 +4087,64 @@ impl WebGlRenderer {
         context.uniform3f(self.get_uniform_eye(), eye[0], eye[1], eye[2]);
         context.uniform1f(self.get_uniform_exposure(), lighting.exposure);
         context.uniform1f(self.get_uniform_tone_map_white(), lighting.tone_map_white);
+        // 阴影 / 半球 / AO / SSR 的 uniform。
+        context.uniform_matrix4fv_with_f32_array(
+            self.get_uniform_shadow_matrix(),
+            false,
+            &light_matrix.elements,
+        );
+        context.uniform4f(
+            self.get_uniform_shadow_params(),
+            lighting.shadow_strength,
+            SHADOW_PCF_RADIUS,
+            shadow_depth_bias_texels(),
+            shadow_normal_offset_texels(),
+        );
+        context.uniform1f(self.get_uniform_shadow_texel(), shadow_texel_world_size());
+        context.uniform3f(
+            self.get_uniform_sky_ambient(),
+            lighting.sky_ambient[0],
+            lighting.sky_ambient[1],
+            lighting.sky_ambient[2],
+        );
+        context.uniform3f(
+            self.get_uniform_ground_ambient(),
+            lighting.ground_ambient[0],
+            lighting.ground_ambient[1],
+            lighting.ground_ambient[2],
+        );
+        context.uniform1f(self.get_uniform_ambient_hemi(), lighting.ambient_hemi);
+        context.uniform1f(self.get_uniform_ao_strength(), lighting.ao_strength);
+        context.uniform1f(self.get_uniform_ssr_strength(), lighting.ssr_strength);
+        if let Some(shadow) = self.targets.shadow.as_ref() {
+            Self::bind_sampler(&context, &shadow.depth, 0, self.get_uniform_shadow_map());
+        }
+        if let Some(ao) = self.targets.ao.as_ref() {
+            Self::bind_sampler(
+                &context,
+                ao.color.as_ref().unwrap_or(&ao.depth),
+                1,
+                self.get_uniform_ao_map(),
+            );
+        }
+        if let Some(ssr) = self.targets.ssr.as_ref() {
+            Self::bind_sampler(
+                &context,
+                ssr.color.as_ref().unwrap_or(&ssr.depth),
+                2,
+                self.get_uniform_ssr_map(),
+            );
+        }
+        // 湿度:地面越低越湿(路面 y=0 湿、人行道以上干)。
+        context.uniform1f(self.get_uniform_wetness(), lighting.wetness);
+        context.uniform1f(self.get_uniform_wet_height(), WET_SURFACE_MAX_HEIGHT);
+        // 顶点烘焙接触 AO 的形状参数。
+        context.uniform1f(self.get_uniform_ao_height(), BAKED_CONTACT_AO_HEIGHT);
+        context.uniform1f(self.get_uniform_ao_floor(), CONTACT_SHADOW_FLOOR);
 
         let mut drawn_triangles: u32 = 0;
-        let hidden: Vec<usize> = crate::game::hidden_batches();
-        for (bi, batch) in scene.batches.iter().enumerate() {
-            if !batch.opaque || batch.instances.is_empty() || hidden.contains(&bi) {
+        for (index, batch) in scene.batches.iter().enumerate() {
+            if !batch.opaque || batch.instances.is_empty() || hidden.contains(&index) {
                 continue;
             }
             // 近处遮挡剔除(见 `NEAR_CULL_RADIUS` 的说明)。
@@ -1756,10 +4184,14 @@ impl WebGlRenderer {
             drawn_triangles += self.draw_batch(batch.mesh_index, &batch.instances);
         }
 
-        // 泛光:带 emissive 的面再叠一遍,加法混合 + 半透明,
-        // 让霓虹招牌 / 路灯在夜里发光(夜间 emissive_gain 更高)。
+        // ---- 4) 泛光:带 emissive 的面再叠一遍,加法混合 + 半透明 ----
+        // 这一 pass 画进**主场景目标**,让 bloom 的亮度提取能看到霓虹。
         if lighting.emissive_gain > 0.25 {
             context.enable(WebGl2RenderingContext::BLEND);
+            context.blend_func(
+                WebGl2RenderingContext::SRC_ALPHA,
+                WebGl2RenderingContext::ONE,
+            );
             context.depth_mask(false);
             context.use_program(Some(&self.get_glow_program()));
             context.uniform_matrix4fv_with_f32_array(
@@ -1771,8 +4203,8 @@ impl WebGlRenderer {
             // 这里必须复用主循环的可见性判定:否则上一轮被剔除掉的
             // 近处实例(以及 `?hide=` 掉的批次)会在泛光 pass 里复活,
             // 表现为一层盖住半屏的加法混合亮片。
-            for (bi, batch) in scene.batches.iter().enumerate() {
-                if !batch.opaque || batch.instances.is_empty() || hidden.contains(&bi) {
+            for (index, batch) in scene.batches.iter().enumerate() {
+                if !batch.opaque || batch.instances.is_empty() || hidden.contains(&index) {
                     continue;
                 }
                 let all_near: bool = !batch.near_cull
@@ -1808,6 +4240,24 @@ impl WebGlRenderer {
             context.depth_mask(true);
             context.disable(WebGl2RenderingContext::BLEND);
         }
+
+        // ---- 5) SSAO / SSR / bloom / 合成 ----
+        // 按画质档位跳过:SSAO / SSR 读两张全屏纹理再各写一张,
+        // 在软渲染上它们合起来能吃掉一半的帧预算。跳过后必须把对应
+        // 目标清成「无 AO / 无反射」的中性值,否则会采样到上一档残留的
+        // 贴图 —— 降档的那一帧会突然出现一片脏污。
+        if quality.wants_ssao() {
+            self.render_ao(&context, fov_y, aspect, far);
+        } else {
+            self.clear_to_neutral(&context, &self.targets.ao, NEUTRAL_AO);
+        }
+        if quality.wants_ssr() {
+            self.render_ssr(&context, fov_y, aspect, far);
+        } else {
+            self.clear_to_neutral(&context, &self.targets.ssr, NEUTRAL_SSR);
+        }
+        self.render_bloom(&context);
+        self.render_composite(&context, lighting, width, height, time);
         Ok(drawn_triangles)
     }
 

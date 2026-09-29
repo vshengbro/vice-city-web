@@ -68,7 +68,7 @@ pub fn limb_swing(part: &str, phase: f32, amount: f32) -> f32 {
     let Some((_, offset, scale)) = LIMB_PLAN.iter().find(|(name, _, _)| *name == part) else {
         return 0.0;
     };
-    scale.sin() * amount * (phase + offset)
+    scale * amount * (phase + offset).sin()
 }
 
 /// 左腿相位:0。
@@ -91,6 +91,8 @@ pub struct Player {
     gait_amount: f32,
     /// 生命值。
     health: f32,
+    /// 护甲值:先于生命值承伤,按比例吸收伤害。
+    armor: f32,
     /// 已拾取的现金。
     cash: f32,
     /// 当前驾驶的车辆索引(`None` = 在地面上)。
@@ -99,6 +101,14 @@ pub struct Player {
     notice: String,
     /// 已被拾取掉的拾取物索引。
     collected: Vec<usize>,
+    /// 身体高度(米):脚底到头顶。室内分离靠它判断「够不够得着」一块
+    /// 二层楼板 —— 站在一楼时头顶 1.9 m 够不到 2.95 m 的板,所以不会被
+    /// 上方的楼板推开。
+    height: f32,
+    /// 垂直速度(米/秒,向上为正)。踩在楼板上时被清零。
+    vertical_velocity: f32,
+    /// 脚底是否正踩在某块楼板 / 地面上。
+    grounded: bool,
 }
 
 impl Player {
@@ -210,6 +220,33 @@ impl Player {
         self.health = value;
     }
 
+    /// 护甲值。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 当前护甲。
+    pub fn get_armor(&self) -> f32 {
+        self.armor
+    }
+
+    /// 写入护甲值。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 新护甲。
+    pub fn set_armor(&mut self, value: f32) {
+        self.armor = value;
+    }
+
+    /// 累加护甲(拾取护甲背心时用)。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 增量(可以为负)。
+    pub fn add_armor(&mut self, amount: f32) {
+        self.armor = (self.armor + amount).clamp(0.0, MAX_ARMOR);
+    }
+
     /// 已拾取的现金。
     ///
     /// # Returns
@@ -291,13 +328,59 @@ impl Player {
         self.collected.push(index);
     }
 
-    /// 已拾取的数量。
+    /// 已被拾取的数量。
     ///
     /// # Returns
     ///
     /// - `usize` - 已拾取的拾取物个数。
     pub fn collected_count(&self) -> usize {
         self.get_collected_ref().len()
+    }
+
+    /// 身体高度(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 脚底到头顶的距离(米)。
+    pub fn get_height(&self) -> f32 {
+        self.height
+    }
+
+
+    /// 垂直速度(米/秒,向上为正)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 当前垂直速度(米/秒)。
+    pub fn get_vertical_velocity(&self) -> f32 {
+        self.vertical_velocity
+    }
+
+    /// 写入垂直速度。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 新的垂直速度(米/秒,向上为正)。
+    pub fn set_vertical_velocity(&mut self, value: f32) {
+        self.vertical_velocity = value;
+    }
+
+    /// 脚底是否正踩在某块楼板 / 地面上。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - 踩在支撑面上时为 `true`。
+    pub fn get_grounded(&self) -> bool {
+        self.grounded
+    }
+
+    /// 写入「是否踩在地上」。
+    ///
+    /// # Arguments
+    ///
+    /// - `bool` - 新的踩地状态。
+    pub fn set_grounded(&mut self, value: bool) {
+        self.grounded = value;
     }
 
     /// 在给定位置创建一个满血玩家。
@@ -318,10 +401,14 @@ impl Player {
             gait_phase: 0.0,
             gait_amount: 0.0,
             health: MAX_HEALTH,
+            armor: 0.0,
             cash: 0.0,
             vehicle: None,
             notice: String::new(),
             collected: Vec::new(),
+            height: PLAYER_BODY_HEIGHT,
+            vertical_velocity: 0.0,
+            grounded: true,
         }
     }
 

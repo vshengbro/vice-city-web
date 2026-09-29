@@ -39,8 +39,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from vcw.builders import (                                      # noqa: E402
-    buildings, markers, misc, palms, pedestrians, props, signs, vehicles,
-    weapons,
+    buildings, markers, misc, palms, pedestrians, props, roads, signs,
+    vehicles, weapons,
 )
 
 BUILDER_MODULES = (
@@ -50,6 +50,7 @@ BUILDER_MODULES = (
     ("props", props),
     ("signs", signs),
     ("palms", palms),
+    ("roads", roads),
     ("misc", misc),
     ("weapons", weapons),
     ("markers", markers),
@@ -82,6 +83,11 @@ PREFERRED = {
     "prop": ("prop_streetlight",),
     "sign": ("sign_hotel",),
     "palm": ("palm_tall",),
+    # The road tiles are flat decals seen at 22 degrees of elevation, so the
+    # camera looks across them rather than down: the cell grid and the patch
+    # blobs are all that carry the image, and that is exactly what this
+    # category exists to show.
+    "road": ("road_asphalt",),
     "beach": ("beach_umbrella",),
     "misc": ("misc_helicopter",),
     "weapon": ("wep_pistol",),

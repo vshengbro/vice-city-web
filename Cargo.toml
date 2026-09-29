@@ -55,7 +55,15 @@ web-sys = { version = "0.3", features = [
   "WebGlUniformLocation",
   "WebGl2RenderingContext",
   "WebGlVertexArrayObject",
-  "CanvasRenderingContext2d",] }
+  "CanvasRenderingContext2d",
+  # 渲染增强管线(shadow map / SSAO / SSR / bloom)全部是 render-to-texture,
+  # 缺了这三个 feature 就没有 `create_texture` / `create_framebuffer` /
+  # `create_renderbuffer`(实测 E0599),只能退回「手写 JS 分发器」那种
+  # 既不可调试又过不了 clippy 的绕路。这三个 feature 只在 web-sys 上
+  # 打开对应的绑定,不动任何依赖版本。
+  "WebGlTexture",
+  "WebGlFramebuffer",
+  "WebGlRenderbuffer",] }
 
 [profile.release]
 opt-level = "s"

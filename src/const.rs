@@ -531,3 +531,1058 @@ pub const GPU_STRIDE_FLOATS: usize = 12;
 /// 正是 GPU mesh 索引错位最典型的症状 —— 那种状态下投影盒仍然完整
 /// 落在画布内,只判「投影成功」会误报成可见。
 pub const CHAR_VISIBLE_MAX_SCREEN_PCT: f64 = 45.0;
+// ===========================================================================
+// 实时光照增强:阴影 / SSAO / SSR / bloom
+//
+// §1.3c 要求所有字符串字面量集中在 const.rs,GLSL 里的 uniform 名与
+// program 标签同样算字符串,一并收在这里。
+// ===========================================================================
+
+/// 阴影贴图的 uniform 名。
+pub const U_SHADOW_MAP: &str = "u_shadow_map";
+
+/// 阴影矩阵(世界 → 光空间裁剪坐标)的 uniform 名。
+pub const U_SHADOW_MATRIX: &str = "u_shadow_matrix";
+
+/// 阴影参数 `vec4(strength, pcf_radius, depth_bias, normal_offset)` 的 uniform 名。
+pub const U_SHADOW_PARAMS: &str = "u_shadow_params";
+
+/// 一个阴影纹素覆盖的世界尺寸(米)uniform 名。
+pub const U_SHADOW_TEXEL: &str = "u_shadow_texel";
+
+/// 半球环境光的半球权重 uniform 名(0 = 纯单色 ambient,1 = 纯半球)。
+pub const U_AMBIENT_HEMI: &str = "u_ambient_hemi";
+
+/// SSR 的最大追踪距离(米)uniform 名。
+pub const U_SSR_MAX_DIST: &str = "u_max_dist";
+
+/// SSR 的步数 uniform 名。
+pub const U_SSR_STEPS: &str = "u_steps";
+
+/// 湿度(0 = 干,1 = 湿路面)uniform 名。
+pub const U_WETNESS: &str = "u_wetness";
+
+/// 湿度衰减高度 uniform 名。
+pub const U_WET_HEIGHT: &str = "u_wet_height";
+
+/// 顶点接触 AO 高度衰减 uniform 名。
+pub const U_AO_HEIGHT: &str = "u_ao_height";
+
+/// 顶点接触 AO 最深压暗系数 uniform 名。
+pub const U_AO_FLOOR: &str = "u_ao_floor";
+
+/// 天光(半球上半球)环境色 uniform 名。
+pub const U_SKY_AMBIENT: &str = "u_sky_ambient";
+
+/// 地面反弹色(半球下半球)uniform 名。
+pub const U_GROUND_AMBIENT: &str = "u_ground_ambient";
+
+/// 主场景离屏目标缺失时的错误信息。
+pub const SCENE_TARGET_MISSING: &str = "scene render target missing";
+
+/// bloom 模糊的采样展开(以 texel 为单位)。
+pub const BLOOM_BLUR_SPREAD: f32 = 1.6;
+
+/// bloom 合成的最小增益(夜晚关灯时也别完全变成硬边色块)。
+pub const BLOOM_MIN_GAIN: f32 = 0.35;
+
+/// G-buffer pass 的视图矩阵 uniform 名。
+pub const U_VIEW: &str = "u_view";
+
+/// 远裁剪面 uniform 名(深度归一化用)。
+pub const U_FAR_PLANE: &str = "u_far_plane";
+
+/// bloom 模糊方向 uniform 名。
+pub const U_BLOOM_DIR: &str = "u_bloom_dir";
+
+/// 胶片颗粒的时间种子 uniform 名。
+pub const U_TIME: &str = "u_time";
+
+/// 采样数 uniform 名(SSAO)。
+pub const U_SAMPLES: &str = "u_samples";
+
+/// AO 模糊半径 uniform 名。
+pub const U_BLUR_RADIUS: &str = "u_radius";
+
+/// SSAO 的 texel 尺寸 uniform 名。
+pub const U_TEXEL_SIZE: &str = "u_texel_size";
+
+/// bloom 模糊的输入贴图 uniform 名。
+pub const U_BLOOM_MAP: &str = "u_bloom_map";
+
+/// 贴图分配失败时的错误信息。
+pub const CREATE_TEXTURE_FAILED: &str = "create_texture failed";
+
+/// framebuffer 分配失败时的错误信息。
+pub const CREATE_FRAMEBUFFER_FAILED: &str = "create_framebuffer failed";
+
+/// FBO 不完整时的错误信息。
+pub const FRAMEBUFFER_INCOMPLETE: &str = "framebuffer incomplete";
+
+/// WebGL2 语义的「FBO 完整」状态码。
+///
+/// web-sys 的 `WebGl2RenderingContext::FRAMEBUFFER_COMPLETE` 是 36053
+/// (WebGL 1 时代的编号),而 WebGL2 的 `checkFramebufferStatus` 在真正
+/// 完整时返回 36054。只比前者会让这个判断恒为假,于是每个 FBO 都被误判
+/// 成不完整、每帧回退软件渲染、画面全黑。两个值都接受。
+pub const FRAMEBUFFER_COMPLETE_WEBGL2_OFFSET: u32 = 36054;
+
+/// SSAO / AO 模糊的强度 uniform 名。
+pub const U_AO_STRENGTH: &str = "u_ao_strength";
+
+/// SSAO 结果贴图的 uniform 名。
+pub const U_AO_MAP: &str = "u_ao_map";
+
+/// SSAO 采样的 G-buffer 贴图 uniform 名。
+pub const U_GBUFFER: &str = "u_gbuffer";
+
+/// 重建视空间位置用的投影参数 `(tan_half_fov_x, tan_half_fov_y)` uniform 名。
+pub const U_PROJ_PARAMS: &str = "u_proj_params";
+
+/// SSAO 世界半径 uniform 名。
+pub const U_AO_RADIUS: &str = "u_radius";
+
+/// SSAO 采样幂次 uniform 名(越大对比越硬)。
+pub const U_AO_POWER: &str = "u_power";
+
+/// AO 模糊用的 AO 贴图 uniform 名。
+pub const U_AO_BLUR_MAP: &str = "u_ao_map";
+
+/// 主场景颜色贴图的 uniform 名(SSR / bloom / 合成共读)。
+pub const U_SCENE_COLOR: &str = "u_scene_color";
+
+/// SSR 结果贴图的 uniform 名。
+pub const U_SSR_MAP: &str = "u_ssr_map";
+
+/// SSR 强度 uniform 名。
+pub const U_SSR_STRENGTH: &str = "u_ssr_strength";
+
+/// bloom 强度 uniform 名。
+pub const U_BLOOM_STRENGTH: &str = "u_bloom_strength";
+
+/// bloom 亮度阈值 uniform 名。
+pub const U_BLOOM_THRESHOLD: &str = "u_bloom_threshold";
+
+/// 色调分级的 lift(黑场染色)uniform 名。
+pub const U_GRADE_LIFT: &str = "u_grade_lift";
+
+/// 色调分级的 gamma(中间调)uniform 名。
+pub const U_GRADE_GAMMA: &str = "u_grade_gamma";
+
+/// 色调分级的 gain(亮场染色)uniform 名。
+pub const U_GRADE_GAIN: &str = "u_grade_gain";
+
+/// 暗角强度 uniform 名。
+pub const U_VIGNETTE: &str = "u_vignette";
+
+/// 胶片颗粒强度 uniform 名。
+pub const U_GRAIN: &str = "u_grain";
+
+/// 阴影 program 的标签(出错时的可读名字)。
+pub const PROGRAM_SHADOW: &str = "shadow";
+
+/// 法线 + 深度预渲染 program 的标签。
+pub const PROGRAM_GBUFFER: &str = "gbuffer";
+
+/// SSAO program 的标签。
+pub const PROGRAM_SSAO: &str = "ssao";
+
+/// AO 双边模糊 program 的标签。
+pub const PROGRAM_AO_BLUR: &str = "ao_blur";
+
+/// SSR program 的标签。
+pub const PROGRAM_SSR: &str = "ssr";
+
+/// bloom 亮度提取 program 的标签。
+pub const PROGRAM_BRIGHT: &str = "bright";
+
+/// bloom 高斯模糊 program 的标签(水平 / 垂直共用一个 program)。
+pub const PROGRAM_MAIN: &str = "main";
+pub const PROGRAM_GLOW: &str = "glow";
+pub const PROGRAM_BLUR: &str = "blur";
+
+/// 合成(色调分级 + 暗角 + 颗粒)program 的标签。
+pub const PROGRAM_COMPOSITE: &str = "composite";
+
+/// 阴影贴图边长(texel)。
+///
+/// 2048 是「正午地面上一辆车(4 m 长)要投出可辨认的影子」的下限:
+/// shadow frustum 半宽取 [`SHADOW_HALF_EXTENT`],于是每 texel 约
+/// 90 / 2048 ≈ 4.4 cm,配 3×3 PCF 得到约 13 cm 的半影。
+pub const SHADOW_MAP_SIZE: u32 = 2048;
+
+/// 阴影正交视锥的半宽 / 半深(米)。
+///
+/// 90 m 覆盖第三人称相机能看到的近景街区:玩家周围 45 m 内的一切都会
+/// 投出影子,再远的东西丢掉影子反而没人会注意到(它们已经被雾吃掉大半)。
+pub const SHADOW_HALF_EXTENT: f32 = 45.0;
+
+/// 阴影光源沿光方向后撤的距离(米)。
+///
+/// 取 3 倍半宽(135 m),让视锥的近平面落在城市最高楼(约 40 m)之上,
+/// 避免高楼顶被切掉。
+pub const SHADOW_LIGHT_DISTANCE: f32 = 135.0;
+
+/// 阴影正交视锥的近裁剪距离(米)。
+pub const SHADOW_NEAR: f32 = 1.0;
+
+/// 阴影正交视锥的远裁剪距离(米)。
+pub const SHADOW_FAR: f32 = 320.0;
+
+/// 法线 + 深度 G-buffer 的分辨率缩放(相对主画面)。
+///
+/// 取 1.0 全分辨率:SSAO 的边缘质量直接由这张图的分辨率决定,降到半分辨率
+/// 之后墙角处的暗部会明显发虚。G-buffer 只写两个通道组,带宽不高。
+pub const GBUFFER_SCALE: f32 = 1.0;
+
+/// SSAO 的分辨率缩放(相对 G-buffer)。
+///
+/// SSAO 之后还要做一次双边模糊把噪声抹平,所以半分辨率在视觉上几乎无损,
+/// 却省掉四分之三的采样开销 —— 在软件光栅(SwiftShader)上这是必需的。
+pub const SSAO_SCALE: f32 = 0.5;
+
+/// SSR 的分辨率缩放(相对主画面)。
+pub const SSR_SCALE: f32 = 0.5;
+
+/// bloom 的分辨率缩放(相对主画面)。
+pub const BLOOM_SCALE: f32 = 0.5;
+
+/// SSAO 的世界半径(米)。
+///
+/// 1.6 m 刚好覆盖「楼与楼之间」「车与地面之间」这种一臂宽的接触关系;
+/// 再大就会把整条街的墙根一起压暗,看起来像脏雾而不是遮蔽。
+pub const SSAO_RADIUS: f32 = 1.6;
+
+/// SSAO 的采样幂次(越大对比越硬)。
+pub const SSAO_POWER: f32 = 2.2;
+
+/// SSAO 的采样数(固定循环,不做抖动)。
+pub const SSAO_SAMPLES: i32 = 8;
+
+/// AO 双边模糊的半径(以半分辨率 texel 为单位)。
+pub const AO_BLUR_RADIUS: i32 = 4;
+
+/// SSR 的光线步数。
+pub const SSR_STEPS: i32 = 20;
+
+/// SSR 的最大追踪距离(米)。
+pub const SSR_MAX_DIST: f32 = 28.0;
+
+/// 湿地面反射率的判定上界:世界高度高于这个值就不是路面。
+///
+/// 路面 y = 0、人行道 y = 0.14、地块 y = 0.16 —— 用高度把「积水只积在
+/// 低洼的车行道上」这件事表达出来,不需要给每个面加材质通道。
+pub const WET_SURFACE_MAX_HEIGHT: f32 = 0.06;
+
+/// 烘焙进顶点色的「向下表面接触 AO」最大压暗比例。
+///
+
+/// 烘焙接触 AO 生效的高度上限(米)—— 只有贴地的面才被压暗。
+pub const BAKED_CONTACT_AO_HEIGHT: f32 = 1.2;
+
+/// 顶点接触 AO 在 y=0 处的最深压暗系数(0.34 = 压到 66% 亮度)。
+pub const CONTACT_SHADOW_FLOOR: f32 = 0.66;
+
+/// `light_dir.y` 超过这个值就认为视线与 up 共线,必须换 up 向量。
+pub const SHADOW_DEGENERATE_UP_Y: f32 = 0.98;
+
+/// 阴影深度偏置(以纹素为单位)。
+///
+/// 取 1.6:2048 的阴影贴图上 1.6 个纹素约 7 cm,足以压掉地面自阴影的
+/// 痤疮又不会明显让影子「浮」起来(Peter-Panning)。
+pub const SHADOW_DEPTH_BIAS_TEXELS: f32 = 1.6;
+
+/// 阴影法线偏移(以纹素为单位)。
+///
+/// 取 1.4:斜率缩放之外再叠一层法线偏移,是自阴影痤疮的双保险。
+pub const SHADOW_NORMAL_OFFSET_TEXELS: f32 = 1.4;
+
+/// 阴影 PCF 的采样半径(以纹素为单位)。
+///
+/// 3×3 核 → 半径 1.0 刚好覆盖相邻纹素;再大只会把半影抹得更宽、
+/// 看起来发虚,不会更「真实」。
+pub const SHADOW_PCF_RADIUS: f32 = 1.0;
+
+/// 主 pass 的色调分级暗角基准强度(乘以相位的 `vignette`)。
+pub const VIGNETTE_BASE: f32 = 0.55;
+
+/// 胶片颗粒的基准强度(乘以相位的 `grain`)。
+pub const GRAIN_BASE: f32 = 0.035;
+
+/// bloom 的强度(乘以相位的 `ssr_strength` 之外的独立常数)。
+pub const BLOOM_STRENGTH: f32 = 0.85;
+
+/// bloom 亮度提取的阈值(线性空间)。
+pub const BLOOM_THRESHOLD: f32 = 0.62;
+
+/// ===========================================================================
+/// 战斗 / 通缉 / 任务系统常量(本作新增)
+/// ===========================================================================
+
+// ---- DOM id ----
+
+/// 生命条填充层。
+pub const ID_HEALTH_BAR: &str = "vcw-health-bar";
+/// 护甲条填充层。
+pub const ID_ARMOR_BAR: &str = "vcw-armor-bar";
+/// 通缉星数容器。
+pub const ID_WANTED: &str = "vcw-wanted";
+/// 弹药计数文本。
+pub const ID_AMMO: &str = "vcw-ammo";
+/// 当前任务 / 提示文本。
+pub const ID_MISSION: &str = "vcw-mission";
+/// 现金文本。
+pub const ID_CASH: &str = "vcw-cash";
+/// 小地图 canvas。
+pub const ID_MINIMAP: &str = "vcw-minimap";
+/// 准星命中标记。
+pub const ID_HITMARKER: &str = "vcw-hitmarker";
+/// 屏幕中央准星。
+pub const ID_CROSSHAIR: &str = "vcw-crosshair";
+
+/// 开火时的事件名。
+pub const EVENT_MOUSEDOWN: &str = "mousedown";
+/// 松开左键时的事件名。
+pub const EVENT_MOUSEUP: &str = "mouseup";
+/// 鼠标移动事件名(单独绑一条,用于悬停瞄准)。
+pub const EVENT_MOUSEMOVE: &str = "mousemove";
+/// 防止右键菜单吃掉右键。
+pub const EVENT_CONTEXTMENU: &str = "contextmenu";
+
+/// 换弹键。
+pub const KEY_RELOAD: &str = "KeyC";
+/// 切回手枪。
+pub const DIGIT1: &str = "Digit1";
+/// 切冲锋枪。
+pub const DIGIT2: &str = "Digit2";
+/// 切球棒。
+pub const DIGIT3: &str = "Digit3";
+/// 接 / 交任务。
+pub const KEY_MISSION: &str = "KeyJ";
+
+/// 生命条的颜色。
+pub const COLOR_HEALTH: &str = "linear-gradient(90deg,#ff4d6d,#ffb36b)";
+/// 护甲条的颜色。
+pub const COLOR_ARMOR: &str = "linear-gradient(90deg,#7dfcff,#5b8cff)";
+/// 小地图底色。
+pub const COLOR_MINIMAP_BG: &str = "#0b1020";
+/// 小地图道路线颜色。
+pub const COLOR_MINIMAP_ROAD: &str = "#2b3a5c";
+/// 小地图里的玩家三角形颜色。
+pub const COLOR_MINIMAP_PLAYER: &str = "#ff7ad9";
+/// 小地图里的敌人圆点颜色。
+pub const COLOR_MINIMAP_ENEMY: &str = "#ff4d6d";
+/// 小地图里的任务点颜色。
+pub const COLOR_MINIMAP_OBJECTIVE: &str = "#7dfcff";
+
+/// HUD 状态条的通用样式(容器)。
+pub const STYLE_STATUS: &str = "position:absolute;left:14px;bottom:74px;width:230px;display:flex;flex-direction:column;gap:5px;pointer-events:none;font-family:ui-monospace,monospace";
+/// 生命 / 护甲条的轨道样式。
+pub const STYLE_BAR_TRACK: &str =
+    "width:100%;height:9px;border-radius:999px;background:rgba(255,255,255,.14);overflow:hidden";
+/// 弹药 / 现金行的样式。
+pub const STYLE_STAT_ROW: &str = "display:flex;flex-direction:row;align-items:center;justify-content:space-between;font-size:11px;color:#cfe9ff;text-shadow:0 1px 3px rgba(0,0,0,.85)";
+/// 任务提示行的样式。
+pub const STYLE_MISSION: &str = "position:absolute;right:14px;top:56px;max-width:340px;padding:7px 11px;border-radius:6px;background:rgba(10,12,22,.62);border:1px solid rgba(125,252,255,.3);font-family:ui-monospace,monospace;font-size:12px;line-height:1.5;color:#e6f6ff;pointer-events:none;white-space:pre-line";
+/// 通缉星容器的样式。
+pub const STYLE_WANTED: &str = "position:absolute;right:14px;top:14px;display:flex;flex-direction:row;gap:3px;font-size:17px;line-height:1;pointer-events:none;text-shadow:0 1px 4px rgba(0,0,0,.9)";
+/// 单颗星的样式。
+pub const STYLE_STAR: &str = "width:19px;height:19px;display:flex;align-items:center;justify-content:center;font-size:19px;line-height:1";
+/// 准星的样式(一个十字,不挡视线)。
+pub const STYLE_CROSSHAIR: &str = "position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;pointer-events:none;opacity:.85";
+/// 准星四臂的样式。
+pub const STYLE_CROSSHAIR_ARM: &str =
+    "position:absolute;background:rgba(125,252,255,.95);box-shadow:0 0 3px rgba(0,0,0,.9)";
+/// 命中标记的样式。
+pub const STYLE_HITMARKER: &str = "position:absolute;left:50%;top:50%;width:26px;height:26px;margin:-13px 0 0 -13px;pointer-events:none;opacity:0;transition:opacity .12s linear";
+/// 小地图 canvas 的样式。
+pub const STYLE_MINIMAP: &str = "position:absolute;right:14px;bottom:14px;width:150px;height:150px;border-radius:8px;border:1px solid rgba(125,252,255,.32);background:#0b1020;pointer-events:none";
+
+/// 子弹命中敌人的提示。
+pub const NOTICE_HIT: &str = "hit";
+/// 击杀提示。
+pub const NOTICE_KILL: &str = "target down";
+/// 换弹提示。
+pub const NOTICE_RELOADED: &str = "reloaded";
+/// 弹药打空提示。
+pub const NOTICE_EMPTY: &str = "click · out of ammo";
+/// 通缉提示。
+pub const NOTICE_WANTED: &str = "WANTED";
+/// 甩掉通缉的提示。
+pub const NOTICE_CLEARED: &str = "you lost them";
+/// 玩家被击倒的提示。
+pub const NOTICE_WASTED: &str = "WASTED";
+/// 任务开始的提示前缀。
+pub const NOTICE_MISSION_START: &str = "job: ";
+/// 任务完成提示前缀。
+pub const NOTICE_MISSION_DONE: &str = "job done +$";
+/// 抢车的提示。
+pub const NOTICE_JACKED: &str = "vehicle jacked";
+/// 抢走警车的提示。
+pub const NOTICE_STOLE_POLICE: &str = "police cruiser jacked";
+
+/// 任务完成奖励的文案模板里的货币符号。
+pub const CASH_SIGN: &str = "$";
+
+// ---- 武器数值 ----
+
+/// 手枪弹匣容量。
+pub const PISTOL_MAGAZINE: u32 = 12;
+/// 冲锋枪弹匣容量。
+pub const SMG_MAGAZINE: u32 = 30;
+/// 手枪射速(发/秒)。
+pub const PISTOL_FIRE_RATE: f32 = 5.0;
+/// 冲锋枪射速(发/秒)。
+pub const SMG_FIRE_RATE: f32 = 11.0;
+/// 手枪单发伤害。
+pub const PISTOL_DAMAGE: f32 = 26.0;
+/// 冲锋枪单发伤害。
+pub const SMG_DAMAGE: f32 = 15.0;
+/// 球棒单次挥击伤害。
+pub const BAT_DAMAGE: f32 = 55.0;
+/// 球棒挥击间隔(秒)。
+pub const BAT_COOLDOWN: f32 = 0.55;
+/// 球棒攻击距离(米)。
+pub const BAT_RANGE: f32 = 2.6;
+/// 枪械最大射程(米):超过这个距离射线不再判定。
+pub const GUN_RANGE: f32 = 90.0;
+/// 距离衰减:到最大射程时伤害乘的系数。
+pub const FALLOFF_MIN: f32 = 0.35;
+/// 距离衰减的过渡距离(米):超过后开始线性衰减。
+pub const FALLOFF_START: f32 = 22.0;
+/// 换弹耗时(秒)。
+pub const RELOAD_TIME: f32 = 1.1;
+/// 敌人被击杀后多久消失(秒)。
+pub const DEATH_FADE_TIME: f32 = 2.0;
+
+// ---- 敌人数值 ----
+
+/// 警察敌人初始血量。
+pub const ENEMY_HEALTH: f32 = 100.0;
+/// 敌对 NPC 初始血量。
+pub const THUG_HEALTH: f32 = 70.0;
+/// 敌人移动速度(米/秒)。
+pub const ENEMY_SPEED: f32 = 5.2;
+/// 敌人发现玩家的最大距离(米)。
+pub const ENEMY_SIGHT: f32 = 46.0;
+/// 敌人开火的最大距离(米)。
+pub const ENEMY_FIRE_RANGE: f32 = 26.0;
+/// 敌人每发伤害。
+pub const ENEMY_DAMAGE: f32 = 7.5;
+/// 敌人射速(发/秒)。
+pub const ENEMY_FIRE_RATE: f32 = 1.6;
+/// 敌人瞄准散布(弧度):太大打不准,太小压迫感过强。
+pub const ENEMY_SPREAD: f32 = 0.07;
+/// 敌人受击后的硬直(秒)。
+pub const ENEMY_HIT_STUN: f32 = 0.18;
+/// 敌人尸体掉落现金。
+pub const ENEMY_CASH_DROP: f32 = 60.0;
+/// 敌人碰撞半径(米)。
+pub const ENEMY_RADIUS: f32 = 0.45;
+/// 敌人最低血量:低于这个值会逃跑。
+pub const ENEMY_FLEE_HEALTH: f32 = 22.0;
+/// 逃跑的移动速度倍率。
+pub const ENEMY_FLEE_SPEED_GAIN: f32 = 1.25;
+
+// ---- 玩家受击 / 死亡 ----
+
+/// 护甲的减伤比例(0.65 = 挡掉 65% 伤害)。
+pub const ARMOR_ABSORB: f32 = 0.65;
+/// 玩家初始护甲。
+pub const MAX_ARMOR: f32 = 100.0;
+/// 护甲的自然回复速度(点/秒,脱战后生效)。
+pub const ARMOR_REGEN: f32 = 6.0;
+/// 护甲脱战回复的延迟(秒)。
+pub const ARMOR_REGEN_DELAY: f32 = 7.0;
+/// 玩家最大生命值。
+pub const PLAYER_MAX_HEALTH: f32 = 100.0;
+/// 玩家受击后的无敌时间(秒),避免被一帧多人打空。
+pub const PLAYER_HIT_INVULN: f32 = 0.45;
+/// 死亡时损失的现金比例。
+pub const DEATH_CASH_LOSS: f32 = 0.15;
+/// 倒地后重生的时间(秒)。
+pub const RESPAWN_DELAY: f32 = 3.0;
+
+// ---- 通缉 ----
+
+/// 通缉星上限。
+pub const WANTED_MAX: u32 = 5;
+/// 开一枪累积的「热度」,达到一个阈值升一颗星。
+pub const WANTED_PER_SHOT: f32 = 3.0;
+/// 打人累积的热度。
+pub const WANTED_PER_HIT: f32 = 9.0;
+/// 抢车累积的热度。
+pub const WANTED_PER_JACK: f32 = 22.0;
+/// 碾死行人累积的热度。
+pub const WANTED_PER_RUNOVER: f32 = 30.0;
+/// 每颗星所需的热度。
+pub const WANTED_PER_STAR: f32 = 34.0;
+/// 甩掉通缉需要的静止时间(秒)—— 不被警察看见这么久就掉一颗星。
+pub const WANTED_COOLDOWN: f32 = 15.0;
+/// 每颗星的警察增派人数。
+pub const WANTED_COP_PER_STAR: u32 = 2;
+/// 藏身区的判定半径(米):后巷 / 警局门口的圆心。
+pub const HIDE_RADIUS: f32 = 4.0;
+/// 站在藏身区里会累积的「降温」倍率(每秒抵消多少热度)。
+pub const HIDE_COOL_RATE: f32 = 42.0;
+/// 掉星的阈值进度(热度满一星后回落到这个比例以下才真正掉星)。
+pub const WANTED_STEP_DOWN: f32 = 0.25;
+
+// ---- 任务 ----
+
+/// 任务的三个阶段。
+pub const MISSION_NONE: u32 = 0;
+/// 「走到某地」阶段。
+pub const MISSION_GOTO: u32 = 1;
+/// 「干掉某人」阶段。
+pub const MISSION_KILL: u32 = 2;
+/// 「把车开到某地」阶段。
+pub const MISSION_DRIVE: u32 = 3;
+/// 任务完成判定半径(米)。
+pub const MISSION_RADIUS: f32 = 4.5;
+/// 任务报酬(美元)。
+pub const MISSION_REWARD: f32 = 900.0;
+/// 接任务所需的最大距离(米)。
+pub const MISSION_ACCEPT_RANGE: f32 = 4.0;
+
+// ---- 行人 ----
+
+/// 街上行人的总数上限(性能预算:每个行人 ≈ 630 三角面)。
+pub const PED_COUNT: usize = 18;
+/// 行人被车撞到时飞出去的速度(米/秒)。
+pub const PED_RUNOVER_SPEED: f32 = 9.0;
+/// 行人倒地后多久消失(秒)。
+pub const PED_DOWN_TIME: f32 = 4.0;
+/// 行人察觉危险的距离(米):会跑开。
+pub const PED_ALERT_RADIUS: f32 = 11.0;
+/// 行人逃跑的持续时间(秒)。
+pub const PED_FLEE_TIME: f32 = 3.2;
+/// 行人的巡航速度(米/秒)。
+pub const PED_SPEED: f32 = 1.7;
+
+// ---- 载具 ----
+
+/// 撞到行人时判定为「碾到」的相对速度下限(米/秒)。
+pub const PED_RUNOVER_MIN_SPEED: f32 = 3.2;
+
+// ---- 小地图 ----
+
+/// 小地图的像素边长。
+pub const MINIMAP_PX: f32 = 150.0;
+/// 小地图覆盖的世界半径(米)。
+pub const MINIMAP_RANGE: f32 = 70.0;
+/// 小地图里道路线的宽度(像素)。
+pub const MINIMAP_ROAD_W: f32 = 3.0;
+
+// ---- 战斗补充常量 ----
+
+/// 冲锋枪开局备弹。
+pub const SMG_RESERVE: u32 = 60;
+/// 敌人受击闪光的时长(秒)。
+pub const ENEMY_FLASH_TIME: f32 = 0.12;
+/// 敌人逃跑状态的持续时间(秒)。
+pub const ENEMY_FLEE_TIME: f32 = 2.6;
+/// HUD 上手枪的短名。
+pub const WEAPON_NAME_PISTOL: &str = "PISTOL";
+/// HUD 上冲锋枪的短名。
+pub const WEAPON_NAME_SMG: &str = "SMG";
+/// HUD 上球棒的短名。
+pub const WEAPON_NAME_BAT: &str = "BAT";
+/// AI 状态:站桩。
+pub const AI_STATE_IDLE: &str = "idle";
+/// AI 状态:巡逻。
+pub const AI_STATE_PATROL: &str = "patrol";
+/// AI 状态:追击。
+pub const AI_STATE_CHASE: &str = "chase";
+/// AI 状态:开火。
+pub const AI_STATE_ATTACK: &str = "attack";
+/// AI 状态:逃跑。
+pub const AI_STATE_FLEE: &str = "flee";
+/// AI 状态:死亡。
+pub const AI_STATE_DEAD: &str = "dead";
+
+/// 敌人受击后的色调(闪烁)。
+pub const TINT_ENEMY_HURT: [f32; 3] = [2.4, 0.5, 0.6];
+/// 敌人正常色调(警察偏蓝)。
+pub const TINT_POLICE: [f32; 3] = [0.55, 0.75, 1.25];
+/// 敌人正常色调(混混偏暖)。
+pub const TINT_THUG: [f32; 3] = [1.25, 0.72, 0.62];
+/// 敌人临死前最后一口气的色调。
+pub const TINT_ENEMY_FLEE: [f32; 3] = [1.6, 1.1, 0.55];
+/// 车辆损坏后的色调(耐久越低越暗)。
+pub const TINT_VEHICLE_MIN: [f32; 3] = [0.55, 0.42, 0.42];
+
+/// 敌人巡逻相位推进速率(弧度/秒)。
+pub const ENEMY_WANDER_RATE: f32 = 0.55;
+/// 敌人重新选巡逻点的时间(秒)。
+pub const ENEMY_PATROL_RESELECT: f32 = 3.4;
+
+/// 任务 A 的标题。
+pub const MISSION_TITLE_A: &str = "check in at the corner";
+/// 任务 B 的标题。
+pub const MISSION_TITLE_B: &str = "drive the plaza loop";
+/// 任务 C 的标题。
+pub const MISSION_TITLE_C: &str = "clear the block";
+/// 手上没有任务时 HUD 里的提示。
+pub const MISSION_IDLE: &str = "no job — press J at a marker";
+
+/// 瞄准反投影使用的深度(米):决定鼠标移动在世界里对应多大的横向位移。
+pub const AIM_DEPTH: f32 = 26.0;
+/// 枪口的高度(米):子弹从角色胸口偏上一点出去。
+pub const AIM_CHEST_HEIGHT: f32 = 1.32;
+/// 俯仰的硬上限(弧度):防止打到正上 / 正下变成垂直射线。
+pub const AIM_PITCH_LIMIT: f32 = 0.9;
+
+/// 敌人被 hitscan 命中的判定半径(米)。
+pub const ENEMY_HIT_RADIUS: f32 = 0.75;
+/// 命中标记的显示时长(秒)。
+pub const HITMARKER_TIME: f32 = 0.16;
+
+/// 通缉升星的一次性提示时长(秒)。
+pub const WANTED_FLASH_TIME: f32 = 0.9;
+/// 通缉状态下希望场上维持的警察总数上限。
+pub const ENEMY_WANTED_TOTAL: u32 = 8;
+/// 行人逃跑时的速度(米/秒)。
+pub const PED_FLEE_SPEED: f32 = 5.4;
+/// 行人的碰撞半径(米)。
+pub const PED_RADIUS: f32 = 0.4;
+/// 行人转身速率(1/秒)。
+pub const PED_TURN_RATE: f32 = 9.0;
+/// 行人步态相位推进速率(rad/米)。
+pub const PED_GAIT_RATE: f32 = 2.4;
+/// 行人步态回零速率(1/秒)。
+pub const PED_RELAX_RATE: f32 = 6.0;
+/// 车判定「撞到行人」的半径(米)。
+pub const CAR_HIT_RADIUS: f32 = 2.0;
+
+/// 医院点坐标(XZ),分��在城市四角与中心附近。
+pub const HOSPITAL_SPOTS: &[[f32; 3]] = &[
+    [HOSPITAL_A_X, 0.0, HOSPITAL_A_Z],
+    [HOSPITAL_B_X, 0.0, HOSPITAL_B_Z],
+    [HOSPITAL_C_X, 0.0, HOSPITAL_C_Z],
+    [HOSPITAL_D_X, 0.0, HOSPITAL_D_Z],
+    [HOSPITAL_E_X, 0.0, HOSPITAL_E_Z],
+];
+
+/// 医院 A 的 X 坐标(米)。
+pub const HOSPITAL_A_X: f32 = 8.2;
+/// 医院 A 的 Z 坐标(米)。
+pub const HOSPITAL_A_Z: f32 = 8.2;
+/// 医院 B 的 X 坐标(米)。
+pub const HOSPITAL_B_X: f32 = -52.0;
+/// 医院 B 的 Z 坐标(米)。
+pub const HOSPITAL_B_Z: f32 = 52.0;
+/// 医院 C 的 X 坐标(米)。
+pub const HOSPITAL_C_X: f32 = 52.0;
+/// 医院 C 的 Z 坐标(米)。
+pub const HOSPITAL_C_Z: f32 = -52.0;
+/// 医院 D 的 X 坐标(米)。
+pub const HOSPITAL_D_X: f32 = -98.0;
+/// 医院 D 的 Z 坐标(米)。
+pub const HOSPITAL_D_Z: f32 = -98.0;
+/// 医院 E 的 X 坐标(米)。
+pub const HOSPITAL_E_X: f32 = 98.0;
+/// 医院 E 的 Z 坐标(米)。
+pub const HOSPITAL_E_Z: f32 = 98.0;
+
+/// 敌人剔除后不再写实例的距离(米)。
+pub const ENEMY_RENDER_RANGE: f32 = 62.0;
+/// 行人剔除后不再写实例的距离(米)。
+pub const PED_RENDER_RANGE: f32 = 52.0;
+/// 行走时身体的上下起伏幅度(米)。
+pub const PED_BOB_HEIGHT: f32 = 0.045;
+/// 城市里的常驻混混数量。
+pub const THUG_COUNT: usize = 7;
+/// 行人的正常色调。
+pub const TINT_PED: [f32; 3] = [1.0, 1.0, 1.0];
+/// 行人倒地后的色调。
+pub const TINT_PED_DOWN: [f32; 3] = [0.6, 0.45, 0.48];
+
+/// 鼠标左键的 `MouseEvent::button()` 取值。
+pub const MOUSE_BUTTON_LEFT: i16 = 0;
+/// 画布的 CSS 兜底宽度(指针坐标换算用)。
+pub const CANVAS_CSS_W: f64 = 1280.0;
+/// 画布的 CSS 兜底高度(指针坐标换算用)。
+pub const CANVAS_CSS_H: f64 = 720.0;
+
+/// 通缉星点亮的字符。
+pub const HUD_STAR_ON: &str = "\u{2605}";
+/// 通缉星熄灭的字符(同样的五角星,靠颜色区分亮灭)。
+pub const HUD_STAR_OFF: &str = "\u{2606}";
+/// 命中标记显示时的样式。
+pub const HUD_OPACITY_ON: &str = "opacity:1";
+/// 命中标记隐藏时的样式。
+pub const HUD_OPACITY_OFF: &str = "opacity:0";
+/// 任务阶段:无。
+pub const MISSION_LABEL_NONE: &str = "—";
+/// 任务阶段:走到某地。
+pub const MISSION_LABEL_GOTO: &str = "walk to the marker";
+/// 任务阶段:开车到某地。
+pub const MISSION_LABEL_DRIVE: &str = "drive there";
+/// 任务阶段:干掉某人。
+pub const MISSION_LABEL_KILL: &str = "take out the target";
+
+// ---- HUD DOM 标签 / 属性 / 样式 ----
+
+/// HUD 根节点的 id。
+pub const ID_HUD: &str = "vcw-hud";
+/// 血条 / 护甲条的容器 id。
+pub const ID_HUD_VITALS: &str = "vcw-vitals";
+/// `Element::set_attribute` 的 `id` 属性名。
+pub const ATTR_ID: &str = "id";
+/// `document.create_element` 的 div 标签名。
+pub const TAG_DIV: &str = "div";
+/// `document.create_element` 的 canvas 标签名。
+pub const TAG_CANVAS: &str = "canvas";
+/// HUD 根:全屏、不吃指针事件,避免挡住左键开火。
+pub const STYLE_HUD_ROOT: &str =
+    "position:fixed;inset:0;pointer-events:none;z-index:20;font-family:system-ui,sans-serif";
+/// 左下角的血条组。
+pub const STYLE_HUD_VITALS: &str = "position:absolute;left:22px;bottom:26px;width:260px;display:flex;flex-direction:column;gap:6px";
+/// 血条:从 100% 宽开始,由 `sync_hud` 每帧改 width。
+pub const STYLE_HUD_HEALTH: &str = "height:14px;width:100%;background:#2ee06a;border-radius:3px;box-shadow:0 0 10px rgba(46,224,106,.55)";
+/// 护甲条:同形状,蓝色。
+pub const STYLE_HUD_ARMOR: &str = "height:9px;width:0%;background:#3aa0ff;border-radius:3px;box-shadow:0 0 8px rgba(58,160,255,.5)";
+/// 右上角通缉星。
+pub const STYLE_HUD_WANTED: &str = "position:absolute;right:26px;top:22px;font-size:30px;letter-spacing:3px;color:#ffd24a;text-shadow:0 0 12px rgba(255,210,74,.6)";
+/// 右下角弹药。
+pub const STYLE_HUD_AMMO: &str = "position:absolute;right:196px;bottom:30px;font-size:17px;color:#eaf6ff;text-shadow:0 2px 6px rgba(0,0,0,.85)";
+/// 右下角现金。
+pub const STYLE_HUD_CASH: &str = "position:absolute;right:26px;bottom:196px;font-size:20px;color:#7dffb0;text-shadow:0 2px 6px rgba(0,0,0,.85)";
+/// 顶部任务文字。
+pub const STYLE_HUD_MISSION: &str = "position:absolute;left:50%;top:20px;transform:translateX(-50%);font-size:16px;color:#ffe6a8;text-align:center;text-shadow:0 2px 6px rgba(0,0,0,.9);white-space:pre-line";
+/// 准星:一个空心小方块。
+pub const STYLE_HUD_CROSSHAIR: &str = "position:absolute;left:50%;top:50%;width:16px;height:16px;margin:-8px 0 0 -8px;border:2px solid rgba(255,255,255,.85);border-radius:50%;box-shadow:0 0 6px rgba(0,0,0,.7)";
+/// 命中标记:默认透明,由 `sync_hud` 点亮。
+pub const STYLE_HUD_HITMARKER: &str = "position:absolute;left:50%;top:50%;width:26px;height:26px;margin:-13px 0 0 -13px;opacity:0;pointer-events:none;background:linear-gradient(45deg,transparent 45%,#ff5a5a 45%,#ff5a5a 55%,transparent 55%),linear-gradient(-45deg,transparent 45%,#ff5a5a 45%,#ff5a5a 55%,transparent 55%)";
+/// 小地图画布。
+pub const STYLE_HUD_MINIMAP: &str = "position:absolute;right:22px;bottom:22px;width:150px;height:150px;border:2px solid rgba(255,255,255,.28);border-radius:4px;background:#0b1020";
+
+
+
+/// 护甲背心给的护甲值。
+pub const ARMOR_PICKUP_GAIN: f32 = 50.0;
+/// 弹药箱给的备弹数。
+pub const AMMO_PICKUP_GAIN: u32 = 24;
+
+/// 手持武器相对角色的右侧偏移(米)。
+pub const WEAPON_SIDE_OFFSET: f32 = 0.24;
+/// 手持武器相对角色的前方偏移(米)。
+pub const WEAPON_FWD_OFFSET: f32 = 0.42;
+/// 手持武器的高度(米)。
+pub const WEAPON_HEIGHT: f32 = 1.22;
+/// 手持武器的模型缩放(资产是「单独一把枪」的尺寸)。
+pub const WEAPON_SCALE: f32 = 0.85;
+/// 手持武器的色调。
+pub const TINT_WEAPON: [f32; 3] = [1.0, 1.0, 1.0];
+
+/// 命中把敌人往后推的速度(米/秒)。
+pub const HIT_KNOCKBACK: f32 = 2.4;
+/// 增援警察在多远之外重生(米)。
+pub const ENEMY_SPAWN_DIST: f32 = 34.0;
+
+/// 手枪的开局备弹。
+pub const PISTOL_RESERVE: u32 = 48;
+
+// ===========================================================================
+// 水体:外海 + 内湖
+// ===========================================================================
+
+/// 水面资产的 id。
+pub const WATER_ID: &str = "water_procedural";
+
+/// 水面资产的分类。
+pub const WATER_CATEGORY: &str = "terrain";
+
+/// 水面 part 名。
+pub const WATER_PART: &str = "surface";
+
+/// 海平面高度(米)。略低于城市地面 y=0,让海岸线低于人行道。
+pub const SEA_LEVEL: f32 = -1.2;
+
+/// 湖面高度(米)。
+pub const LAKE_LEVEL: f32 = 0.34;
+
+/// 海面环形网格的环数。
+pub const SEA_RINGS: usize = 6;
+
+/// 海面环形网格的辐条数。
+pub const SEA_SPOKES: usize = 48;
+
+/// 海面环的半径序列(内半径, 外半径),从城市边缘一路铺到远裁剪面。
+///
+/// 相机 far = 900,海面铺到 900 正好填满地平线;再往外就是天空。
+/// 半径按几何级数走:近处 20 m 一环(浪的细节看得出),最外一环
+/// 一次跨 400 m(只贡献一条远处的蓝色带)。
+pub const SEA_RING_RADII: [(f32, f32); 6] = [
+    (0.0, 170.0),
+    (170.0, 240.0),
+    (240.0, 360.0),
+    (360.0, 540.0),
+    (540.0, 700.0),
+    (700.0, 900.0),
+];
+
+/// 浅海颜色(靠城市一侧)。
+pub const SEA_SHALLOW: [f32; 3] = [0.055, 0.290, 0.330];
+
+/// 深海颜色(最外圈)。
+pub const SEA_DEEP: [f32; 3] = [0.012, 0.072, 0.155];
+
+/// 湖心深水颜色。
+pub const LAKE_DEEP: [f32; 3] = [0.030, 0.170, 0.240];
+
+/// 湖岸浅滩颜色。
+pub const LAKE_SHORE: [f32; 3] = [0.090, 0.330, 0.320];
+
+/// 湖中心的世界 XZ 坐标。
+pub const LAKE_CENTER: [f32; 2] = [92.0, 96.0];
+
+/// 湖的 X 半径(米)。
+pub const LAKE_RADIUS: f32 = 26.0;
+
+/// 湖的 Z 半径(米)—— 刻意比 X 半径大,湖是椭圆的,不是正圆。
+pub const LAKE_RADIUS_X: f32 = 17.0;
+
+/// 湖的岸边浅滩内缩比例。
+pub const LAKE_SHORE_INSET: f32 = 0.55;
+
+/// 湖面扇区数。
+pub const LAKE_SEGMENTS: usize = 24;
+
+/// 水面每个面的自发光(全黑 —— 水面的「亮」来自反射,不是自发光)。
+pub const WATER_EMISSIVE: [f32; 3] = [0.0, 0.0, 0.0];
+
+/// 水面展开失败的错误信息。
+pub const EXPECT_WATER: &str = "procedural water must be valid";
+
+// ===========================================================================
+// 自适应画质阈值
+// ===========================================================================
+
+/// 平滑帧率的指数平滑系数(越大越跟随瞬时值,越小越迟钝)。
+pub const FPS_SMOOTHING: f32 = 0.90;
+
+/// 低于这个帧率开始累计「慢帧」。
+pub const QUALITY_DOWN_FPS: f32 = 24.0;
+
+/// 高于这个帧率算「快」。
+pub const QUALITY_UP_FPS: f32 = 55.0;
+
+/// 连续多少帧慢才真的降一档。
+pub const SLOW_FRAME_THRESHOLD: u32 = 30;
+
+/// 连续多少帧快才考虑升档(当前实现是单向降级,这个值只用于计数)。
+pub const FAST_FRAME_THRESHOLD: u32 = 180;
+
+/// 建管线后前多少帧不参与降级判定。
+pub const QUALITY_WARMUP_FRAMES: u32 = 20;
+
+/// 跳过 SSAO 时 AO 贴图的中性值(1.0 = 完全不遮蔽)。
+pub const NEUTRAL_AO: f32 = 1.0;
+
+/// 跳过 SSR 时反射贴图的中性值(0.0 = 未命中,回退到环境色)。
+pub const NEUTRAL_SSR: f32 = 0.0;
+
+// ===========================================================================
+// 可进入的样板楼(室内系统)
+// ===========================================================================
+
+/// 样板楼 A 的资产 id:紫丁香色 LOFT,12 × 10 m,带门洞 / 楼板 / 楼梯。
+pub const BLDG_LOFT_SHOWCASE: &str = "bldg_loft_showcase";
+
+/// 样板楼 B 的资产 id:珊瑚色商铺,10 × 9 m,带雨棚。
+pub const BLDG_SHOP_SHOWCASE: &str = "bldg_shop_showcase";
+
+/// 室内楼梯级高(米):必须与 `interior.py` 的 `STAIR_RISE` 一致。
+pub const SHOWCASE_STAIR_RISE: f32 = 0.305;
+
+/// 室内楼梯踏面进深(米):必须与 `interior.py` 的 `STAIR_RUN` 一致。
+pub const SHOWCASE_STAIR_RUN: f32 = 0.45;
+
+/// 室内楼梯级数:必须与 `interior.py` 的 `STAIR_STEPS` 一致。
+pub const SHOWCASE_STAIR_STEPS: usize = 10;
+
+/// 样板楼首层楼板面高度(米)。
+pub const SHOWCASE_GROUND_TOP: f32 = 0.15;
+
+/// 样板楼二层楼板下表面高度(米)。
+pub const SHOWCASE_UPPER_BOTTOM: f32 = 2.95;
+
+/// 样板楼二层楼板上表面高度(米),与楼梯顶端齐平。
+pub const SHOWCASE_UPPER_TOP: f32 = 3.20;
+
+/// 样板楼外墙厚度(米)。
+pub const SHOWCASE_WALL_THICKNESS: f32 = 0.25;
+
+/// 样板楼门洞的半宽(米)——门洞净宽 1.60 m。
+pub const SHOWCASE_DOOR_HALF: f32 = 0.80;
+
+/// 样板楼门洞净高(米)——门洞上沿高度。
+pub const SHOWCASE_DOOR_TOP: f32 = 2.45;
+
+/// 样板楼隔墙的顶面高度(米)。
+pub const SHOWCASE_PARTITION_TOP: f32 = 2.75;
+
+/// 样板楼外墙高度(米)。
+pub const SHOWCASE_WALL_HEIGHT: f32 = 6.40;
+
+/// 样板楼室内楼梯宽度(米)。
+pub const SHOWCASE_STAIR_WIDTH: f32 = 1.30;
+
+/// 第一级踏面到临街内墙的间隙(米)。
+pub const SHOWCASE_STAIR_LEAD: f32 = 0.20;
+
+/// 样板楼首层隔墙的厚度(米)。
+pub const SHOWCASE_PARTITION_THICKNESS: f32 = 0.075;
+
+/// 样板楼首层隔墙中心相对楼中心的 Z 偏移(米,本地坐标)。
+pub const SHOWCASE_PARTITION_Y: f32 = 2.40;
+
+/// 隔墙右端与楼梯之间保留的过道宽度(米)。
+pub const SHOWCASE_PARTITION_GAP: f32 = 1.70;
+
+/// 玩家身体高度(米):脚底到头顶,决定室内墙是否「够得着」。
+pub const PLAYER_BODY_HEIGHT: f32 = 1.75;
+
+/// 城市地面的高度(米):整张地面网格就在 y = 0。
+pub const GROUND_LEVEL: f32 = 0.0;
+
+/// 重力加速度(米/秒²)。
+pub const GRAVITY: f32 = 22.0;
+
+/// 下落速度上限(米/秒):防止穿过薄楼板。
+pub const TERMINAL_VELOCITY: f32 = 34.0;
+
+
+/// 落地下沉容差(米):脚底在楼板面下方这么多之内仍然算站住,防抖。
+pub const GROUND_SNAP_SKIN: f32 = 0.06;
+
+/// 玩家每秒被拉回「站在当前楼板上」的最大高度(米/秒)——防穿地。
+pub const ANTI_TUNNEL_LIFT_SPEED: f32 = 6.0;
+
+// ===========================================================================
+// 室内系统单元测试断言文案
+// ===========================================================================
+
+/// 单元测试断言文案:沿楼梯上行的高度必须逐级递增。
+pub const T_INTERIOR_STAIR_MONOTONIC: &str = "必须走满所有台阶,实际 {heights:?}";
+
+/// 单元测试断言文案:楼梯必须能被一级一级走上去并与二层楼板齐平。
+pub const T_INTERIOR_STAIR_CLIMBS: &str = "楼梯必须逐级抬升并抵达二层楼板,实际 {pair:?}";
+
+/// 单元测试断言文案:二级楼板必须高于一步的踏高容差。
+pub const T_INTERIOR_UPPER_FLOOR_ABOVE: &str = "踏高容差不能大到一步跨上二层楼板";
+
+/// 单元测试断言文案:两室之间的隔墙必须挡住玩家。
+pub const T_INTERIOR_WALL_BLOCKS: &str = "隔墙必须挡住玩家,实际 {pushed:?}";
+
+/// 单元测试断言文案:不在墙上的玩家必须能自由通过。
+pub const T_INTERIOR_WALL_PASSES: &str = "远离隔墙时必须原地不动,实际 {away:?}";
+
+/// 单元测试断言文案:头顶的楼板不得推开玩家。
+pub const T_INTERIOR_CEILING_ABOVE: &str = "头顶的楼板不得推开玩家,实际 {inside:?}";
+
+/// 单元测试断言文案:门洞是唯一能穿过的缺口。
+pub const T_INTERIOR_DOORWAY_PASSES: &str = "门洞中心必须能穿过去,实际 {through:?}";
+
+/// 单元测试断言文案:门洞两侧的墙与门楣必须挡住玩家。
+pub const T_INTERIOR_DOORWAY_BLOCKS: &str = "门洞之外的墙面必须挡住玩家,实际 {blocked:?}";
+
+/// 单元测试断言文案:脚下没有楼板时不得凭空生成支撑面。
+pub const T_INTERIOR_NO_SLAB_UNDER: &str = "楼板外侧不得出现支撑面";
+
+// ===========================================================================
+// 样板楼接线单元测试断言文案
+// ===========================================================================
+
+/// 单元测试断言文案:门洞里必须站得住人(有首层楼板)。
+pub const T_SHOWCASE_DOOR_INSIDE: &str = "门洞内侧必须落在首层楼板上";
+
+/// 单元测试断言文案:门洞两侧的墙必须挡住玩家。
+pub const T_SHOWCASE_DOOR_OUTSIDE_BLOCKED: &str = "门洞两侧的墙必须挡住玩家";
+
+/// 单元测试断言文案:外墙必须把玩家挡在临街面之外。
+pub const T_SHOWCASE_FRONT_FACING: &str = "外墙必须把玩家挡在临街面之外";
+
+/// 单元测试断言文案:楼梯总高必须与二层楼板齐平。
+pub const T_SHOWCASE_STAIR_REACHES_TOP: &str = "楼梯总高必须不小于二层楼板面高度";
+
+/// 单元测试断言文案:单级踏高必须小于踏高容差,否则爬不上楼梯。
+pub const T_SHOWCASE_STAIR_RISE_SHALLOW: &str = "单级踏高必须小于踏高容差,否则爬不上楼梯";
+
+/// 单元测试断言文案:模拟行走必须真的把玩家带到二层楼板面。
+pub const T_SHOWCASE_WALKER_REACHES_TOP: &str = "模拟沿楼梯行走必须抵达二层楼板面";
+
+/// 单元测试断言文案:两栋样板楼的门必须相向而开。
+pub const T_SHOWCASE_DOORS_FACE_EACH_OTHER: &str = "两栋样板楼的门洞必须相向,便于从中间走进去";
+
+/// 单元测试断言文案:样板楼占地必须避开车行道与相邻的普通楼。
+pub const T_SHOWCASE_FOOTPRINT_CLEAR: &str = "样板楼占地不能和普通楼重叠";
+
+/// 单元测试断言文案:相邻两级踏步的高度必须严格递增。
+pub const T_INTERIOR_STAIR_PAIR: &str = "楼梯相邻两级必须严格递增 {pair:?}";
+
+/// 单元测试断言文案:头顶楼板不得把玩家横向推开。
+pub const T_INTERIOR_CEILING_INSIDE: &str = "头顶楼板不得推开玩家 {inside:?}";
+
+/// 单元测试断言文案:门洞中心必须能穿过去。
+pub const T_INTERIOR_DOORWAY_THROUGH: &str = "门洞中心必须穿得过去 {through:?}";
+
+// ===========================================================================
+// 样板楼测试断言文案(§1.3c:字面量一律进 const.rs)
+// ===========================================================================
+
+/// 单元测试断言文案:门洞内侧必须踩得到首层楼板。
+pub const T_SHOWCASE_DOOR_NO_SLAB: &str = "门洞里没有首层楼板,support={support:?}";
+
+/// 单元测试断言文案:门洞中心必须穿得过去。
+pub const T_SHOWCASE_DOOR_CENTER_BLOCKED: &str = "门洞中心被挡住了 after={after:?}";
+
+/// 单元测试断言文案:门垛必须挡住玩家。
+pub const T_SHOWCASE_PIER_LET_PLAYER_THROUGH: &str = "门垛没有挡住玩家 at={at:?} pushed={pushed:?}";
+
+/// 单元测试断言文案:两栋样板楼不得互相重叠。
+pub const T_SHOWCASE_TWO_OVERLAP: &str = "两栋楼重合了";
+
+/// 单元测试断言文案:两扇门必须相向。
+pub const T_SHOWCASE_DOOR_NOT_FACING: &str = "门法线没有指向另一栋楼(dot={dot})";
+
+/// 单元测试断言文案:分离器不得把玩家留进墙里。
+pub const T_SHOWCASE_PUSHED_INTO_WALL: &str = "的人被推进了墙里 {pushed:?}";
+
+/// 单元测试断言文案:楼梯总高必须与二层楼板齐平。
+pub const T_SHOWCASE_STAIR_TOP_LEVEL: &str = "最高一级 {}{STAIR_TOTAL} 与楼板面 {SHOWCASE_UPPER_TOP} 不齐平";
+
+/// 单元测试断言文案:单级踏高必须小于踏高容差。
+pub const T_SHOWCASE_RISE_GE_TOLERANCE: &str = "踏高 {SHOWCASE_STAIR_RISE} >= 容差 {STEP_UP_TOLERANCE}";
+
+/// 单元测试断言文案:容差不得大到能一步跨上一层。
+pub const T_SHOWCASE_TOLERANCE_TOO_BIG: &str = "容差 {STEP_UP_TOLERANCE} 大到能一步跨上一层";
+
+/// 单元测试断言文案:容差必须小于两级踏高之和。
+pub const T_SHOWCASE_TOLERANCE_TWO_RISES: &str = "容差必须小于两级踏高 {}";
+
+/// 单元测试断言文案:模拟行走必须爬到二层。
+pub const T_SHOWCASE_WALKER_DIRECTION: &str = "走了 {frames} 帧,楼梯方向 (normal {:?}) 下的 y={y}";
+
+/// 单元测试断言文案:头顶的楼板不得把玩家推开。
+pub const T_SHOWCASE_CEILING_PUSHED: &str = "楼 {index} 的头顶楼板把玩家推开了";
+
+/// 单元测试断言文案:隔墙必须挡住玩家。
+pub const T_SHOWCASE_PARTITION_LET_THROUGH: &str = "的隔墙没有挡住玩家 mid={mid:?} pushed={pushed:?}";
+
+/// 单元测试断言文案:隔墙与楼梯之间必须留出过道。
+pub const T_SHOWCASE_PARTITION_LANE: &str = "隔墙必须与楼梯之间留出过道,partition_end={partition_end}";
+
+/// 单元测试断言文案:过道必须走得通。
+pub const T_SHOWCASE_LANE_BLOCKED: &str = "的过道被堵住了 lane={lane:?} through={through:?}";
+
+/// 单元测试断言文案:占地不得压上车行道。
+pub const T_SHOWCASE_AXIS_ON_ROAD: &str = "的轴 {axis} 压到了车行道:x={} 街={line} 半径={reach}";
+
+/// 单元测试断言文案:占地不得与普通楼重叠。
+pub const T_SHOWCASE_OVERLAPS_ORDINARY: &str = "与普通楼 ({:.1},{:.1}) 的保守包围盒重叠";
+
+/// 单元测试断言文案:二维碰撞体不得堵死门洞。
+pub const T_SHOWCASE_DOORWAY_2D_BLOCKED: &str = "的门洞被二维碰撞体堵住";

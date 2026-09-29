@@ -10,9 +10,79 @@
 //! 投影矩阵是标准 WebGL 深度范围 `[-1, 1]` 的右手透视矩阵。
 
 use crate::{
-    collision::{CollisionWorld, ray_to_shapes},
-    r#type::{Mat4Data, Vec3, Vec4},
+    collision::{CAMERA_PROBE_RADIUS, CollisionWorld, ray_to_shapes},
+    interior::FloorWorld,
+    r#type::{Mat4Data, Vec2, Vec3, Vec4},
 };
+
+/// 室内遮挡探针沿射线的采样步长(米)。
+///
+/// 室内形状全部是轴对齐盒,本可以用 slab 法精确求交;但回避关心的是
+/// 「**带半径的探针**什么时候碰到墙」,和外部世界的球体推进同源。步长
+/// 取探针半径的 1/3,命中距离的最大误差就是 0.11 m,远小于
+/// `OCCLUSION_SKIN` 的贴墙余量,肉眼不可见。
+const INTERIOR_PROBE_STEP: f32 = CAMERA_PROBE_RADIUS / 3.0;
+
+/// 从 `origin` 沿 `dir` 推进一个球体探针,求撞上第一个室内碰撞体的距离。
+///
+/// 走的是「球体推进」而不是零半径射线:探针半径当成相机本体的尺寸,
+/// 于是命中距离等于「球面贴上墙」的那一刻,掠射角下不会剧烈跳变 ——
+/// 与 [`ray_to_shapes`] 处理外部世界的做法完全一致。
+///
+/// # Arguments
+///
+/// - `&FloorWorld` - 室内碰撞世界。
+/// - `Vec3` - 射线起点(焦点)。
+/// - `Vec3` - 射线的另一端参考点(眼点),只用来定探针的高度区间。
+/// - `Vec3` - 单位方向。
+/// - `f32` - 最多推进多远(米)。
+///
+/// # Returns
+///
+/// - `Option<f32>` - 命中距离(米);未命中为 `None`。
+fn interior_ray_hit(
+    interiors: &FloorWorld,
+    origin: Vec3,
+    eye: Vec3,
+    dir: Vec3,
+    max_distance: f32,
+) -> Option<f32> {
+    // 探针沿射线推进时覆盖的高度区间:焦点高度与眼点高度之间,再向上下
+    // 各扩半个探针直径。`contains_interior_point` 判的是「这个点是否在
+    // 某块碰撞体的竖直区间内」,所以上下各扩一次就够了。
+    let low: f32 = origin[1].min(eye[1]) - CAMERA_PROBE_RADIUS;
+    let high: f32 = origin[1].max(eye[1]) + CAMERA_PROBE_RADIUS;
+    let mut travelled: f32 = 0.0;
+    while travelled <= max_distance {
+        let point: Vec3 = [
+            origin[0] + dir[0] * travelled,
+            origin[1] + dir[1] * travelled,
+            origin[2] + dir[2] * travelled,
+        ];
+        let at: Vec2 = [point[0], point[2]];
+        let blocked: bool = interiors
+            .get_floors()
+            .iter()
+            .any(|floor: &crate::interior::Floor| {
+                let (min, max): (Vec3, Vec3) = match floor {
+                    crate::interior::Floor::Slab { min, max } => (*min, *max),
+                    crate::interior::Floor::Wall { min, max } => (*min, *max),
+                };
+                if max[1] < low || min[1] > high {
+                    return false;
+                }
+                at[0] >= min[0] - CAMERA_PROBE_RADIUS
+                    && at[0] <= max[0] + CAMERA_PROBE_RADIUS
+                    && at[1] >= min[2] - CAMERA_PROBE_RADIUS
+                    && at[1] <= max[2] + CAMERA_PROBE_RADIUS
+            });
+        if blocked {
+            return Some(travelled);
+        }
+        travelled += INTERIOR_PROBE_STEP;
+    }
+    None
+}
 
 /// 城市边界半长(米):地面覆盖 [-150, 150] × [-150, 150]。
 pub const CITY_BOUNDS: f32 = 150.0;
@@ -652,6 +722,69 @@ impl Camera {
         tightest.map(|limit: f32| (limit - OCCLUSION_SKIN).max(0.0))
     }
 
+    /// 相机回避的**室内**版本:额外考虑 [`crate::interior::FloorWorld`]。
+    ///
+    /// 玩家站进样板楼之后,眼点到焦点之间横着的往往是**隔墙 / 门垛**,
+    /// 它们根本不在 `CollisionWorld` 里(那里面装的是整车城,样板楼为了
+    /// 能走进去被特意排除了)。只查 `CollisionWorld` 的相机会直接穿墙:
+    /// 隔墙在镜头上糊成一片平面,玩家在另一侧完全看不见。
+    ///
+    /// 这里用与 [`Self::resolve_occlusion`] 相同的三射线 + 球体探针规则,
+    /// 只是把求交换成「沿射线按步长采样,被室内碰撞体包住就记下距离」。
+    /// 室内形状总数是常数级(两栋楼 ~30 件),按步长采样的开销可以忽略,
+    /// 而换来的是**和现有回避手感完全一致**的参数与阻尼。
+    ///
+    /// # Arguments
+    ///
+    /// - `&CollisionWorld` - 静态碰撞世界的只读引用。
+    /// - `&FloorWorld` - 室内碰撞世界的只读引用。
+    /// - `f32` - 期望的最大距离(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<f32>` - 真正遮挡时为「本帧允许的最远距离(米)」;否则为 `None`。
+    pub fn resolve_occlusion_interior(
+        &self,
+        world: &CollisionWorld,
+        interiors: &FloorWorld,
+        max_distance: f32,
+    ) -> Option<f32> {
+        let outside: Option<f32> = self.resolve_occlusion(world, max_distance);
+        let target: Vec3 = self.get_target();
+        // 视线垂直:地面上没东西可挡,沿用外部世界的结果。
+        let forward: Vec3 = self.eye_direction();
+        let flat: f32 = (forward[0] * forward[0] + forward[2] * forward[2]).sqrt();
+        if flat < 1.0e-5 {
+            return outside;
+        }
+        let side: Vec3 = [-forward[2] / flat, 0.0, forward[0] / flat];
+        let spread: f32 = (self.get_fov_y() * 0.5).tan() * OCCLUSION_COVERAGE_WIDTH;
+        // 眼点高度就是焦点高度加上俯角带来的那一段:回避时相机就在
+        // 这条线上,所以用它决定「墙够不够得着」。
+        let eye: Vec3 = self.eye();
+        let mut tightest: Option<f32> = outside;
+        for sign in [-1.0_f32, 0.0, 1.0] {
+            let dir: Vec3 = [
+                forward[0] + side[0] * spread * sign,
+                forward[1],
+                forward[2] + side[2] * spread * sign,
+            ];
+            let Some(hit) = interior_ray_hit(interiors, target, eye, dir, max_distance) else {
+                continue;
+            };
+            let along: f32 = if sign == 0.0 {
+                hit
+            } else {
+                hit / (1.0 + spread * spread).sqrt()
+            };
+            tightest = Some(match tightest {
+                Some(current) => current.min(along),
+                None => along,
+            });
+        }
+        tightest.map(|limit: f32| (limit - OCCLUSION_SKIN).max(0.0))
+    }
+
     /// 眼点相对焦点的单位方向向量(焦点 → 眼点)。
     ///
     /// # Returns
@@ -923,6 +1056,7 @@ mod tests {
         T_OCCLUSION_SHORTER, T_PULL_IN, T_PULL_IN_SMOOTH, T_RAY_DISTANCE, T_RAY_MUST_HIT,
         T_RECOVERS, T_SIDE_HITS, T_SKIN_BOUNDED, T_SKIN_POSITIVE,
     };
+    use crate::interior::FloorWorld;
     use crate::r#type::{Vec2, Vec3};
 
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值。
@@ -951,6 +1085,59 @@ mod tests {
         let mut world: CollisionWorld = CollisionWorld::new();
         world.push_aabb([-4.0, 0.0], [1.0, 6.0]);
         world
+    }
+
+    fn empty_interiors() -> FloorWorld {
+        FloorWorld::new()
+    }
+
+    fn follow_camera() -> Camera {
+        let mut camera: Camera = Camera::new();
+        camera.set_target([0.0, 1.45, 0.0]);
+        camera.set_pitch(0.0);
+        camera.set_yaw(0.0);
+        camera.set_fov_y(FOLLOW_FOV);
+        camera.set_distance(9.5);
+        camera.set_desired_distance(9.5);
+        camera
+    }
+
+    fn interiors_with_wall() -> FloorWorld {
+        let mut world: FloorWorld = FloorWorld::new();
+        world.push_wall([-4.25, 0.0, -6.0], [-3.75, 6.4, 6.0]);
+        world
+    }
+
+    #[test]
+    fn interior_wall_pulls_the_camera_in() {
+        // 眼点会落在 -X 一侧(见 `world_with_wall` 的说明),所以墙立在
+        // x = -4 m。外部碰撞世界里**没有**这堵墙,只有室内碰撞世界有。
+        let camera: Camera = follow_camera();
+        let empty: FloorWorld = empty_interiors();
+        let outside: Option<f32> =
+            camera.resolve_occlusion_interior(&CollisionWorld::new(), &empty, 9.5);
+        assert!(outside.is_none(), "{}", T_NO_OCCLUSION);
+        let hit: Option<f32> =
+            camera.resolve_occlusion_interior(&CollisionWorld::new(), &interiors_with_wall(), 7.4);
+        let allowed: f32 = hit.unwrap_or(7.4);
+        assert!(
+            allowed < 7.4,
+            "{}",
+            fill(T_OCCLUSION_SHORTER, &[("allowed", &format!("{allowed}"))])
+        );
+        assert!(
+            allowed > 0.0,
+            "{}",
+            fill(T_OCCLUSION_POSITIVE, &[("allowed", &format!("{allowed}"))])
+        );
+    }
+
+    #[test]
+    fn empty_interiors_never_pull_the_camera_in() {
+        let camera: Camera = follow_camera();
+        let hit: Option<f32> =
+            camera.resolve_occlusion_interior(&CollisionWorld::new(), &empty_interiors(), 7.4);
+        assert!(hit.is_none(), "{}", fill(T_NO_OCCLUSION, &[]));
     }
 
     #[test]

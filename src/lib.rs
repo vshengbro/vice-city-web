@@ -10,18 +10,24 @@
 //! - [`mesh`] —— 资产 JSON schema 解析 → GPU 顶点布局。
 //! - [`camera`] —— 轨道相机、投影矩阵、背面剔除。
 //! - [`collision`] —— 二维圆形 vs AABB / 圆分离与世界边界。
+//! - [`interior`] —— 三维楼板 / 隔墙 / 楼梯的垂直支撑与室内分离。
 //! - [`player`] —— 玩家状态、步态骨架与第三人称移动。
+//! - [`combat`] —— 武器、敌人 AI、通缉等级、任务与伤害结算。
 //! - [`traffic`] —— 车队 AI、上下车、拾取物。
 //! - [`render`] —— WebGL2 / Canvas2D 两个渲染后端 + 共享光照参数。
 //! - [`game`] —— 场景蓝图、异步加载、固定步长循环、输入、昼夜循环。
 
 mod r#camera;
 mod r#collision;
+mod r#combat;
 mod r#const;
+mod r#enemy;
 mod r#game;
+mod r#interior;
 mod r#mesh;
 mod r#player;
 mod r#render;
+mod r#spawn;
 mod r#traffic;
 mod r#type;
 

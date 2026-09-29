@@ -73,11 +73,11 @@ Vehicles and pedestrians face **+Z** in JSON space. Both are authored facing
   "category":   "vehicle",          // see the table in §5
   "y_up":       true,               // always true; asserts the up axis
   "bounds": {
-    "min":      [-2.305, 0.0, -0.90],
-    "max":      [ 2.305, 1.45, 0.90]
+    "min":      [-2.283, 0.0, -0.925581],
+    "max":      [ 2.283, 1.45, 0.925581]
   },
-  "part_count": 7,
-  "tri_count":  2068,
+  "part_count": 9,
+  "tri_count":  4220,
   "parts":      [ /* see below */ ]
 }
 ```
@@ -118,8 +118,8 @@ different colours via `face_colors`.
   "faces":         [[i0,i1,i2], ...],    // triangle indices into positions
   "face_colors":   [[r,g,b], ...],       // exactly one per face
   "flat":          true,                 // flat vs smooth shading
-  "tri_count":     2068,
-  "outward_check": "closed(12 shells)"   // diagnostic, see §4
+  "tri_count":     4220,
+  "outward_check": "closed(2 shells)"    // diagnostic, see §4
 }
 ```
 
@@ -183,23 +183,98 @@ different colours via `face_colors`.
 
 ---
 
+## 4a. Tiling assets (`road`)
+
+The nine `road_*` assets are **tiles**, meant to be repeated to pave the city.
+Three rules make that work, and a renderer that wants to lay them out needs to
+know all three:
+
+1. **The pattern is centred on the origin**, and the asset's XZ extent is an
+   exact whole number of repeat periods, so tiling on that period puts the
+   partial pattern back together exactly. Measured values:
+
+   | Tile | Extent | Period | Periods in extent |
+   |---|---|---|---|
+   | `road_lane_line` | 0.15 × 6.00 m | **3.00 m** (1.50 m dash + 1.50 m gap) | 2 |
+   | `road_crosswalk` | 6.00 × 4.00 m | **1.00 m** (0.45 m bar + 0.55 m gap) | 6 across, 4 deep |
+   | `road_lane_line_yellow` | 0.40 × 6.00 m | solid, none needed | — |
+   | `road_asphalt`, `road_sidewalk` | 12 × 12 m | 12 m (6×6 / 6×6 cell grid) | 1 |
+   | `road_grass`, `road_sand` | 8 × 8 m | 8 m | 1 |
+
+   The lane line and the crosswalk both clip the bar/dash that would otherwise
+   straddle the seam into two half-bars, which is what makes the seam invisible.
+2. **No bevel or chamfer on a tile's outer boundary.** A chamfer on a tile edge
+   breaks tiling — the strip simply does not meet its neighbour. All the road
+   assets are therefore axis-aligned flat quads, and their surface variety
+   comes entirely from `face_colors`, not from normal breaks.
+3. **They are very thin (0.01–0.20 m).** They are painted onto the street, not
+   built up from it. Lay them a few centimetres above the base road plane to
+   avoid z-fighting.
+
+Lane lines and the crosswalk carry **`emissive` exactly 0** — they are retroreflective
+paint, not light sources, and the runtime's glow pass must not pick them up.
+
+---
+
+## 4b. How the runtime shades these assets
+
+`src/render.rs` shades every face with, in linear space:
+
+```text
+base  = face_color * instance_tint
+lit   = base * (ambient + light_color * max(dot(normal, light_dir), 0))
+      + base * emissive * emissive_gain
+color = tonemap(lit)                        # hue-preserving Reinhard
+color = mix(color, sky_color, fog)          # smoothstep, ~90 m to ~460 m
+color = linear_to_srgb(color)
+```
+
+Three consequences for anyone authoring or reviewing assets here:
+
+* **No specular, no PBR, no texture lookup.** `roughness` and `metallic` are
+  exported and validated but are never read. The only sources of surface
+  variation are the surface **normal**, the **albedo**, and **emissive**.
+* **`emissive` is what drives the night look.** The engine has a separate
+  additive glow pass keyed on `emissive`, and `emissive_gain` scales from 0.18
+  at noon to 1.85 at night. Give anything that should glow at night (signs,
+  street lamps, traffic lenses, vehicle lamps, lit windows) a non-zero
+  `emissive`; give it a matching solid `base_color` too, so it still reads when
+  the gain is low.
+* **Flat shading is the house style**, and at these triangle counts it is the
+  right call. A chamfered edge (see `core.chamfer_box`) is often worth more than
+  a smoother surface, because it gives the one directional light something to
+  fall across.
+
+---
+
 ## 5. Categories
 
 | Category | Count | Contents |
 |---|---|---|
-| `building` | 12 | Art Deco / pastel Miami towers and low-rises |
-| `vehicle` | 5 | sedan, coupe, pickup, police, taxi |
-| `pedestrian` | 4 | suit, dress, overalls, streetwear — rigged as separate parts |
-| `prop` | 14 | street furniture (incl. construction barrier, parking meter) |
-| `sign` | 8 | neon signs (HOTEL, BAR, DINER, PIZZA, TROPIC, CLUB, ARCADE, MOTEL) |
-| `palm` | 3 | tall, short, bushy |
+| `animal` | 4 | dog, cat, bird, fish |
 | `beach` | 4 | umbrella, chair, surfboard, boardwalk plank |
-| `misc` | 6 | helicopter, helipad marking, dumpster pile, graffiti board, awning, street phone |
-| `weapon` | 6 | pistol, SMG, shotgun, rocket launcher, bat, grenade |
-| `pickup` | 6 | armour vest, health pack, ammo box, cash stack, O₂ tank, flare pack |
+| `building` | 14 | Art Deco / pastel Miami towers and low-rises |
+| `interior` | 2 | interior fit-out pieces |
 | `marker` | 2 | objective flame cone, rotating coin ring |
+| `military` | 2 | military hardware |
+| `misc` | 6 | helicopter, helipad marking, dumpster pile, graffiti board, awning, street phone |
+| `nature` | 2 | grass patch, flower cluster |
+| `palm` | 3 | tall, short, bushy |
+| `pedestrian` | 4 | suit, dress, overalls, streetwear — rigged as 13 named parts |
+| `pickup` | 8 | armour vest, health pack, ammo box, cash stack, O₂ tank, flare pack, rocket round, grenade case |
+| `prop` | 14 | street furniture (incl. construction barrier, parking meter) |
+| `road` | 9 | tileable asphalt / sidewalk / lane line / crosswalk / grass / sand / manhole decal / drain grate |
+| `sign` | 8 | neon signs (HOTEL, BAR, DINER, PIZZA, TROPIC, CLUB, ARCADE, MOTEL) |
+| `terrain` | 1 | mountain terrain piece |
+| `vehicle` | 14 | street vehicles (sedan, coupe, pickup, police, taxi, city bus) + boats, ships, aircraft |
+| `weapon` | 6 | pistol, SMG, shotgun, rocket launcher, bat, grenade |
 
-Totals: **70 assets, 73,478 triangles.**
+Totals: **99 assets, 133,067 triangles.**
+
+A category is a label, not a behavioural contract: nothing in the runtime
+branches on it. The categories that *do* carry a hard obligation are
+`building`, `prop`, `palm`, `vehicle` and `sign`, which the verifier requires to
+rest on `y = 0` (see §4, check 10).
 
 ---
 
@@ -211,18 +286,19 @@ Totals: **70 assets, 73,478 triangles.**
   "generator": "tools/blender/build_assets.py",
   "up_axis": "Y",
   "unit": "meter",
-  "asset_count": 70,
-  "tri_count": 73478,
-  "categories": ["beach", "building", "marker", "misc", "palm",
-                 "pedestrian", "pickup", "prop", "sign", "vehicle",
+  "asset_count": 99,
+  "tri_count": 133067,
+  "categories": ["animal", "beach", "building", "interior", "marker",
+                 "military", "misc", "nature", "palm", "pedestrian",
+                 "pickup", "prop", "road", "sign", "terrain", "vehicle",
                  "weapon"],
   "assets": [
     {
       "id": "car_sedan",
       "category": "vehicle",
       "file": "car_sedan.json",     // relative to the assets/ directory
-      "tri_count": 2068,
-      "part_count": 7,
+      "tri_count": 4220,
+      "part_count": 9,
       "bounds": { "min": [...], "max": [...] }
     }
     // ... one entry per asset

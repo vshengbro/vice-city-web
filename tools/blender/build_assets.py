@@ -29,19 +29,24 @@ if HERE not in sys.path:
 
 from vcw import export                                          # noqa: E402
 from vcw.builders import (                                     # noqa: E402
-    buildings, markers, misc, palms, pedestrians, props, signs, vehicles,
-    weapons,
+    buildings, interior, markers, military, misc, nature, palms, pedestrians,
+    props, roads, signs, vehicles, watercraft, weapons,
 )
 
 # Every builder module, in a stable order so the report and the manifest assets
 # array read the same way on every run.
 BUILDER_MODULES = (
     ("buildings", buildings),
+    ("interior", interior),
     ("vehicles", vehicles),
+    ("military", military),
+    ("watercraft", watercraft),
     ("pedestrians", pedestrians),
     ("props", props),
     ("signs", signs),
     ("palms", palms),
+    ("nature", nature),
+    ("roads", roads),
     ("misc", misc),
     ("weapons", weapons),
     ("markers", markers),
