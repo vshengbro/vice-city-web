@@ -845,6 +845,24 @@ impl Instance {
         &self.model
     }
 
+    /// 用**显式 model matrix** 构造实例。
+    ///
+    /// 车轮要同时做两件事:跟着车身绕 Y 转,再绕自己的轮心自转。
+    /// [`Self::new`] 只能表达单轴 Y 旋转,表达不了这个复合变换,所以这里
+    /// 直接接受调用方算好的列主序矩阵。
+    ///
+    /// # Arguments
+    ///
+    /// - `Mat4Data` - 列主序 model matrix(长度 16)。
+    /// - `Vec3` - 逐实例色调乘子。
+    ///
+    /// # Returns
+    ///
+    /// - `Self` - 构造好的实例。
+    pub fn from_model(model: Mat4Data, tint: Vec3) -> Self {
+        Self { model, tint }
+    }
+
     /// 构造一个实例。
     ///
     /// # Arguments

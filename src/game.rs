@@ -1179,6 +1179,10 @@ pub struct Game {
     pub player_batches: Vec<PlayerLimbBatch>,
     /// 车队车辆每个批次对应的车辆索引。
     pub car_batches: Vec<usize>,
+    /// 每辆车四个可转车轮的批次。
+    pub car_wheel_batches: Vec<CarWheelBatch>,
+    /// 车型 id → 该车型切好的「单个车轮」mesh 索引(0..4 四个 slot 共用)。
+    pub car_wheel_meshes: HashMap<String, Vec<usize>>,
     /// 拾取物每个批次对应的拾取物索引。
     pub pickup_batches: Vec<usize>,
     /// 是否处于第三人称跟随模式(Tab 切回自由观察)。
@@ -1233,6 +1237,22 @@ pub struct PlayerLimbBatch {
     /// 关节枢轴的资产本地坐标。
     pub pivot: Vec3,
     /// 该 part 在场景批次表里的索引。
+    pub batch: usize,
+}
+
+/// 一辆车的四个可转车轮各占一个批次。
+///
+/// 车身保持「整张车一个批次」不变(它不需要单独动画),只有轮子被切出来
+/// 独立变换 —— 与玩家肢体的 `PlayerLimbBatch` 同一套做法。
+#[derive(Clone, Debug)]
+pub struct CarWheelBatch {
+    /// 对应的车辆索引。
+    pub car: usize,
+    /// 第几个轮子(0..4,对应 `WHEEL_MOUNTS` 的顺序)。
+    pub slot: usize,
+    /// 该轮子在资产本地坐标的安装位(轮心)。
+    pub mount: Vec3,
+    /// 该轮子批次的场景索引。
     pub batch: usize,
 }
 
@@ -2393,6 +2413,12 @@ const PICKUP_PLACEMENTS: &[(&str, &str, Vec3)] = &[
     (MARKER_FLAME, NOTICE_MARKER, [26.5, 0.35, -60.0]),
 ];
 
+/// 需要按 part 切出可转车轮的车型资产 id。
+///
+/// 只有这五个 `car_*` 资产带 `tyres` / `hubs` 部件(见各自的
+/// `parts[].name`);把它们留一份原始 `MeshAsset` 好切单轮网格。
+const CAR_ASSET_IDS: &[&str] = &[CAR_TAXI, CAR_COUPE, CAR_SEDAN, CAR_POLICE, TRUCK_PICKUP];
+
 /// 玩家骨架要渲染的 part 名(躯干 / 头 / 头发 + 四肢 + 两只鞋)。
 ///
 /// 顺序不重要(每个 part 一个独立批次),但必须与 `ped_suit.json` 的
@@ -2454,6 +2480,188 @@ fn push_player_part(scene: &mut Scene, asset: &MeshAsset, part_name: &str) -> us
     // `near_cull = false`:第三人称相机离角色只有几米,而默认的近处剔除
     // 半径是 26 m,不豁免的话角色会被整批剔掉、画面里根本看不到人。
     scene.push_batch_with_cull(mesh_index, true, false)
+}
+
+/// 算出一个车轮的 model matrix:先绕轮心自转,再随车身绕 Y 转并平移。
+///
+/// 顺序很关键 —— 轮子网格已经被平移到「轮心在原点」,所以自转直接绕
+/// 本地 X 轴即可(车轮的轴就是 X)。自转之后再用车身朝向把安装位转到世界
+/// 空间,最后加上车身位置。
+///
+/// # Arguments
+///
+/// - `Vec3` - 车身世界位置。
+/// - `f32` - 车身朝向(弧度)。
+/// - `Vec3` - 轮子在资产本地的安装位(轮心)。
+/// - `f32` - 车轮转角(弧度)。
+///
+/// # Returns
+///
+/// - `Mat4Data` - 列主序 model matrix。
+fn car_wheel_model(position: Vec3, yaw: f32, mount: Vec3, spin: f32) -> Mat4Data {
+    let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+    let (sin_spin, cos_spin): (f32, f32) = spin.sin_cos();
+    // 安装位随车身转到世界:与 `Instance::new` 同一套约定
+    // (本地 +X → 世界 (cos yaw, 0, -sin yaw),本地 +Z → (sin yaw, 0, cos yaw))。
+    let world_mount: Vec3 = [
+        position[0] + mount[0] * cos_yaw + mount[2] * sin_yaw,
+        position[1] + mount[1],
+        position[2] - mount[0] * sin_yaw + mount[2] * cos_yaw,
+    ];
+    // 绕本地 X 轴自转:基向量 X 不动,Y/Z 在 (cos, sin) 平面里转。
+    // 再由 yaw 把这三个基向量转到世界。
+    let local: [[f32; 3]; 3] = [
+        [1.0, 0.0, 0.0],
+        [0.0, cos_spin, sin_spin],
+        [0.0, -sin_spin, cos_spin],
+    ];
+    let mut columns: [[f32; 3]; 3] = [[0.0; 3]; 3];
+    for (row, column) in columns.iter_mut().enumerate() {
+        let basis: [f32; 3] = local[row];
+        column[0] = basis[0] * cos_yaw + basis[2] * sin_yaw;
+        column[1] = basis[1];
+        column[2] = -basis[0] * sin_yaw + basis[2] * cos_yaw;
+    }
+    [
+        columns[0][0],
+        columns[0][1],
+        columns[0][2],
+        0.0, //
+        columns[1][0],
+        columns[1][1],
+        columns[1][2],
+        0.0, //
+        columns[2][0],
+        columns[2][1],
+        columns[2][2],
+        0.0, //
+        world_mount[0],
+        world_mount[1],
+        world_mount[2],
+        1.0,
+    ]
+}
+
+/// 切出**一个**车轮的 mesh:只保留某个象限的顶点,并把坐标平移成
+/// 「轮心在原点」,这样渲染时绕 X 轴旋转就是真实的滚动。
+///
+/// `car_*` 资产的 `tyres` part 把四个轮子合并在一个 part 里(8 个三角形
+/// 索引 ×4,`tyres` 有 576 个顶点),`hubs` 同理。不切开的话四个轮子会
+/// 一起绕同一个点公转,看起来像车轮在原地打转。
+///
+/// # Arguments
+///
+/// - `&mut Scene` - 场景。
+/// - `&MeshAsset` - 车辆资产。
+/// - `usize` - 轮子编号(0..4,对应 `WHEEL_MOUNTS` 的顺序)。
+///
+/// # Returns
+///
+/// - `usize` - 新 mesh 的索引;资产里没有轮子时返回 `usize::MAX`。
+fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
+    let mount: [f32; 3] = crate::traffic::WHEEL_MOUNTS[slot];
+    let sign_x: f32 = if mount[0] >= 0.0 { 1.0 } else { -1.0 };
+    let sign_z: f32 = if mount[2] >= 0.0 { 1.0 } else { -1.0 };
+    let mut parts: Vec<MeshPart> = Vec::new();
+    for name in [PART_TYRES, PART_HUBS] {
+        let Some(part) = asset
+            .parts
+            .iter()
+            .find(|candidate: &&MeshPart| candidate.name == name)
+        else {
+            continue;
+        };
+        let part: &MeshPart = part;
+        let _in_quad: Vec<bool> = part
+            .positions
+            .iter()
+            .map(|position: &[f32; 3]| {
+                let sx: f32 = if position[0] >= 0.0 { 1.0 } else { -1.0 };
+                let sz: f32 = if position[2] >= 0.0 { 1.0 } else { -1.0 };
+                (sx - sign_x).abs() < 0.5 && (sz - sign_z).abs() < 0.5
+            })
+            .collect();
+        // 三角面是**顶点下标**(`faces: Vec<[usize; 3]>`),不是连续三顶点。
+        // 一个面只在其三个顶点**全部**落在本象限时保留 —— 轮子之间没有
+        // 跨象限的面,直接按面筛即可。
+        let normals: &Option<Vec<[f32; 3]>> = &part.normals;
+        let mut kept_face_indices: Vec<usize> = Vec::new();
+        let mut new_positions: Vec<[f32; 3]> = Vec::new();
+        let mut new_normals: Vec<[f32; 3]> = Vec::new();
+        let mut new_faces: Vec<[usize; 3]> = Vec::new();
+        for (face_index, face) in part.faces.iter().enumerate() {
+            let inside: bool = face.iter().all(|vertex: &usize| {
+                let position: [f32; 3] = part.positions[*vertex];
+                let sx: f32 = if position[0] >= 0.0 { 1.0 } else { -1.0 };
+                let sz: f32 = if position[2] >= 0.0 { 1.0 } else { -1.0 };
+                (sx - sign_x).abs() < 0.5 && (sz - sign_z).abs() < 0.5
+            });
+            if !inside {
+                continue;
+            }
+            kept_face_indices.push(face_index);
+            let base: usize = new_positions.len();
+            for vertex in face {
+                let position: [f32; 3] = part.positions[*vertex];
+                new_positions.push([
+                    position[0] - mount[0],
+                    position[1] - mount[1],
+                    position[2] - mount[2],
+                ]);
+                new_normals.push(match normals {
+                    Some(values) if values.len() > *vertex => values[*vertex],
+                    _ => [0.0, 1.0, 0.0],
+                });
+            }
+            new_faces.push([base, base + 1, base + 2]);
+        }
+        if new_faces.is_empty() {
+            continue;
+        }
+        // 面颜色按同样的筛选顺序取:重建时 `new_faces` 的第 k 个面就是
+        // `kept_indices` 的第 k 个,直接按下标取回原色。
+        let kept_indices: Vec<usize> = kept_face_indices;
+        let face_colors: Option<Vec<[f32; 3]>> =
+            part.face_colors.as_ref().map(|colors: &Vec<[f32; 3]>| {
+                kept_indices
+                    .iter()
+                    .map(|index: &usize| colors.get(*index).copied().unwrap_or([0.0; 3]))
+                    .collect()
+            });
+        parts.push(MeshPart {
+            name: name.to_string(),
+            positions: new_positions,
+            normals: Some(new_normals),
+            faces: new_faces,
+            base_color: part.base_color,
+            emissive: part.emissive,
+            face_colors,
+            flat: part.flat,
+        });
+    }
+    if parts.is_empty() {
+        return usize::MAX;
+    }
+    let mut emissive: Vec<[f32; 3]> = Vec::new();
+    for part in &parts {
+        let base: [f32; 3] = part.emissive.unwrap_or([0.0; 3]);
+        for _ in &part.faces {
+            emissive.push(base);
+        }
+    }
+    let solo: MeshAsset = MeshAsset {
+        id: asset.id.clone(),
+        category: asset.category.clone(),
+        y_up: asset.y_up,
+        bounds: None,
+        parts,
+    };
+    let Ok(mesh) = expand_asset(&solo) else {
+        return usize::MAX;
+    };
+    // 只返回 mesh 索引,**不**建批次:同一车型的所有车共用这一份几何,
+    // 批次由调用方逐车建立(批次才持有每辆车自己的 model matrix)。
+    scene.push_mesh(build_gpu_mesh(&mesh, &emissive))
 }
 
 /// 玩家骨架每个 part 的本地包围盒(min / max 各一份)。
@@ -3075,6 +3283,25 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
         None => String::from(crate::r#const::NO_BATCHES),
     };
     let bn: usize = game.scene.batches.len();
+    let wheel_count: usize = game.car_wheel_batches.len();
+    // 车轮批次总数 + 第一个车轮的 Y 基向量(自转角的可观测代理):
+    // 停车时该向量是 [0,1,0];车轮滚动时会随转角在 XZ 平面里摆动。
+    let wheel_probe: String = match game.car_wheel_batches.first() {
+        None => String::from("[]"),
+        Some(wheel) => match game.scene.batches.get(wheel.batch) {
+            None => String::from("[]"),
+            Some(batch) => match batch.instances.first() {
+                None => String::from("[]"),
+                Some(instance) => {
+                    let m: Mat4Data = *instance.get_model_ref();
+                    format!(
+                        "[{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}]",
+                        m[4], m[5], m[6], m[1], m[2], m[3]
+                    )
+                }
+            },
+        },
+    };
     // 最近的建筑实例位置:验收脚本要拿它当「推挤目标」,而不是写死
     // 一个魔法坐标 —— 街区布局会变,写死的坐标早晚会推到空气上。
     let bpos_json: String = json_point(game.nearest_building);
@@ -3206,7 +3433,7 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
         .collect::<Vec<String>>()
         .join(",");
     let json: String = format!(
-        "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy}{DEBUG_CLOSE}",
+        "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy}{DEBUG_CLOSE}",
         x = position[0],
         z = position[2],
         yaw = game.player.get_yaw(),
@@ -3869,6 +4096,9 @@ fn show_loading_error(message: &str) {
 fn simulate(game: &mut Game, delta: f32) {
     let forward_input: f32 = axis(&game.input, KEYW, KEYS);
     let strafe_input: f32 = axis(&game.input, KEYD, KEYA);
+    // 驾驶时 A/D 当方向盘:横向输入就是舵角,不再被
+    // `set_position([lane_x, ...])` 吃掉。
+    let steer_input: f32 = strafe_input;
     let running: bool = game.input.held(KEY_SHIFT_LEFT) || game.input.held(KEY_SHIFT_RIGHT);
     let dt: f32 = delta.min(FIXED_DT * 4.0);
 
@@ -3882,7 +4112,7 @@ fn simulate(game: &mut Game, delta: f32) {
     match driven {
         Some(index) => {
             if let Some(car) = game.traffic.get_car_mut(index) {
-                car.drive(forward_input, dt, &game.world);
+                car.drive(forward_input, steer_input, dt, &game.world);
             }
         }
         None => {
@@ -4980,10 +5210,12 @@ fn toggle_vehicle(game: &mut Game) -> bool {
 /// - `&mut Game` - Game 的可变引用。
 /// - `&HashMap<String, usize>` - 资产 id → 场景 mesh 索引。
 /// - `&MeshAsset` - `ped_suit` 的完整资产(用于切 part)。
+/// - `&HashMap<String, MeshAsset>` - 车辆资产(用于切出可转车轮)。
 fn spawn_player_traffic_pickups(
     game: &mut Game,
     index_map: &HashMap<String, usize>,
     ped: &MeshAsset,
+    car_assets: &HashMap<String, MeshAsset>,
 ) {
     // 玩家骨架:每个 part 一个独立 mesh + 独立批次。
     game.player_batches.clear();
@@ -5001,6 +5233,9 @@ fn spawn_player_traffic_pickups(
     }
 
     // 车队:每辆车一个批次(姿态独立)。
+    //
+    // 车轮批次要按车资产切网格,而网格必须**每辆车型切一次**(不同车型的
+    // 轮子尺寸不同),所以缓存键是「资产 id」而不是「车实例」。
     game.car_batches.clear();
     for index in 0..game.traffic.get_cars_ref().len() {
         let asset: &'static str = match game.traffic.get_cars_ref().get(index) {
@@ -5012,6 +5247,39 @@ fn spawn_player_traffic_pickups(
         };
         let batch: usize = find_or_create_batch(&mut game.scene, *mesh_index);
         game.car_batches.push(batch);
+        // 车轮:每辆车四个轮子各一个批次。
+        //
+        // 切网格的键是**车型**而不是车实例 —— 四个轮子的网格完全相同
+        // (只差安装位),同一车型的所有车共用一份切好的单轮 mesh。
+        let Some(car_asset): Option<&MeshAsset> = car_assets.get(asset) else {
+            continue;
+        };
+        // 同一车型的车**共用**切好的 mesh,但每辆车仍然要建自己的批次 ——
+        // 批次持有 model matrix,不同车的轮子位置不同。
+        let meshes: Vec<usize> = match game.car_wheel_meshes.get(asset) {
+            Some(existing) => existing.clone(),
+            None => {
+                let mut built: Vec<usize> = Vec::new();
+                for slot in 0..4 {
+                    let mesh: usize = push_car_wheel(&mut game.scene, car_asset, slot);
+                    if mesh != usize::MAX {
+                        built.push(mesh);
+                    }
+                }
+                game.car_wheel_meshes
+                    .insert(asset.to_string(), built.clone());
+                built
+            }
+        };
+        for (slot, mesh) in meshes.iter().enumerate() {
+            let wheel_batch: usize = game.scene.push_batch_with_cull(*mesh, true, false);
+            game.car_wheel_batches.push(CarWheelBatch {
+                car: index,
+                slot,
+                mount: crate::traffic::WHEEL_MOUNTS[slot],
+                batch: wheel_batch,
+            });
+        }
     }
 
     // 拾取物:每个拾取物一个批次(自转相位独立)。
@@ -5094,6 +5362,25 @@ fn sync_dynamic_instances(game: &mut Game) {
             scene_batch
                 .instances
                 .push(Instance::new(position, car_yaw, 1.0, [1.0, 1.0, 1.0]));
+        }
+    }
+
+    // 车轮:跟着车身走,并绕自己的轮心自转。
+    for wheel in &game.car_wheel_batches {
+        let Some(car) = game.traffic.get_cars_ref().get(wheel.car) else {
+            continue;
+        };
+        let model: Mat4Data = car_wheel_model(
+            car.get_position(),
+            car.get_yaw(),
+            wheel.mount,
+            car.get_wheel_spin(),
+        );
+        if let Some(scene_batch) = game.scene.batches.get_mut(wheel.batch) {
+            scene_batch.instances.clear();
+            scene_batch
+                .instances
+                .push(Instance::from_model(model, [1.0, 1.0, 1.0]));
         }
     }
 
@@ -5480,6 +5767,8 @@ pub fn boot() {
         interiors: FloorWorld::new(),
         player_batches: Vec::new(),
         car_batches: Vec::new(),
+        car_wheel_batches: Vec::new(),
+        car_wheel_meshes: HashMap::new(),
         pickup_batches: Vec::new(),
         third_person: true,
         follow_target: [SPAWN_POINT[0], FOLLOW_HEIGHT, SPAWN_POINT[2]],
@@ -5617,6 +5906,9 @@ async fn load_assets_and_build(handles: GameHandles) {
     let mut index_map: HashMap<String, usize> = HashMap::new();
     let mut asset_bounds: HashMap<String, Bounds> = HashMap::new();
     let mut ped_suit: Option<MeshAsset> = None;
+    // 车辆资产要留着按 part 切轮子(`tyres` / `hubs` 各自被切成单个轮子),
+    // 与 `ped_suit` 同理:解析一次、留一份原始 part。
+    let mut car_assets: HashMap<String, MeshAsset> = HashMap::new();
     let mut scene: Scene = Scene::default();
     let mut failed: Vec<String> = Vec::new();
     let mut loaded: usize = 0;
@@ -5643,6 +5935,9 @@ async fn load_assets_and_build(handles: GameHandles) {
                         }
                         if *id == PED_SUIT {
                             ped_suit = Some(asset.clone());
+                        }
+                        if CAR_ASSET_IDS.contains(id) {
+                            car_assets.insert((*id).to_string(), asset.clone());
                         }
                         if let Err(message) = push_parsed_asset(&mut scene, &mut index_map, &asset)
                         {
@@ -5787,7 +6082,7 @@ async fn load_assets_and_build(handles: GameHandles) {
         populate_combatants(&mut game, 0.37);
         spawn_combat_batches(&mut game, &index_map);
         if let Some(ped) = ped_suit.as_ref() {
-            spawn_player_traffic_pickups(&mut game, &index_map, ped);
+            spawn_player_traffic_pickups(&mut game, &index_map, ped, &car_assets);
         }
         console_log(&format!(
             "[vcw] player rig: {} limb batches, {} cars, {} pickups, {} colliders",
@@ -5967,6 +6262,7 @@ pub fn app_root() -> VirtualNode {
 mod tests {
     use std::collections::HashMap;
 
+    use super::car_wheel_model;
     use crate::collision::CollisionWorld;
     use crate::r#const::{
         GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, PLAYER_BODY_HEIGHT, T_SHOWCASE_AXIS_ON_ROAD,
@@ -5991,6 +6287,7 @@ mod tests {
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
     use crate::player::WALK_SPEED;
+    use crate::r#type::Mat4Data;
     use crate::r#type::Vec2;
 
     /// 两栋样板楼楼板 + 楼梯的期望顶面高度之和(级高 × 级数)。
@@ -6403,6 +6700,84 @@ mod tests {
                 pos
             );
         }
+    }
+
+    /// 车轮矩阵:静止时轮心必须落在车的安装位上。
+    #[test]
+    fn wheel_model_places_the_axle_at_its_mount() {
+        let mounts: [[f32; 3]; 4] = crate::traffic::WHEEL_MOUNTS;
+        for mount in mounts {
+            let model: Mat4Data = car_wheel_model([10.0, 0.0, -5.0], 0.0, mount, 0.0);
+            // 列主序:平移在最后四个浮点里。
+            assert!(
+                (model[12] - (10.0 + mount[0])).abs() < 1e-5,
+                "轮心 X {} 应等于车身 X + 安装位 X {}",
+                model[12],
+                10.0 + mount[0]
+            );
+            assert!(
+                (model[13] - mount[1]).abs() < 1e-5,
+                "轮心 Y {} 应等于安装位 Y {}",
+                model[13],
+                mount[1]
+            );
+            assert!(
+                (model[14] - (-5.0 + mount[2])).abs() < 1e-5,
+                "轮心 Z {} 应等于车身 Z + 安装位 Z {}",
+                model[14],
+                -5.0 + mount[2]
+            );
+        }
+    }
+
+    /// 车轮矩阵:自转角必须真的改变朝向矩阵,不能只平移。
+    #[test]
+    fn wheel_spin_rotates_the_axle() {
+        let mount: [f32; 3] = crate::traffic::WHEEL_MOUNTS[0];
+        let rest: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, 0.0);
+        let turned: Mat4Data =
+            car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, std::f32::consts::FRAC_PI_2);
+        // 绕本地 X 自转:X 基向量不动,Y/Z 两个基向量在 XZ 平面上转 90 度。
+        // 列主序下第一列是 X 基向量(model[0..3]),所以要看 **第二、三列**。
+        let y_rest: [f32; 3] = [rest[4], rest[5], rest[6]];
+        let y_turned: [f32; 3] = [turned[4], turned[5], turned[6]];
+        let delta: f32 = (0..3)
+            .map(|axis: usize| (y_rest[axis] - y_turned[axis]).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            delta > 0.5,
+            "自转 90 度必须改变 Y 轴基向量,rest={:?} turned={:?}",
+            y_rest,
+            y_turned
+        );
+        // X 轴(轮轴方向)必须保持不变。
+        let x_rest: [f32; 3] = [rest[0], rest[1], rest[2]];
+        let x_turned: [f32; 3] = [turned[0], turned[1], turned[2]];
+        let axle: f32 = (0..3)
+            .map(|axis: usize| (x_rest[axis] - x_turned[axis]).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        assert!(axle < 1e-5, "绕 X 自转不得转动 X 轴本身,变化量 {}", axle);
+        // 旋转不改变轴心位置。
+        let centre_delta: f32 =
+            (rest[12] - turned[12]) + (rest[13] - turned[13]) + (rest[14] - turned[14]);
+        assert!(centre_delta.abs() < 1e-5, "自转不得移动轮心");
+    }
+
+    /// 车身转向:同一个安装位在不同车身朝向下必须落在不同世界位置。
+    #[test]
+    fn wheel_follows_the_body_yaw() {
+        let mount: [f32; 3] = crate::traffic::WHEEL_MOUNTS[0];
+        let east: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, 0.0);
+        let north: Mat4Data =
+            car_wheel_model([0.0, 0.0, 0.0], -std::f32::consts::FRAC_PI_2, mount, 0.0);
+        assert!(
+            (east[12] - north[14]).abs() < 1e-5,
+            "车身转 90 度后安装位应从 +X 转到 +Z,实际 {} vs {}",
+            east[12],
+            north[14]
+        );
     }
 
     #[test]

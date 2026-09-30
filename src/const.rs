@@ -1506,6 +1506,11 @@ pub const T_SHOWCASE_FRONT_FACING: &str = "外墙必须把玩家挡在临街面�
 pub const T_SHOWCASE_STAIR_REACHES_TOP: &str = "楼梯总高必须不小于二层楼板面高度";
 
 /// 单元测试断言文案:单级踏高必须小于踏高容差,否则爬不上楼梯。
+// ---- 车轮渲染:资产 part 名(§1.3c 字面量入 const) ----
+
+pub const PART_TYRES: &str = "tyres";
+pub const PART_HUBS: &str = "hubs";
+
 pub const T_SHOWCASE_STAIR_RISE_SHALLOW: &str = "单级踏高必须小于踏高容差,否则爬不上楼梯";
 
 /// 单元测试断言文案:模拟行走必须真的把玩家带到二层楼板面。
