@@ -657,13 +657,22 @@ impl Enemy {
         self.home
     }
 
+    /// 当前水平速度(XZ)。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 速度。
+    pub fn get_velocity(&self) -> Vec2 {
+        self.velocity
+    }
+
     /// 速度的模长。
     ///
     /// # Returns
     ///
     /// - `f32` - 速度大小(米/秒)。
     pub fn length(&self) -> f32 {
-        let v: Vec2 = self.velocity;
+        let v: Vec2 = self.get_velocity();
         (v[0] * v[0] + v[1] * v[1]).sqrt()
     }
 

@@ -1900,7 +1900,97 @@ impl AdaptiveQuality {
     ///
     /// - `QualityTier` - 档位。
     pub fn tier(&self) -> QualityTier {
+        self.get_tier()
+    }
+
+    /// 读 `tier` 字段。
+    ///
+    /// # Returns
+    ///
+    /// - `QualityTier` - 档位。
+    pub fn get_tier(&self) -> QualityTier {
         self.tier
+    }
+
+    /// 写 `tier` 字段。
+    ///
+    /// # Arguments
+    ///
+    /// - `QualityTier` - 新档位。
+    pub fn set_tier(&mut self, value: QualityTier) {
+        self.tier = value;
+    }
+
+    /// 读 `smoothed_fps` 字段(指数平滑后的实测帧率)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 平滑帧率。
+    pub fn get_smoothed_fps(&self) -> f32 {
+        self.smoothed_fps
+    }
+
+    /// 写 `smoothed_fps` 字段。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 新平滑帧率。
+    pub fn set_smoothed_fps(&mut self, value: f32) {
+        self.smoothed_fps = value;
+    }
+
+    /// 读 `slow_frames` 字段(连续慢帧计数)。
+    ///
+    /// # Returns
+    ///
+    /// - `u32` - 慢帧计数。
+    pub fn get_slow_frames(&self) -> u32 {
+        self.slow_frames
+    }
+
+    /// 写 `slow_frames` 字段。
+    ///
+    /// # Arguments
+    ///
+    /// - `u32` - 新慢帧计数。
+    pub fn set_slow_frames(&mut self, value: u32) {
+        self.slow_frames = value;
+    }
+
+    /// 读 `fast_frames` 字段(连续快帧计数)。
+    ///
+    /// # Returns
+    ///
+    /// - `u32` - 快帧计数。
+    pub fn get_fast_frames(&self) -> u32 {
+        self.fast_frames
+    }
+
+    /// 写 `fast_frames` 字段。
+    ///
+    /// # Arguments
+    ///
+    /// - `u32` - 新快帧计数。
+    pub fn set_fast_frames(&mut self, value: u32) {
+        self.fast_frames = value;
+    }
+
+    /// 读 `samples` 字段(已采样帧数)。
+    ///
+    /// # Returns
+    ///
+    /// - `u32` - 采样帧数。
+    pub fn get_samples(&self) -> u32 {
+        self.samples
+    }
+
+    /// 写 `samples` 字段。
+    ///
+    /// # Arguments
+    ///
+    /// - `u32` - 新采样帧数。
+    pub fn set_samples(&mut self, value: u32) {
+        self.samples = value;
     }
 
     /// 喂入一帧的实测帧率,必要时降档。
@@ -1916,38 +2006,40 @@ impl AdaptiveQuality {
         if fps <= 0.0 || !fps.is_finite() {
             return;
         }
-        if self.samples == 0 {
-            self.smoothed_fps = fps;
+        if self.get_samples() == 0 {
+            self.set_smoothed_fps(fps);
         } else {
-            self.smoothed_fps = self.smoothed_fps * FPS_SMOOTHING + fps * (1.0 - FPS_SMOOTHING);
+            self.set_smoothed_fps(
+                self.get_smoothed_fps() * FPS_SMOOTHING + fps * (1.0 - FPS_SMOOTHING),
+            );
         }
-        self.samples += 1;
+        self.set_samples(self.get_samples() + 1);
         // 前几秒不判 —— 管线刚建立起来的第一帧总是最慢的。
-        if self.samples < QUALITY_WARMUP_FRAMES {
+        if self.get_samples() < QUALITY_WARMUP_FRAMES {
             return;
         }
-        if self.smoothed_fps < QUALITY_DOWN_FPS {
-            self.slow_frames += 1;
-            self.fast_frames = 0;
-        } else if self.smoothed_fps > QUALITY_UP_FPS {
-            self.fast_frames += 1;
-            self.slow_frames = 0;
+        if self.get_smoothed_fps() < QUALITY_DOWN_FPS {
+            self.set_slow_frames(self.get_slow_frames() + 1);
+            self.set_fast_frames(0);
+        } else if self.get_smoothed_fps() > QUALITY_UP_FPS {
+            self.set_fast_frames(self.get_fast_frames() + 1);
+            self.set_slow_frames(0);
         } else {
-            self.slow_frames = 0;
-            self.fast_frames = 0;
+            self.set_slow_frames(0);
+            self.set_fast_frames(0);
         }
-        if self.slow_frames >= SLOW_FRAME_THRESHOLD {
-            self.slow_frames = 0;
-            self.tier = match self.tier {
+        if self.get_slow_frames() >= SLOW_FRAME_THRESHOLD {
+            self.set_slow_frames(0);
+            self.set_tier(match self.get_tier() {
                 QualityTier::High => QualityTier::Medium,
                 QualityTier::Medium => QualityTier::Low,
                 QualityTier::Low => QualityTier::Low,
-            };
+            });
         }
         // 升档只在明确很快、且已经稳定很久时发生,避免抖动。
-        if self.fast_frames >= FAST_FRAME_THRESHOLD && self.tier != QualityTier::High {
+        if self.get_fast_frames() >= FAST_FRAME_THRESHOLD && self.get_tier() != QualityTier::High {
             // 单向降级:这里刻意**不**执行升档。
-            self.fast_frames = 0;
+            self.set_fast_frames(0);
         }
     }
 }
@@ -2956,6 +3048,87 @@ impl WebGlRenderer {
         self.instance_capacity
     }
 
+    /// 读 `targets` 字段(增强管线的全部离屏目标)。
+    ///
+    /// # Returns
+    ///
+    /// - `&PipelineTargets` - 离屏目标集合。
+    fn get_targets(&self) -> &PipelineTargets {
+        &self.targets
+    }
+
+    /// 写 `targets` 字段(增强管线的全部离屏目标)。
+    ///
+    /// # Arguments
+    ///
+    /// - `PipelineTargets` - 新的离屏目标集合。
+    fn set_targets(&mut self, value: PipelineTargets) {
+        self.targets = value;
+    }
+
+    /// SSAO program 的克隆句柄。
+    ///
+    /// # Returns
+    ///
+    /// - `WebGlProgram` - SSAO program。
+    fn get_ssao_program(&self) -> WebGlProgram {
+        self.ssao_program.clone()
+    }
+
+    /// AO 模糊 program 的克隆句柄。
+    ///
+    /// # Returns
+    ///
+    /// - `WebGlProgram` - AO 模糊 program。
+    fn get_ao_blur_program(&self) -> WebGlProgram {
+        self.ao_blur_program.clone()
+    }
+
+    /// SSR program 的克隆句柄。
+    ///
+    /// # Returns
+    ///
+    /// - `WebGlProgram` - SSR program。
+    fn get_ssr_program(&self) -> WebGlProgram {
+        self.ssr_program.clone()
+    }
+
+    /// bloom 亮度提取 program 的克隆句柄。
+    ///
+    /// # Returns
+    ///
+    /// - `WebGlProgram` - 亮度提取 program。
+    fn get_bright_program(&self) -> WebGlProgram {
+        self.bright_program.clone()
+    }
+
+    /// bloom 模糊 program 的克隆句柄。
+    ///
+    /// # Returns
+    ///
+    /// - `WebGlProgram` - 模糊 program。
+    fn get_blur_program(&self) -> WebGlProgram {
+        self.blur_program.clone()
+    }
+
+    /// 合成 program 的克隆句柄。
+    ///
+    /// # Returns
+    ///
+    /// - `WebGlProgram` - 合成 program。
+    fn get_composite_program(&self) -> WebGlProgram {
+        self.composite_program.clone()
+    }
+
+    /// G-buffer program 的克隆句柄。
+    ///
+    /// # Returns
+    ///
+    /// - `WebGlProgram` - G-buffer program。
+    fn get_gbuffer_program(&self) -> WebGlProgram {
+        self.gbuffer_program.clone()
+    }
+
     /// 设置 instance buffer 的当前容量。
     ///
     /// # Arguments
@@ -3568,7 +3741,7 @@ impl WebGlRenderer {
     ///
     /// - `Result<(), String>` - 分配失败时的错误信息。
     fn ensure_targets(&mut self, width: u32, height: u32) -> Result<(), String> {
-        if self.targets.allocated == (width, height) && self.targets.scene.is_some() {
+        if self.get_targets().allocated == (width, height) && self.get_targets().scene.is_some() {
             return Ok(());
         }
         let context: WebGl2RenderingContext = self.get_context();
@@ -3587,7 +3760,7 @@ impl WebGlRenderer {
         let ssr_h: i32 = scaled(height, SSR_SCALE);
         let bloom_w: i32 = scaled(width, BLOOM_SCALE);
         let bloom_h: i32 = scaled(height, BLOOM_SCALE);
-        self.targets = PipelineTargets {
+        self.set_targets(PipelineTargets {
             shadow: Some(RenderTarget::new_depth(&context, SHADOW_MAP_SIZE as i32)?),
             scene: Some(RenderTarget::new_color(&context, w, h)?),
             gbuffer: Some(RenderTarget::new_color(&context, g_w, g_h)?),
@@ -3598,7 +3771,7 @@ impl WebGlRenderer {
             blur_ping: Some(RenderTarget::new_color(&context, bloom_w, bloom_h)?),
             blur_pong: Some(RenderTarget::new_color(&context, bloom_w, bloom_h)?),
             allocated: (width, height),
-        };
+        });
         Ok(())
     }
 
@@ -3674,9 +3847,9 @@ impl WebGlRenderer {
     /// - `f32` - 远裁剪面距离(米)。
     fn render_ao(&self, context: &WebGl2RenderingContext, fov_y: f32, aspect: f32, far: f32) {
         let (Some(ssao), Some(ao), Some(gbuffer)) = (
-            self.targets.ssao.as_ref(),
-            self.targets.ao.as_ref(),
-            self.targets.gbuffer.as_ref(),
+            self.get_targets().ssao.as_ref(),
+            self.get_targets().ao.as_ref(),
+            self.get_targets().gbuffer.as_ref(),
         ) else {
             return;
         };
@@ -3687,7 +3860,7 @@ impl WebGlRenderer {
         context.disable(WebGl2RenderingContext::BLEND);
         context.disable(WebGl2RenderingContext::CULL_FACE);
         context.viewport(0, 0, ssao.width, ssao.height);
-        context.use_program(Some(&self.ssao_program));
+        context.use_program(Some(&self.get_ssao_program()));
         // G-buffer 的「法线 + 线性深度」打包在同一张 RGBA8 上。
         Self::bind_sampler(
             context,
@@ -3709,7 +3882,7 @@ impl WebGlRenderer {
         // ---- 双边模糊 ----
         RenderTarget::bind(context, Some(ao));
         context.viewport(0, 0, ao.width, ao.height);
-        context.use_program(Some(&self.ao_blur_program));
+        context.use_program(Some(&self.get_ao_blur_program()));
         Self::bind_sampler(
             context,
             ssao.color.as_ref().unwrap_or(&ssao.depth),
@@ -3735,9 +3908,9 @@ impl WebGlRenderer {
     /// - `f32` - 远裁剪面距离(米)。
     fn render_ssr(&self, context: &WebGl2RenderingContext, fov_y: f32, aspect: f32, far: f32) {
         let (Some(ssr), Some(gbuffer), Some(scene)) = (
-            self.targets.ssr.as_ref(),
-            self.targets.gbuffer.as_ref(),
-            self.targets.scene.as_ref(),
+            self.get_targets().ssr.as_ref(),
+            self.get_targets().gbuffer.as_ref(),
+            self.get_targets().scene.as_ref(),
         ) else {
             return;
         };
@@ -3746,7 +3919,7 @@ impl WebGlRenderer {
         context.disable(WebGl2RenderingContext::BLEND);
         context.disable(WebGl2RenderingContext::CULL_FACE);
         context.viewport(0, 0, ssr.width, ssr.height);
-        context.use_program(Some(&self.ssr_program));
+        context.use_program(Some(&self.get_ssr_program()));
         Self::bind_sampler(
             context,
             gbuffer.color.as_ref().unwrap_or(&gbuffer.depth),
@@ -3785,10 +3958,10 @@ impl WebGlRenderer {
     /// - `&WebGl2RenderingContext` - WebGl2RenderingContext 的只读引用。
     fn render_bloom(&self, context: &WebGl2RenderingContext) {
         let (Some(scene), Some(bright), Some(ping), Some(pong)) = (
-            self.targets.scene.as_ref(),
-            self.targets.bright.as_ref(),
-            self.targets.blur_ping.as_ref(),
-            self.targets.blur_pong.as_ref(),
+            self.get_targets().scene.as_ref(),
+            self.get_targets().bright.as_ref(),
+            self.get_targets().blur_ping.as_ref(),
+            self.get_targets().blur_pong.as_ref(),
         ) else {
             return;
         };
@@ -3798,7 +3971,7 @@ impl WebGlRenderer {
         // ---- 亮度提取 ----
         RenderTarget::bind(context, Some(bright));
         context.viewport(0, 0, bright.width, bright.height);
-        context.use_program(Some(&self.bright_program));
+        context.use_program(Some(&self.get_bright_program()));
         Self::bind_sampler(
             context,
             scene.color.as_ref().unwrap_or(&scene.depth),
@@ -3810,7 +3983,7 @@ impl WebGlRenderer {
         // ---- 水平模糊 ----
         RenderTarget::bind(context, Some(ping));
         context.viewport(0, 0, ping.width, ping.height);
-        context.use_program(Some(&self.blur_program));
+        context.use_program(Some(&self.get_blur_program()));
         Self::bind_sampler(
             context,
             bright.color.as_ref().unwrap_or(&bright.depth),
@@ -3858,16 +4031,16 @@ impl WebGlRenderer {
         height: u32,
         time: f32,
     ) {
-        let Some(scene) = self.targets.scene.as_ref() else {
+        let Some(scene) = self.get_targets().scene.as_ref() else {
             return;
         };
-        let bloom: Option<&RenderTarget> = self.targets.blur_pong.as_ref();
+        let bloom: Option<&RenderTarget> = self.get_targets().blur_pong.as_ref();
         RenderTarget::bind(context, None);
         context.viewport(0, 0, width as i32, height as i32);
         context.disable(WebGl2RenderingContext::DEPTH_TEST);
         context.disable(WebGl2RenderingContext::BLEND);
         context.disable(WebGl2RenderingContext::CULL_FACE);
-        context.use_program(Some(&self.composite_program));
+        context.use_program(Some(&self.get_composite_program()));
         Self::bind_sampler(
             context,
             scene.color.as_ref().unwrap_or(&scene.depth),
@@ -3983,7 +4156,7 @@ impl WebGlRenderer {
         let light_matrix: Mat4 = shadow_view_projection(shadow_focus, lighting.light_dir);
 
         // ---- 1) 阴影 pass ----
-        if let Some(shadow) = self.targets.shadow.as_ref() {
+        if let Some(shadow) = self.get_targets().shadow.as_ref() {
             RenderTarget::bind(&context, Some(shadow));
             context.viewport(0, 0, shadow.width, shadow.height);
             // 阴影贴图要从 1.0 清到「最远」:正交投影下深度是线性的,
@@ -4018,7 +4191,7 @@ impl WebGlRenderer {
         }
 
         // ---- 2) G-buffer pass ----
-        if let Some(gbuffer) = self.targets.gbuffer.as_ref() {
+        if let Some(gbuffer) = self.get_targets().gbuffer.as_ref() {
             RenderTarget::bind(&context, Some(gbuffer));
             context.viewport(0, 0, gbuffer.width, gbuffer.height);
             context.clear_color(0.5, 0.5, 1.0, 1.0);
@@ -4030,7 +4203,7 @@ impl WebGlRenderer {
             context.disable(WebGl2RenderingContext::BLEND);
             context.enable(WebGl2RenderingContext::CULL_FACE);
             context.cull_face(WebGl2RenderingContext::BACK);
-            context.use_program(Some(&self.gbuffer_program));
+            context.use_program(Some(&self.get_gbuffer_program()));
             context.uniform_matrix4fv_with_f32_array(
                 self.get_uniform_gbuffer_view(),
                 false,
@@ -4140,10 +4313,10 @@ impl WebGlRenderer {
         context.uniform1f(self.get_uniform_ambient_hemi(), lighting.ambient_hemi);
         context.uniform1f(self.get_uniform_ao_strength(), lighting.ao_strength);
         context.uniform1f(self.get_uniform_ssr_strength(), lighting.ssr_strength);
-        if let Some(shadow) = self.targets.shadow.as_ref() {
+        if let Some(shadow) = self.get_targets().shadow.as_ref() {
             Self::bind_sampler(&context, &shadow.depth, 0, self.get_uniform_shadow_map());
         }
-        if let Some(ao) = self.targets.ao.as_ref() {
+        if let Some(ao) = self.get_targets().ao.as_ref() {
             Self::bind_sampler(
                 &context,
                 ao.color.as_ref().unwrap_or(&ao.depth),
@@ -4151,7 +4324,7 @@ impl WebGlRenderer {
                 self.get_uniform_ao_map(),
             );
         }
-        if let Some(ssr) = self.targets.ssr.as_ref() {
+        if let Some(ssr) = self.get_targets().ssr.as_ref() {
             Self::bind_sampler(
                 &context,
                 ssr.color.as_ref().unwrap_or(&ssr.depth),
@@ -4273,12 +4446,12 @@ impl WebGlRenderer {
         if quality.wants_ssao() {
             self.render_ao(&context, fov_y, aspect, far);
         } else {
-            self.clear_to_neutral(&context, &self.targets.ao, NEUTRAL_AO);
+            self.clear_to_neutral(&context, &self.get_targets().ao, NEUTRAL_AO);
         }
         if quality.wants_ssr() {
             self.render_ssr(&context, fov_y, aspect, far);
         } else {
-            self.clear_to_neutral(&context, &self.targets.ssr, NEUTRAL_SSR);
+            self.clear_to_neutral(&context, &self.get_targets().ssr, NEUTRAL_SSR);
         }
         self.render_bloom(&context);
         self.render_composite(&context, lighting, width, height, time);

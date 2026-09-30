@@ -73,6 +73,15 @@ impl FloorWorld {
         &self.floors
     }
 
+    /// 全部室内碰撞体的可变视图。
+    ///
+    /// # Returns
+    ///
+    /// - `&mut Vec<Floor>` - 楼板与隔墙表。
+    pub fn get_floors_mut(&mut self) -> &mut Vec<Floor> {
+        &mut self.floors
+    }
+
     /// 追加一块水平楼板(玩家站在它的 `max[1]` 面上)。
     ///
     /// # Arguments
@@ -80,7 +89,7 @@ impl FloorWorld {
     /// - `Vec3` - 楼板的世界空间下角。
     /// - `Vec3` - 楼板的世界空间上角。
     pub fn push_slab(&mut self, min: Vec3, max: Vec3) {
-        self.floors.push(Floor::Slab { min, max });
+        self.get_floors_mut().push(Floor::Slab { min, max });
     }
 
     /// 追加一段竖直隔墙。
@@ -90,7 +99,7 @@ impl FloorWorld {
     /// - `Vec3` - 墙脚的世界空间下角。
     /// - `Vec3` - 墙顶的世界空间上角。
     pub fn push_wall(&mut self, min: Vec3, max: Vec3) {
-        self.floors.push(Floor::Wall { min, max });
+        self.get_floors_mut().push(Floor::Wall { min, max });
     }
 
     /// 玩家脚下应该踩的高度:在「不高于 `from_y + STEP_UP_TOLERANCE`」的

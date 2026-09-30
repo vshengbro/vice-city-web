@@ -244,7 +244,7 @@ impl Player {
     ///
     /// - `f32` - 增量(可以为负)。
     pub fn add_armor(&mut self, amount: f32) {
-        self.armor = (self.armor + amount).clamp(0.0, MAX_ARMOR);
+        self.set_armor((self.get_armor() + amount).clamp(0.0, MAX_ARMOR));
     }
 
     /// 已拾取的现金。
