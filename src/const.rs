@@ -1592,3 +1592,31 @@ pub const T_SHOWCASE_OVERLAPS_ORDINARY: &str = "与普通楼 ({:.1},{:.1}) 的�
 
 /// 单元测试断言文案:二维碰撞体不得堵死门洞。
 pub const T_SHOWCASE_DOORWAY_2D_BLOCKED: &str = "的门洞被二维碰撞体堵住";
+
+/// 断言信息:样板楼门洞必须落在外墙面上,而不是内墙净跨的边界。
+pub const T_SHOWCASE_DOOR_ON_OUTER_WALL: &str = "showcase doorway is on the inner wall face";
+
+/// 断言信息:走路线的路点必须互不相同、相邻间距大于一个身位。
+pub const T_SHOWCASE_ROUTE_WALKABLE: &str =
+    "showcase walk route has duplicate or too-close waypoints";
+
+/// 验收通道:探针结果挂在这个 window 属性上。
+pub const K_PROBE_WINDOW: &str = "__vcw_probe";
+/// 验收通道:`__vcw_teleport` 请求里的 `probe` 字段 —— 打印玩家四周的墙。
+pub const K_TELEPORT_PROBE: &str = "probe";
+/// 验收通道:`__vcw_teleport` 请求里的 `speed` 字段 —— 时间加速倍率。
+pub const K_TELEPORT_SPEED: &str = "speed";
+/// 验收通道:`__vcw_teleport` 请求里的 `safe` 字段 —— 打开无敌。
+pub const K_TELEPORT_SAFE: &str = "safe";
+/// 验收通道:`__vcw_teleport` 请求里的 `walk` 字段 —— 持续走位方向。
+pub const K_TELEPORT_WALK: &str = "walk";
+/// 验收通道:`__vcw_teleport` 请求里的 `hold` 字段 —— 注入开火剩余帧数。
+pub const K_TELEPORT_HOLD: &str = "hold";
+
+/// 验收通道:瞄准请求挂在这个 window 属性上。
+pub const K_AIM_WINDOW: &str = "__vcw_aim";
+/// 断言信息:路线的一段同时动了 X 和 Z(楼里有隔墙,斜线会撞上)。
+pub const T_ROUTE_LEG_DIAGONAL: &str = "a route leg moves on both axes";
+
+/// 验收通道:传送 / 走位 / 加速 / 探针请求挂在这个 window 属性上。
+pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";

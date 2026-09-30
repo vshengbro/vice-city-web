@@ -207,24 +207,144 @@ const SPAWN_YAW: f32 = std::f32::consts::FRAC_PI_2;
 //              ...
 // ```
 //
-// `CITY_HALF` 是城市的半边长(米),4 条南北向 + 4 条东西向街道 = 4×4
+// 城市是**无限**的:街道轴线落在 `STREET_PITCH * k` 上,没有边界。
 // = 16 个网格路口,每个路口四角都有红绿灯。
 // ===========================================================================
 
-/// 城市的半边长(米):地面覆盖 [-150, 150] × [-150, 150],即 300 m × 300 m。
-const CITY_HALF: f32 = 150.0;
 /// 街道半宽(路面,不含人行道)。
 const STREET_HALF_WIDTH: f32 = 7.0;
 /// 人行道宽度(单侧)。
 const SIDEWALK_WIDTH: f32 = 3.6;
-/// 网格街道的轴线坐标(正负各一条,共 4 条)。
-const STREET_LINES: &[f32] = &[-90.0, -30.0, 30.0, 90.0];
+/// 相邻两条街道轴线之间的间距(米)。
+///
+/// 世界是**无限**的:轴线落在 `STREET_PITCH * k`(k 为任意整数)上,没有
+/// 边界。原先这是一张写死的 `&[-90, -30, 30, 90]`,城市被锁死在
+/// `[-150, 150]`,玩家走到 149 m 就撞墙。
+const STREET_PITCH: f32 = 60.0;
+/// 街区 / 道具的生成半径(米):以玩家为中心,这个半径内才生成城市内容。
+///
+/// 真实视距比这个小得多,但建筑有高度、街道有宽度,半径太小会看到
+/// 「楼凭空出现」。这一档取 300 m,配合 22 m 的剔除半径已经够远。
+const BLOCK_VIEW_RADIUS: f32 = 300.0;
+/// 街道索引的绝对值上限(安全阀)。
+///
+/// 街道索引本身没有上限 —— 真正的边界是**视距**。这个常量只保证
+/// 浮点坐标在荒谬远处时不至于让 `hash` 之类的位运算溢出,并且给
+/// 「玩家跑到多远算跑出世界」一个可测的判据。
+const STREET_INDEX_LIMIT: i32 = 100_000;
 /// 街区内部沿道路方向的楼间距(米),留出巷子 / 后巷。
 const LOT_PITCH: f32 = 34.0;
 /// 建筑围合的「内圈」半径(米):离街区中心多远开始放楼。
 const BLOCK_INNER: f32 = 11.0;
-/// 地面网格在每个方向上的分段数(整城一次,不是每街区一次)。
+/// 地面网格在每个方向上的分段数(整块一次,不是每街区一次)。
 const GROUND_SUBDIV: usize = 192;
+/// 地面网格单块的边长(米):以玩家为中心,左右各这么多。
+///
+/// 旧值是 300 m,固定铺满整城。世界改成无限之后
+/// 玩家可以一直往外走,300 m 必然不够 —— 现在这块地面会跟着玩家
+/// 重新生成,边长只决定「一次生成多少顶点」。
+const GROUND_SPAN: f32 = 480.0;
+/// 地面网格重新生成的步长(米):玩家走满这么远才重算一次。
+const GROUND_CELL_ALIGN: f32 = STREET_PITCH;
+
+/// 沿每条街道反复行走的「世界循环」—— 替代原先固定有限区间的一次性区间。
+///
+/// 原写法把每种道具的摆放都写成「遍历一张写死的街道数组,再在一个
+/// 有限区间上 while 循环」。世界改成无限之后这两层都必须按需枚举,
+/// 而每个调用点的「留边距」数值不同(`+18` / `+26` / `+40` / `+34` /
+/// `+20`),写成通用迭代器会把留边距吞进闭包,读代码时看不出某个道具
+/// 到底离路口多远。所以这里保留显式区间,只把「街道来自哪里」换掉。
+///
+/// # Arguments
+///
+/// - `f32` - 中心 X 坐标(米)。
+/// - `f32` - 中心 Z 坐标(米)。
+/// - `f32` - 距中心的生成半径(米)。
+/// - `f32` - 沿街道方向的端点留边距(米)。
+///
+/// # Returns
+///
+/// - `Vec<(f32, f32, f32)>` - 每条街道的 `(轴线坐标, 起点, 终点)`,起点
+///   终点已扣掉端点留边距。
+fn street_strips(center: f32, radius: f32, margin: f32) -> Vec<(f32, f32, f32)> {
+    // 区间只由这一个中心决定。早期版本把「街道轴线方向的坐标」和
+    // 「沿线方向的范围中心」一起取 min/max 当边界,于是中心在
+    // (-6000, 1500) 时区间被撑成 7750 m 宽,每一段街道都铺了远超
+    // 地面块的范围。
+    let lo: f32 = (center - radius).floor() - margin;
+    let hi: f32 = (center + radius).ceil() + margin;
+    let mut out: Vec<(f32, f32, f32)> = Vec::new();
+    for index in street_indices_in(lo, hi) {
+        out.push((street_axis(index), lo + margin, hi - margin));
+    }
+    out
+}
+
+/// 地面块覆盖的沿线区间(起点, 终点)。
+///
+/// 与 [`street_strips`] 分开是因为「哪条街道」和「铺多远」是两个问题:
+/// 南北向街道的**轴线**由 X 中心决定,而它**沿线铺的长度**由 Z 中心
+/// 决定。两个中心混在一起用(旧实现),一块以 (-6000, 1500) 为心的地面
+/// 里会混进 x = -6240 的路缘石 —— 顶点离中心整整 7700 m。
+///
+/// # Arguments
+///
+/// - `f32` - 沿线中心(米)。
+/// - `f32` - 生成半径(米)。
+///
+/// # Returns
+///
+/// - `(f32, f32)` - `(起点, 终点)`,单位米。
+fn ground_along_span(along_center: f32, radius: f32) -> (f32, f32) {
+    (
+        (along_center - radius).floor(),
+        (along_center + radius).ceil(),
+    )
+}
+
+/// 第 `index` 条街道的轴线世界坐标。
+///
+/// # Arguments
+///
+/// - `i32` - 街道索引(任意整数,正负皆可,`0` 就是世界原点那条)。
+///
+/// # Returns
+///
+/// - `f32` - 街道轴线的 X 或 Z 坐标(米)。
+fn street_axis(index: i32) -> f32 {
+    STREET_PITCH * index as f32
+}
+
+/// 枚举覆盖 `[lo, hi]` 区间的全部街道索引。
+///
+/// 世界没有边界,任何摆放逻辑都不能再遍历一张写死的数组 —— 只能问
+/// 「这段区间里有哪些街道」。索引经由 [`street_axis`] 反算回来,所以
+/// 区间恰好压在网格边界上时不会多出或漏掉一条。
+///
+/// # Arguments
+///
+/// - `f32` - 区间下界(米)。
+/// - `f32` - 区间上界(米)。
+///
+/// # Returns
+///
+/// - `Vec<i32>` - 落在区间内的街道索引,升序。
+fn street_indices_in(lo: f32, hi: f32) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::new();
+    if hi < lo {
+        return out;
+    }
+    let first: i32 = (lo / STREET_PITCH).ceil() as i32;
+    let last: i32 = (hi / STREET_PITCH).floor() as i32;
+    let mut index: i32 = first.clamp(-STREET_INDEX_LIMIT, STREET_INDEX_LIMIT);
+    while index <= last {
+        if index >= -STREET_INDEX_LIMIT && index <= STREET_INDEX_LIMIT {
+            out.push(index);
+        }
+        index += 1;
+    }
+    out
+}
 
 /// 网格街道之间的一个街区:楼围合出一个内部院落,而不是沿街一条线。
 struct BlockLayout {
@@ -240,12 +360,43 @@ struct BlockLayout {
 ///
 /// - `Vec<BlockLayout>` - 9 个街区中心,顺序为行优先(先 z 后 x)。
 fn block_layouts() -> Vec<BlockLayout> {
+    blocks_near(0.0, 0.0, BLOCK_VIEW_RADIUS)
+}
+
+/// 枚举玩家视距内的全部街区中心。
+///
+/// 街区由**相邻两条街道**围成,所以街区数是街道数的两倍关系;在
+/// 无限网格上不能遍历写死数组,只能按玩家位置取一段索引区间。
+/// 区间两端各多取一条街道,保证跨过玩家位置的街区不会被切掉。
+///
+/// # Arguments
+///
+/// - `f32` - 玩家 X 坐标(米)。
+/// - `f32` - 玩家 Z 坐标(米)。
+/// - `f32` - 生成半径(米)。
+///
+/// # Returns
+///
+/// - `Vec<BlockLayout>` - 视距内的街区中心。
+fn blocks_near(x: f32, z: f32, radius: f32) -> Vec<BlockLayout> {
+    let lo_x: f32 = x - radius;
+    let hi_x: f32 = x + radius;
+    let lo_z: f32 = z - radius;
+    let hi_z: f32 = z + radius;
+    let xs: Vec<i32> = street_indices_in(lo_x - STREET_PITCH, hi_x + STREET_PITCH);
+    let zs: Vec<i32> = street_indices_in(lo_z - STREET_PITCH, hi_z + STREET_PITCH);
     let mut out: Vec<BlockLayout> = Vec::new();
-    for i in 0..STREET_LINES.len().saturating_sub(1) {
-        for j in 0..STREET_LINES.len().saturating_sub(1) {
+    for (i, ix) in xs.iter().enumerate() {
+        if i + 1 >= xs.len() {
+            break;
+        }
+        for (j, iz) in zs.iter().enumerate() {
+            if j + 1 >= zs.len() {
+                break;
+            }
             out.push(BlockLayout {
-                cx: (STREET_LINES[i] + STREET_LINES[j + 1]) * 0.5,
-                cz: (STREET_LINES[j] + STREET_LINES[j + 1]) * 0.5,
+                cx: (street_axis(*ix) + street_axis(xs[i + 1])) * 0.5,
+                cz: (street_axis(*iz) + street_axis(zs[j + 1])) * 0.5,
             });
         }
     }
@@ -315,17 +466,11 @@ fn on_roadway_raw(x: f32, z: f32, margin: f32) -> bool {
 /// - `bool` - `true` 表示压在沥青面上。
 fn on_roadway_inner(x: f32, z: f32, margin: f32) -> bool {
     let reach: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH + margin;
-    let mut on_x_road: bool = false;
-    let mut on_z_road: bool = false;
-    for line in STREET_LINES {
-        if (x - *line).abs() <= reach {
-            on_z_road = true;
-        }
-        if (z - *line).abs() <= reach {
-            on_x_road = true;
-        }
-    }
-    on_x_road || on_z_road
+    // 街道是无限密的,「到最近街道轴线的距离」闭式可解,不用枚举:
+    // 索引取 round(坐标 / 间距),轴线就是间距乘回去。
+    let nearest_x: f32 = street_axis((x / STREET_PITCH).round() as i32);
+    let nearest_z: f32 = street_axis((z / STREET_PITCH).round() as i32);
+    (x - nearest_x).abs() <= reach || (z - nearest_z).abs() <= reach
 }
 
 /// 一栋楼在场景里的摆放。
@@ -449,7 +594,7 @@ const BLOCK_RING: &[(f32, f32, f32)] = &[
 /// 门洞都朝着出生点 —— 推门就进,不用找。
 ///
 /// 坐标不是拍脑袋写的,是一次性网格搜索的结果,四个条件同时成立:
-/// 1. **不压车行道**:外轮廓的每个角离所有 `STREET_LINES` 都大于
+/// 1. **不压车行道**:外轮廓的每个角离所有街道轴线都大于
 ///    `STREET_HALF_WIDTH + SIDEWALK_WIDTH`(硬约束,见 `on_roadway`)。
 /// 2. **不与程序化楼重叠**:与 `build_city_buildings` 的每一栋都留 1 m。
 /// 3. **门前有一块 7 m 长的空地**:沿门洞法线往外采样,既没有别的楼,
@@ -467,14 +612,36 @@ const SHOWCASE_YAW: f32 = std::f32::consts::FRAC_PI_2;
 /// 样板楼 B 的朝向与 A 相反,让两栋的门相向。
 const SHOWCASE_YAW_FLIPPED: f32 = -std::f32::consts::FRAC_PI_2;
 
-/// 样板楼 A(LOFT)的中心 X 坐标(米)。
-const SHOWCASE_LOFT_X: f32 = -11.0;
-/// 样板楼 A(LOFT)的中心 Z 坐标(米)。
-const SHOWCASE_LOFT_Z: f32 = 7.0;
-/// 样板楼 B(SHOP)的中心 X 坐标(米)。
-const SHOWCASE_SHOP_X: f32 = 11.0;
-/// 样板楼 B(SHOP)的中心 Z 坐标(米)。
-const SHOWCASE_SHOP_Z: f32 = 7.0;
+/// 样板楼 A(LOFT)所在街区的 X 索引 —— 街区中心在 `STREET_PITCH * k`。
+const SHOWCASE_LOFT_BLOCK_X: i32 = 0;
+/// 样板楼 A(LOFT)相对街区中心的 X 偏移(米)。
+///
+/// 偏移是必需的:街区中心正好落在两条街道的**中线上**吗?不 —— 街区
+/// 中心就是 `PITCH * k`,而街道轴线也在 `PITCH * k`,所以街区中心
+/// **就在街道上**。要放楼必须往街区内部挪,离两侧街道都留够
+/// `STREET_HALF_WIDTH + SIDEWALK_WIDTH`。
+const SHOWCASE_LOFT_OFFSET_X: f32 = -7.0;
+/// 样板楼 A(LOFT)所在街区的 Z 索引。
+const SHOWCASE_LOFT_BLOCK_Z: i32 = 0;
+/// 样板楼 A(LOFT)相对街区中心的 Z 偏移(米)。
+const SHOWCASE_LOFT_OFFSET_Z: f32 = 0.0;
+/// 样板楼 B(SHOP)所在街区的 X 索引。
+const SHOWCASE_SHOP_BLOCK_X: i32 = 0;
+/// 样板楼 B(SHOP)相对街区中心的 X 偏移(米)—— 与 A 相向而开。
+const SHOWCASE_SHOP_OFFSET_X: f32 = 7.0;
+/// 样板楼 B(SHOP)所在街区的 Z 索引。
+const SHOWCASE_SHOP_BLOCK_Z: i32 = 0;
+/// 样板楼 B(SHOP)相对街区中心的 Z 偏移(米)。
+const SHOWCASE_SHOP_OFFSET_Z: f32 = 0.0;
+/// 门洞在资产本地坐标里的 Z(米)—— `interior` 里的外墙就铺在这个面上。
+///
+/// 之前这个数字只以字面量 `6.4` 出现在 `interior.rs` 的四面墙里,验收
+/// 脚本要导航到门口时只能从源码里抄一遍。抄出来的数字和真实墙面差
+/// 0.1 m 就走不进门,与其抄不如让它成为一处命名常量。
+const SHOWCASE_DOOR_Z: f32 = 6.4;
+
+/// 外墙厚度(米)—— 与 `interior` 里铺墙用的 `WALL_T` 是同一个数。
+const SHOWCASE_WALL_THICKNESS: f32 = 0.2;
 
 /// 程序化生成整座城市的建筑布局。
 ///
@@ -482,12 +649,17 @@ const SHOWCASE_SHOP_Z: f32 = 7.0;
 /// 相邻两栋之间;街区之间再穿插路口四角的对角楼,让街道交叉口
 /// 也有转角的门面。
 ///
+/// # Arguments
+///
+/// - `f32` - 流式生成中心的世界 X(米)。
+/// - `f32` - 流式生成中心的世界 Z(米)。
+///
 /// # Returns
 ///
 /// - `Vec<BuildingPlacement>` - 全城建筑摆放表(不含两栋可进入样板楼,
 ///   它们由 [`showcase_placements`] 单独提供)。
-fn build_city_buildings() -> Vec<BuildingPlacement> {
-    build_city_buildings_with(BUILDING_FOOTPRINT_GUARD)
+fn build_city_buildings(cx: f32, cz: f32) -> Vec<BuildingPlacement> {
+    build_city_buildings_with(BUILDING_FOOTPRINT_GUARD, cx, cz)
 }
 
 /// 可进入样板楼的**内墙之间**净跨(米),即资产 `floor_ground` 的 XZ 尺寸。
@@ -563,19 +735,250 @@ fn showcase_specs() -> [ShowcaseSpec; 2] {
     [
         ShowcaseSpec {
             asset: BLDG_LOFT_SHOWCASE,
-            position: [SHOWCASE_LOFT_X, SHOWCASE_LOFT_Z],
+            position: showcase_position(
+                SHOWCASE_LOFT_BLOCK_X,
+                SHOWCASE_LOFT_BLOCK_Z,
+                SHOWCASE_LOFT_OFFSET_X,
+                SHOWCASE_LOFT_OFFSET_Z,
+            ),
             yaw: SHOWCASE_YAW,
             span: showcase_span(BLDG_LOFT_SHOWCASE),
             half: showcase_half(BLDG_LOFT_SHOWCASE),
         },
         ShowcaseSpec {
             asset: BLDG_SHOP_SHOWCASE,
-            position: [SHOWCASE_SHOP_X, SHOWCASE_SHOP_Z],
+            position: showcase_position(
+                SHOWCASE_SHOP_BLOCK_X,
+                SHOWCASE_SHOP_BLOCK_Z,
+                SHOWCASE_SHOP_OFFSET_X,
+                SHOWCASE_SHOP_OFFSET_Z,
+            ),
             yaw: SHOWCASE_YAW_FLIPPED,
             span: showcase_span(BLDG_SHOP_SHOWCASE),
             half: showcase_half(BLDG_SHOP_SHOWCASE),
         },
     ]
+}
+
+/// 程序化楼是否压到了某栋样板楼的占地。
+///
+/// # Arguments
+///
+/// - `f32` - 程序化楼中心 X(米)。
+/// - `f32` - 程序化楼中心 Z(米)。
+/// - `f32` - 程序化楼的保守半径(米)。
+///
+/// # Returns
+///
+/// - `bool` - `true` 表示会重叠,这一栋必须放弃。
+fn hits_a_showcase(x: f32, z: f32, radius: f32) -> bool {
+    showcase_specs().iter().any(|spec: &ShowcaseSpec| {
+        let dx: f32 = (x - spec.position[0]).abs();
+        let dz: f32 = (z - spec.position[1]).abs();
+        dx < radius + spec.half[0] && dz < radius + spec.half[1]
+    })
+}
+
+/// 把「街区索引 + 街区内偏移」换算成世界坐标。
+///
+/// # Arguments
+///
+/// - `i32` - 街区 X 方向的街道索引(街区中心 = 轴线 + 半间距)。
+/// - `i32` - 街区 Z 方向的街道索引。
+/// - `f32` - 街区内 X 偏移(米)。
+/// - `f32` - 街区内 Z 偏移(米)。
+///
+/// # Returns
+///
+/// - `Vec2` - 世界 XZ 坐标(米)。
+fn showcase_position(block_x: i32, block_z: i32, offset_x: f32, offset_z: f32) -> Vec2 {
+    [
+        street_axis(block_x) + STREET_PITCH * 0.5 + offset_x,
+        street_axis(block_z) + STREET_PITCH * 0.5 + offset_z,
+    ]
+}
+
+/// 某栋样板楼门洞正前方的世界坐标 —— 验收脚本的导航目标。
+///
+/// 门在资产本地 `+Z = SHOWCASE_DOOR_Z` 处(见 [`interior`]),朝向由
+/// `yaw` 旋转。脚本必须走到这个点**再往里走**,朝随机方向走只会撞到
+/// 建筑外墙上,永远进不去 —— 上一轮「上楼失败」就是这么来的。
+///
+/// # Arguments
+///
+/// - `f32` - 样板楼中心的 X(米)。
+/// - `f32` - 样板楼中心的 Z(米)。
+/// - `f32` - 样板楼 yaw(弧度,绕 Y)。
+/// - `f32` - 往门外多站一点(米)。
+///
+/// # Returns
+///
+/// - `Vec3` - 门外站位的世界坐标。
+pub fn showcase_door_approach(x: f32, z: f32, yaw: f32, outside: f32) -> Vec3 {
+    let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+    // 本地 +Z 轴经 yaw 旋转后的世界方向。
+    let forward: [f32; 2] = [sin_yaw, cos_yaw];
+    let reach: f32 = SHOWCASE_DOOR_Z + outside;
+    [x + forward[0] * reach, 0.0, z + forward[1] * reach]
+}
+
+/// 把**资产本地**的 XZ 坐标变成世界坐标。
+///
+/// 本地坐标用来描述「门洞在正前方」「楼梯贴着 +X 内墙」这些**与朝向无关**
+/// 的事实,再旋到世界。两栋样板楼朝向相反(`+π/2` 与 `−π/2`),写死世界
+/// +Z 是门面的做法朝向一改就全错。
+///
+/// # Arguments
+///
+/// - `usize` - 样板楼序号(0 = LOFT, 1 = SHOP)。
+/// - `Vec2` - 本地 XZ。
+///
+/// # Returns
+///
+/// - `Vec2` - 世界 XZ。
+pub fn showcase_to_world(index: usize, local: Vec2) -> Vec2 {
+    let specs: [ShowcaseSpec; 2] = showcase_specs();
+    let spec: &ShowcaseSpec = &specs[index];
+    let (sin_yaw, cos_yaw): (f32, f32) = spec.yaw.sin_cos();
+    [
+        spec.position[0] + local[0] * cos_yaw + local[1] * sin_yaw,
+        spec.position[1] - local[0] * sin_yaw + local[1] * cos_yaw,
+    ]
+}
+
+/// 门洞中心的世界坐标(本地 `z = span.z / 2`)。
+///
+/// # Arguments
+///
+/// - `usize` - 样板楼序号。
+///
+/// # Returns
+///
+/// - `Vec2` - 门洞中心世界 XZ。
+pub fn showcase_door_center(index: usize) -> Vec2 {
+    let specs: [ShowcaseSpec; 2] = showcase_specs();
+    // 门开在**外墙面**上,不是内墙面。外墙在本地 `z = half.z + WALL_T`,
+    // 内墙净跨只到 `span.z / 2`;两者差 1.65 m。之前这里返回内墙面,
+    // 于是「门外 1.5 m」这个落点正好卡在外墙与内墙之间的夹缝里 ——
+    // 玩家一出生就被两堵墙夹住,往里走不动、往外走被弹回,
+    // 浏览器里表现为「进了门洞但原地打转」。
+    showcase_to_world(index, [0.0, specs[index].half[1] + SHOWCASE_WALL_THICKNESS])
+}
+
+/// 门洞法线的世界方向(本地 +Z 旋到世界)。
+///
+/// # Arguments
+///
+/// - `usize` - 样板楼序号。
+///
+/// # Returns
+///
+/// - `Vec2` - 外法线世界 XZ。
+pub fn showcase_front_normal(index: usize) -> Vec2 {
+    let yaw: f32 = showcase_specs()[index].yaw;
+    [yaw.sin(), yaw.cos()]
+}
+
+/// 世界 XZ 反算回资产本地 XZ(把 [`showcase_to_world`] 逆转)。
+///
+/// # Arguments
+///
+/// - `usize` - 样板楼序号。
+/// - `Vec2` - 世界 XZ。
+///
+/// # Returns
+///
+/// - `Vec2` - 本地 XZ。
+pub fn showcase_to_local(index: usize, world: Vec2) -> Vec2 {
+    let specs: [ShowcaseSpec; 2] = showcase_specs();
+    let spec: &ShowcaseSpec = &specs[index];
+    let (sin_yaw, cos_yaw): (f32, f32) = spec.yaw.sin_cos();
+    let dx: f32 = world[0] - spec.position[0];
+    let dz: f32 = world[1] - spec.position[1];
+    [dx * cos_yaw - dz * sin_yaw, dx * sin_yaw + dz * cos_yaw]
+}
+
+/// 楼梯中线上的某一点的本地 XZ:楼梯贴着本地 +X 内墙。
+///
+/// # Arguments
+///
+/// - `usize` - 样板楼序号。
+/// - `f32` - 本地 Z。
+///
+/// # Returns
+///
+/// - `Vec2` - 世界 XZ。
+pub fn showcase_stair_point(index: usize, local_z: f32) -> Vec2 {
+    let span: [f32; 2] = showcase_specs()[index].span;
+    let stair_x: f32 = span[0] * 0.5 - SHOWCASE_STAIR_WIDTH * 0.5;
+    showcase_to_world(index, [stair_x, local_z])
+}
+
+/// 走进样板楼二层需要依次踩过的世界路点(验收脚本用)。
+///
+/// 门 → 隔墙缺口 → 楼梯跑段 → 二层楼板,一共 7 个点。之所以暴露出来,
+/// 是因为浏览器里**没法可靠地走位**:WASD 是相机相对的,无头浏览器又
+/// 接不上鼠标拖拽转向,靠按键盲走进门必然卡在墙里。逐点推进测的仍然是
+/// 真实的 `step_vertical` 垂直积分(楼梯抬升、楼板支撑、踏空回落),
+/// 只是把「怎么走到楼梯口」这段导航从测试里剥掉。
+///
+/// # Arguments
+///
+/// - `usize` - 样板楼序号(0 = LOFT, 1 = SHOP)。
+///
+/// # Returns
+///
+/// - `Vec<Vec2>` - 世界坐标路点,从门外到二层楼板。
+pub fn showcase_walk_route(index: usize) -> Vec<Vec2> {
+    let spec: &ShowcaseSpec = &showcase_specs()[index];
+    let span: [f32; 2] = spec.span;
+    let hx: f32 = span[0] * 0.5;
+    let hz: f32 = span[1] * 0.5;
+    let sx0: f32 = hx - SHOWCASE_STAIR_WIDTH;
+    let stair_x: f32 = (sx0 + hx) * 0.5;
+    let sz_last: f32 = hz - SHOWCASE_STAIR_LEAD;
+    let stair_end: f32 = sz_last - SHOWCASE_STAIR_STEPS as f32 * SHOWCASE_STAIR_RUN;
+    let front: Vec2 = showcase_door_center(index);
+    let normal: Vec2 = showcase_front_normal(index);
+    let gap_x: f32 = sx0 - SHOWCASE_PARTITION_GAP * 0.5;
+    [
+        // 门外
+        [front[0] + normal[0] * 1.5, front[1] + normal[1] * 1.5],
+        // 门洞(外墙面)。**不要**在这里停:从门外 1.5 m 冲进 1.6 m
+        // 宽的门洞,4 步就会冲到 x ≈ 26.5 —— 那里是楼梯下沿,玩家撞上
+        // 基座被弹回,弹回的力又把他推回街上。下一段终点在室内,让他
+        // 一路走进去更顺。
+        front,
+        // 深入室内(纯 -X)。**必须**推得够深:玩家到本地 z = 3.6
+        // (世界 x = 26.6)时实际会停在 x ≈ 27.3,而外墙内表面在 28.0、
+        // 缺口在 25.4 —— 中间只有一条 1.4 m 宽的过道。停在 27.3 一拐
+        // 弯就贴上外墙被推回街上(实测 x = 28.30,恰好是本地 z = 5.3)。
+        // 推到本地 z = 2.7(世界 x = 25.7)过深了:隔墙在 x = 25.4,
+        // 玩家半径 0.4,站在 25.83 就已经贴着隔墙了,一转向就被弹开。
+        // 本地 z = 3.3(世界 x = 26.3)才是过道正中 —— 外墙 28.0 和
+        // 隔墙 25.4 的中点是 26.7,但还要让开 0.4 的身位。
+        showcase_to_world(index, [0.0, SHOWCASE_PARTITION_Y + 0.43]),
+        // 沿缺口走向走到正对位(纯世界 -Z = 本地 +X)。
+        //
+        // 探针读出的真实墙位(2026-09-30,`window.__vcw_probe` 打印
+        // `game.interiors` 里半径 0.8 m 内的墙):
+        //   外墙  世界 x=[27.75, 27.95]  z=[24.00, 29.20]
+        //   隔墙  世界 x=[25.33, 25.48]  z=[27.25, 35.75]
+        // 缺口是**沿世界 Z 的整条通道** z ∈ [24.00, 27.25],不是一点。
+        // 本地 X 随 yaw 旋到世界 Z,所以这一步 = 本地 X 从 0 增到 gap_x,
+        // 目标是缺口**起点**那一侧,不是中点。
+        showcase_to_world(index, [gap_x, SHOWCASE_PARTITION_Y + 0.43]),
+        // 穿过隔墙(纯世界 -X = 本地 -Z)
+        showcase_to_world(index, [gap_x, SHOWCASE_PARTITION_Y - 1.6]),
+        // 缺口另一侧横移到梯中线(纯世界 -Z = 本地 +X)
+        showcase_to_world(index, [stair_x, SHOWCASE_PARTITION_Y - 1.6]),
+        // 沿梯中线上行(纯 +X,本地 Z 从楼梯下沿往梯顶)
+        showcase_to_world(index, [stair_x, sz_last - SHOWCASE_STAIR_RUN * 0.5]),
+        showcase_to_world(index, [stair_x, (sz_last + stair_end) * 0.5]),
+        // 站上二层楼板(越过梯顶)
+        showcase_to_world(index, [stair_x, stair_end - 0.8]),
+    ]
+    .to_vec()
 }
 
 /// 可进入样板楼的世界摆放表(场景批次用)。
@@ -716,6 +1119,67 @@ fn push_showcase_interior(interiors: &mut FloorWorld, spec: &ShowcaseSpec) {
     );
 }
 
+/// 诊断:列出玩家四周正在推开他的碰撞体,并把结果挂到
+/// `window.__vcw_probe`。
+///
+/// 存在的理由:2026-09-30 连续九轮都在从路点坐标反推碰撞体布局,
+/// 反复得出错误的通路。`CollisionWorld` 里 1800+ 个 shape 的实际排布
+/// 才是权威,直接读它。
+///
+/// # Arguments
+///
+/// - `&Game` - 只读借用,只取玩家位置与室内碰撞体。
+fn probe_nearby_shapes(game: &Game) {
+    let here: Vec2 = [game.player.get_position()[0], game.player.get_position()[2]];
+    let radius: f32 = game.world.get_player_radius();
+    let mut hits: Vec<String> = Vec::new();
+    // 关键:墙体**不在** `game.world` 里。样板楼作为实心 AABB 推进碰撞
+    // 世界会在门洞外砌一堵看不见的墙,所以它们被移到了
+    // `game.interiors`(见 `build_collision_world` 的注释)。第一次跑这个
+    // 探针只扫 `world`,拿回来 12 个圆柱道具、零个 AABB —— 因为墙根本
+    // 不在那儿。查室内几何必须读 `interiors`。
+    for piece in game.interiors.get_floors() {
+        let (lo, hi, label): (Vec3, Vec3, &str) = match piece {
+            crate::interior::Floor::Slab { min, max } => (*min, *max, "S"),
+            crate::interior::Floor::Wall { min, max } => (*min, *max, "W"),
+        };
+        // 只有墙会水平推开玩家;楼板是踩在上面的。
+        if label == "S" {
+            continue;
+        }
+        let half: Vec2 = [(hi[0] - lo[0]) * 0.5, (hi[2] - lo[2]) * 0.5];
+        let center: Vec2 = [lo[0] + half[0], lo[2] + half[1]];
+        let dx: f32 = here[0] - center[0];
+        let dz: f32 = here[1] - center[1];
+        let pen_x: f32 = dx.abs() - half[0] - radius;
+        let pen_z: f32 = dz.abs() - half[1] - radius;
+        if pen_x.abs() < 0.8 || pen_z.abs() < 0.8 {
+            hits.push(format!(
+                "{label} c=({:.2},{:.2}) y=[{:.2},{:.2}] x=[{:.2},{:.2}] z=[{:.2},{:.2}] pen=({:+.2},{:+.2})",
+                center[0], center[1], lo[1], hi[1],
+                center[0] - half[0], center[0] + half[0],
+                center[1] - half[1], center[1] + half[1],
+                pen_x, pen_z
+            ));
+        }
+    }
+    let text: String = format!(
+        "at ({:.2},{:.2}) r={radius:.2} n={} :: {}",
+        here[0],
+        here[1],
+        hits.len(),
+        hits.join(" | ")
+    );
+    if let Some(window) = window() {
+        let handle: JsValue = JsValue::from(window.clone());
+        let _reflect: Result<bool, JsValue> = js_sys::Reflect::set(
+            &handle,
+            &JsValue::from_str(K_PROBE_WINDOW),
+            &JsValue::from_str(&text),
+        );
+    }
+}
+
 /// 把两栋样板楼的可进入几何铺进室内碰撞世界。
 ///
 /// # Arguments
@@ -758,10 +1222,13 @@ fn footprint_hits_roadway(x: f32, z: f32, guard: f32) -> bool {
 /// # Returns
 ///
 /// - `Vec<BuildingPlacement>` - 楼的摆放列表。
-fn build_city_buildings_with(guard: f32) -> Vec<BuildingPlacement> {
+fn build_city_buildings_with(guard: f32, cx: f32, cz: f32) -> Vec<BuildingPlacement> {
     let mut out: Vec<BuildingPlacement> = Vec::new();
     let mut seed: u32 = 0x5EED_0001;
-    for (bi, block) in block_layouts().into_iter().enumerate() {
+    for (bi, block) in blocks_near(cx, cz, BLOCK_VIEW_RADIUS)
+        .into_iter()
+        .enumerate()
+    {
         for (edge, (dx, dz, yaw)) in BLOCK_RING.iter().enumerate() {
             let count: usize = 2 + (bi + edge) % 2;
             for slot in 0..count {
@@ -786,6 +1253,12 @@ fn build_city_buildings_with(guard: f32) -> Vec<BuildingPlacement> {
                 if footprint_hits_roadway(px, pz, guard) {
                     continue;
                 }
+                // 让开两栋可进入的样板楼:它们的占地面积由
+                // `showcase_specs()` 声明,程序化楼必须绕开,否则两栋楼
+                // 叠在一起,玩家进门就被另一栋的外墙挡住。
+                if hits_a_showcase(px, pz, guard) {
+                    continue;
+                }
                 let scale: f32 = 0.88 + hash_unit(seed, 2) * 0.34;
                 let tint: [f32; 3] = [
                     0.94 + hash_unit(seed, 3) * 0.14,
@@ -803,16 +1276,22 @@ fn build_city_buildings_with(guard: f32) -> Vec<BuildingPlacement> {
         }
     }
     // 路口四角的对角楼:给每个网格路口一个转角门面。
-    for (xi, line_x) in STREET_LINES.iter().enumerate() {
-        for (zi, line_z) in STREET_LINES.iter().enumerate() {
+    let lights: Vec<i32> = street_indices_in(
+        (cx.min(cz) - BLOCK_VIEW_RADIUS).floor(),
+        (cx.max(cz) + BLOCK_VIEW_RADIUS).ceil(),
+    );
+    for (xi, line_xi) in lights.iter().enumerate() {
+        let line_x: f32 = street_axis(*line_xi);
+        for (zi, line_zi) in lights.iter().enumerate() {
+            let line_z: f32 = street_axis(*line_zi);
             seed = hash2(seed, 0xBEEF);
             if (xi + zi) % 2 != 0 {
                 continue;
             }
             let corner: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH + 9.0;
-            let px: f32 = *line_x + corner;
-            let pz: f32 = *line_z + corner;
-            if px.abs() > CITY_HALF - 6.0 || pz.abs() > CITY_HALF - 6.0 {
+            let px: f32 = line_x + corner;
+            let pz: f32 = line_z + corner;
+            if hits_a_showcase(px, pz, 8.0) {
                 continue;
             }
             out.push(BuildingPlacement {
@@ -835,16 +1314,27 @@ fn build_city_buildings_with(guard: f32) -> Vec<BuildingPlacement> {
 /// # Returns
 ///
 /// - `Vec<PropPlacement>` - 全城道具摆放表。
-fn build_city_props() -> Vec<PropPlacement> {
+///
+/// # Arguments
+///
+/// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
+/// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
+fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
     let mut out: Vec<PropPlacement> = Vec::new();
     let corner: f32 = STREET_HALF_WIDTH + 0.9;
     // ---- 每个网格路口四个角的交通灯 ----
-    for line_x in STREET_LINES {
-        for line_z in STREET_LINES {
+    let junctions: Vec<i32> = street_indices_in(
+        (cx.min(cz) - BLOCK_VIEW_RADIUS).floor(),
+        (cx.max(cz) + BLOCK_VIEW_RADIUS).ceil(),
+    );
+    for line_xi in junctions.iter() {
+        let line_x: f32 = street_axis(*line_xi);
+        for line_zi in junctions.iter() {
+            let line_z: f32 = street_axis(*line_zi);
             for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
                 out.push(PropPlacement {
                     asset: PROP_TRAFFICLIGHT,
-                    position: [*line_x + sx * corner, 0.0, *line_z + sz * corner],
+                    position: [line_x + sx * corner, 0.0, line_z + sz * corner],
                     yaw: if sx * sz > 0.0 {
                         0.0
                     } else {
@@ -857,20 +1347,20 @@ fn build_city_props() -> Vec<PropPlacement> {
     }
     // ---- 路灯:沿每条街道两侧交替 ----
     let mut seed: u32 = 0xC0FFEE;
-    for line in STREET_LINES {
-        let mut step: f32 = -CITY_HALF + 18.0;
-        while step < CITY_HALF - 18.0 {
+    for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 18.0) {
+        let mut step: f32 = strip_lo;
+        while step < strip_hi {
             seed = hash2(seed, 0x11);
             // 南北向街道(x = line)与东西向街道(z = line)各放一侧。
             out.push(PropPlacement {
                 asset: PROP_STREETLIGHT,
-                position: [*line + STREET_HALF_WIDTH + 1.5, 0.0, step],
+                position: [line + STREET_HALF_WIDTH + 1.5, 0.0, step],
                 yaw: std::f32::consts::FRAC_PI_2,
                 tint: [1.0, 1.0, 1.0],
             });
             out.push(PropPlacement {
                 asset: PROP_STREETLIGHT,
-                position: [step, 0.0, *line - STREET_HALF_WIDTH - 1.5],
+                position: [step, 0.0, line - STREET_HALF_WIDTH - 1.5],
                 yaw: std::f32::consts::PI,
                 tint: [1.0, 1.0, 1.0],
             });
@@ -878,31 +1368,31 @@ fn build_city_props() -> Vec<PropPlacement> {
             match hash2(seed, 2) % 6 {
                 0 => out.push(PropPlacement {
                     asset: PROP_BENCH,
-                    position: [*line + STREET_HALF_WIDTH + 2.2, 0.0, step + 7.0],
+                    position: [line + STREET_HALF_WIDTH + 2.2, 0.0, step + 7.0],
                     yaw: 0.0,
                     tint: [1.0, 0.98, 0.94],
                 }),
                 1 => out.push(PropPlacement {
                     asset: PROP_TRASH_BIN,
-                    position: [step + 5.0, 0.0, *line + STREET_HALF_WIDTH + 2.0],
+                    position: [step + 5.0, 0.0, line + STREET_HALF_WIDTH + 2.0],
                     yaw: 0.3,
                     tint: [0.96, 1.0, 0.98],
                 }),
                 2 => out.push(PropPlacement {
                     asset: PROP_FIRE_HYDRANT,
-                    position: [*line - STREET_HALF_WIDTH - 1.8, 0.0, step + 9.0],
+                    position: [line - STREET_HALF_WIDTH - 1.8, 0.0, step + 9.0],
                     yaw: 0.0,
                     tint: [1.0, 0.9, 0.9],
                 }),
                 3 => out.push(PropPlacement {
                     asset: PROP_NEWSSTAND,
-                    position: [step + 11.0, 0.0, *line - STREET_HALF_WIDTH - 2.0],
+                    position: [step + 11.0, 0.0, line - STREET_HALF_WIDTH - 2.0],
                     yaw: std::f32::consts::FRAC_PI_2,
                     tint: [1.0, 1.0, 1.0],
                 }),
                 4 => out.push(PropPlacement {
                     asset: PROP_PHONE_BOOTH,
-                    position: [*line + STREET_HALF_WIDTH + 2.0, 0.0, step + 13.0],
+                    position: [line + STREET_HALF_WIDTH + 2.0, 0.0, step + 13.0],
                     yaw: -std::f32::consts::FRAC_PI_2,
                     tint: [0.98, 1.0, 1.0],
                 }),
@@ -911,7 +1401,7 @@ fn build_city_props() -> Vec<PropPlacement> {
                     // 锥桶要放在**路缘**上,不能丢在车行道正中:之前放在
                     // `line + 2.4`,正好压在 26.5 / 33.5 的车道上,动态
                     // 车队每帧撞上去,看起来就是「车开了但不动」。
-                    position: [step + 3.0, 0.0, *line + STREET_HALF_WIDTH + 0.8],
+                    position: [step + 3.0, 0.0, line + STREET_HALF_WIDTH + 0.8],
                     yaw: hash_unit(seed, 3) * 1.2,
                     tint: [1.05, 0.9, 0.7],
                 }),
@@ -927,13 +1417,18 @@ fn build_city_props() -> Vec<PropPlacement> {
 /// # Returns
 ///
 /// - `PalmSpots` - 棕榈的世界 (x, z) 坐标。
-fn build_city_palms() -> PalmSpots {
+///
+/// # Arguments
+///
+/// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
+/// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
+fn build_city_palms(cx: f32, cz: f32) -> PalmSpots {
     let mut out: Vec<[f32; 2]> = Vec::new();
-    for line in STREET_LINES {
-        let mut step: f32 = -CITY_HALF + 26.0;
-        while step < CITY_HALF - 26.0 {
-            out.push([*line + STREET_HALF_WIDTH + SIDEWALK_WIDTH * 0.55, step]);
-            out.push([step, *line - STREET_HALF_WIDTH - SIDEWALK_WIDTH * 0.55]);
+    for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 26.0) {
+        let mut step: f32 = strip_lo;
+        while step < strip_hi {
+            out.push([line + STREET_HALF_WIDTH + SIDEWALK_WIDTH * 0.55, step]);
+            out.push([step, line - STREET_HALF_WIDTH - SIDEWALK_WIDTH * 0.55]);
             step += 24.0;
         }
     }
@@ -952,13 +1447,18 @@ fn build_city_palms() -> PalmSpots {
 /// # Returns
 ///
 /// - `Vec<Placement>` - `(资产, 位置, 朝向)`。
-fn build_city_vehicles() -> Vec<Placement> {
+///
+/// # Arguments
+///
+/// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
+/// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
+fn build_city_vehicles(cx: f32, cz: f32) -> Vec<Placement> {
     let mut out: Vec<(&'static str, [f32; 3], f32)> = Vec::new();
     let lane: f32 = STREET_HALF_WIDTH - 2.6;
     let mut seed: u32 = 0xABCD_1234;
-    for line in STREET_LINES {
-        let mut step: f32 = -CITY_HALF + 40.0;
-        while step < CITY_HALF - 40.0 {
+    for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 40.0) {
+        let mut step: f32 = strip_lo;
+        while step < strip_hi {
             seed = hash2(seed, 0x21);
             if !hash2(seed, 1).is_multiple_of(3) {
                 step += 44.0;
@@ -971,9 +1471,9 @@ fn build_city_vehicles() -> Vec<Placement> {
                 -1.0
             };
             let position: [f32; 3] = if along_x {
-                [step, 0.0, *line + side * lane]
+                [step, 0.0, line + side * lane]
             } else {
-                [*line + side * lane, 0.0, step]
+                [line + side * lane, 0.0, step]
             };
             out.push((
                 VEHICLE_POOL[hash2(seed, 4) as usize % VEHICLE_POOL.len()],
@@ -995,24 +1495,29 @@ fn build_city_vehicles() -> Vec<Placement> {
 /// # Returns
 ///
 /// - `Vec<Placement>` - `(资产, 位置, 朝向)`。
-fn build_city_signs() -> Vec<Placement> {
+///
+/// # Arguments
+///
+/// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
+/// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
+fn build_city_signs(cx: f32, cz: f32) -> Vec<Placement> {
     let mut out: Vec<(&'static str, [f32; 3], f32)> = Vec::new();
     let face: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH + 3.2;
     let mut seed: u32 = 0x5151_5151;
-    for line in STREET_LINES {
-        let mut step: f32 = -CITY_HALF + 34.0;
-        while step < CITY_HALF - 34.0 {
+    for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 34.0) {
+        let mut step: f32 = strip_lo;
+        while step < strip_hi {
             seed = hash2(seed, 0x31);
             if hash2(seed, 1).is_multiple_of(2) {
                 out.push((
                     SIGN_POOL[hash2(seed, 2) as usize % SIGN_POOL.len()],
-                    [*line - face, 4.2, step],
+                    [line - face, 4.2, step],
                     -std::f32::consts::FRAC_PI_2,
                 ));
             } else {
                 out.push((
                     SIGN_POOL[hash2(seed, 2) as usize % SIGN_POOL.len()],
-                    [step, 3.8, *line + face],
+                    [step, 3.8, line + face],
                     std::f32::consts::FRAC_PI_2,
                 ));
             }
@@ -1027,17 +1532,22 @@ fn build_city_signs() -> Vec<Placement> {
 /// # Returns
 ///
 /// - `Vec<Placement>` - `(资产, 位置, 朝向)`。
-fn build_city_peds() -> Vec<Placement> {
+///
+/// # Arguments
+///
+/// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
+/// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
+fn build_city_peds(cx: f32, cz: f32) -> Vec<Placement> {
     let mut out: Vec<(&'static str, [f32; 3], f32)> = Vec::new();
     let mut seed: u32 = 0x7777_7777;
-    for line in STREET_LINES {
-        let mut step: f32 = -CITY_HALF + 20.0;
-        while step < CITY_HALF - 20.0 {
+    for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 20.0) {
+        let mut step: f32 = strip_lo;
+        while step < strip_hi {
             seed = hash2(seed, 0x41);
             out.push((
                 PED_POOL[hash2(seed, 1) as usize % PED_POOL.len()],
                 [
-                    *line + (hash_unit(seed, 2) - 0.5) * (2.0 * STREET_HALF_WIDTH - 2.0),
+                    line + (hash_unit(seed, 2) - 0.5) * (2.0 * STREET_HALF_WIDTH - 2.0),
                     0.0,
                     step,
                 ],
@@ -1133,6 +1643,44 @@ pub struct Game {
     pub camera: Camera,
     /// 场景(资产 + 批次)。
     pub scene: Scene,
+    /// 流式世界:地面批次 —— 玩家跨过阈值时这块网格会被整体重建。
+    pub ground_batch: usize,
+    /// 流式世界:水面批次 —— 同上。
+    pub water_batch: usize,
+    /// 流式世界:当前地面 / 水面是围绕哪个点生成的(米)。
+    pub streamed_center: Vec2,
+    /// 注入开火剩余帧数(验收通道,见 [`apply_teleport_request`] 的 `hold` 分支)。
+    pub hold_frames: u32,
+    /// 验收期间的时间加速倍率(1.0 = 正常)。
+    ///
+    /// 无头浏览器把 rAF 节流到约 1 fps,而 `MAX_FRAME_TIME` 把每帧的真实
+    /// 间隔钳到 0.25 s —— 合起来游戏只跑 **25% 速度**。走完 7 个路点要
+    /// 二十分钟,验证一轮全量功能要跑将近一个小时。加速只改喂给模拟的
+    /// 步数,不改物理常量,所以走的仍然是同一套积分。
+    pub speed_scale: f32,
+    /// 验收期间是否免疫伤害(见 [`apply_teleport_request`] 的 `safe` 分支)。
+    ///
+    /// 走位验证要花好几分钟真实时间(无头浏览器把 rAF 节流到约 1 fps,
+    /// 模拟只跑 6% 速度),而街上敌人一直在开火 —— 前几轮实测血量从
+    /// 91 一路掉到 68,掉光就重生到最近的医院点,玩家被瞬移回城中心,
+    /// 看起来就是「走位脚本把玩家弹飞了」。
+    pub safe_mode: bool,
+
+    /// 验收脚本下达的「朝这个**世界**方向持续走」请求(米/秒归一化向量)。
+    ///
+    /// 不走 WASD 是因为 WASD 是**相机相对**的:脚本必须先把相机转到
+    /// 正前方才能让 W 变成世界某个方向,而无头浏览器里合成鼠标事件进不了
+    /// 相机的拖拽监听器 —— 上一步就是卡在这里。直接给世界方向,移动这一段
+    /// 走的仍然是 `Player::step` 的真实积分(含碰撞分离与室内判定)。
+    pub walk_request: Vec2,
+    /// 流式世界:资产 id → 场景网格索引,重建静态批次时要用。
+    pub asset_index: HashMap<String, usize>,
+    /// 流式世界:静态批次(楼 / 树 / 道具 / 招牌)占用的批次表长度。
+    ///
+    /// 静态批次是 `build_scene` 按生成中心铺的,流式重建时整段换掉;
+    /// 批次表是**尾插**的,玩家骨架 / 车队 / 拾取物的批次在静态批次之后,
+    /// 所以「静态段长度」就是把静态部分与动态部分分开的唯一依据。
+    pub static_batch_count: usize,
     /// 输入状态。
     pub input: InputState,
     /// 渲染后端。
@@ -1346,7 +1894,7 @@ fn push_quad(
 
 /// 构造程序化水面:外海 + 内湖,两块独立的顶点色网格。
 ///
-/// 城市本体是 300 m × 300 m(`CITY_HALF` = 150),所以海面从 ±150 一直
+/// 海面必须盖住玩家脚下,不能因为「城市无限大」就够不到
 /// 铺到 ±900 —— 外面没有别的几何,海面就是地平线。湖放在城内东南角的一
 /// 块凹地里,和海不连通。
 ///
@@ -1361,6 +1909,24 @@ fn push_quad(
 ///
 /// - `MeshAsset` - 含 `ocean` 与 `lake` 两个 part 的水面资产。
 pub fn build_water() -> MeshAsset {
+    build_water_near(0.0, 0.0)
+}
+
+/// 以 `(cx, cz)` 为中心生成水面 —— 海面必须跟着玩家平移。
+///
+/// 海是环形网格,原本以世界原点为中心铺到 ±900。世界变成无限之后
+/// 玩家可以走到 (5000, 5000),那里的海早就铺不到,脚下直接是虚空。
+/// 和地面同理:海面跟着玩家走,不跟着世界坐标铺。
+///
+/// # Arguments
+///
+/// - `f32` - 中心 X 坐标(米)。
+/// - `f32` - 中心 Z 坐标(米)。
+///
+/// # Returns
+///
+/// - `MeshAsset` - 含 `ocean` 与 `lake` 两个 part 的水面资产。
+pub fn build_water_near(cx: f32, cz: f32) -> MeshAsset {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut faces: Vec<[usize; 3]> = Vec::new();
     let mut face_colors: Vec<[f32; 3]> = Vec::new();
@@ -1378,8 +1944,8 @@ pub fn build_water() -> MeshAsset {
         for s in 0..=spokes {
             let angle: f32 = (s as f32 / spokes as f32) * std::f32::consts::TAU;
             let (sin_a, cos_a): (f32, f32) = angle.sin_cos();
-            positions.push([cos_a * start, SEA_LEVEL, sin_a * start]);
-            positions.push([cos_a * outer, SEA_LEVEL, sin_a * outer]);
+            positions.push([cx + cos_a * start, SEA_LEVEL, cz + sin_a * start]);
+            positions.push([cx + cos_a * outer, SEA_LEVEL, cz + sin_a * outer]);
         }
         for s in 0..spokes {
             let a: usize = base + s * 2;
@@ -1481,6 +2047,29 @@ pub fn build_water() -> MeshAsset {
 ///
 /// - `MeshAsset` - 展开后的地面网格资产。
 pub fn build_ground() -> MeshAsset {
+    build_ground_near(0.0, 0.0)
+}
+
+/// 以 `(cx, cz)` 为中心生成一块 [`GROUND_SPAN`] 见方的地面。
+///
+/// 地面不能像建筑那样「卸载了就没了」—— 脚下的每一格都得永远存在。
+/// 所以做法是**跟着玩家平移**一块固定尺寸的地面网格,而不是按世界
+/// 坐标铺一张无限大网格。后者顶点会随距离变成天文数字,精度直接崩。
+///
+/// # Arguments
+///
+/// - `f32` - 中心 X 坐标(米)。
+/// - `f32` - 中心 Z 坐标(米)。
+///
+/// # Returns
+///
+/// - `MeshAsset` - 展开后的地面网格资产。
+///
+/// 参数刻意叫 `centre_x` / `centre_z` 而不是 `cx` / `cz`:底面循环
+/// 内部要按格子算 `let cx = (x0 + x1) * 0.5`,同名会**遮蔽**函数参数,
+/// 于是后面几段的街道枚举全都读到了最后一个单元的中心,而不是本函数
+/// 的中心 —— 一块以 (-6000, 1500) 为心的地面上会混进 z = -6240 的路缘石。
+pub fn build_ground_near(centre_x: f32, centre_z: f32) -> MeshAsset {
     const ROAD: [f32; 3] = [0.085, 0.085, 0.098];
     const ROAD_ALT: [f32; 3] = [0.100, 0.100, 0.114];
     const SIDEWALK: [f32; 3] = [0.44, 0.42, 0.40];
@@ -1495,24 +2084,28 @@ pub fn build_ground() -> MeshAsset {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut faces: Vec<[usize; 3]> = Vec::new();
     let mut face_colors: Vec<[f32; 3]> = Vec::new();
-    let span: f32 = 2.0 * CITY_HALF;
-    let cell: f32 = span / GROUND_SUBDIV as f32;
+    let cell: f32 = GROUND_SPAN / GROUND_SUBDIV as f32;
+    // 网格对齐到街道网格的整数倍,免得玩家每走一格就看到地面整体抖动
+    // 一格 —— 那会让「站在原地」看起来像在滑。
+    let origin_x: f32 =
+        street_axis((centre_x / GROUND_CELL_ALIGN).round() as i32) - GROUND_SPAN * 0.5;
+    let origin_z: f32 =
+        street_axis((centre_z / GROUND_CELL_ALIGN).round() as i32) - GROUND_SPAN * 0.5;
 
     // ---- 1) 底面:整城铺满,按「沥青 / 人行道 / 地块」三态着色 ----
     for i in 0..GROUND_SUBDIV {
         for j in 0..GROUND_SUBDIV {
-            let x0: f32 = -CITY_HALF + cell * j as f32;
+            let x0: f32 = origin_x + cell * j as f32;
             let x1: f32 = x0 + cell;
-            let z0: f32 = -CITY_HALF + cell * i as f32;
+            let z0: f32 = origin_z + cell * i as f32;
             let z1: f32 = z0 + cell;
             let cx: f32 = (x0 + x1) * 0.5;
             let cz: f32 = (z0 + z1) * 0.5;
             let edge_x: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH;
             // 距最近街道轴线的距离。
-            let mut dist: f32 = f32::MAX;
-            for line in STREET_LINES {
-                dist = dist.min((cx - *line).abs()).min((cz - *line).abs());
-            }
+            let nearest_x: f32 = street_axis((cx / STREET_PITCH).round() as i32);
+            let nearest_z: f32 = street_axis((cz / STREET_PITCH).round() as i32);
+            let dist: f32 = (cx - nearest_x).abs().min((cz - nearest_z).abs());
             let color: [f32; 3] = if dist <= STREET_HALF_WIDTH {
                 if (i + j) % 2 == 0 { ROAD } else { ROAD_ALT }
             } else if dist <= edge_x {
@@ -1546,13 +2139,22 @@ pub fn build_ground() -> MeshAsset {
     }
 
     // ---- 2) 路缘石:每条街道两侧各一条竖直面 ----
-    for line in STREET_LINES {
-        for axis in 0..2 {
+    //
+    // 南北向街道(axis 0,沿 Z 铺)与东西向街道(axis 1,沿 X 铺)必须
+    // **各自**按自己的轴心枚举。共用一条枚举时,沿 X 铺的那批街道会
+    // 拿着 X 的区间往 Z 上画,于是一块以 (-6000, 1500) 为心的地面
+    // 里会混进 z = -6247 的路缘石 —— 顶点离中心整整 7700 m。
+    let radius: f32 = GROUND_SPAN * 0.5;
+    for axis in 0..2 {
+        let cross_center: f32 = if axis == 0 { centre_x } else { centre_z };
+        let (along_lo, along_hi): (f32, f32) =
+            ground_along_span(if axis == 0 { centre_z } else { centre_x }, radius);
+        for (line, _, _) in street_strips(cross_center, radius, 0.0) {
             for side in [-1.0f32, 1.0f32] {
-                let inner: f32 = *line + side * STREET_HALF_WIDTH;
+                let inner: f32 = line + side * STREET_HALF_WIDTH;
                 let outer: f32 = inner + side * 0.24;
-                let mut t: f32 = -CITY_HALF;
-                while t < CITY_HALF - cell {
+                let mut t: f32 = along_lo;
+                while t < along_hi {
                     let t1: f32 = t + cell;
                     let (x0, x1, z0, z1): (f32, f32, f32, f32) = if axis == 0 {
                         (inner.min(outer), inner.max(outer), t, t1)
@@ -1581,71 +2183,88 @@ pub fn build_ground() -> MeshAsset {
     // ---- 3) 中央双黄线 + 车道虚线(沿每条街道,路口处断开)----
     let dash_pitch: f32 = 6.0;
     let dash_len: f32 = 3.0;
-    for line in STREET_LINES {
-        let mut t: f32 = -CITY_HALF;
-        while t < CITY_HALF {
-            // 路口范围内不画线。
-            let in_junction: bool = STREET_LINES
-                .iter()
-                .any(|other: &f32| (t - *other).abs() <= STREET_HALF_WIDTH + 1.0);
-            if !in_junction {
-                let t1: f32 = t + dash_len;
-                // 中央双黄线(两条 0.18 m 宽的实线,只在虚线段画满)。
-                for offset in [-0.25f32, 0.25f32] {
-                    let c: f32 = *line + offset;
-                    push_quad(
-                        &mut QuadBuffers {
-                            positions: &mut positions,
-                            faces: &mut faces,
-                            face_colors: &mut face_colors,
-                        },
-                        c - 0.09,
-                        c + 0.09,
-                        t,
-                        t1,
-                        0.011,
-                        LINE_YELLOW,
-                    );
+    //
+    // 和路缘石同一件事:南北向街道沿线画的是 Z,东西向街道沿线画的是
+    // X,两条街必须各按各的轴心枚举一遍,否则只会画出一个方向的线。
+    for axis in 0..2 {
+        let cross_center: f32 = if axis == 0 { centre_x } else { centre_z };
+        let (along_lo, along_hi): (f32, f32) =
+            ground_along_span(if axis == 0 { centre_z } else { centre_x }, radius);
+        for (line, _, _) in street_strips(cross_center, radius, 0.0) {
+            let mut t: f32 = along_lo;
+            while t < along_hi {
+                // 路口范围内不画线:到最近十字街道轴线的距离。
+                let nearest_cross: f32 = street_axis((t / STREET_PITCH).round() as i32);
+                let in_junction: bool = (t - nearest_cross).abs() <= STREET_HALF_WIDTH + 1.0;
+                if !in_junction {
+                    let t1: f32 = t + dash_len;
+                    // 中央双黄线(两条 0.18 m 宽的实线,只在虚线段画满)。
+                    for offset in [-0.25f32, 0.25f32] {
+                        let c: f32 = line + offset;
+                        let (x0, x1, z0, z1): (f32, f32, f32, f32) = if axis == 0 {
+                            (c - 0.09, c + 0.09, t, t1)
+                        } else {
+                            (t, t1, c - 0.09, c + 0.09)
+                        };
+                        push_quad(
+                            &mut QuadBuffers {
+                                positions: &mut positions,
+                                faces: &mut faces,
+                                face_colors: &mut face_colors,
+                            },
+                            x0,
+                            x1,
+                            z0,
+                            z1,
+                            0.011,
+                            LINE_YELLOW,
+                        );
+                    }
+                    // 车道分隔虚线(两侧各一条)。
+                    for lane in [-3.5f32, 3.5f32] {
+                        let c: f32 = line + lane;
+                        let (x0, x1, z0, z1): (f32, f32, f32, f32) = if axis == 0 {
+                            (c - 0.12, c + 0.12, t, t1)
+                        } else {
+                            (t, t1, c - 0.12, c + 0.12)
+                        };
+                        push_quad(
+                            &mut QuadBuffers {
+                                positions: &mut positions,
+                                faces: &mut faces,
+                                face_colors: &mut face_colors,
+                            },
+                            x0,
+                            x1,
+                            z0,
+                            z1,
+                            0.012,
+                            LINE_WHITE,
+                        );
+                    }
                 }
-                // 车道分隔虚线(两侧各一条)。
-                for lane in [-3.5f32, 3.5f32] {
-                    let c: f32 = *line + lane;
-                    push_quad(
-                        &mut QuadBuffers {
-                            positions: &mut positions,
-                            faces: &mut faces,
-                            face_colors: &mut face_colors,
-                        },
-                        c - 0.12,
-                        c + 0.12,
-                        t,
-                        t1,
-                        0.012,
-                        LINE_WHITE,
-                    );
-                }
+                t += dash_pitch;
             }
-            t += dash_pitch;
         }
     }
 
     // ---- 4) 路口斑马线:每个网格路口四条,横跨每条进出街道 ----
-    for line_x in STREET_LINES {
-        for line_z in STREET_LINES {
+    for (line_x, _, _) in street_strips(centre_x, GROUND_SPAN * 0.5, 0.0) {
+        for (line_z, _, _) in street_strips(centre_z, GROUND_SPAN * 0.5, 0.0) {
             for stripe in 0..7 {
                 let offset: f32 = -5.4 + stripe as f32 * 1.8;
                 let w: f32 = 0.9;
                 // 横跨南北向街道(x = line_x)的斑马线,贴在路口南 / 北两侧。
                 for side_z in [-1.0f32, 1.0] {
-                    let c: f32 = *line_z + side_z * (STREET_HALF_WIDTH + 1.0);
+                    let c: f32 = line_z + side_z * (STREET_HALF_WIDTH + 1.0);
                     push_quad(
                         &mut QuadBuffers {
                             positions: &mut positions,
                             faces: &mut faces,
                             face_colors: &mut face_colors,
                         },
-                        *line_x + offset - w * 0.5,
-                        *line_x + offset + w * 0.5,
+                        line_x + offset - w * 0.5,
+                        line_x + offset + w * 0.5,
                         c - 1.4,
                         c + 1.4,
                         0.013,
@@ -1654,7 +2273,7 @@ pub fn build_ground() -> MeshAsset {
                 }
                 // 横跨东西向街道(z = line_z)的斑马线。
                 for side_x in [-1.0f32, 1.0] {
-                    let c: f32 = *line_x + side_x * (STREET_HALF_WIDTH + 1.0);
+                    let c: f32 = line_x + side_x * (STREET_HALF_WIDTH + 1.0);
                     push_quad(
                         &mut QuadBuffers {
                             positions: &mut positions,
@@ -1663,8 +2282,8 @@ pub fn build_ground() -> MeshAsset {
                         },
                         c - 1.4,
                         c + 1.4,
-                        *line_z + offset - w * 0.5,
-                        *line_z + offset + w * 0.5,
+                        line_z + offset - w * 0.5,
+                        line_z + offset + w * 0.5,
                         0.013,
                         CROSSWALK,
                     );
@@ -1737,25 +2356,27 @@ struct ManifestEntry {
 /// - `Vec<&'static str>` - 计算结果。
 fn required_asset_ids() -> Vec<&'static str> {
     let mut ids: Vec<&'static str> = Vec::new();
-    for building in &build_city_buildings() {
+    // 资产清单只回答「场景引用了哪些资产」,与玩家站在哪里无关;城市是
+    // 程序化生成的,任何位置的取用集合都一样,所以固定按原点求一次。
+    for building in &build_city_buildings(0.0, 0.0) {
         ids.push(building.asset);
     }
     // 两栋可进入样板楼必须预载,否则场景里根本没有它们的批次。
     for building in &showcase_placements() {
         ids.push(building.asset);
     }
-    for prop in &build_city_props() {
+    for prop in &build_city_props(0.0, 0.0) {
         ids.push(prop.asset);
     }
     ids.push(PALM_TALL);
     ids.push(PALM_SHORT);
-    for (asset, _, _) in &build_city_vehicles() {
+    for (asset, _, _) in &build_city_vehicles(0.0, 0.0) {
         ids.push(asset);
     }
-    for (asset, _, _) in &build_city_signs() {
+    for (asset, _, _) in &build_city_signs(0.0, 0.0) {
         ids.push(asset);
     }
-    for (asset, _, _) in &build_city_peds() {
+    for (asset, _, _) in &build_city_peds(0.0, 0.0) {
         ids.push(asset);
     }
     // 武器模型:任务奖励与拾取点都要用到,必须预载。
@@ -2003,13 +2624,29 @@ fn query_number(key: &str, fallback: f32) -> f32 {
 
 /// 按蓝图把已加载的资产铺成场景批次。
 ///
+/// - `f32` - 流式生成中心的世界 X(米)。
+/// - `f32` - 流式生成中心的世界 Z(米)。
+///
+/// # Returns
+///
+/// - `(usize, usize, usize)` - 批次网格的三个维度(索引 i / j / k)。
 /// # Arguments
 ///
 /// - `&mut Scene` - Scene 的可变引用。
 /// - `&HashMap<String, usize>` - HashMap<String, usize> 的只读引用。
-fn build_scene(scene: &mut Scene, index_map: &HashMap<String, usize>) {
-    // 地面:程序化网格,走同一条展开管线。
-    let ground: MeshAsset = build_ground();
+/// - `f32` - 流式生成中心的世界 X(米)。
+/// - `f32` - 流式生成中心的世界 Z(米)。
+fn build_scene(
+    scene: &mut Scene,
+    index_map: &HashMap<String, usize>,
+    cx: f32,
+    cz: f32,
+) -> (usize, usize, usize) {
+    let mut ground_slot: usize = 0;
+    let mut water_slot: usize = 0;
+    // 地面:程序化网格,走同一条展开管线。以生成中心为准 —— 世界无限,
+    // 地面永远跟着生成中心走。
+    let ground: MeshAsset = build_ground_near(cx, cz);
     let mut ground_emissive: Vec<[f32; 3]> = Vec::with_capacity(
         ground
             .parts
@@ -2027,6 +2664,7 @@ fn build_scene(scene: &mut Scene, index_map: &HashMap<String, usize>) {
     let ground_index: usize = scene.push_mesh(build_gpu_mesh(&ground_mesh, &ground_emissive));
 
     let ground_batch: usize = scene.push_batch(ground_index, true);
+    ground_slot = ground_batch;
     scene.push_instance(
         ground_batch,
         Instance::new([0.0, 0.0, 0.0], 0.0, 1.0, [1.0, 1.0, 1.0]),
@@ -2035,7 +2673,7 @@ fn build_scene(scene: &mut Scene, index_map: &HashMap<String, usize>) {
     // 水面:外海 + 内湖,同样是程序化网格,走同一条展开管线。
     // 放在地面之后 —— 水面低于地面 y=0,深度测试会自然把它挡在
     // 城市底下,不需要额外的图层判定。
-    let water: MeshAsset = build_water();
+    let water: MeshAsset = build_water_near(cx, cz);
     let mut water_emissive: Vec<[f32; 3]> = Vec::with_capacity(
         water
             .parts
@@ -2052,6 +2690,7 @@ fn build_scene(scene: &mut Scene, index_map: &HashMap<String, usize>) {
     let water_mesh: crate::mesh::GpuMesh = expand_asset(&water).expect(EXPECT_WATER);
     let water_index: usize = scene.push_mesh(build_gpu_mesh(&water_mesh, &water_emissive));
     let water_batch: usize = scene.push_batch(water_index, true);
+    water_slot = water_batch;
     scene.push_instance(
         water_batch,
         Instance::new([0.0, 0.0, 0.0], 0.0, 1.0, [1.0, 1.0, 1.0]),
@@ -2059,7 +2698,7 @@ fn build_scene(scene: &mut Scene, index_map: &HashMap<String, usize>) {
 
     // 建筑:程序化生成的网格街区围合。同类资产合批后每批次一次
     // instanced draw call,顶点数据仍然只解析一次。
-    for building in &build_city_buildings() {
+    for building in &build_city_buildings(cx, cz) {
         let Some(&mesh_index) = index_map.get(building.asset) else {
             continue;
         };
@@ -2098,7 +2737,7 @@ fn build_scene(scene: &mut Scene, index_map: &HashMap<String, usize>) {
     }
 
     // 街道道具(含每个路口四角的交通灯):按资产分组 → 天然 instancing。
-    for prop in &build_city_props() {
+    for prop in &build_city_props(cx, cz) {
         let Some(&mesh_index) = index_map.get(prop.asset) else {
             continue;
         };
@@ -2110,7 +2749,7 @@ fn build_scene(scene: &mut Scene, index_map: &HashMap<String, usize>) {
     }
 
     // 棕榈:两个品种交替,每个品种一个批次。
-    for (index, position) in build_city_palms().iter().enumerate() {
+    for (index, position) in build_city_palms(cx, cz).iter().enumerate() {
         let asset: &str = if index % 3 == 0 {
             PALM_TALL
         } else {
@@ -2139,7 +2778,7 @@ fn build_scene(scene: &mut Scene, index_map: &HashMap<String, usize>) {
     // 还会在车道中间形成看不见的碰撞体,把动态车队顶死。
 
     // 霓虹招牌:挂在临街楼的外墙上,自发光在夜里点亮。
-    for (asset, position, yaw) in &build_city_signs() {
+    for (asset, position, yaw) in &build_city_signs(cx, cz) {
         let Some(&mesh_index) = index_map.get(*asset) else {
             continue;
         };
@@ -2148,12 +2787,167 @@ fn build_scene(scene: &mut Scene, index_map: &HashMap<String, usize>) {
     }
 
     // 行人点缀。
-    for (asset, position, yaw) in &build_city_peds() {
+    for (asset, position, yaw) in &build_city_peds(cx, cz) {
         let Some(&mesh_index) = index_map.get(*asset) else {
             continue;
         };
         let batch: usize = find_or_create_batch(scene, mesh_index);
         scene.push_instance(batch, Instance::new(*position, *yaw, 1.0, [1.0, 1.0, 1.0]));
+    }
+    (ground_slot, water_slot, scene.batches.len())
+}
+
+/// 玩家走到哪里了才需要重新生成地面 —— 距离当前生成中心超过这一档。
+///
+/// 地面块边长是 [`GROUND_SPAN`],玩家站在正中时离边缘还有一半。阈值
+/// 取一整个街道间距(60 m):世界无限,但**每走一格街道才重算一次**是
+/// 够的 —— 地面网格本身就是按街道网格对齐的,重算与不重算在视觉上
+/// 完全一致,只有走到块外才必须重来。
+const STREAM_REBUILD_STEP: f32 = STREET_PITCH;
+
+/// 玩家当前位置是否已经走出当前地面块。
+///
+/// # Arguments
+///
+/// - `Vec2` - 玩家 XZ 坐标(米)。
+/// - `Vec2` - 当前地面块的生成中心(米)。
+///
+/// # Returns
+///
+/// - `bool` - `true` 表示该重建了。
+fn stream_needs_rebuild(player: Vec2, center: Vec2) -> bool {
+    (player[0] - center[0]).abs() > STREAM_REBUILD_STEP
+        || (player[1] - center[1]).abs() > STREAM_REBUILD_STEP
+}
+
+/// 围绕玩家当前位置重建地面与水面网格。
+///
+/// 场景的批次表是稳定的(实例表每帧都会重写),所以这里只换掉地面 /
+/// 水面两块网格的顶点数据,不动任何批次索引 —— 否则流式重建会顺手
+/// 把玩家骨架、车队、拾取物的批次一起搬走。
+///
+/// # Arguments
+///
+/// - `&mut Scene` - 场景。
+/// - `usize` - 地面批次索引。
+/// - `usize` - 水面批次索引。
+/// - `f32` - 新的生成中心 X(米)。
+/// - `f32` - 新的生成中心 Z(米)。
+/// - `&HashMap<String, usize>` - 资产 id → 场景网格索引。
+/// - `usize` - 静态批次占用的长度。
+pub fn rebuild_streamed_surface(
+    scene: &mut Scene,
+    ground_batch: usize,
+    water_batch: usize,
+    cx: f32,
+    cz: f32,
+    index_map: &HashMap<String, usize>,
+    static_batch_count: usize,
+) {
+    rebuild_static_batches(scene, index_map, static_batch_count, cx, cz);
+    let surfaces: [(usize, MeshAsset); 2] = [
+        (ground_batch, build_ground_near(cx, cz)),
+        (water_batch, build_water_near(cx, cz)),
+    ];
+    for (batch, asset) in surfaces {
+        let Some(target) = scene.batches.get(batch) else {
+            continue;
+        };
+        let mesh_index: usize = target.mesh_index;
+        let mut emissive: Vec<[f32; 3]> = Vec::with_capacity(
+            asset
+                .parts
+                .iter()
+                .map(|part: &MeshPart| part.faces.len())
+                .sum(),
+        );
+        for part in &asset.parts {
+            let value: [f32; 3] = part.emissive.unwrap_or([0.0; 3]);
+            for _ in &part.faces {
+                emissive.push(value);
+            }
+        }
+        let Ok(mesh) = expand_asset(&asset) else {
+            continue;
+        };
+        scene.meshes[mesh_index] = build_gpu_mesh(&mesh, &emissive);
+    }
+}
+
+/// 整段换掉静态批次(建筑 / 树 / 道具 / 招牌 / 行人 / 摆件车)。
+///
+/// 静态批次是尾插的:它们一定排在玩家骨架 / 车队 / 拾取物之前,于是
+/// 「截断到 `static_batch_count` 再重新铺一遍」能精确换掉静态段而不动
+/// 动态段。不这么做的后果是玩家走到 600 m 外看到的还是出生点那批楼 ——
+/// 地面是新的,楼是旧的,等于没做流式。
+///
+/// # Arguments
+///
+/// - `&mut Scene` - 场景。
+/// - `&HashMap<String, usize>` - 资产 id → 场景网格索引。
+/// - `usize` - 静态批次当前占用的长度。
+/// - `f32` - 新的生成中心 X(米)。
+/// - `f32` - 新的生成中心 Z(米)。
+fn rebuild_static_batches(
+    scene: &mut Scene,
+    index_map: &HashMap<String, usize>,
+    static_batch_count: usize,
+    cx: f32,
+    cz: f32,
+) {
+    if static_batch_count == 0 || static_batch_count > scene.batches.len() {
+        return;
+    }
+    scene.batches.truncate(static_batch_count);
+    for building in build_city_buildings(cx, cz) {
+        let Some(&mesh_index) = index_map.get(building.asset) else {
+            continue;
+        };
+        let batch: usize = find_or_create_batch(scene, mesh_index);
+        let position: [f32; 3] = [building.position[0], 0.0, building.position[1]];
+        scene.push_instance(
+            batch,
+            Instance::new(position, building.yaw, building.scale, building.tint),
+        );
+    }
+    for prop in build_city_props(cx, cz) {
+        let Some(&mesh_index) = index_map.get(prop.asset) else {
+            continue;
+        };
+        let batch: usize = find_or_create_batch(scene, mesh_index);
+        scene.push_instance(
+            batch,
+            Instance::new(prop.position, prop.yaw, 1.0, prop.tint),
+        );
+    }
+    for (index, spot) in build_city_palms(cx, cz).iter().enumerate() {
+        let Some(&mesh_index) = index_map.get(if index.is_multiple_of(2) {
+            PALM_TALL
+        } else {
+            PALM_SHORT
+        }) else {
+            continue;
+        };
+        let batch: usize = find_or_create_batch(scene, mesh_index);
+        let tint: [f32; 3] = [0.95, 1.0, 0.92];
+        scene.push_instance(
+            batch,
+            Instance::new([spot[0], 0.0, spot[1]], 0.0, 1.0, tint),
+        );
+    }
+    for (asset, position, yaw) in build_city_signs(cx, cz) {
+        let Some(&mesh_index) = index_map.get(asset) else {
+            continue;
+        };
+        let batch: usize = find_or_create_batch(scene, mesh_index);
+        scene.push_instance(batch, Instance::new(position, yaw, 1.0, [1.0, 1.0, 1.0]));
+    }
+    for (asset, position, yaw) in build_city_peds(cx, cz) {
+        let Some(&mesh_index) = index_map.get(asset) else {
+            continue;
+        };
+        let batch: usize = find_or_create_batch(scene, mesh_index);
+        scene.push_instance(batch, Instance::new(position, yaw, 1.0, [1.0, 1.0, 1.0]));
     }
 }
 
@@ -2194,11 +2988,18 @@ fn find_or_create_batch(scene: &mut Scene, mesh_index: usize) -> usize {
 ///
 /// - `&mut CollisionWorld` - 碰撞世界。
 /// - `&HashMap<String, Bounds>` - 资产 id → 该资产声明的包围盒。
-fn build_collision_world(world: &mut CollisionWorld, bounds_map: &HashMap<String, Bounds>) {
+/// - `f32` - 流式生成中心的世界 X(米)。
+/// - `f32` - 流式生成中心的世界 Z(米)。
+fn build_collision_world(
+    world: &mut CollisionWorld,
+    bounds_map: &HashMap<String, Bounds>,
+    cx: f32,
+    cz: f32,
+) {
     world.get_shapes_mut().clear();
     world.set_player_radius(PLAYER_RADIUS);
     world.set_half_extent([WORLD_HALF, WORLD_HALF]);
-    for building in build_city_buildings() {
+    for building in build_city_buildings(cx, cz) {
         push_box(
             world,
             bounds_map,
@@ -2218,7 +3019,7 @@ fn build_collision_world(world: &mut CollisionWorld, bounds_map: &HashMap<String
     // 代价是样板楼**不再挡车**:车可以开进它的首层。但两栋楼都摆在
     // 街区围合的**内圈**(`BLOCK_INNER` 半径),离最近车道 19.5 m,
     // 而车道是循环跑固定线路的,所以这条车道永远不会有车。
-    for prop in build_city_props() {
+    for prop in build_city_props(cx, cz) {
         push_box(
             world,
             bounds_map,
@@ -2231,7 +3032,7 @@ fn build_collision_world(world: &mut CollisionWorld, bounds_map: &HashMap<String
             prop_collider_scale(prop.asset),
         );
     }
-    for (index, spot) in build_city_palms().iter().enumerate() {
+    for (index, spot) in build_city_palms(cx, cz).iter().enumerate() {
         // 棕榈的碰撞体是**树干**,不是树冠:资产包围盒的 XZ 最大跨度是
         // 展开的叶子(3 m+),拿它当碰撞半径会在车道中间立一圈看不见的
         // 树桩墙。树干半径固定,只挡人不挡车。
@@ -2321,8 +3122,11 @@ fn local_bounds(bounds_map: &HashMap<String, Bounds>, asset: &str) -> (Vec3, Vec
 /// 路面半宽 `STREET_HALF_WIDTH` = 7 m,双向车道各占一半,车道中心落在
 /// ±3.5 m 处 —— 正好压在程序化地面画的车道虚线上。
 const LANE_OFFSET_X: f32 = 3.5;
-/// 车队循环轨道的半长(米):比城市半边长 [`CITY_HALF`] 小,车到端点 wrap。
-const TRAFFIC_HALF: f32 = CITY_HALF - 30.0;
+/// 车队循环轨道的半长(米):车沿 Z 跑完这一段就 wrap 回起点。
+///
+/// 世界本身没有边界,这一档只是「车队循环一圈多长」,不是世界的边。
+/// 旧值是 `CITY_HALF - 30`,把世界边长当成了循环长度。
+const TRAFFIC_HALF: f32 = 600.0;
 
 /// 实心大道具(交通灯 / 路灯)碰撞体不缩放。
 const FULL_PROP_COLLIDER_SCALE: f32 = 1.0;
@@ -2340,10 +3144,11 @@ const CONE_COLLIDER_SCALE: f32 = 0.3;
 ///
 /// - `bool` - `true` 表示该 X 在某条街的车道缓冲带内。
 fn on_lane(x: f32) -> bool {
-    STREET_LINES.iter().any(|line: &f32| {
-        let offset: f32 = (x - *line).abs();
-        (offset - LANE_OFFSET_X).abs() < LANE_CLEAR_MARGIN
-    })
+    // 世界是无限网格,「任一街道的车道缓冲带」是无限个区间;只可能
+    // 检查紧邻 x 的那一条,再按 2 的步长镜像一次就覆盖 ±。
+    let nearest: f32 = street_axis((x / STREET_PITCH).round() as i32);
+    let offset: f32 = (x - nearest).abs();
+    (offset - LANE_OFFSET_X).abs() < LANE_CLEAR_MARGIN
 }
 
 /// 棕榈树干碰撞半径(米)—— 只挡人,树叶可以从中穿过。
@@ -2351,22 +3156,21 @@ const PALM_TRUNK_RADIUS: f32 = 0.4;
 /// 车道缓冲区半宽(米):街道中轴线两侧这么多米内不放静态碰撞体。
 const LANE_CLEAR_MARGIN: f32 = 1.8;
 
-/// 南北向街道的轴线(取 `STREET_LINES` 里最靠中间的两条,再取负号补一条
-/// 西侧车道),也就是车队实际会出现的 X 坐标。
+/// 南北向街道的车道 X 坐标,也就是车队实际会出现的 X 坐标。
 ///
-/// 从 `STREET_LINES` **派生**而不是另抄一份数字:街道网格改了这里自动跟着
+/// 从 [`street_axis`] **派生**而不是另抄一份数字:街道网格改了这里自动跟着
 /// 改,不会出现「车开在没有路的虚空里」。
 ///
 /// # Arguments
 ///
-/// - `usize` - `STREET_LINES` 里的街道索引。
+/// - `i32` - 街道索引(任意整数)。
 /// - `f32` - 车道在街道哪一侧(`-1.0` / `+1.0`)。
 ///
 /// # Returns
 ///
 /// - `f32` - 该街道的车道 X 坐标(米)。
-fn lane_x(street_index: usize, side: f32) -> f32 {
-    STREET_LINES[street_index] + side * LANE_OFFSET_X
+fn lane_x(street_index: i32, side: f32) -> f32 {
+    street_axis(street_index) + side * LANE_OFFSET_X
 }
 
 /// 车队车道蓝图:`(资产, 车道 X, 起始 Z, 巡航速度, 方向)`。
@@ -3213,9 +4017,142 @@ fn json_f32s(values: &[f32]) -> String {
 /// `Runtime.evaluate` 读这里,才能证明「玩家真的在动」而不是「只有相机动」。
 ///
 /// # Arguments
+/// 执行自动化验证脚本下达的传送请求。
 ///
-/// - `&GameHandles` - 事件句柄。
-/// - `&str` - 本帧的 HUD 文本。
+/// 走「每帧读一次 `window.__vcw_teleport`」而不是往 window 挂函数,
+/// 因为挂函数需要 web-sys 的 `Function` feature,而 Cargo.toml 已定稿。
+/// 脚本侧只要 `__vcw_teleport = {x, z}` 写一个普通对象,下一帧就会生效,
+/// 传送后游戏自身会重新贴地 / 重建流式地面 —— 那正是要测的东西。
+///
+/// # Arguments
+///
+/// - `&mut Game` - 游戏状态,写入传送后的位置。
+fn apply_teleport_request(game: &mut Game) {
+    let window: Option<web_sys::Window> = web_sys::window();
+    let Some(window) = window else {
+        return;
+    };
+    // 相机朝向也可以注入。WASD 是**相机相对**的,所以「按住 W 走进门」
+    // 必须先把相机对准门;真机上靠鼠标拖拽,无头浏览器里合成拖拽会把
+    // 画布卡在按住状态,于是朝向也走同一个验收通道。
+    let aim_key: JsValue = JsValue::from_str(K_AIM_WINDOW);
+    let aim_request: JsValue = js_sys::Reflect::get(&window, &aim_key).unwrap_or(JsValue::NULL);
+    if !aim_request.is_null() && !aim_request.is_undefined() {
+        let _: bool = js_sys::Reflect::set(&window, &aim_key, &JsValue::NULL).unwrap_or(false);
+        if let Some(yaw) = aim_request.as_f64() {
+            game.camera.set_yaw(yaw as f32);
+        }
+    }
+    let key: JsValue = JsValue::from_str(K_TELEPORT_WINDOW);
+    let request: JsValue = js_sys::Reflect::get(&window, &key).unwrap_or(JsValue::NULL);
+    if request.is_null() || request.is_undefined() {
+        return;
+    }
+    // `speed` 子命令:设定时间加速倍率,一直有效到下次改。
+    if js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_PROBE))
+        .ok()
+        .and_then(|value: JsValue| value.as_bool())
+        .unwrap_or(false)
+    {
+        probe_nearby_shapes(game);
+        return;
+    }
+    if let Some(scale) = js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_SPEED))
+        .ok()
+        .and_then(|value: JsValue| value.as_f64())
+    {
+        game.speed_scale = (scale as f32).clamp(0.1, 8.0);
+        return;
+    }
+    // `safe` 子命令:打开 / 关闭无敌,直到脚本清掉为止。
+    if js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_SAFE))
+        .ok()
+        .map(|value: JsValue| value.is_truthy())
+        .unwrap_or(false)
+    {
+        game.safe_mode = true;
+        game.player.set_health(PLAYER_MAX_HEALTH);
+        return;
+    }
+    // `walk` 子命令:朝世界方向持续走,直到脚本清掉为止。
+    if js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_WALK))
+        .ok()
+        .map(|value: JsValue| value.is_truthy())
+        .unwrap_or(false)
+    {
+        let dx: f32 = js_sys::Reflect::get(&request, &JsValue::from_str("dx"))
+            .ok()
+            .and_then(|value: JsValue| value.as_f64())
+            .map(|value: f64| value as f32)
+            .unwrap_or(0.0);
+        let dz: f32 = js_sys::Reflect::get(&request, &JsValue::from_str("dz"))
+            .ok()
+            .and_then(|value: JsValue| value.as_f64())
+            .map(|value: f64| value as f32)
+            .unwrap_or(0.0);
+        if dx == 0.0 && dz == 0.0 {
+            // 松手时把速度一起清掉。只清输入方向的话,玩家会带着余速
+            // 继续滑行好几米 —— 下一个路点就从偏离的位置起步,撞墙。
+            game.walk_request = [0.0, 0.0];
+            game.player.set_velocity([0.0, 0.0]);
+            return;
+        }
+        game.walk_request = [dx, dz];
+        return;
+    }
+    let read = |field: &str| -> f32 {
+        let field_key: JsValue = JsValue::from_str(field);
+        js_sys::Reflect::get(&request, &field_key)
+            .ok()
+            .and_then(|value: JsValue| value.as_f64())
+            .map(|value: f64| value as f32)
+            .unwrap_or(SPAWN_POINT[0])
+    };
+    let x: f32 = read("x");
+    let z: f32 = read("z");
+    let hold: bool = js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_HOLD))
+        .ok()
+        .map(|value: JsValue| value.is_truthy())
+        .unwrap_or(false);
+    // 清掉请求,否则每帧都会传送。
+    let _cleared: bool = js_sys::Reflect::set(&window, &key, &JsValue::NULL).unwrap_or(false);
+    if hold {
+        // 注意:这里**不**立刻清 `fire_held`,让 simulate 消费。
+
+        // 注入开火意图,绕过输入层。真机上的开火路径是
+        // canvas `mousedown` -> `fire_held` -> `fire_weapon`;无头浏览器的
+        // CDP `Input.dispatchMouseEvent` 与合成 `MouseEvent` 都进不了这个
+        // 监听器(实测 `fire_held` 恒为 false),于是从事件层往下的整条
+        // 链路一次都测不到。设成 true 之后,`fire_weapon` 走的是**和真人
+        // 一样的那段代码**:扣弹匣、算冷却、算命中、结算伤害。
+        game.input.fire_held = true;
+        game.input.fire_pressed = true;
+        game.input.aim_point = [CANVAS_CSS_W * 0.5, CANVAS_CSS_H * 0.5];
+        game.input.viewport = [CANVAS_CSS_W, CANVAS_CSS_H];
+        // 只注入一帧:`fire_held` 是「按住」语义,不清掉就会一直开火,
+        // 脚本连发 14 下就变成扣光整个弹匣外加打空全部备弹。
+        game.hold_frames = 1;
+        return;
+    }
+    let here: Vec3 = game.player.get_position();
+    game.player.set_position([x, here[1], z]);
+    game.camera.set_target([x, FOLLOW_HEIGHT, z]);
+    // **不能**顺手把 `streamed_center` 设成目的地。那样下一帧
+    // `stream_needs_rebuild` 看到「玩家 == 中心」就判定不用重建,于是
+    // 传送过去看到的还是旧地形的三角形数 —— 这正是第一轮 P3 观察到的
+    // 「4 次传送三角形一模一样」。让中心留在原处,重建由阈值判定自然触发。
+}
+
+/// 把验收脚本要读的状态写进 `window.__vcw`。
+///
+/// # Arguments
+///
+/// - `&GameHandles` - WASM 侧持有的各子系统句柄。
+/// - `&str` - 当前 HUD 文本(带引号后写入 JSON)。
+///
+/// # Returns
+///
+/// - `()` - 无返回值,结果通过 `window.__vcw` 暴露。
 fn publish_debug_state(handles: &GameHandles, hud: &str) {
     let game: std::cell::Ref<Game> = handles.game.borrow();
     let position: Vec3 = game.player.get_position();
@@ -3283,6 +4220,40 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
         None => String::from(crate::r#const::NO_BATCHES),
     };
     let bn: usize = game.scene.batches.len();
+    // 流式地面的当前生成中心:验收脚本用它证明地面跟着玩家走。
+    let stream_x: f32 = game.streamed_center[0];
+    let stream_z: f32 = game.streamed_center[1];
+    // 全量验收脚本要看「走到远处之后脚下还有没有地」,所以把三角形数
+    // 和击杀数一起挂出来:三角形塌成 0 就是几何没生成,击杀数用来确认
+    // 战斗回路是活的。
+    let tris: usize = game.scene.total_triangles;
+    let kills: u32 = game.kills;
+    let loaded: usize = game.loaded_assets;
+    // 验收脚本要导航到样板楼门口才能验证「进门 → 上楼」,所以把门外的
+    // 站位坐标一起挂出来。脚本自己从源码抄 `6.4` 的话,内墙改一次就得
+    // 跟着改脚本,迟早对不上。
+    let door_spec: &ShowcaseSpec = &showcase_specs()[0];
+    let door_at: Vec3 = showcase_door_approach(
+        door_spec.position[0],
+        door_spec.position[1],
+        door_spec.yaw,
+        1.6,
+    );
+    let route_points: Vec<[f32; 2]> = showcase_walk_route(0);
+    let mut route_parts: Vec<String> = Vec::new();
+    for point in route_points.iter() {
+        route_parts.push(format!("[{:.3},{:.3}]", point[0], point[1]));
+    }
+    let route_json: String = format!("[{}]", route_parts.join(","));
+    let door_json: String = format!(
+        "{{\"x\":{:.3},\"y\":{:.3},\"z\":{:.3},\"yaw\":{:.4},\"cx\":{:.3},\"cz\":{:.3}}}",
+        door_at[0],
+        door_at[1],
+        door_at[2],
+        door_spec.yaw,
+        door_spec.position[0],
+        door_spec.position[1]
+    );
     let wheel_count: usize = game.car_wheel_batches.len();
     // 车轮批次总数 + 第一个车轮的 Y 基向量(自转角的可观测代理):
     // 停车时该向量是 [0,1,0];车轮滚动时会随转角在 XZ 平面里摆动。
@@ -3433,7 +4404,7 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
         .collect::<Vec<String>>()
         .join(",");
     let json: String = format!(
-        "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy}{DEBUG_CLOSE}",
+        "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf}{DEBUG_CLOSE}",
         x = position[0],
         z = position[2],
         yaw = game.player.get_yaw(),
@@ -3467,6 +4438,12 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
         ceye_z = eye[2],
         py = position[1],
         grounded = game.player.get_grounded(),
+        wr0 = game.walk_request[0],
+        wr1 = game.walk_request[1],
+        vx = game.player.get_velocity()[0],
+        vz = game.player.get_velocity()[1],
+        rsp = game.hurt.get_respawn(),
+        saf = game.safe_mode,
         vy = game.player.get_vertical_velocity(),
         interiors_json = format!(
             "{{\"count\":{},\"inSolid\":{}}}",
@@ -4096,6 +5073,9 @@ fn show_loading_error(message: &str) {
 fn simulate(game: &mut Game, delta: f32) {
     let forward_input: f32 = axis(&game.input, KEYW, KEYS);
     let strafe_input: f32 = axis(&game.input, KEYD, KEYA);
+    // 验收通道的「朝世界方向走」优先于键盘:它绕过相机朝向,让脚本不用
+    // 先转相机就能沿直线推进。零向量表示不干预。
+    let world_walk: Vec2 = game.walk_request;
     // 驾驶时 A/D 当方向盘:横向输入就是舵角,不再被
     // `set_position([lane_x, ...])` 吃掉。
     let steer_input: f32 = strafe_input;
@@ -4105,7 +5085,17 @@ fn simulate(game: &mut Game, delta: f32) {
     // 相机水平朝向:WASD 的「前」永远跟着相机走,所以拖鼠标转相机就能
     // 转移动方向(第三人称射击的标准操作)。
     let camera_yaw: f32 = game.camera.get_yaw();
-    let forward: Vec2 = [camera_yaw.cos(), -camera_yaw.sin()];
+    let forward: Vec2 = if world_walk != [0.0, 0.0] {
+        world_walk
+    } else {
+        [camera_yaw.cos(), -camera_yaw.sin()]
+    };
+    // 世界方向直控时,「前 / 侧」输入直接就是方向本身,不再乘相机基向量。
+    let (forward_input, strafe_input): (f32, f32) = if world_walk != [0.0, 0.0] {
+        (1.0, 0.0)
+    } else {
+        (forward_input, strafe_input)
+    };
 
     // 车队先走:玩家开的那辆由 `drive` 接管,其余按巡航速度循环。
     let driven: Option<usize> = game.player.get_vehicle();
@@ -4150,9 +5140,60 @@ fn simulate(game: &mut Game, delta: f32) {
         }
     }
 
+    if game.safe_mode {
+        // 只回血不够:掉到 0 的那一帧 `step_combat` 已经进了 `step_death`,
+        // 之后血量拉满也救不回来 —— `hurt` 还在重生倒计时里,下一次
+        // `step_death` 照样把玩家扔到最近的医院点。实测每段走位结束
+        // 都被弹到 (33.5, 32.9) 附近,两次不同起点弹到几乎同一点,正是
+        // 医院点而不是碰撞解算的结果。
+        game.hurt.revive();
+        game.player.set_health(PLAYER_MAX_HEALTH);
+    }
     collect_pickups(game);
     step_combat(game, dt);
+    step_streamed_surface(game);
     update_camera(game, delta);
+    // 注入的开火只持续一帧,到期后放开。
+    if game.hold_frames > 0 {
+        game.hold_frames -= 1;
+        if game.hold_frames == 0 {
+            game.input.fire_held = false;
+        }
+    }
+}
+
+/// 玩家走出当前地面块时,把地面与水面重新生成到新中心。
+///
+/// 世界是无限的,而地面是一块固定尺寸、跟着玩家平移的网格块。判定
+/// 单独抽出来(见 [`stream_needs_rebuild`]),这样「什么时候重建」是可
+/// 单测的纯函数,不必真的跑一局游戏才知道。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+fn step_streamed_surface(game: &mut Game) {
+    let here: Vec3 = game.player.get_position();
+    let player: Vec2 = [here[0], here[2]];
+    let center: Vec2 = game.streamed_center;
+    if !stream_needs_rebuild(player, center) {
+        return;
+    }
+    // 对齐到街道网格:地面块本来就按街道对齐,不对齐会导致玩家每走
+    // 一格就看到地面整体跳一格。
+    let next_x: f32 = street_axis((player[0] / STREET_PITCH).round() as i32);
+    let next_z: f32 = street_axis((player[1] / STREET_PITCH).round() as i32);
+    let index_map: HashMap<String, usize> = game.asset_index.clone();
+    let static_count: usize = game.static_batch_count;
+    rebuild_streamed_surface(
+        &mut game.scene,
+        game.ground_batch,
+        game.water_batch,
+        next_x,
+        next_z,
+        &index_map,
+        static_count,
+    );
+    game.streamed_center = [next_x, next_z];
 }
 
 /// 重力 + 楼板支撑 + 楼梯抬升 —— 玩家 Y 轴的一帧推进。
@@ -5297,7 +6338,12 @@ fn spawn_player_traffic_pickups(
     }
 
     // 碰撞世界:从资产 bounds 自动推导。
-    build_collision_world(&mut game.world, &game.asset_bounds);
+    build_collision_world(
+        &mut game.world,
+        &game.asset_bounds,
+        SPAWN_POINT[0],
+        SPAWN_POINT[2],
+    );
     // 室内碰撞世界:两栋可进入样板楼的楼板 / 隔墙 / 楼梯 / 外墙。
     build_showcase_interiors(&mut game.interiors);
 
@@ -5307,7 +6353,7 @@ fn spawn_player_traffic_pickups(
     let player_at: Vec3 = game.player.get_position();
     let mut best_distance: f32 = f32::MAX;
     let mut nearest: Option<[f32; 2]> = None;
-    for placement in build_city_buildings() {
+    for placement in build_city_buildings(0.0, 0.0) {
         let dx: f32 = placement.position[0] - player_at[0];
         let dz: f32 = placement.position[1] - player_at[2];
         let distance: f32 = dx * dx + dz * dz;
@@ -5437,6 +6483,10 @@ fn step_and_render(
     game.canvas_size.set((width, height));
 
     // ---- 输入 → 玩家 / 车队 / 相机 ----
+    // 传送 / 注入开火请求要在逻辑步进**之前**吃掉:挂在帧尾的话这一帧
+    // 用的还是旧坐标算出来的碰撞与流式中心,而 `fire_held` 会等到下一帧
+    // 才被读到 —— 中间那一帧已经把流式判定跳过了。
+    apply_teleport_request(game);
     simulate(game, delta);
 
     // 相机俯仰始终收在合法区间。
@@ -5748,6 +6798,15 @@ pub fn boot() {
         canvas: canvas.clone(),
         camera,
         scene: Scene::default(),
+        ground_batch: 0,
+        water_batch: 0,
+        streamed_center: [SPAWN_POINT[0], SPAWN_POINT[2]],
+        static_batch_count: 0,
+        asset_index: HashMap::new(),
+        hold_frames: 0,
+        walk_request: [0.0, 0.0],
+        safe_mode: false,
+        speed_scale: 1.0,
         input: InputState::default(),
         renderer,
         loaded_assets: 0,
@@ -5985,7 +7044,8 @@ async fn load_assets_and_build(handles: GameHandles) {
     // 拿到的 mesh_index 会落在「已上传列表」之外,GPU 侧 get() 返回 None,
     // 地面就整块不画 —— 画面里只剩一片街道两侧的楼和树,没有马路。
     set_progress(94.0, BUILDING_SCENE);
-    build_scene(&mut scene, &index_map);
+    let (ground_batch, water_batch, static_batch_count): (usize, usize, usize) =
+        build_scene(&mut scene, &index_map, SPAWN_POINT[0], SPAWN_POINT[2]);
 
     // 4) 上传所有 GPU 资源。批次里的 mesh_index 与 scene.meshes 同序。
     //
@@ -6041,6 +7101,11 @@ async fn load_assets_and_build(handles: GameHandles) {
     {
         let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
         game.scene = scene;
+        game.ground_batch = ground_batch;
+        game.water_batch = water_batch;
+        game.static_batch_count = static_batch_count;
+        game.asset_index = index_map.clone();
+        game.streamed_center = [SPAWN_POINT[0], SPAWN_POINT[2]];
         game.loaded_assets = index_map.len();
         game.total_assets = total;
         game.load_error = if failed.is_empty() {
@@ -6057,7 +7122,7 @@ async fn load_assets_and_build(handles: GameHandles) {
     {
         let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
         game.asset_bounds = asset_bounds.clone();
-        // 车道 X 用 `lane_x()` 从 `STREET_LINES` 现算一遍,和蓝图里的字面值
+        // 车道 X 用 `lane_x()` 从 `street_axis()` 现算一遍,和蓝图里的字面值
         // 互相校验:如果街道网格改了而蓝图没改,这里能立刻发现。
         console_log(&format!(
             "[vcw] lane Xs: {} / {} / {}",
@@ -6265,24 +7330,28 @@ mod tests {
     use super::car_wheel_model;
     use crate::collision::CollisionWorld;
     use crate::r#const::{
-        GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, PLAYER_BODY_HEIGHT, T_SHOWCASE_AXIS_ON_ROAD,
-        T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE,
-        T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
+        GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, PLAYER_BODY_HEIGHT, T_ROUTE_LEG_DIAGONAL,
+        T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DOOR_CENTER_BLOCKED,
+        T_SHOWCASE_DOOR_INSIDE, T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING,
+        T_SHOWCASE_DOOR_ON_OUTER_WALL, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
         T_SHOWCASE_DOORS_FACE_EACH_OTHER, T_SHOWCASE_DOORWAY_2D_BLOCKED,
         T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING, T_SHOWCASE_LANE_BLOCKED,
         T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
         T_SHOWCASE_PIER_LET_PLAYER_THROUGH, T_SHOWCASE_PUSHED_INTO_WALL,
-        T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_STAIR_REACHES_TOP, T_SHOWCASE_STAIR_RISE_SHALLOW,
-        T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES,
-        T_SHOWCASE_TWO_OVERLAP, T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP,
-        TERMINAL_VELOCITY,
+        T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE, T_SHOWCASE_STAIR_REACHES_TOP,
+        T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_TOLERANCE_TOO_BIG,
+        T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP, T_SHOWCASE_WALKER_DIRECTION,
+        T_SHOWCASE_WALKER_REACHES_TOP, TERMINAL_VELOCITY,
     };
     use crate::game::{
-        PLAYER_RADIUS, SHOWCASE_DOOR_HALF, SHOWCASE_GROUND_TOP, SHOWCASE_STAIR_LEAD,
-        SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN, SHOWCASE_STAIR_STEPS, SHOWCASE_STAIR_WIDTH,
-        SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH, STREET_HALF_WIDTH,
-        STREET_LINES, ShowcaseSpec, build_city_buildings, build_collision_world,
-        build_showcase_interiors, showcase_placements, showcase_specs,
+        BLOCK_VIEW_RADIUS, BlockLayout, BuildingPlacement, GROUND_CELL_ALIGN, GROUND_SPAN,
+        MeshAsset, MeshPart, PLAYER_RADIUS, SHOWCASE_DOOR_HALF, SHOWCASE_GROUND_TOP,
+        SHOWCASE_STAIR_LEAD, SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN, SHOWCASE_STAIR_STEPS,
+        SHOWCASE_STAIR_WIDTH, SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH,
+        STREAM_REBUILD_STEP, STREET_HALF_WIDTH, STREET_PITCH, ShowcaseSpec, blocks_near,
+        build_city_buildings, build_collision_world, build_ground_near, build_showcase_interiors,
+        build_water_near, on_roadway, showcase_placements, showcase_specs, stream_needs_rebuild,
+        street_axis, street_indices_in, street_strips,
     };
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
@@ -6306,13 +7375,7 @@ mod tests {
     /// 无关**的事实,再旋到世界。这样两栋楼朝向相反(`+π/2` 与 `−π/2`)
     /// 时测试仍然成立 —— 之前测试写死世界 +Z 是门面,朝向一改就全错。
     fn to_world(index: usize, local: Vec2) -> Vec2 {
-        let specs = showcase_specs();
-        let spec = &specs[index];
-        let (sin_yaw, cos_yaw) = spec.yaw.sin_cos();
-        [
-            spec.position[0] + local[0] * cos_yaw + local[1] * sin_yaw,
-            spec.position[1] - local[0] * sin_yaw + local[1] * cos_yaw,
-        ]
+        super::showcase_to_world(index, local)
     }
 
     /// 本地 XZ 的**行向量**(切向),即门洞的左右方向。
@@ -6324,20 +7387,36 @@ mod tests {
 
     /// 门洞中心的世界坐标(本地 `z = span.z / 2`)。
     fn doorway(index: usize) -> Vec2 {
-        to_world(index, [0.0, showcase_specs()[index].span[1] * 0.5])
+        super::showcase_door_center(index)
     }
 
     /// 门洞法线的世界方向(本地 +Z 旋到世界)。
     fn front_normal(index: usize) -> Vec2 {
-        let yaw = showcase_specs()[index].yaw;
-        [yaw.sin(), yaw.cos()]
+        super::showcase_front_normal(index)
+    }
+
+    /// 世界 XZ 反算回资产本地 XZ(把 [`showcase_to_world`] 逆转)。
+    ///
+    /// # Arguments
+    ///
+    /// - `usize` - 样板楼序号。
+    /// - `Vec2` - 世界 XZ。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 本地 XZ。
+    pub fn showcase_to_local(index: usize, world: Vec2) -> Vec2 {
+        let specs: [ShowcaseSpec; 2] = showcase_specs();
+        let spec: &ShowcaseSpec = &specs[index];
+        let (sin_yaw, cos_yaw): (f32, f32) = spec.yaw.sin_cos();
+        let dx: f32 = world[0] - spec.position[0];
+        let dz: f32 = world[1] - spec.position[1];
+        [dx * cos_yaw - dz * sin_yaw, dx * sin_yaw + dz * cos_yaw]
     }
 
     /// 楼梯中线上的某一点的本地 XZ:楼梯贴着本地 +X 内墙。
     fn stair_point(index: usize, local_z: f32) -> Vec2 {
-        let span = showcase_specs()[index].span;
-        let stair_x: f32 = span[0] * 0.5 - SHOWCASE_STAIR_WIDTH * 0.5;
-        to_world(index, [stair_x, local_z])
+        super::showcase_stair_point(index, local_z)
     }
 
     /// 楼梯最上一级的本地 Z(那一级的**前沿**,即顶面最高处)。
@@ -6507,6 +7586,65 @@ mod tests {
             T_SHOWCASE_STAIR_RISE_SHALLOW,
             2.0 * SHOWCASE_STAIR_RISE
         );
+    }
+
+    /// 走路线的每一个路点都必须**互不相同且真正能走**(相邻点间距
+    /// 大于一个身位)。
+    ///
+    /// 之前踩过两次:一次是「沿门轴深入」的中间点与下一个点共用本地 Z,
+    /// 旋转到世界后 X 完全相同,路线在原地打转;另一次是斜穿隔墙的
+    /// 路点直接顶在墙上。两者都不会让任何单测变红 —— 端到端那条全程用
+    /// 本地坐标做判定,根本不经过世界变换。只能在这个层面查。
+    #[test]
+    fn the_showcase_walk_route_has_no_duplicate_or_adjacent_points() {
+        for index in 0..2 {
+            let route: Vec<[f32; 2]> = super::showcase_walk_route(index);
+            assert!(
+                route.len() >= 8,
+                "{} route has {} points",
+                T_SHOWCASE_ROUTE_WALKABLE,
+                route.len()
+            );
+            for pair in route.windows(2) {
+                let gap: f32 =
+                    ((pair[1][0] - pair[0][0]).powi(2) + (pair[1][1] - pair[0][1]).powi(2)).sqrt();
+                assert!(
+                    gap > 0.9,
+                    "{} consecutive route points are {gap:.2} m apart",
+                    T_SHOWCASE_ROUTE_WALKABLE
+                );
+                // 单轴:楼里有隔墙和楼梯基座,斜着走必然一头撞上。
+                // 所以每一段只能沿 X 或沿 Z,不能同时动两个轴。
+                assert!(
+                    (pair[1][0] - pair[0][0]).abs() < 0.01
+                        || (pair[1][1] - pair[0][1]).abs() < 0.01,
+                    "{}",
+                    T_ROUTE_LEG_DIAGONAL
+                );
+            }
+        }
+    }
+
+    /// 门必须开在**外墙面**上,而不是内墙净跨的边界。
+    ///
+    /// 两者差一层墙厚(约 1.65 m)。取内墙面的话,「门外 1.5 m」这个落点
+    /// 会正好卡在外墙与内墙之间的夹缝里 —— 浏览器实测玩家进了门洞就在
+    /// 原地打转,往里推不动、往外被弹回。
+    #[test]
+    fn the_showcase_doorway_sits_on_the_outer_wall() {
+        for index in 0..2 {
+            let spec = &showcase_specs()[index];
+            let door = super::showcase_door_center(index);
+            let local = super::showcase_to_local(index, door);
+            let expected: f32 = spec.half[1] + SHOWCASE_WALL_THICKNESS;
+            assert!(
+                (local[1] - expected).abs() < 1e-3,
+                "{} door local z = {}, expected outer wall at {}",
+                T_SHOWCASE_DOOR_ON_OUTER_WALL,
+                local[1],
+                expected
+            );
+        }
     }
 
     #[test]
@@ -6730,6 +7868,144 @@ mod tests {
         }
     }
 
+    /// 街道网格是无限的:远离原点的地方照样有街道、街区与建筑。
+    ///
+    /// 这是「地图太小」的直接断言 —— 只要 `street_axis` 还停在
+    /// `[-90, -30, 30, 90]`,走到 500 m 外就只剩虚空。
+    #[test]
+    fn the_street_grid_extends_far_past_the_old_city_bounds() {
+        // 半条街的倍数在很远的地方依然是街道轴线。
+        for index in [-1000i32, -37, 0, 11, 250] {
+            let axis: f32 = street_axis(index);
+            assert!(
+                (axis - STREET_PITCH * index as f32).abs() < 1e-4,
+                "第 {index} 条街道的轴线必须等于间距乘索引"
+            );
+            // 街道间距固定,所以相邻两条永远相隔一个定值。
+            let next: f32 = street_axis(index + 1);
+            assert!(
+                (next - axis - STREET_PITCH).abs() < 1e-4,
+                "相邻街道间距必须恒为 {STREET_PITCH}"
+            );
+        }
+        // 街区间枚举必须覆盖住整个查询区间,不多不少。
+        let indices: Vec<i32> = street_indices_in(-125.0, 190.0);
+        assert!(
+            indices.first() == Some(&-2) && indices.last() == Some(&3),
+            "区间枚举必须含首尾,得到 {indices:?}"
+        );
+        // 逆序区间必须返回空,而不是 panic 或反向结果。
+        let empty: Vec<i32> = street_indices_in(100.0, -100.0);
+        assert!(empty.is_empty(), "逆序区间必须返回空");
+    }
+
+    /// 远离原点的位置照样能生成城市内容。
+    #[test]
+    fn blocks_and_buildings_generate_far_from_the_origin() {
+        for center in [[0.0f32, 0.0f32], [3000.0, 3000.0], [-4500.0, 1200.0]] {
+            let blocks: Vec<BlockLayout> = blocks_near(center[0], center[1], BLOCK_VIEW_RADIUS);
+            assert!(!blocks.is_empty(), "({}) 附近必须有街区", center[0]);
+            let buildings: Vec<BuildingPlacement> = build_city_buildings(center[0], center[1]);
+            assert!(!buildings.is_empty(), "({}) 附近必须生成楼", center[0]);
+            // 每一栋都必须真的落在生成中心附近,而不是仍然堆在原点。
+            let nearest: f32 = buildings
+                .iter()
+                .map(|b: &BuildingPlacement| {
+                    (b.position[0] - center[0])
+                        .abs()
+                        .max((b.position[1] - center[1]).abs())
+                })
+                .fold(f32::MAX, f32::min);
+            assert!(
+                nearest <= BLOCK_VIEW_RADIUS,
+                "({}) 附近生成的楼离中心 {nearest} m,超出 {BLOCK_VIEW_RADIUS} m 视距",
+                center[0]
+            );
+        }
+    }
+
+    /// 地面与水面跟着玩家走,不是钉在世界原点。
+    #[test]
+    fn streamed_surfaces_follow_the_player() {
+        let (origin, far): (MeshAsset, MeshAsset) =
+            (build_ground_near(0.0, 0.0), build_ground_near(3000.0, 0.0));
+        // 两块地面必然不同 —— 不跟随玩家的话它们会逐字节相同。
+        let same: bool = origin
+            .parts
+            .iter()
+            .zip(far.parts.iter())
+            .all(|(a, b): (&MeshPart, &MeshPart)| a.positions == b.positions);
+        assert!(!same, "地面必须跟着生成中心走,不能固定在世界原点");
+        // 路面判定在远处同样成立:3000 是街道轴线,所以那里是沥青。
+        assert!(on_roadway(3000.0, 30.0), "远处街道上必须是沥青");
+        assert!(!on_roadway(3015.0, 30.0), "远离街道的点不能是沥青");
+    }
+
+    /// 流式判定:玩家走满一格街道才重建,原地站着不重建。
+    #[test]
+    fn streaming_rebuilds_only_after_a_full_street_of_travel() {
+        let center: Vec2 = [0.0, 0.0];
+        assert!(
+            !stream_needs_rebuild([0.0, 0.0], center),
+            "原地站着不该触发重建"
+        );
+        assert!(
+            !stream_needs_rebuild([STREAM_REBUILD_STEP - 0.1, 0.0], center),
+            "差一步没走满不该触发重建"
+        );
+        assert!(
+            stream_needs_rebuild([STREAM_REBUILD_STEP + 0.1, 0.0], center),
+            "走满一整格街道必须触发重建"
+        );
+        assert!(
+            stream_needs_rebuild([0.0, -STREAM_REBUILD_STEP - 0.1], center),
+            "Z 方向同样要触发"
+        );
+    }
+
+    /// 地面 / 水面网格在任何位置都能生成 —— 这才是「地图无限」的底层保证。
+    ///
+    /// 之前地面是固定 `[-150, 150]` 的一块网格,玩家走到 149 m 就到了
+    /// 边;现在它跟着生成中心平移,所以「中心在 3000 m 处」和「中心在
+    /// 0 处」生成出来的东西一样多、一样可用。
+    #[test]
+    fn streamed_ground_and_water_build_far_from_the_origin() {
+        for (x, z) in [(0.0f32, 0.0f32), (3000.0, 3000.0), (-6000.0, 1500.0)] {
+            let ground: MeshAsset = build_ground_near(x, z);
+            let water: MeshAsset = build_water_near(x, z);
+            let ground_faces: usize = ground.parts.iter().map(|p: &MeshPart| p.faces.len()).sum();
+            let water_faces: usize = water.parts.iter().map(|p: &MeshPart| p.faces.len()).sum();
+            assert!(
+                ground_faces > 1000,
+                "({x},{z}) 的地面必须真的生成了面,得到 {ground_faces}"
+            );
+            assert!(
+                water_faces > 100,
+                "({x},{z}) 的水面必须真的生成了面,得到 {water_faces}"
+            );
+            // 顶点必须落在中心附近,而不是仍然堆在原点。
+            // 顶点必须**跟着中心**走。底面是 `GROUND_SPAN` 见方;街道附属
+            // 几何(路缘石、斑马线)挂在街道轴线上,最多再往外一个
+            // 街道半宽加人行道。所以合法上界是「半块 + 街道附属宽度」,
+            // 而不是 `GROUND_SPAN` 本身。
+            let reach: f32 = ground
+                .parts
+                .iter()
+                .flat_map(|part: &MeshPart| part.positions.iter())
+                .map(|p: &[f32; 3]| (p[0] - x).abs().max((p[2] - z).abs()))
+                .fold(0.0f32, f32::max);
+            let limit: f32 = GROUND_SPAN * 0.5 + STREET_HALF_WIDTH + SIDEWALK_WIDTH;
+            assert!(
+                reach <= limit,
+                "({x},{z}) 的地面顶点离中心最远 {reach} m,超过 {limit} m —— 街道附属几何铺出了地面块"
+            );
+        }
+        // 原点处和远处的内容不同 —— 不跟随中心的话两块会逐字节相同。
+        let a: Vec<[f32; 3]> = build_ground_near(0.0, 0.0).parts[0].positions.clone();
+        let b: Vec<[f32; 3]> = build_ground_near(3000.0, 0.0).parts[0].positions.clone();
+        assert!(a != b, "地面必须跟着中心走,两块网格不能完全相同");
+    }
+
     /// 车轮矩阵:自转角必须真的改变朝向矩阵,不能只平移。
     #[test]
     fn wheel_spin_rotates_the_axle() {
@@ -6860,8 +8136,13 @@ mod tests {
             ];
             for axis in 0..2 {
                 let reach: f32 = half[axis] + STREET_HALF_WIDTH + SIDEWALK_WIDTH;
-                for line in STREET_LINES {
-                    let gap: f32 = (spec.position[axis] - line).abs();
+                // 无限街道网格:只有紧邻样板楼的那些街道可能压到它,
+                // 更远的街道离得远到不可能相交。
+                for line in street_indices_in(
+                    spec.position[axis] - reach - STREET_PITCH,
+                    spec.position[axis] + reach + STREET_PITCH,
+                ) {
+                    let gap: f32 = (spec.position[axis] - street_axis(line)).abs();
                     assert!(
                         gap > reach,
                         "{} {} {}",
@@ -6886,7 +8167,7 @@ mod tests {
                 cos_yaw.abs() * spec.half[0] + sin_yaw.abs() * spec.half[1],
                 sin_yaw.abs() * spec.half[0] + cos_yaw.abs() * spec.half[1],
             ];
-            for other in build_city_buildings() {
+            for other in build_city_buildings(0.0, 0.0) {
                 // 楼的外形是资产包围盒,这里用最宽的通用包围盒
                 // (`BUILDING_FOOTPRINT_GUARD`)做保守判定。
                 let guard: f32 = 11.0;
@@ -6934,7 +8215,7 @@ mod tests {
             );
         }
         let mut world = CollisionWorld::new();
-        build_collision_world(&mut world, &bounds);
+        build_collision_world(&mut world, &bounds, 0.0, 0.0);
         for spec in showcase_specs() {
             let (sin_yaw, cos_yaw) = spec.yaw.sin_cos();
             let local: Vec2 = [0.0, spec.half[1]];
