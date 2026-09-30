@@ -33,7 +33,7 @@ use crate::{
 // ===========================================================================
 
 /// 三种可切换武器。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Weapon {
     /// 手枪:精度高、射速中等、弹匣小。
     Pistol,
@@ -368,7 +368,6 @@ impl Arsenal {
         }
     }
 
-
     /// 读 `field`。
     ///
     /// # Returns
@@ -477,7 +476,7 @@ impl Arsenal {
 // ===========================================================================
 
 /// 敌人的行为状态。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AiState {
     /// 站桩不动(出生后的第一帧)。
     Idle,
@@ -512,7 +511,7 @@ impl AiState {
 }
 
 /// 敌人是警察还是敌对混混。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Faction {
     /// 警察:被通缉触发,攻击玩家,不掉通缉热度。
     Police,
@@ -717,7 +716,6 @@ impl Enemy {
         }
         false
     }
-
 
     /// 写入水平速度。
     ///
@@ -1088,7 +1086,8 @@ impl Wanted {
             self.set_heat((self.get_heat() - HIDE_COOL_RATE * dt).max(0.0));
         } else if self.get_unseen() >= WANTED_COOLDOWN {
             self.set_heat(
-                (self.get_heat() - WANTED_PER_STAR * WANTED_STEP_DOWN / WANTED_COOLDOWN * dt).max(0.0),
+                (self.get_heat() - WANTED_PER_STAR * WANTED_STEP_DOWN / WANTED_COOLDOWN * dt)
+                    .max(0.0),
             );
         }
         self.recompute_stars()
@@ -1446,7 +1445,9 @@ impl Pedestrian {
     ///
     /// - `bool` - 该回收时为 `true`。
     pub fn is_gone(&self) -> bool {
-        self.get_has_fallen() && self.get_down_timer() <= 0.0 && self.get_knock()[0].abs() < f32::EPSILON
+        self.get_has_fallen()
+            && self.get_down_timer() <= 0.0
+            && self.get_knock()[0].abs() < f32::EPSILON
     }
 
     /// 推进一个固定步长:走向目标 / 逃跑 / 倒地弹飞。
@@ -1465,7 +1466,10 @@ impl Pedestrian {
             self.set_down_timer(self.get_down_timer() - dt);
             // 击飞:按当前击飞速度匀速飞出去,直到停下来。
             let here: Vec3 = self.get_position();
-            let wanted: Vec2 = [here[0] + self.get_knock()[0] * dt, here[2] + self.get_knock()[1] * dt];
+            let wanted: Vec2 = [
+                here[0] + self.get_knock()[0] * dt,
+                here[2] + self.get_knock()[1] * dt,
+            ];
             let resolved: Vec2 = world.resolve_with_radius(wanted, PED_RADIUS);
             self.set_knock([
                 (resolved[0] - here[0]) / dt.max(f32::EPSILON),
@@ -1536,12 +1540,17 @@ impl Pedestrian {
         let planar: f32 = (to[0] * to[0] + to[1] * to[1]).sqrt();
         if planar > 0.05 {
             let desired: f32 = -to[1].atan2(to[0]);
-            self.set_yaw(self.get_yaw() + wrap_angle(desired - self.get_yaw()) * PED_TURN_RATE * dt);
+            self.set_yaw(
+                self.get_yaw() + wrap_angle(desired - self.get_yaw()) * PED_TURN_RATE * dt,
+            );
             let ratio: f32 = (planar / speed).clamp(0.0, 1.0);
             let relaxed: f32 = (1.0 - (-PED_RELAX_RATE * dt).exp()).clamp(0.0, 1.0);
-            self.set_gait_amount(self.get_gait_amount() + (ratio - self.get_gait_amount()) * relaxed);
+            self.set_gait_amount(
+                self.get_gait_amount() + (ratio - self.get_gait_amount()) * relaxed,
+            );
             self.set_gait_phase(
-                (self.get_gait_phase() + planar * PED_GAIT_RATE * dt) % (2.0 * std::f32::consts::PI),
+                (self.get_gait_phase() + planar * PED_GAIT_RATE * dt)
+                    % (2.0 * std::f32::consts::PI),
             );
         } else {
             let relaxed: f32 = (1.0 - (-PED_RELAX_RATE * dt).exp()).clamp(0.0, 1.0);

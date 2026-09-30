@@ -101,7 +101,7 @@ pub fn deploy_police(
         return 0;
     }
     let mut made: usize = 0;
-    for slot in (live as u32)..target {
+    for slot in live..target {
         // 环形散布:每个增派点用不同相位,避免所有警察叠在同一个点。
         let angle: f32 = phase * std::f32::consts::TAU + slot as f32 * 2.399_963;
         let radius: f32 = DEPLOY_RING_MIN

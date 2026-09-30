@@ -1258,8 +1258,6 @@ pub const STYLE_HUD_HITMARKER: &str = "position:absolute;left:50%;top:50%;width:
 /// 小地图画布。
 pub const STYLE_HUD_MINIMAP: &str = "position:absolute;right:22px;bottom:22px;width:150px;height:150px;border:2px solid rgba(255,255,255,.28);border-radius:4px;background:#0b1020";
 
-
-
 /// 护甲背心给的护甲值。
 pub const ARMOR_PICKUP_GAIN: f32 = 50.0;
 /// 弹药箱给的备弹数。
@@ -1454,7 +1452,6 @@ pub const GRAVITY: f32 = 22.0;
 /// 下落速度上限(米/秒):防止穿过薄楼板。
 pub const TERMINAL_VELOCITY: f32 = 34.0;
 
-
 /// 落地下沉容差(米):脚底在楼板面下方这么多之内仍然算站住,防抖。
 pub const GROUND_SNAP_SKIN: f32 = 0.06;
 
@@ -1552,10 +1549,12 @@ pub const T_SHOWCASE_DOOR_NOT_FACING: &str = "门法线没有指向另一栋楼(
 pub const T_SHOWCASE_PUSHED_INTO_WALL: &str = "的人被推进了墙里 {pushed:?}";
 
 /// 单元测试断言文案:楼梯总高必须与二层楼板齐平。
-pub const T_SHOWCASE_STAIR_TOP_LEVEL: &str = "最高一级 {}{STAIR_TOTAL} 与楼板面 {SHOWCASE_UPPER_TOP} 不齐平";
+pub const T_SHOWCASE_STAIR_TOP_LEVEL: &str =
+    "最高一级 {}{STAIR_TOTAL} 与楼板面 {SHOWCASE_UPPER_TOP} 不齐平";
 
 /// 单元测试断言文案:单级踏高必须小于踏高容差。
-pub const T_SHOWCASE_RISE_GE_TOLERANCE: &str = "踏高 {SHOWCASE_STAIR_RISE} >= 容差 {STEP_UP_TOLERANCE}";
+pub const T_SHOWCASE_RISE_GE_TOLERANCE: &str =
+    "踏高 {SHOWCASE_STAIR_RISE} >= 容差 {STEP_UP_TOLERANCE}";
 
 /// 单元测试断言文案:容差不得大到能一步跨上一层。
 pub const T_SHOWCASE_TOLERANCE_TOO_BIG: &str = "容差 {STEP_UP_TOLERANCE} 大到能一步跨上一层";
@@ -1570,10 +1569,12 @@ pub const T_SHOWCASE_WALKER_DIRECTION: &str = "走了 {frames} 帧,楼梯方向 
 pub const T_SHOWCASE_CEILING_PUSHED: &str = "楼 {index} 的头顶楼板把玩家推开了";
 
 /// 单元测试断言文案:隔墙必须挡住玩家。
-pub const T_SHOWCASE_PARTITION_LET_THROUGH: &str = "的隔墙没有挡住玩家 mid={mid:?} pushed={pushed:?}";
+pub const T_SHOWCASE_PARTITION_LET_THROUGH: &str =
+    "的隔墙没有挡住玩家 mid={mid:?} pushed={pushed:?}";
 
 /// 单元测试断言文案:隔墙与楼梯之间必须留出过道。
-pub const T_SHOWCASE_PARTITION_LANE: &str = "隔墙必须与楼梯之间留出过道,partition_end={partition_end}";
+pub const T_SHOWCASE_PARTITION_LANE: &str =
+    "隔墙必须与楼梯之间留出过道,partition_end={partition_end}";
 
 /// 单元测试断言文案:过道必须走得通。
 pub const T_SHOWCASE_LANE_BLOCKED: &str = "的过道被堵住了 lane={lane:?} through={through:?}";

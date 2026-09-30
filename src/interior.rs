@@ -179,11 +179,48 @@ impl FloorWorld {
                 // 围墙 —— 玩家站在街上 y = 0,身体区间与 0.15 m 高的地板
                 // 相交,会被推着绕楼一圈,门洞永远走不进去。正确的做法是
                 // 让 `support_height` 把人**抬上去**。
-                if let Floor::Slab { .. } = floor
-                    && body_min_y >= max[1] - STEP_UP_TOLERANCE
-                {
+                // 楼板只在「脚已经站上去了」时跳过横向分离。这里必须是
+                // `>=`,不能是 `==` 附近的比较:玩家踩在第 N 级踏面上时
+                // 脚底 y 恰好等于该级的 max[1],而 `support_height` 每次都
+                // 把人放到**恰好**这个高度,于是条件成立、正常跳过。
+                //
+                // 但一旦人还在往上跳的半空(脚底比踏面**低**几毫米),旧写法
+                // 就会把这个楼板当成实体墙,`push_out_aabb` 取最小松弛方向
+                // 把人从**侧面**弹出去 —— 上楼梯时正好卡在两级之间触发,
+                // 人被弹到楼梯侧面外的中厅(y 从 1.065 一路掉回 0.15),
+                // 于是「楼梯有台阶但永远上不去」。所以这里只认「脚底
+                // 已经在板面之上」这一种情况。
+                // 楼板永远不该把人**从侧面**推走。
+                //
+                // 判据不是「脚底有没有站到板面上」,而是「脚底是否已经
+                // 高过这块板」——只要人还在板面以下或齐平,这块板就是他
+                // 脚下要踩的东西(或者下一级台阶),横向分离只应该由
+                // **墙**来做。早先只看 `body_min_y >= max[1] - TOLERANCE`,
+                // 于是人站在第 N 级踏面、还没跨上第 N+1 级的那一瞬间
+                // (脚底比 N+1 级踏面低一个踏高)会被当成撞上实体,
+                // `push_out_aabb` 取最小松弛方向把人从楼梯**侧边**弹出去 ——
+                // 表现就是上到一半 y 突然从 1.065 掉回 0.15,楼梯永远上不去。
+                //
+                // 代价:一层那圈 0.15 m 高的地板也不再横向推人。这本来是
+                // 好事(否则首层地板会变成看不见的围墙,门洞走不进去),
+                // 由 `support_height` 负责把人**抬**上去。
+                //
+                // **楼板(踏面)永远不做横向分离。** 玩家踩在第 N 级踏面上时,
+                // 身体的竖直区间会与第 1..N 级的每一级相交,而人又正好站在
+                // 那一级的 XZ 盒子里 —— `push_out_aabb` 于是走「点在盒内」
+                // 分支,按 `slack_x <= slack_z` 取**最小松弛轴**,把人从
+                // 楼梯的**侧面**弹出去(踏面宽 1.30 m,人这一弹直接掉到
+                // 中厅,实测本地 x 5.03 → 4.10、y 从 1.065 掉回 0.15)。
+                // 表现就是:楼梯有台阶、能踩两级,然后永远上不去。
+                //
+                // 所以踏面只提供**竖直支撑**(`support_height` 负责把人
+                // 抬上去),横向只由 `Wall` 挡。一层那块 0.15 m 的地板因此
+                // 也不再横向推人 —— 这本来就想要,否则首层地板会变成一圈
+                // 看不见的围墙,门洞永远走不进去。
+                if let Floor::Slab { .. } = floor {
                     continue;
                 }
+
                 let center: Vec2 = [(min[0] + max[0]) * 0.5, (min[2] + max[2]) * 0.5];
                 let half: Vec2 = [(max[0] - min[0]) * 0.5, (max[2] - min[2]) * 0.5];
                 let Some((direction, depth)) = push_out_aabb(center, half, current, radius) else {
@@ -280,10 +317,10 @@ fn push_out_aabb(center: Vec2, half: Vec2, point: Vec2, radius: f32) -> Option<(
 #[cfg(test)]
 mod tests {
     use crate::r#const::{
-        T_INTERIOR_CEILING_ABOVE, T_INTERIOR_DOORWAY_BLOCKS, T_INTERIOR_DOORWAY_PASSES,
+        T_INTERIOR_CEILING_INSIDE, T_INTERIOR_DOORWAY_BLOCKS, T_INTERIOR_DOORWAY_THROUGH,
         T_INTERIOR_NO_SLAB_UNDER, T_INTERIOR_STAIR_CLIMBS, T_INTERIOR_STAIR_MONOTONIC,
-        T_INTERIOR_CEILING_INSIDE, T_INTERIOR_DOORWAY_THROUGH, T_INTERIOR_STAIR_PAIR,
-        T_INTERIOR_UPPER_FLOOR_ABOVE, T_INTERIOR_WALL_BLOCKS, T_INTERIOR_WALL_PASSES,
+        T_INTERIOR_STAIR_PAIR, T_INTERIOR_UPPER_FLOOR_ABOVE, T_INTERIOR_WALL_BLOCKS,
+        T_INTERIOR_WALL_PASSES,
     };
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::r#type::Vec2;

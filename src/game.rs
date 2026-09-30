@@ -3584,16 +3584,16 @@ fn draw_minimap(handles: &GameHandles) {
         Err(_) => return,
     };
     let size: f64 = f64::from(MINIMAP_PX);
-    let _ = context.clear_rect(0.0, 0.0, size, size);
-    let _ = context.set_fill_style_str(COLOR_MINIMAP_BG);
-    let _ = context.fill_rect(0.0, 0.0, size, size);
+    context.clear_rect(0.0, 0.0, size, size);
+    context.set_fill_style_str(COLOR_MINIMAP_BG);
+    context.fill_rect(0.0, 0.0, size, size);
     let game: std::cell::Ref<Game> = handles.game.borrow();
     let here: Vec3 = game.player.get_position();
     let center: Vec2 = [here[0], here[2]];
     // 世界 → 地图像素:以玩家为中心,固定比例(不随速度缩放)。
     let scale: f64 = size / (2.0 * f64::from(MINIMAP_RANGE));
     // 街道:四条南北 + 四条东西,画成两条粗线。
-    let _ = context.set_fill_style_str(COLOR_MINIMAP_ROAD);
+    context.set_fill_style_str(COLOR_MINIMAP_ROAD);
     for line in MAP_STREET_LINES {
         let offset: f64 = f64::from(*line) - f64::from(center[1]);
         let pixel: f64 = size * 0.5 + offset * scale;
@@ -3617,11 +3617,11 @@ fn draw_minimap(handles: &GameHandles) {
         let target: Vec3 = game.mission.get_target();
         let dx: f64 = f64::from(target[0] - here[0]) * scale;
         let dz: f64 = f64::from(target[2] - here[2]) * scale;
-        let _ = context.set_fill_style_str(COLOR_MINIMAP_OBJECTIVE);
-        let _ = context.fill_rect(size * 0.5 + dx - 3.0, size * 0.5 + dz - 3.0, 6.0, 6.0);
+        context.set_fill_style_str(COLOR_MINIMAP_OBJECTIVE);
+        context.fill_rect(size * 0.5 + dx - 3.0, size * 0.5 + dz - 3.0, 6.0, 6.0);
     }
     // 敌人。
-    let _ = context.set_fill_style_str(COLOR_MINIMAP_ENEMY);
+    context.set_fill_style_str(COLOR_MINIMAP_ENEMY);
     for enemy in &game.enemies {
         if !enemy.is_alive() {
             continue;
@@ -3629,26 +3629,26 @@ fn draw_minimap(handles: &GameHandles) {
         let at: Vec3 = enemy.get_position();
         let dx: f64 = f64::from(at[0] - here[0]) * scale;
         let dz: f64 = f64::from(at[2] - here[2]) * scale;
-        let _ = context.fill_rect(size * 0.5 + dx - 2.0, size * 0.5 + dz - 2.0, 4.0, 4.0);
+        context.fill_rect(size * 0.5 + dx - 2.0, size * 0.5 + dz - 2.0, 4.0, 4.0);
     }
     // 玩家:一个朝向三角。
-    let _ = context.set_fill_style_str(COLOR_MINIMAP_PLAYER);
+    context.set_fill_style_str(COLOR_MINIMAP_PLAYER);
     let yaw: f32 = game.player.get_yaw();
     let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
     let points: [f64; 6] = [
         cos_yaw as f64 * 7.0,
         -sin_yaw as f64 * 7.0,
-        (-cos_yaw as f64 * 5.0 - sin_yaw as f64 * 4.0) as f64,
-        (sin_yaw as f64 * 5.0 - cos_yaw as f64 * 4.0) as f64,
-        (-cos_yaw as f64 * 5.0 + sin_yaw as f64 * 4.0) as f64,
-        (sin_yaw as f64 * 5.0 + cos_yaw as f64 * 4.0) as f64,
+        (-cos_yaw as f64 * 5.0 - sin_yaw as f64 * 4.0),
+        (sin_yaw as f64 * 5.0 - cos_yaw as f64 * 4.0),
+        (-cos_yaw as f64 * 5.0 + sin_yaw as f64 * 4.0),
+        (sin_yaw as f64 * 5.0 + cos_yaw as f64 * 4.0),
     ];
-    let _ = context.begin_path();
-    let _ = context.move_to(size * 0.5 + points[0], size * 0.5 + points[1]);
-    let _ = context.line_to(size * 0.5 + points[2], size * 0.5 + points[3]);
-    let _ = context.line_to(size * 0.5 + points[4], size * 0.5 + points[5]);
-    let _ = context.close_path();
-    let _ = context.fill();
+    context.begin_path();
+    context.move_to(size * 0.5 + points[0], size * 0.5 + points[1]);
+    context.line_to(size * 0.5 + points[2], size * 0.5 + points[3]);
+    context.line_to(size * 0.5 + points[4], size * 0.5 + points[5]);
+    context.close_path();
+    context.fill();
 }
 
 /// 让「护甲背心 / 弹药箱」真的影响战斗数值。
@@ -3762,16 +3762,15 @@ fn build_hud_dom(document: &Document) -> Option<Element> {
     };
     let _ = root.append_child(&mission);
     // ---- 右下角:小地图(独立 canvas,每帧 2D 重画)----
-    if let Ok(map) = document.create_element(TAG_CANVAS) {
-        if let Ok(canvas) = map.dyn_into::<HtmlCanvasElement>() {
-            canvas.set_width(MINIMAP_PX as u32);
-            canvas.set_height(MINIMAP_PX as u32);
-            let _: Result<(), euv::wasm_bindgen::JsValue> =
-                canvas.set_attribute(ATTR_ID, ID_MINIMAP);
-            let _: Result<(), euv::wasm_bindgen::JsValue> =
-                canvas.set_attribute(ATTR_STYLE, STYLE_HUD_MINIMAP);
-            let _ = root.append_child(&canvas);
-        }
+    if let Ok(map) = document.create_element(TAG_CANVAS)
+        && let Ok(canvas) = map.dyn_into::<HtmlCanvasElement>()
+    {
+        canvas.set_width(MINIMAP_PX as u32);
+        canvas.set_height(MINIMAP_PX as u32);
+        let _: Result<(), euv::wasm_bindgen::JsValue> = canvas.set_attribute(ATTR_ID, ID_MINIMAP);
+        let _: Result<(), euv::wasm_bindgen::JsValue> =
+            canvas.set_attribute(ATTR_STYLE, STYLE_HUD_MINIMAP);
+        let _ = root.append_child(&canvas);
     }
     // ---- 屏幕中央:准星 + 命中标记 ----
     let (Some(crosshair), Some(marker)) = (
@@ -4156,10 +4155,10 @@ fn fire_weapon(game: &mut Game) {
             enemy.get_position()[2],
         ];
         let reach: f32 = ray_sphere_distance(muzzle, direction, center, ENEMY_HIT_RADIUS);
-        if reach <= length.max(ENEMY_HIT_RADIUS) {
-            if best.map(|(_, d): (usize, f32)| reach < d).unwrap_or(true) {
-                best = Some((index, reach));
-            }
+        if reach <= length.max(ENEMY_HIT_RADIUS)
+            && best.map(|(_, d): (usize, f32)| reach < d).unwrap_or(true)
+        {
+            best = Some((index, reach));
         }
     }
     // 近战武器不消耗弹药,直接结算一次挥击。
@@ -4718,26 +4717,26 @@ fn sync_combat_instances(game: &mut Game) {
     // ---- 手持武器:贴在角色右手,朝向 = 瞄准方向 ----
     {
         let batch: usize = game.weapon_batch;
-        if batch != usize::MAX {
-            if let Some(scene_batch) = game.scene.batches.get_mut(batch) {
-                scene_batch.instances.clear();
-                let driving: bool = game.player.get_driving();
-                if !driving {
-                    let at: Vec3 = game.player.get_position();
-                    let aim: Vec2 = game.arsenal.get_aim();
-                    let yaw: f32 = -aim[1].atan2(aim[0]);
-                    // 枪口位置:角色右前方,按瞄准方向偏移。
-                    let right: Vec2 = [aim[1], -aim[0]];
-                    let at2: Vec3 = [
-                        at[0] + right[0] * WEAPON_SIDE_OFFSET + aim[0] * WEAPON_FWD_OFFSET,
-                        at[1] + WEAPON_HEIGHT,
-                        at[2] + right[1] * WEAPON_SIDE_OFFSET + aim[1] * WEAPON_FWD_OFFSET,
-                    ];
-                    let model: Mat4 = body_matrix(at2, yaw, WEAPON_SCALE);
-                    scene_batch
-                        .instances
-                        .push(Instance::from_matrix(model, TINT_WEAPON));
-                }
+        if batch != usize::MAX
+            && let Some(scene_batch) = game.scene.batches.get_mut(batch)
+        {
+            scene_batch.instances.clear();
+            let driving: bool = game.player.get_driving();
+            if !driving {
+                let at: Vec3 = game.player.get_position();
+                let aim: Vec2 = game.arsenal.get_aim();
+                let yaw: f32 = -aim[1].atan2(aim[0]);
+                // 枪口位置:角色右前方,按瞄准方向偏移。
+                let right: Vec2 = [aim[1], -aim[0]];
+                let at2: Vec3 = [
+                    at[0] + right[0] * WEAPON_SIDE_OFFSET + aim[0] * WEAPON_FWD_OFFSET,
+                    at[1] + WEAPON_HEIGHT,
+                    at[2] + right[1] * WEAPON_SIDE_OFFSET + aim[1] * WEAPON_FWD_OFFSET,
+                ];
+                let model: Mat4 = body_matrix(at2, yaw, WEAPON_SCALE);
+                scene_batch
+                    .instances
+                    .push(Instance::from_matrix(model, TINT_WEAPON));
             }
         }
     }
@@ -5970,23 +5969,24 @@ mod tests {
 
     use crate::collision::CollisionWorld;
     use crate::r#const::{
-    GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, PLAYER_BODY_HEIGHT, TERMINAL_VELOCITY,
-    T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DOORS_FACE_EACH_OTHER,
-    T_SHOWCASE_DOORWAY_2D_BLOCKED, T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE,
-    T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
-    T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING, T_SHOWCASE_LANE_BLOCKED,
-    T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
-    T_SHOWCASE_PIER_LET_PLAYER_THROUGH, T_SHOWCASE_PUSHED_INTO_WALL,
-    T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_STAIR_REACHES_TOP, T_SHOWCASE_STAIR_RISE_SHALLOW,
-    T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES,
-    T_SHOWCASE_TWO_OVERLAP, T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP,
-};
+        GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, PLAYER_BODY_HEIGHT, T_SHOWCASE_AXIS_ON_ROAD,
+        T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE,
+        T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
+        T_SHOWCASE_DOORS_FACE_EACH_OTHER, T_SHOWCASE_DOORWAY_2D_BLOCKED,
+        T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING, T_SHOWCASE_LANE_BLOCKED,
+        T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
+        T_SHOWCASE_PIER_LET_PLAYER_THROUGH, T_SHOWCASE_PUSHED_INTO_WALL,
+        T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_STAIR_REACHES_TOP, T_SHOWCASE_STAIR_RISE_SHALLOW,
+        T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES,
+        T_SHOWCASE_TWO_OVERLAP, T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP,
+        TERMINAL_VELOCITY,
+    };
     use crate::game::{
         PLAYER_RADIUS, SHOWCASE_DOOR_HALF, SHOWCASE_GROUND_TOP, SHOWCASE_STAIR_LEAD,
-        SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_STEPS, SHOWCASE_STAIR_WIDTH, SHOWCASE_UPPER_TOP,
-        SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH, STREET_HALF_WIDTH, STREET_LINES,
-        build_city_buildings, build_collision_world, build_showcase_interiors, showcase_placements,
-        showcase_specs,
+        SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN, SHOWCASE_STAIR_STEPS, SHOWCASE_STAIR_WIDTH,
+        SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH, STREET_HALF_WIDTH,
+        STREET_LINES, ShowcaseSpec, build_city_buildings, build_collision_world,
+        build_showcase_interiors, showcase_placements, showcase_specs,
     };
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
@@ -6059,7 +6059,7 @@ mod tests {
             // 门洞中心:脚下必须有首层楼板(身体从地面起算,不是从门洞起算)。
             let just_inside: Vec2 = [front[0] - normal[0] * 1.0, front[1] - normal[1] * 1.0];
             let support: Option<f32> = w.support_height(just_inside, GROUND_LEVEL);
-                assert!(
+            assert!(
                 support.is_some_and(|height: f32| height > 0.0),
                 "{} {}",
                 T_SHOWCASE_DOOR_NO_SLAB,
@@ -6076,7 +6076,7 @@ mod tests {
                 ((after[0] - front[0]) * normal[0] + (after[1] - front[1]) * normal[1]).abs();
             let lateral: f32 =
                 ((after[0] - front[0]) * side[0] + (after[1] - front[1]) * side[1]).abs();
-                assert!(
+            assert!(
                 drift < 1e-3 && lateral < 1e-3,
                 "{} {}",
                 T_SHOWCASE_DOOR_CENTER_BLOCKED,
@@ -6098,7 +6098,7 @@ mod tests {
                 // 沿着门垛的横向挪一点点不算「被挡住」。
                 let moved: f32 = (pushed[0] - at[0]) * normal[0] + (pushed[1] - at[1]) * normal[1];
                 let escaped: f32 = (pushed[0] - at[0]) * side[0] + (pushed[1] - at[1]) * side[1];
-                    assert!(
+                assert!(
                     moved.abs() > 1e-3 || escaped.abs() > 1e-3,
                     "{} {}",
                     T_SHOWCASE_PIER_LET_PLAYER_THROUGH,
@@ -6122,14 +6122,14 @@ mod tests {
                 specs[1 - index].position[1] - spec.position[1],
             ];
             let length: f32 = (toward[0] * toward[0] + toward[1] * toward[1]).sqrt();
-                assert!(
+            assert!(
                 length > 1.0,
                 "{} {}",
                 T_SHOWCASE_TWO_OVERLAP,
                 T_SHOWCASE_DOORS_FACE_EACH_OTHER
             );
             let dot: f32 = (normal[0] * toward[0] + normal[1] * toward[1]) / length;
-                assert!(
+            assert!(
                 dot > 0.5,
                 "{} {} {}",
                 T_SHOWCASE_DOOR_NOT_FACING,
@@ -6163,7 +6163,7 @@ mod tests {
                     GROUND_LEVEL + PLAYER_BODY_HEIGHT,
                     PLAYER_RADIUS,
                 );
-                    assert!(
+                assert!(
                     !w.contains_interior_point(pushed, GROUND_LEVEL + 0.5),
                     "{} {}",
                     T_SHOWCASE_PUSHED_INTO_WALL,
@@ -6178,7 +6178,7 @@ mod tests {
     fn walking_up_the_stair_reaches_the_upper_floor() {
         // 纯几何校验:楼梯最顶一级必须与二层楼板面齐平,否则玩家走上
         // 楼梯会停在半空或者要再跳一下。
-            assert!(
+        assert!(
             (SHOWCASE_GROUND_TOP + STAIR_TOTAL - SHOWCASE_UPPER_TOP).abs() < 1e-4,
             "{} {} {}",
             T_SHOWCASE_STAIR_TOP_LEVEL,
@@ -6187,7 +6187,7 @@ mod tests {
         );
         // 踏高必须落在容差内,否则玩家踏上第一级就会被当成「撞墙」,
         // 楼梯变成一段永远走不上去的坡。
-            assert!(
+        assert!(
             SHOWCASE_STAIR_RISE < STEP_UP_TOLERANCE,
             "{} {}",
             T_SHOWCASE_RISE_GE_TOLERANCE,
@@ -6195,7 +6195,7 @@ mod tests {
         );
         // 反过来,容差也不能大到能一步跨上整层楼 —— 那会让玩家在楼下
         // 一按前就瞬移到二楼。
-            assert!(
+        assert!(
             STEP_UP_TOLERANCE < SHOWCASE_UPPER_TOP - SHOWCASE_GROUND_TOP,
             "{} {}",
             T_SHOWCASE_TOLERANCE_TOO_BIG,
@@ -6203,7 +6203,7 @@ mod tests {
         );
         // 也不能大到能跨两级:两级 = 0.61 m,一次跨两级会让楼梯的视觉
         // 台阶感和实际的抬升对不上。
-            assert!(
+        assert!(
             STEP_UP_TOLERANCE < 2.0 * SHOWCASE_STAIR_RISE,
             "{} {} {}",
             T_SHOWCASE_TOLERANCE_TWO_RISES,
@@ -6256,13 +6256,152 @@ mod tests {
                 }
             }
             let _ = normal;
-                assert!(
+            assert!(
                 (y - SHOWCASE_UPPER_TOP).abs() < 1e-2,
                 "{} {}",
                 T_SHOWCASE_WALKER_DIRECTION,
                 T_SHOWCASE_WALKER_REACHES_TOP
             );
             let _ = specs;
+        }
+    }
+
+    /// 端到端:从门外一路走上二层楼板。
+    ///
+    /// 之前每条测试只覆盖楼梯的一段(几何 / 单步 / 上升趋势),所以
+    /// 「玩家能不能真的按一串路点走完全程」从没被验证过。实测就是
+    /// 走到第三级会被楼梯侧面弹回首层(y 从 1.065 掉回 0.15),而分段
+    /// 测试全绿。这里把 门外 → 门洞 → 隔墙过道 → 第一级 → 楼梯顶 →
+    /// 二层楼板 串成一条路线跑完整积分,任何一段断了都会失败。
+    #[test]
+    fn a_player_can_walk_from_the_doorway_to_the_top_of_the_stair() {
+        let w: FloorWorld = world();
+        let dt: f32 = 1.0 / 60.0;
+        for index in 0..2 {
+            let specs: [ShowcaseSpec; 2] = showcase_specs();
+            let spec: &ShowcaseSpec = &specs[index];
+            let span: [f32; 2] = spec.span;
+            let hz: f32 = span[1] * 0.5;
+            let hx: f32 = span[0] * 0.5;
+            let sx0: f32 = hx - SHOWCASE_STAIR_WIDTH;
+            let stair_x: f32 = (sx0 + hx) * 0.5;
+            let sz_last: f32 = hz - SHOWCASE_STAIR_LEAD;
+            let stair_end: f32 = sz_last - SHOWCASE_STAIR_STEPS as f32 * SHOWCASE_STAIR_RUN;
+            let front: Vec2 = doorway(index);
+            let normal: Vec2 = front_normal(index);
+            // 路线(资产本地坐标):门外 → 门洞 → 隔墙过道 → 第一级前沿
+            // → 楼梯顶端 → 二层楼板中央。
+            // 路线(资产本地坐标)。要点:隔墙横在 z = PARTITION_Y 处,右端
+            // 止于「楼梯左边缘再往回 GAP」,所以要**先横移到缺口那一侧、
+            // 绕过隔墙,再回到楼梯跑段的下沿**,不能直奔梯中线。
+            // 过道缺口的**中点**,不是它的左边缘:缺口左端就是隔墙的端头,
+            // 把路点放在端头上,加上玩家半径就正好卡在墙面上(实测停在
+            // local z=2.83 动弹不得)。中点离两面墙都有 0.85 m 余量。
+            let gap_end: f32 = span[0] * 0.5 - SHOWCASE_STAIR_WIDTH;
+            let _gap_x: f32 = gap_end - crate::r#const::SHOWCASE_PARTITION_GAP * 0.5;
+            // 路线(资产本地坐标)。每段的必要性都来自实测:
+            //  · 隔墙横在 z = PARTITION_Y,右端止于「楼梯左边缘往回 GAP」,
+            //    所以要先横移到**缺口中点**再回到梯中线 —— 路点放在缺口
+            //    边缘会被隔墙端头挡住(实测停在 z=2.83 动弹不得)。
+            //  · 楼梯第一级贴 z = sz_last 一侧,顶面最低;越往 z **小**的
+            //    方向级数越高,最后一级顶面正好 3.20 与二层楼板齐平。
+            //  · 梯顶那一侧(z >= stair_end)本来就有二层板,不用跨井口。
+            let gap_x: f32 = sx0 - crate::r#const::SHOWCASE_PARTITION_GAP * 0.5;
+            let route: [Vec2; 7] = [
+                // 门外
+                [front[0] + normal[0] * 1.5, front[1] + normal[1] * 1.5],
+                // 门洞
+                front,
+                // 绕到隔墙的过道缺口
+                to_world(index, [gap_x, crate::r#const::SHOWCASE_PARTITION_Y]),
+                // 穿过缺口,进到楼梯这一侧
+                to_world(index, [stair_x, crate::r#const::SHOWCASE_PARTITION_Y]),
+                // 踏上第一级
+                to_world(index, [stair_x, sz_last - SHOWCASE_STAIR_RUN * 0.5]),
+                // 沿梯中线一路上行
+                stair_point(index, stair_end + SHOWCASE_STAIR_RUN * 0.5),
+                // 站上二层楼板
+                to_world(index, [stair_x, stair_end + 0.5]),
+            ];
+            let mut pos: Vec2 = route[0];
+            let mut y: f32 = GROUND_LEVEL;
+            let mut vy: f32 = 0.0;
+            let mut max_y: f32 = y;
+            for waypoint in route.iter().skip(1) {
+                let target: Vec2 = *waypoint;
+                let mut frames: usize = 0;
+                while frames < 1200 {
+                    frames += 1;
+                    let delta: Vec2 = [target[0] - pos[0], target[1] - pos[1]];
+                    let dist: f32 = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+                    if dist < 0.05 {
+                        break;
+                    }
+                    let step: f32 = dist.min(0.05);
+                    let want: Vec2 = [
+                        pos[0] + delta[0] / dist * step,
+                        pos[1] + delta[1] / dist * step,
+                    ];
+                    let support: Option<f32> = w.support_height(want, y);
+                    let floor: f32 = support.unwrap_or(GROUND_LEVEL);
+                    pos =
+                        w.resolve_interior(want, floor, floor + PLAYER_BODY_HEIGHT, PLAYER_RADIUS);
+                    // 与 `step_vertical` 完全同一套判定顺序:踩住 → 地面
+                    // → 自由落体 + 穿透吸附。少任何一条,跨级时都会掉回
+                    // 首层(`support_height` 认的是**脚底那一格**的板,
+                    // 人还在两级之间时脚下是空的,必须靠落体后吸附上去)。
+                    let on_slab: bool = support.is_some();
+                    if on_slab && floor - y <= STEP_UP_TOLERANCE {
+                        y = floor;
+                        vy = 0.0;
+                    } else if y <= GROUND_LEVEL {
+                        y = GROUND_LEVEL;
+                        vy = 0.0;
+                    } else {
+                        let falling: f32 = (vy - GRAVITY * dt).max(-TERMINAL_VELOCITY);
+                        let next: f32 = y + falling * dt;
+                        let base: f32 = if on_slab { floor } else { GROUND_LEVEL };
+                        if falling <= 0.0 && next <= base + GROUND_SNAP_SKIN {
+                            y = base;
+                            vy = 0.0;
+                        } else {
+                            y = next;
+                            vy = falling;
+                        }
+                    }
+                    max_y = max_y.max(y);
+                    let d2: Vec2 = [
+                        pos[0] - specs[index].position[0],
+                        pos[1] - specs[index].position[1],
+                    ];
+                    let cc: f32 = specs[index].yaw.cos();
+                    let ss: f32 = specs[index].yaw.sin();
+                    let lz: f32 = d2[0] * ss + d2[1] * cc;
+                    if frames.is_multiple_of(40) {
+                        let _: () =
+                            println!("   leg y={:.3} local_z={:.2} target_z={:.2}", y, lz, {
+                                let dd: Vec2 = [
+                                    target[0] - specs[index].position[0],
+                                    target[1] - specs[index].position[1],
+                                ];
+                                dd[0] * ss + dd[1] * cc
+                            });
+                    }
+                }
+            }
+            // 断言的是**终点高度**而不是过程最高点:路线最后一段是
+            // 「从楼梯顶走进二层楼板中央」,终点必须仍站在楼板面上。
+            // 走过头会从楼板边缘踏空掉回一层,那是正确行为,所以路点
+            // 收在板内,不做「上去再掉下来」这种自欺的断言。
+            assert!(
+                (y - SHOWCASE_UPPER_TOP).abs() < 0.35,
+                "{} {} 抵达 y={} max_y={} pos={:?}",
+                T_SHOWCASE_WALKER_REACHES_TOP,
+                T_SHOWCASE_WALKER_DIRECTION,
+                y,
+                max_y,
+                pos
+            );
         }
     }
 
@@ -6307,7 +6446,7 @@ mod tests {
             let normal: Vec2 = front_normal(index);
             let moved: f32 = (pushed[0] - mid[0]) * normal[0] + (pushed[1] - mid[1]) * normal[1];
             let escaped: f32 = (pushed[0] - mid[0]) * side[0] + (pushed[1] - mid[1]) * side[1];
-                assert!(
+            assert!(
                 moved.abs() > 1e-3 || escaped.abs() > 1e-3,
                 "{} {}",
                 T_SHOWCASE_PARTITION_LET_THROUGH,
@@ -6315,11 +6454,7 @@ mod tests {
             );
             // 隔墙右端与楼梯之间留出过道:那里必须穿得过去。
             // 过道中点:隔墙右端与楼梯之间,必须真的穿得过去。
-                assert!(
-                partition_end < gap_end,
-                "{}",
-                T_SHOWCASE_PARTITION_LANE
-            );
+            assert!(partition_end < gap_end, "{}", T_SHOWCASE_PARTITION_LANE);
             let lane_local: f32 = (partition_end + gap_end) * 0.5;
             let lane: Vec2 = to_world(index, [lane_local, partition_y]);
             let through: Vec2 = w.resolve_interior(
@@ -6329,7 +6464,7 @@ mod tests {
                 PLAYER_RADIUS,
             );
             let drift: f32 = (through[0] - lane[0]).hypot(through[1] - lane[1]);
-                assert!(
+            assert!(
                 drift < 1e-3,
                 "{} {}",
                 T_SHOWCASE_LANE_BLOCKED,
@@ -6340,7 +6475,7 @@ mod tests {
 
     #[test]
     fn both_showcases_are_placed_off_the_roadway() {
-        for (index, spec) in showcase_specs().iter().enumerate() {
+        for spec in showcase_specs().iter() {
             // 用**旋转后**的世界半尺寸判:yaw = ±90° 时 span / half 的
             // X、Z 分量会互换,拿本地的半跨去比就会判错。
             let (sin_yaw, cos_yaw) = spec.yaw.sin_cos();
@@ -6352,7 +6487,7 @@ mod tests {
                 let reach: f32 = half[axis] + STREET_HALF_WIDTH + SIDEWALK_WIDTH;
                 for line in STREET_LINES {
                     let gap: f32 = (spec.position[axis] - line).abs();
-                        assert!(
+                    assert!(
                         gap > reach,
                         "{} {} {}",
                         T_SHOWCASE_AXIS_ON_ROAD,
@@ -6384,7 +6519,7 @@ mod tests {
                     (spec.position[0] - other.position[0]).abs() < half[0] + guard;
                 let overlap_z: bool =
                     (spec.position[1] - other.position[1]).abs() < half[1] + guard;
-                    assert!(
+                assert!(
                     !(overlap_x && overlap_z),
                     "{} {} {} {} {}",
                     T_SHOWCASE_OVERLAPS_ORDINARY,
@@ -6432,7 +6567,7 @@ mod tests {
                 spec.position[0] + local[0] * cos_yaw + local[1] * sin_yaw,
                 spec.position[1] - local[0] * sin_yaw + local[1] * cos_yaw,
             ];
-                assert!(
+            assert!(
                 !world.contains_point(doorway),
                 "{} {} {}",
                 T_SHOWCASE_DOORWAY_2D_BLOCKED,

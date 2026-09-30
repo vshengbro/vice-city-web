@@ -527,8 +527,8 @@ pub fn mat4_ortho(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: 
     out[0] = 2.0 / (right - left);
     out[5] = 2.0 / (top - bottom);
     out[10] = 2.0 * range;
-    out[12] = (right + left) * range * -1.0;
-    out[13] = (top + bottom) * range * -1.0;
+    out[12] = -((right + left) * range);
+    out[13] = -((top + bottom) * range);
     out[14] = (far + near) * range;
     out[15] = 1.0;
     Mat4::from_column_major(out)
@@ -1816,7 +1816,7 @@ void main() {
 ///
 /// 降级是**单向**的:只往下走,不自动升回去。否则玩家开着车穿过一片
 /// 楼群(掉到 Low)又开回空旷海面,画质会来回抖,比一直低更难受。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QualityTier {
     /// 全开:阴影 + SSAO + SSR + bloom。
     High,
@@ -2217,9 +2217,8 @@ impl RenderTarget {
         // 规范里 `FRAMEBUFFER_COMPLETE` 是**最小**的状态码(36053..36061
         // 全是各种 INCOMPLETE),所以「返回值落在完整区间」这个判据在两套
         // 编号下都成立,也不依赖任何驱动私有编号。
-        let status: u32 =
-            context.check_framebuffer_status(WebGl2RenderingContext::FRAMEBUFFER) as u32;
-        status == WebGl2RenderingContext::FRAMEBUFFER_COMPLETE as u32
+        let status: u32 = context.check_framebuffer_status(WebGl2RenderingContext::FRAMEBUFFER);
+        status == WebGl2RenderingContext::FRAMEBUFFER_COMPLETE
             || status == FRAMEBUFFER_COMPLETE_WEBGL2_OFFSET
     }
 }
@@ -3239,8 +3238,6 @@ impl WebGlRenderer {
             gl_context.get_uniform_location(&program, U_SHADOW_MATRIX);
         let uniform_shadow_params: Option<WebGlUniformLocation> =
             gl_context.get_uniform_location(&program, U_SHADOW_PARAMS);
-        let uniform_shadow_texel: Option<WebGlUniformLocation> =
-            gl_context.get_uniform_location(&program, U_SHADOW_TEXEL);
         let uniform_sky_ambient: Option<WebGlUniformLocation> =
             gl_context.get_uniform_location(&program, U_SKY_AMBIENT);
         let uniform_ground_ambient: Option<WebGlUniformLocation> =
