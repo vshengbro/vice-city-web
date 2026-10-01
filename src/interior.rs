@@ -524,6 +524,92 @@ mod tests {
     const BODY_TOP: f32 = 1.90;
     const RADIUS: f32 = 0.35;
 
+    /// 一面横墙:z ∈ [10.0, 10.2],x ∈ [-5, 5],高 0..6.4。
+    fn cross_wall() -> FloorWorld {
+        let mut w: FloorWorld = FloorWorld::new();
+        w.push_wall([-5.0, 0.0, 10.0], [5.0, 6.4, 10.2]);
+        w
+    }
+
+    /// 顶着横墙斜走时,切向位移必须被保留 —— 「有速度、无位移」的回归测试。
+    ///
+    /// **必须从「已经陷进墙里」的位置出发**,这才是线上的真实顺序:
+    /// 静态层(`CollisionWorld`)看不见室内隔墙,它照常把玩家推进去,
+    /// 室内层下一帧才分离。起点正好贴着墙面时(`d == radius`)推动量
+    /// 为零,根本走不到滑动分支,那样的测试对任何实现都通过。
+    ///
+    /// 旧实现(纯分离,没有 `delta`)会把 x 一起弹回 0.000 —— 那正是
+    /// 线上每帧净位移为零、玩家被钉在墙上的形态。
+    #[test]
+    fn sliding_along_a_wall_keeps_the_tangential_step() {
+        let world: FloorWorld = cross_wall();
+        // 墙占 z ∈ [10.0, 10.2],贴面站位 10.0 - 0.35 = 9.65。
+        // 起点取 9.85 —— 陷进墙里 0.20 m,模拟静态层刚把人推进去。
+        let here: Vec2 = [0.0, 10.0 - RADIUS + 0.20];
+        let delta: Vec2 = [0.05, 0.05];
+        let got: Vec2 = world.resolve_interior_slide(here, delta, 0.0, BODY_TOP, RADIUS);
+        // 切向必须真的走掉。
+        assert!(
+            got[0] - here[0] > 0.03,
+            "切向位移被吃掉了:x {} -> {}",
+            here[0],
+            got[0]
+        );
+        // 法向被墙推回接触面,不得越过(= 陷进墙里)。
+        assert!(
+            got[1] <= 10.0 - RADIUS + 1e-3,
+            "穿墙了:{} > {}",
+            got[1],
+            10.0 - RADIUS
+        );
+        // 旧行为的对照:同样起点下纯分离会吃掉全部切向。
+        let pure: Vec2 = world.resolve_interior(here, 0.0, BODY_TOP, RADIUS);
+        assert!(
+            got[0] - pure[0] > 0.03,
+            "带位移版本必须比纯分离多走出切向:{} vs {}",
+            got[0],
+            pure[0]
+        );
+    }
+
+    /// 正面顶墙时不得穿墙(切向为 0 的退化情形)。
+    #[test]
+    fn head_on_into_a_wall_never_crosses_it() {
+        let world: FloorWorld = cross_wall();
+        let here: Vec2 = [0.0, 10.0 - RADIUS];
+        let got: Vec2 = world.resolve_interior_slide(here, [0.0, 0.05], 0.0, BODY_TOP, RADIUS);
+        assert!(
+            got[1] <= 10.0 - RADIUS + 1e-3,
+            "穿墙了:{} > {}",
+            got[1],
+            10.0 - RADIUS
+        );
+    }
+
+    /// 视线被横墙挡住时 `blocks_sight` 为真,绕过去之后为假。
+    #[test]
+    fn a_partition_wall_blocks_sight_only_across_itself() {
+        let world: FloorWorld = cross_wall();
+        // 正对着墙:南 -> 北,必然被挡。
+        assert!(world.blocks_sight([0.0, 5.0], [0.0, 15.0], 1.32));
+        // 沿墙同侧:不穿过墙,不该被挡。
+        assert!(!world.blocks_sight([-4.0, 5.0], [4.0, 5.0], 1.32));
+    }
+
+    /// 楼板不挡「站在它上面的人的横向视线」,只挡真正压在视线高度上的。
+    ///
+    /// 二楼地板(2.95 ~ 3.20)绝不能把一楼的人整片挡死,否则站在街上
+    /// 的玩家会被自家天花板保护起来。
+    #[test]
+    fn an_upper_slab_does_not_block_eye_level_sight() {
+        let mut world: FloorWorld = FloorWorld::new();
+        world.push_slab([-5.0, UPPER_BOT, -5.0], [5.0, UPPER_TOP, 5.0]);
+        // 视线高度 1.32 m,在二楼地板下面:通畅。
+        assert!(!world.blocks_sight([-4.0, 0.0], [4.0, 0.0], 1.32));
+        // 视线正好在板面高度:被挡。
+        assert!(world.blocks_sight([-4.0, 0.0], [4.0, 0.0], UPPER_BOT));
+    }
+
     fn slab_world() -> FloorWorld {
         let mut w: FloorWorld = FloorWorld::new();
         w.push_slab([-5.75, 0.0, -4.75], [5.75, GROUND_TOP, 4.75]);
