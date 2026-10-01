@@ -677,11 +677,15 @@ impl Traffic {
                 let dx: f32 = here[0] - who[0];
                 let dz: f32 = here[2] - who[1];
                 let distance: f32 = (dx * dx + dz * dz).sqrt();
-                if distance <= HAUL_RANGE && best.map(|(_, d)| distance < d).unwrap_or(true) {
+                if distance <= HAUL_RANGE
+                    && best
+                        .map(|(_held, held): (usize, f32)| distance < held)
+                        .unwrap_or(true)
+                {
                     best = Some((index, distance));
                 }
             }
-            best.map(|(index, _)| index)
+            best.map(|(index, _distance): (usize, f32)| index)
         });
         for index in 0..self.get_cars_ref().len() {
             if let Some(car) = self.get_car_mut(index) {
@@ -716,11 +720,15 @@ pub fn nearest_car(traffic: &Traffic, position: Vec3) -> Option<usize> {
         let dx: f32 = here[0] - position[0];
         let dz: f32 = here[2] - position[2];
         let distance: f32 = (dx * dx + dz * dz).sqrt();
-        if distance <= ENTER_VEHICLE_RADIUS && best.map(|(_, d)| distance < d).unwrap_or(true) {
+        if distance <= ENTER_VEHICLE_RADIUS
+            && best
+                .map(|(_held, held): (usize, f32)| distance < held)
+                .unwrap_or(true)
+        {
             best = Some((index, distance));
         }
     }
-    best.map(|(index, _)| index)
+    best.map(|(index, _distance): (usize, f32)| index)
 }
 
 /// 结算一次拾取:回血 / 加钱 / 记录,并标记拾取物已被拿走。

@@ -18,6 +18,23 @@ const RESOLVE_ITERATIONS: usize = 4;
 /// 判定「圆心在形状内部」的向量长度阈值(米)。
 const INSIDE_EPSILON: f32 = 1e-5;
 
+/// 判定「这次分离真的搬了人」的修正量阈值(米)。
+///
+/// 小于 1 mm 的修正只是浮点噪声,按「没有碰到墙」处理,免得每帧都
+/// 多走一遍滑动。
+const SLIDE_EPSILON: f32 = 1e-3;
+
+/// 滑动分离的子步长(米)。
+///
+/// 一帧最多走 0.08 m(步行 4.6 m/s × 1/60 s),所以最多切成 2 步。
+/// 取 0.05 m 保证单步位移远小于碰撞半径,不会跨过内表面落进
+/// `push_out_aabb` 的「点在盒内」分支(那个分支对厚墙会选错面,把
+/// 人送到墙的另一侧)。
+const SLIDE_STEP: f32 = 0.05;
+
+/// 一步里至少要走完这个比例才继续推进,否则判定为撞墙收手。
+const SLIDE_MIN_PROGRESS: f32 = 0.25;
+
 /// 车辆等效碰撞圆半径(米):比玩家大,车身也更宽。
 pub const CAR_RADIUS: f32 = 1.25;
 
@@ -186,6 +203,167 @@ impl CollisionWorld {
         [
             current[0].clamp(-limits[0], limits[0]),
             current[1].clamp(-limits[1], limits[1]),
+        ]
+    }
+
+    /// 圆 vs 静态形状的**滑动**分离:沿墙保留切向位移。
+    ///
+    /// [`Self::resolve`] 是「全有全无」的位置钳制 —— 它把圆心直接推到
+    /// 形状的最近面,**本帧想要的切向位移也一起被改写**。玩家斜着
+    /// 撞上墙面时位移被削到几乎为零,表现为「有速度、无位移」:
+    /// `want (-1.00, -0.00)` 拿到 `got (+0.00, +0.00)`,几十帧推不动
+    /// 一毫米。卡点不固定在某一面墙(实测 x = 28.3 / 28.4 / 33.1 / 35.0
+    /// 都出现过),因为**每一面墙都这样** —— 弹到哪就贴住哪面墙。
+    ///
+    /// 这里是标准两步 `move_and_slide`:
+    ///
+    /// 1. `wanted = here + delta` 先做一次分离,拿到法线 `n` 与穿透
+    ///    深度;
+    /// 2. 把 `delta` 沿 `n` 的**法向分量扣掉**,只保留切向,再走一遍
+    ///    分离。于是顶着墙斜走时玩家顺着墙滑过去,而不是被钉在接触点。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 上一帧结束时的世界 XZ 坐标。
+    /// - `Vec2` - 本帧想要的位移(米)。
+    /// - `f32` - 圆半径(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 本帧实际走到的世界 XZ 坐标(已钳进世界边界)。
+    pub fn resolve_slide(&self, here: Vec2, delta: Vec2, radius: f32) -> Vec2 {
+        let limits: Vec2 = self.get_half_extent();
+        // 逐段推进:把这一帧想走的位移切成若干小步,每步都从**上一步的
+        // 合法位置**出发做分离。
+        //
+        // 不能只做一次「先 resolve(wanted) 再扣法向分量」:圆心一旦在一步
+        // 里跨过内表面,`push_out_aabb` 的「点在盒内」分支只能猜一个面
+        // 推 —— 对厚墙它会选**人正在走向的那一面**,于是人被直接送到墙
+        // 的另一侧(实测 0.15 m 的一步穿过了整个墙:从 -0.15 跳到 +0.35)。
+        // 切成小步之后,每一步的穿透都远小于步长,永远走不到「盒内」
+        // 分支,墙也就不再是隐形的传送带。
+        //
+        // 步长取 0.05 m(不到半径的 1/6):一帧最多 0.08 m(4.6 m/s ×
+        // 1/60 s),也就是 1~2 步,开销可以忽略。
+        let want_len: f32 = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        if want_len <= SLIDE_EPSILON {
+            return self.clamp_to_world(here, limits);
+        }
+        let steps: usize = (want_len / SLIDE_STEP).ceil().max(1.0) as usize;
+        let step: Vec2 = [delta[0] / steps as f32, delta[1] / steps as f32];
+        let mut current: Vec2 = here;
+        for _ in 0..steps {
+            // 已经陷进某个形状内部(不是「贴着」):停下,别再往里走。
+            // 用严格小于 + 一层皮,于是「正好贴在墙面上」不算穿透,
+            // 切向滑动才不会被自己的接触测试挡住。
+            if self.penetrates(current, radius) {
+                break;
+            }
+            let next: Vec2 = [current[0] + step[0], current[1] + step[1]];
+            let resolved: Vec2 = self.resolve(next);
+            let achieved: Vec2 = [resolved[0] - current[0], resolved[1] - current[1]];
+            let want_dot: f32 = step[0] * step[0] + step[1] * step[1];
+            let got_dot: f32 = achieved[0] * step[0] + achieved[1] * step[1];
+            if got_dot >= want_dot * SLIDE_MIN_PROGRESS {
+                // 这一步基本走完了,继续下一小步。
+                current = resolved;
+                continue;
+            }
+            // 被挡住了:只保留**切向**分量再走一次,玩家于是顺着墙滑
+            // 过去,而不是被钉在接触点上(这正是「有速度、无位移」的
+            // 修复点)。
+            current = self.slide_step(current, step, resolved, radius);
+            break;
+        }
+        self.clamp_to_world(current, limits)
+    }
+
+    /// 被挡住时的切向滑动:从 `before` 出发,沿 `want` 的切向分量走。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 这一小步开始时的位置。
+    /// - `Vec2` - 这一小步想要的位移。
+    /// - `Vec2` - 分离之后的位置(用来推法线)。
+    /// - `f32` - 圆半径(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 沿墙滑过之后的位置。
+    fn slide_step(&self, before: Vec2, want: Vec2, pushed: Vec2, radius: f32) -> Vec2 {
+        let correction: Vec2 = [
+            pushed[0] - (before[0] + want[0]),
+            pushed[1] - (before[1] + want[1]),
+        ];
+        let correction_len: f32 =
+            (correction[0] * correction[0] + correction[1] * correction[1]).sqrt();
+        if correction_len <= SLIDE_EPSILON {
+            return pushed;
+        }
+        // 分离方向指向形状**外侧**,所以法向就是它本身。
+        let normal: Vec2 = [
+            correction[0] / correction_len,
+            correction[1] / correction_len,
+        ];
+        let into: f32 = want[0] * normal[0] + want[1] * normal[1];
+        if into >= 0.0 {
+            // 没有往墙里钻(擦边),分离结果就是对的。
+            return pushed;
+        }
+        let tangent: Vec2 = [want[0] - normal[0] * into, want[1] - normal[1] * into];
+        if (tangent[0] * tangent[0] + tangent[1] * tangent[1]).sqrt() <= SLIDE_EPSILON {
+            // 纯正面顶墙:没有切向可留。
+            return pushed;
+        }
+        self.resolve([before[0] + tangent[0], before[1] + tangent[1]])
+    }
+
+    /// 圆心是否**陷进**了某个形状内部(贴着墙面不算)。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 圆心的世界 XZ 坐标。
+    /// - `f32` - 圆半径(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - 已经陷进某个形状时为 `true`。
+    fn penetrates(&self, point: Vec2, radius: f32) -> bool {
+        let reach: f32 = radius - SLIDE_EPSILON;
+        self.get_shapes().iter().any(|shape: &Shape| match shape {
+            // 圆 vs 盒 = 「圆心到盒的**距离** < 半径」。
+            //
+            // 两个坑都踩过:一开始写成「圆心落在盒的矩形足迹内」,对 20 m
+            // 深的墙恒为真(墙在 z 方向覆盖 ±10 m),贴着墙面也会被判成陷
+            // 进去,切向滑动被自己的接触测试冻住,于是又回到「有速度、
+            // 无位移」。改用真距离后:贴着时距离恰为半径,减去一层皮后
+            // 严格大于阈值,正常放行。
+            Shape::Aabb { center, half } => distance_to_shape(shape, point) < reach,
+            Shape::Circle {
+                center,
+                radius: other,
+            } => {
+                let dx: f32 = point[0] - center[0];
+                let dz: f32 = point[1] - center[1];
+                (dx * dx + dz * dz).sqrt() < *other + reach
+            }
+        })
+    }
+
+    /// 把坐标钳进世界边界。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 世界 XZ 坐标。
+    /// - `Vec2` - 世界半边长。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 钳进边界后的世界 XZ 坐标。
+    fn clamp_to_world(&self, point: Vec2, limits: Vec2) -> Vec2 {
+        [
+            point[0].clamp(-limits[0], limits[0]),
+            point[1].clamp(-limits[1], limits[1]),
         ]
     }
 
@@ -571,4 +749,110 @@ pub fn placement_box(min: Vec3, max: Vec3, yaw: f32, scale: f32, position: Vec3)
         (sin_yaw.abs() * local_half[0] + cos_yaw.abs() * local_half[1]) * scale,
     ];
     (center, half)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::collision::CollisionWorld;
+    use crate::r#const::{
+        T_COLLISION_SLIDE_KEEPS_TANGENT, T_COLLISION_SLIDE_OPEN_GROUND_X,
+        T_COLLISION_SLIDE_OPEN_GROUND_Z, T_COLLISION_SLIDE_STOPS_AT_WALL,
+    };
+    use crate::r#type::Vec2;
+
+    /// 墙占 x ∈ [-10, 0](盒心 -5、半尺寸 5),内表面在 x = 0,墙体在 -X 侧。
+    ///
+    /// 玩家从 **+X** 一侧靠近,圆心恰好贴在面上时 x = 半径 = `REST_X`。
+    const REST_X: f32 = 0.35;
+    const RADIUS: f32 = 0.35;
+
+    fn wall_world() -> CollisionWorld {
+        let mut world: CollisionWorld = CollisionWorld::new();
+        world.set_player_radius(RADIUS);
+        world.push_aabb([-5.0, 0.0], [5.0, 10.0]);
+        world
+    }
+
+    /// 贴着墙斜着走:法向被墙挡住,**切向必须保住**。
+    ///
+    /// 这是「有速度、无位移」(`want (-1, 0) got (0, 0)`)的回归测试:
+    /// 旧的 `resolve` 是全有全无钳制,0.30 m 的切向会被一起清零。
+    #[test]
+    fn sliding_keeps_the_tangential_component() {
+        let world: CollisionWorld = wall_world();
+        let here: Vec2 = [REST_X, 0.0];
+        // 往 -X 顶进墙里,同时往 +Z 走。
+        let delta: Vec2 = [-0.20, 0.30];
+        let at: Vec2 = world.resolve_slide(here, delta, world.get_player_radius());
+        assert!(
+            (at[1] - 0.30).abs() < 1e-2,
+            "{} 切向 z 只走了 {} m,应保留 0.30 m",
+            T_COLLISION_SLIDE_KEEPS_TANGENT,
+            at[1]
+        );
+        assert!(
+            at[0] >= REST_X - 1e-2,
+            "{} x={} 穿过了墙(应 >= {REST_X})",
+            T_COLLISION_SLIDE_STOPS_AT_WALL,
+            at[0]
+        );
+    }
+
+    /// 正面顶墙仍然必须停住,不能穿墙 —— 滑动不能削弱阻挡。
+    #[test]
+    fn sliding_still_stops_head_on_at_a_wall() {
+        let world: CollisionWorld = wall_world();
+        let here: Vec2 = [REST_X, 0.0];
+        let delta: Vec2 = [-0.50, 0.0];
+        let at: Vec2 = world.resolve_slide(here, delta, world.get_player_radius());
+        assert!(
+            at[0] >= REST_X - 1e-2,
+            "{} 正面顶墙后 x={},穿过了墙(应 >= {REST_X})",
+            T_COLLISION_SLIDE_STOPS_AT_WALL,
+            at[0]
+        );
+        assert!(
+            (at[0] - REST_X).abs() < 1e-2,
+            "{} 正面顶墙后 x={},应贴住 {REST_X}",
+            T_COLLISION_SLIDE_STOPS_AT_WALL,
+            at[0]
+        );
+    }
+
+    /// 空地上滑动必须等于原位移(不得引入任何偏移)。
+    #[test]
+    fn sliding_on_open_ground_is_the_full_delta() {
+        let mut world: CollisionWorld = CollisionWorld::new();
+        world.set_player_radius(RADIUS);
+        let here: Vec2 = [10.0, 20.0];
+        let delta: Vec2 = [0.15, -0.25];
+        let at: Vec2 = world.resolve_slide(here, delta, world.get_player_radius());
+        assert!(
+            (at[0] - (here[0] + delta[0])).abs() < 1e-5,
+            "{}",
+            T_COLLISION_SLIDE_OPEN_GROUND_X
+        );
+        assert!(
+            (at[1] - (here[1] + delta[1])).abs() < 1e-5,
+            "{}",
+            T_COLLISION_SLIDE_OPEN_GROUND_Z
+        );
+    }
+
+    /// 顶着墙连续走很多帧:位置必须稳定,绝不能被送到墙的另一侧。
+    #[test]
+    fn repeated_walking_into_a_wall_never_tunnels_through_it() {
+        let world: CollisionWorld = wall_world();
+        let mut at: Vec2 = [REST_X, 0.0];
+        // 一帧 0.077 m(4.6 m/s × 1/60 s),共 300 帧 ≈ 5 s。
+        for _ in 0..300 {
+            at = world.resolve_slide(at, [-0.077, 0.0], world.get_player_radius());
+            assert!(
+                at[0] >= REST_X - 1e-2,
+                "{} 顶着墙走了几帧后 x={},穿墙了(应 >= {REST_X})",
+                T_COLLISION_SLIDE_STOPS_AT_WALL,
+                at[0]
+            );
+        }
+    }
 }

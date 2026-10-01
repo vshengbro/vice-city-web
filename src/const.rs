@@ -1446,6 +1446,18 @@ pub const PLAYER_BODY_HEIGHT: f32 = 1.75;
 /// 城市地面的高度(米):整张地面网格就在 y = 0。
 pub const GROUND_LEVEL: f32 = 0.0;
 
+/// 顶着墙斜走时必须保留切向位移,不能位移归零。
+pub const T_COLLISION_SLIDE_KEEPS_TANGENT: &str = "滑动分离必须沿墙保留切向位移";
+
+/// 正面顶墙仍然必须被挡住,不能穿墙。
+pub const T_COLLISION_SLIDE_STOPS_AT_WALL: &str = "正面顶墙必须停住,不能穿墙";
+
+/// 空地上滑动后,x 轴必须等于「起点 x + 位移 x」。
+pub const T_COLLISION_SLIDE_OPEN_GROUND_X: &str = "空地滑行后 x 必须等于起点加位移";
+
+/// 空地上滑动后,z 轴必须等于「起点 z + 位移 z」。
+pub const T_COLLISION_SLIDE_OPEN_GROUND_Z: &str = "空地滑行后 z 必须等于起点加位移";
+
 /// 重力加速度(米/秒²)。
 pub const GRAVITY: f32 = 22.0;
 

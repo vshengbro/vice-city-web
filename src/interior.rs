@@ -347,12 +347,12 @@ mod tests {
     const RADIUS: f32 = 0.35;
 
     fn slab_world() -> FloorWorld {
-        let mut w = FloorWorld::new();
+        let mut w: FloorWorld = FloorWorld::new();
         w.push_slab([-5.75, 0.0, -4.75], [5.75, GROUND_TOP, 4.75]);
         w.push_slab([-5.75, UPPER_BOT, -4.75], [4.45, UPPER_TOP, 4.75]);
         for i in 0..STAIR_STEPS {
-            let y0 = -4.55 + i as f32 * STAIR_RUN;
-            let top = GROUND_TOP + (i + 1) as f32 * STAIR_RISE;
+            let y0: f32 = -4.55 + i as f32 * STAIR_RUN;
+            let top: f32 = GROUND_TOP + (i + 1) as f32 * STAIR_RISE;
             w.push_slab([4.45, GROUND_TOP, y0], [5.75, top, y0 + STAIR_RUN]);
         }
         w
@@ -364,9 +364,9 @@ mod tests {
 
     fn step_along_stair(w: &FloorWorld) -> Vec<f32> {
         let mut out: Vec<f32> = Vec::new();
-        let mut y = GROUND_TOP;
+        let mut y: f32 = GROUND_TOP;
         for i in 0..STAIR_STEPS {
-            let z = -4.55 + (i as f32 + 0.5) * STAIR_RUN;
+            let z: f32 = -4.55 + (i as f32 + 0.5) * STAIR_RUN;
             y = height_at(w, 5.1, z, y).unwrap_or(y);
             out.push(y);
         }
@@ -375,8 +375,8 @@ mod tests {
 
     #[test]
     fn stair_ramp_returns_increasing_heights() {
-        let w = slab_world();
-        let heights = step_along_stair(&w);
+        let w: FloorWorld = slab_world();
+        let heights: Vec<f32> = step_along_stair(&w);
         assert_eq!(heights.len(), STAIR_STEPS, "{}", T_INTERIOR_STAIR_MONOTONIC);
         for pair in heights.windows(2) {
             assert!(pair[1] > pair[0], "{}", T_INTERIOR_STAIR_PAIR);
@@ -390,33 +390,31 @@ mod tests {
 
     #[test]
     fn stair_tolerance_exceeds_one_rise_and_one_storey() {
-        assert!(
-            STEP_UP_TOLERANCE > STAIR_RISE,
-            "{}",
-            T_INTERIOR_STAIR_CLIMBS
-        );
-        assert!(
-            STEP_UP_TOLERANCE < UPPER_TOP - GROUND_TOP,
-            "{}",
-            T_INTERIOR_UPPER_FLOOR_ABOVE
-        );
+        // 走局部 `let` 而不是把常量直接写进 `assert!`:容差 / 台阶高 / 楼层高
+        // 三个都是编译期常量,直接比较会被 clippy 判成 `assertions_on_constants`
+        // —— 而这条测试的价值恰恰是「常量之间的大小关系一旦被改坏就报警」。
+        let tolerance: f32 = STEP_UP_TOLERANCE;
+        let rise: f32 = STAIR_RISE;
+        let storey: f32 = UPPER_TOP - GROUND_TOP;
+        assert!(tolerance > rise, "{}", T_INTERIOR_STAIR_CLIMBS);
+        assert!(tolerance < storey, "{}", T_INTERIOR_UPPER_FLOOR_ABOVE);
     }
 
     #[test]
     fn wall_between_two_rooms_blocks_movement() {
-        let mut w = FloorWorld::new();
+        let mut w: FloorWorld = FloorWorld::new();
         w.push_slab([-5.0, 0.0, -5.0], [5.0, GROUND_TOP, 5.0]);
         w.push_wall([-2.0, GROUND_TOP, -0.10], [2.0, 2.75, 0.10]);
-        let pushed = w.resolve_interior([0.0, 0.0], GROUND_TOP, BODY_TOP, RADIUS);
+        let pushed: Vec2 = w.resolve_interior([0.0, 0.0], GROUND_TOP, BODY_TOP, RADIUS);
         assert!(pushed[1].abs() > 0.1, "{}", T_INTERIOR_WALL_BLOCKS);
-        let away = w.resolve_interior([0.0, 2.0], GROUND_TOP, BODY_TOP, RADIUS);
+        let away: Vec2 = w.resolve_interior([0.0, 2.0], GROUND_TOP, BODY_TOP, RADIUS);
         assert!((away[1] - 2.0).abs() < 1e-4, "{}", T_INTERIOR_WALL_PASSES);
     }
 
     #[test]
     fn slab_above_head_does_not_block_player() {
-        let w = slab_world();
-        let inside = w.resolve_interior([0.0, 0.0], GROUND_TOP, BODY_TOP, RADIUS);
+        let w: FloorWorld = slab_world();
+        let inside: Vec2 = w.resolve_interior([0.0, 0.0], GROUND_TOP, BODY_TOP, RADIUS);
         assert!(
             (inside[0] - 0.0).abs() < 1e-4 && (inside[1] - 0.0).abs() < 1e-4,
             "{}",
@@ -426,30 +424,31 @@ mod tests {
 
     #[test]
     fn doorway_gap_is_the_only_way_through_the_front_wall() {
-        let mut w = FloorWorld::new();
+        let mut w: FloorWorld = FloorWorld::new();
         w.push_slab([-5.0, 0.0, -5.0], [5.0, GROUND_TOP, 5.0]);
-        let y_in = -5.0 + WALL_T;
+        let y_in: f32 = -5.0 + WALL_T;
         w.push_wall([-5.0, 0.0, y_in - WALL_T], [-DOOR_HALF, 6.4, y_in]);
         w.push_wall([DOOR_HALF, 0.0, y_in - WALL_T], [5.0, 6.4, y_in]);
         w.push_wall(
             [-DOOR_HALF, DOOR_TOP, y_in - WALL_T],
             [DOOR_HALF, 6.4, y_in],
         );
-        let through = w.resolve_interior([0.0, y_in], GROUND_TOP, BODY_TOP, RADIUS);
+        let through: Vec2 = w.resolve_interior([0.0, y_in], GROUND_TOP, BODY_TOP, RADIUS);
         assert!(
             (through[1] - y_in).abs() < 1e-3,
             "{}",
             T_INTERIOR_DOORWAY_THROUGH
         );
-        let blocked = w.resolve_interior([DOOR_HALF + 0.1, y_in], GROUND_TOP, BODY_TOP, RADIUS);
+        let blocked: Vec2 =
+            w.resolve_interior([DOOR_HALF + 0.1, y_in], GROUND_TOP, BODY_TOP, RADIUS);
         assert!(blocked[1] > y_in, "{}", T_INTERIOR_DOORWAY_BLOCKS);
-        let lintel = w.resolve_interior([0.0, y_in], GROUND_TOP, 3.0, RADIUS);
+        let lintel: Vec2 = w.resolve_interior([0.0, y_in], GROUND_TOP, 3.0, RADIUS);
         assert!(lintel[1] > y_in, "{}", T_INTERIOR_DOORWAY_BLOCKS);
     }
 
     #[test]
     fn support_height_reports_the_drop_when_walking_off_a_ledge() {
-        let w = slab_world();
+        let w: FloorWorld = slab_world();
         // 站在二楼高度、脚下已经没有二层板的位置(楼梯井):仍然只有
         // 0.15 m 的首层板够得着,返回值就是那 3.05 m 的落差。调用方据此
         // 判断「该走上去」还是「该掉下去」。
@@ -480,7 +479,7 @@ mod tests {
 
     #[test]
     fn probe_reports_containment_by_height() {
-        let w = slab_world();
+        let w: FloorWorld = slab_world();
         let on_ground: Vec2 = [0.0, 0.0];
         assert!(w.contains_interior_point(on_ground, GROUND_TOP * 0.5));
         assert!(!w.contains_interior_point(on_ground, 1.5));
@@ -490,7 +489,7 @@ mod tests {
 
     #[test]
     fn outside_the_footprint_there_is_no_support() {
-        let w = slab_world();
+        let w: FloorWorld = slab_world();
         let far: Vec2 = [40.0, 40.0];
         assert!(
             w.support_height(far, GROUND_TOP).is_none(),

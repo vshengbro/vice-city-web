@@ -65,7 +65,10 @@ pub const LIMB_PLAN: &[(&str, f32, f32)] = &[
 ///
 /// - `f32` - 该 part 的关节摆角(弧度)。
 pub fn limb_swing(part: &str, phase: f32, amount: f32) -> f32 {
-    let Some((_, offset, scale)) = LIMB_PLAN.iter().find(|(name, _, _)| *name == part) else {
+    let Some((_, offset, scale)) = LIMB_PLAN
+        .iter()
+        .find(|(name, _, _): &&(&str, f32, f32)| *name == part)
+    else {
         return 0.0;
     };
     scale * amount * (phase + offset).sin()
@@ -443,17 +446,31 @@ impl Player {
             current[1] + (target[1] - current[1]) * ramp,
         ]);
 
-        // 碰撞:把想要的位移交给分离函数,拿到被挡下来的位置。
+        // 碰撞:标准 **move_and_slide**。先把想要的位移交给
+        // `resolve_slide`,它只沿碰撞法线推出穿透深度,**切向分量原样
+        // 保留**。
+        //
+        // 之前这里是 `world.resolve(wanted)` —— 那是**全有全无**的位置
+        // 钳制:圆心被直接推到形状的最近面,沿墙方向的位移也一起没了。
+        // 于是顶着墙走时位移恰好为零,`want (-1.00, 0.00)` 拿到
+        // `got (+0.00, +0.00)`,几十帧推不动一毫米。卡点不固定在某一
+        // 面墙(实测 x = 28.3 / 28.4 / 33.1 / 35.0 各出现过一次),因为
+        // **每一面墙都这样**:被弹到哪就贴住哪面墙。
         let velocity: Vec2 = self.get_velocity();
         let here: Vec3 = self.get_position();
-        let wanted: Vec2 = [here[0] + velocity[0] * dt, here[2] + velocity[1] * dt];
-        let resolved: Vec2 = world.resolve(wanted);
+        let delta: Vec2 = [velocity[0] * dt, velocity[1] * dt];
+        let radius: f32 = world.get_player_radius();
+        let resolved: Vec2 = world.resolve_slide([here[0], here[2]], delta, radius);
         self.set_position([resolved[0], here[1], resolved[1]]);
 
         // 速度取「**实际走出来的位移** / dt」,而不是把分离修正量加回去。
         // 后者会被 1/dt 放大几十倍,一次 1 cm 的分离就会注入 0.6 m/s 的
-        // 侧向速度,角色会被「弹」着走。现在撞墙时朝墙的速度分量自然
-        // 归零,不会一直顶着墙搓,也不会被弹飞。
+        // 侧向速度,角色会被「弹」着走。现在撞墙时**朝墙**的速度分量
+        // 自然归零,不会一直顶着墙搓,也不会被弹飞。
+        //
+        // 关键在于 `resolved - here` 现在**包含切向位移**了(滑动之前是
+        // 零),所以反算出来的速度正确地保留了沿墙分量,不会把玩家
+        // 钉死在接触点上。
         let inverse_dt: f32 = 1.0 / dt.max(f32::EPSILON);
         let achieved: Vec2 = [resolved[0] - here[0], resolved[1] - here[2]];
         self.set_velocity([

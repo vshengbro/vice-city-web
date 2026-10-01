@@ -23,7 +23,8 @@ use euv::{
     wasm_bindgen_futures::{JsFuture, spawn_local},
     web_sys::{
         Document, DomRect, Element, Event, EventTarget, HtmlCanvasElement, HtmlInputElement,
-        KeyboardEvent, MouseEvent, Response, TouchEvent, TouchList, WheelEvent, Window, window,
+        KeyboardEvent, MouseEvent, Node, Response, TouchEvent, TouchList, WheelEvent, Window,
+        window,
     },
 };
 
@@ -35,7 +36,7 @@ use crate::{
         apply_damage, body_matrix, falloff, flat_distance, has_line_of_sight, regen_armor,
     },
     r#const::*,
-    enemy::{aim_with_spread, apply as apply_enemy, decide, is_active},
+    enemy::{aim_with_spread, decide, is_active},
     interior::{FloorWorld, STEP_UP_TOLERANCE},
     mesh::{Bounds, GpuMesh, MeshAsset, MeshError, MeshPart, expand_asset},
     player::{Player, RUN_SPEED, WALK_SPEED, joint_pivot, limb_matrix, limb_swing},
@@ -48,7 +49,7 @@ use crate::{
         advance_mission, build_hideouts, deploy_police, is_hidden, mission_blueprints, spawn_peds,
         spawn_thugs,
     },
-    traffic::{PICKUP_RADIUS, Traffic, TrafficCar, apply_pickup, nearest_car},
+    traffic::{PICKUP_RADIUS, Pickup, Traffic, TrafficCar, apply_pickup, nearest_car},
     r#type::{Mat4Data, MeshExtent, PalmSpots, Placement, Vec2, Vec3},
 };
 
@@ -694,6 +695,14 @@ struct ShowcaseSpec {
     half: Vec2,
 }
 
+/// 两栋样板楼蓝图的全集,等价于 `[ShowcaseSpec; 2]`。
+///
+/// 用类型别名而不是裸 `[ShowcaseSpec; 2]`,是因为 doc-comment 的
+/// 返回类型解析(`verify_doc_comment_format` 的 `->\s*([^{=;]+)`)会在
+/// `;` 处截断,于是 `# Returns` 里写正确的 `[ShowcaseSpec; 2]` 反而被判成
+/// 「与签名的 `[ShowcaseSpec` 不匹配」。展开后的类型完全等价。
+type ShowcaseSpecs = [ShowcaseSpec; 2];
+
 /// 两栋可进入样板楼的内墙净跨。
 ///
 /// # Arguments
@@ -730,8 +739,8 @@ fn showcase_half(asset: &str) -> Vec2 {
 ///
 /// # Returns
 ///
-/// - `[ShowcaseSpec; 2]`: 两栋样板楼的完整蓝图。
-fn showcase_specs() -> [ShowcaseSpec; 2] {
+/// - `ShowcaseSpecs` - 两栋样板楼的完整蓝图。
+fn showcase_specs() -> ShowcaseSpecs {
     [
         ShowcaseSpec {
             asset: BLDG_LOFT_SHOWCASE,
@@ -1163,6 +1172,37 @@ fn probe_nearby_shapes(game: &Game) {
             ));
         }
     }
+    // 2D 世界的形状**也要**一起报出来。室内墙只解释得了「被门垛弹回」,
+    // 解释不了「从 29.2 一步跳到 33.1」—— 那 4 m 的位移里
+    // `CollisionWorld::resolve`(`collision.rs` `push_out_aabb`)才是
+    // 嫌疑人:它把圆心沿**最近面**推出 `penetration`,而玩家一旦站到
+    // 1800 多个 shape 里某个的**内部**,走「最小松弛轴」分支会一次
+    // 推出好几米。诊断必须同时看两个世界。
+    for shape in game.world.get_shapes() {
+        let (center, half, kind): (Vec2, Vec2, &str) = match shape {
+            crate::collision::Shape::Aabb { center, half } => (*center, *half, "B"),
+            crate::collision::Shape::Circle { center, radius } => {
+                ([center[0], center[1]], [*radius, *radius], "C")
+            }
+        };
+        let dx: f32 = here[0] - center[0];
+        let dz: f32 = here[1] - center[1];
+        let pen_x: f32 = dx.abs() - half[0] - radius;
+        let pen_z: f32 = dz.abs() - half[1] - radius;
+        if pen_x.abs() < 0.8 || pen_z.abs() < 0.8 {
+            hits.push(format!(
+                "2D{kind} c=({:.2},{:.2}) x=[{:.2},{:.2}] z=[{:.2},{:.2}] pen=({:+.2},{:+.2})",
+                center[0],
+                center[1],
+                center[0] - half[0],
+                center[0] + half[0],
+                center[1] - half[1],
+                center[1] + half[1],
+                pen_x,
+                pen_z
+            ));
+        }
+    }
     let text: String = format!(
         "at ({:.2},{:.2}) r={radius:.2} n={} :: {}",
         here[0],
@@ -1551,7 +1591,7 @@ fn build_city_peds(cx: f32, cz: f32) -> Vec<Placement> {
                     0.0,
                     step,
                 ],
-                hash_unit(seed, 3) * 6.28,
+                hash_unit(seed, 3) * std::f32::consts::TAU,
             ));
             step += 19.0;
         }
@@ -3669,26 +3709,41 @@ fn bind_pointer_events(handles: &GameHandles) {
                     .sqrt();
                     let center_x: f64 = (a.client_x() + b.client_x()) as f64 * 0.5;
                     let center_y: f64 = (a.client_y() + b.client_y()) as f64 * 0.5;
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
-                    if game.input.last_pinch > 0.0 {
-                        let previous: f64 = game.input.last_pinch;
-                        let scale: f32 = (previous / distance.max(1.0)) as f32;
-                        game.camera.distance = (game.camera.distance * scale).clamp(12.0, 180.0);
-                        game.camera.confine_to_city();
-                        // 双指平移:中心位移反向推动相机焦点。
+                    // 相机改动拆成两段,因为 `forward()` 在 §borrow 的可重入
+                    // 清单里(history `forward`)。第一段在 `RefMut` 内把
+                    // `Camera` **move 出来**并读出旧的 input 状态,guard 随
+                    // block 结束 drop;第二段在没有 guard 的情况下对 owned
+                    // `Camera` 算完,第三段再把相机与新 input 状态一起写回。
+                    // 持着 `RefMut` 调 `forward()` 就是一次真实的重入 borrow
+                    // —— WASM 里 panic 不可 catch,直接白屏。
+                    let (mut camera, previous_pinch, previous_center): (Camera, f64, [f64; 2]) = {
+                        let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                        let previous_pinch: f64 = game.input.last_pinch;
                         let previous_center: [f64; 2] = game.input.last_pointer;
-                        let forward: [f32; 3] = game.camera.forward();
+                        let camera: Camera = std::mem::take(&mut game.camera);
+                        (camera, previous_pinch, previous_center)
+                    };
+                    if previous_pinch > 0.0 {
+                        let scale: f32 = (previous_pinch / distance.max(1.0)) as f32;
+                        camera.distance = (camera.distance * scale).clamp(12.0, 180.0);
+                        camera.confine_to_city();
+                        // 双指平移:中心位移反向推动相机焦点。
+                        let forward: [f32; 3] = camera.forward();
                         let right: [f32; 3] = normalize3([-forward[2], 0.0, forward[0]]);
-                        let pan: f32 = game.camera.distance * 0.0016;
+                        let pan: f32 = camera.distance * 0.0016;
                         for axis in 0..3 {
-                            game.camera.target[axis] += (right[axis]
+                            camera.target[axis] += (right[axis]
                                 * (center_x - previous_center[0]) as f32
                                 - forward[axis] * (center_y - previous_center[1]) as f32)
                                 * pan;
                         }
                     }
-                    game.input.last_pinch = distance;
-                    game.input.last_pointer = [center_x, center_y];
+                    {
+                        let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                        game.camera = camera;
+                        game.input.last_pinch = distance;
+                        game.input.last_pointer = [center_x, center_y];
+                    }
                 }
                 _ => {
                     let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
@@ -4065,6 +4120,16 @@ fn apply_teleport_request(game: &mut Game) {
         return;
     }
     // `safe` 子命令:打开 / 关闭无敌,直到脚本清掉为止。
+    //
+    // 和 `walk` 放在同一个请求对象里时(`{walk: true, safe: true, ...}`)
+    // 只设标志、不 return ——两者共用 `window.__vcw_teleport` 这一个通道,
+    // 分开发送时后一条会覆盖前一条,玩家在 leg 中途被击中重生。
+    // 之前这里无条件 return,于是带 safe 的 walk 请求整条被吃掉:
+    // 玩家站着不动,看起来像门洞堵死,其实是 walk 根本没被读到。
+    let wants_walk: bool = js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_WALK))
+        .ok()
+        .map(|value: JsValue| value.is_truthy())
+        .unwrap_or(false);
     if js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_SAFE))
         .ok()
         .map(|value: JsValue| value.is_truthy())
@@ -4072,14 +4137,24 @@ fn apply_teleport_request(game: &mut Game) {
     {
         game.safe_mode = true;
         game.player.set_health(PLAYER_MAX_HEALTH);
-        return;
+        if !wants_walk {
+            return;
+        }
     }
     // `walk` 子命令:朝世界方向持续走,直到脚本清掉为止。
-    if js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_WALK))
+    //
+    // 判据是**字段存不存在**,不是「值是不是 true」:验收脚本的松手动作
+    // 发的是 `{walk: false, dx: 0, dz: 0}`,而 `is_truthy()` 对 false
+    // 返回 false,于是整个分支被跳过 —— 松手请求既没有停下走路,也
+    // 没有被清掉,玩家带着上一次的方向一直朝前冲。实测每次
+    // `walk_to` 结束、脚本发完松手,玩家都会**继续**走将近一米才停
+    // (TEST1 结束在 30.63,松手后落到 29.71)。路点判定因此永远差一截,
+    // 下一段从偏离的位置起步,越走越偏。
+    let has_walk: bool = js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_WALK))
         .ok()
-        .map(|value: JsValue| value.is_truthy())
-        .unwrap_or(false)
-    {
+        .map(|value: JsValue| !value.is_undefined() && !value.is_null())
+        .unwrap_or(false);
+    if has_walk {
         let dx: f32 = js_sys::Reflect::get(&request, &JsValue::from_str("dx"))
             .ok()
             .and_then(|value: JsValue| value.as_f64())
@@ -4090,26 +4165,33 @@ fn apply_teleport_request(game: &mut Game) {
             .and_then(|value: JsValue| value.as_f64())
             .map(|value: f64| value as f32)
             .unwrap_or(0.0);
-        if dx == 0.0 && dz == 0.0 {
-            // 松手时把速度一起清掉。只清输入方向的话,玩家会带着余速
-            // 继续滑行好几米 —— 下一个路点就从偏离的位置起步,撞墙。
-            game.walk_request = [0.0, 0.0];
-            game.player.set_velocity([0.0, 0.0]);
-            return;
-        }
+        // 松手时把速度一起清掉。只清输入方向的话,玩家会带着余速
+        // 继续滑行好几米 —— 下一个路点就从偏离的位置起步,撞墙。
         game.walk_request = [dx, dz];
+        if dx == 0.0 && dz == 0.0 {
+            game.player.set_velocity([0.0, 0.0]);
+        }
+        // **必须清掉请求**,否则下一帧会掉进下面的传送分支:
+        // `has_walk` 变成 false,于是 `read("x")` / `read("z")` 读不到
+        // 字段,双双回落到 `SPAWN_POINT[0]`,玩家被瞬移到 (33.5, 33.5)。
+        // 这正是「每段路点走完就被弹回街上」的原因。
+        let _: bool = js_sys::Reflect::set(&window, &key, &JsValue::NULL).unwrap_or(false);
         return;
     }
-    let read = |field: &str| -> f32 {
+    let read = |field: &str, fallback: f32| -> f32 {
         let field_key: JsValue = JsValue::from_str(field);
         js_sys::Reflect::get(&request, &field_key)
             .ok()
             .and_then(|value: JsValue| value.as_f64())
             .map(|value: f64| value as f32)
-            .unwrap_or(SPAWN_POINT[0])
+            .unwrap_or(fallback)
     };
-    let x: f32 = read("x");
-    let z: f32 = read("z");
+    // 回退值必须按轴取:x 回落 `SPAWN_POINT[0]`、z 回落 `SPAWN_POINT[2]`。
+    // 之前两轴共用 `SPAWN_POINT[0]`,于是任何「只有 x 没有 z」的请求都会
+    // 把玩家送到 (33.5, 33.5) —— 一个既不是出生点、也不在任何碰撞体
+    // 里的地方(真出生点是 (33.5, 45))。
+    let x: f32 = read("x", SPAWN_POINT[0]);
+    let z: f32 = read("z", SPAWN_POINT[2]);
     let hold: bool = js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_HOLD))
         .ok()
         .map(|value: JsValue| value.is_truthy())
@@ -4154,328 +4236,341 @@ fn apply_teleport_request(game: &mut Game) {
 ///
 /// - `()` - 无返回值,结果通过 `window.__vcw` 暴露。
 fn publish_debug_state(handles: &GameHandles, hud: &str) {
-    let game: std::cell::Ref<Game> = handles.game.borrow();
-    let position: Vec3 = game.player.get_position();
-    let car_x: Vec<f64> = game
-        .traffic
-        .get_cars_ref()
-        .iter()
-        .map(|car| f64::from(car.get_position()[0]))
-        .collect();
-    let car_z: Vec<f64> = game
-        .traffic
-        .get_cars_ref()
-        .iter()
-        .map(|car| f64::from(car.get_position()[2]))
-        .collect();
-    let car_speed: Vec<f64> = game
-        .traffic
-        .get_cars_ref()
-        .iter()
-        .map(|car| f64::from(car.get_speed()))
-        .collect();
-    // 第一件还没被捡走的医疗包:验收脚本读它就能走过去真的拾取,而不是
-    // 猜一组魔法坐标。
-    let health_pack: Option<[f64; 2]> = game
-        .traffic
-        .get_pickups_ref()
-        .iter()
-        .find(|p| !p.get_taken() && p.get_asset() == PICKUP_HEALTH_PACK)
-        .map(|p| {
-            let at: Vec3 = p.get_position();
-            [f64::from(at[0]), f64::from(at[2])]
-        });
-    // 正在开的那辆车的实时坐标 / 速度:用来证明"车真的在动",而不是
-    // 只有相机在动。
-    let (cdrive_x, cdrive_z, cdrive_v): (f64, f64, f64) = match game.player.get_vehicle() {
-        Some(index) => match game.traffic.get_cars_ref().get(index) {
-            Some(car) => {
-                let at: Vec3 = car.get_position();
-                (
-                    f64::from(at[0]),
-                    f64::from(at[2]),
-                    f64::from(car.get_speed()),
-                )
-            }
-            None => (0.0, 0.0, 0.0),
-        },
-        None => (0.0, 0.0, 0.0),
-    };
-    // 相机眼点:验收脚本靠它核对「回避之后眼点到底站在哪」。
-    let eye: Vec3 = game.camera.eye();
-    // 探针必须序列化成**合法 JSON**:`{:?}` 打出的是 Rust 的
-    // `Some([1.0, 2.0])`,在 JSON 里是非法的,整份 `window.__vcw`
-    // 会因此解析失败,自动化脚本就再也读不到任何状态。
-    // 验收探针:第一个不透明批次的实例矩阵与数量,用来判断「模型矩阵
-    // 是不是没写进去」。
-    let b0: String = match game.scene.batches.first() {
-        Some(batch) => format!(
-            "{:?} x{}",
-            batch
-                .instances
-                .first()
-                .map(|i: &Instance| i.get_model_ref()),
-            batch.instances.len()
-        ),
-        None => String::from(crate::r#const::NO_BATCHES),
-    };
-    let bn: usize = game.scene.batches.len();
-    // 流式地面的当前生成中心:验收脚本用它证明地面跟着玩家走。
-    let stream_x: f32 = game.streamed_center[0];
-    let stream_z: f32 = game.streamed_center[1];
-    // 全量验收脚本要看「走到远处之后脚下还有没有地」,所以把三角形数
-    // 和击杀数一起挂出来:三角形塌成 0 就是几何没生成,击杀数用来确认
-    // 战斗回路是活的。
-    let tris: usize = game.scene.total_triangles;
-    let kills: u32 = game.kills;
-    let loaded: usize = game.loaded_assets;
-    // 验收脚本要导航到样板楼门口才能验证「进门 → 上楼」,所以把门外的
-    // 站位坐标一起挂出来。脚本自己从源码抄 `6.4` 的话,内墙改一次就得
-    // 跟着改脚本,迟早对不上。
-    let door_spec: &ShowcaseSpec = &showcase_specs()[0];
-    let door_at: Vec3 = showcase_door_approach(
-        door_spec.position[0],
-        door_spec.position[1],
-        door_spec.yaw,
-        1.6,
-    );
-    let route_points: Vec<[f32; 2]> = showcase_walk_route(0);
-    let mut route_parts: Vec<String> = Vec::new();
-    for point in route_points.iter() {
-        route_parts.push(format!("[{:.3},{:.3}]", point[0], point[1]));
-    }
-    let route_json: String = format!("[{}]", route_parts.join(","));
-    let door_json: String = format!(
-        "{{\"x\":{:.3},\"y\":{:.3},\"z\":{:.3},\"yaw\":{:.4},\"cx\":{:.3},\"cz\":{:.3}}}",
-        door_at[0],
-        door_at[1],
-        door_at[2],
-        door_spec.yaw,
-        door_spec.position[0],
-        door_spec.position[1]
-    );
-    let wheel_count: usize = game.car_wheel_batches.len();
-    // 车轮批次总数 + 第一个车轮的 Y 基向量(自转角的可观测代理):
-    // 停车时该向量是 [0,1,0];车轮滚动时会随转角在 XZ 平面里摆动。
-    let wheel_probe: String = match game.car_wheel_batches.first() {
-        None => String::from("[]"),
-        Some(wheel) => match game.scene.batches.get(wheel.batch) {
-            None => String::from("[]"),
-            Some(batch) => match batch.instances.first() {
-                None => String::from("[]"),
-                Some(instance) => {
-                    let m: Mat4Data = *instance.get_model_ref();
-                    format!(
-                        "[{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}]",
-                        m[4], m[5], m[6], m[1], m[2], m[3]
+    // 读阶段整体包在一个 block 里:所有取值与两份 JSON 字面量都在这里算完,
+    // block 结束时 `Ref` 随作用域析构,之后才写 `window` —— 写 `window` 走
+    // `web_sys::window()` / `js_sys::JSON::parse`,是 §borrow 的可重入调用,
+    // 不能与活着的 guard 同处一个作用域。
+    let (json, visibility): (String, String) = {
+        let game: std::cell::Ref<Game> = handles.game.borrow();
+        let position: Vec3 = game.player.get_position();
+        let car_x: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_position()[0]))
+            .collect();
+        let car_z: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_position()[2]))
+            .collect();
+        let car_speed: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_speed()))
+            .collect();
+        // 第一件还没被捡走的医疗包:验收脚本读它就能走过去真的拾取,而不是
+        // 猜一组魔法坐标。
+        let health_pack: Option<[f64; 2]> = game
+            .traffic
+            .get_pickups_ref()
+            .iter()
+            .find(|p: &&Pickup| !p.get_taken() && p.get_asset() == PICKUP_HEALTH_PACK)
+            .map(|p: &Pickup| {
+                let at: Vec3 = p.get_position();
+                [f64::from(at[0]), f64::from(at[2])]
+            });
+        // 正在开的那辆车的实时坐标 / 速度:用来证明"车真的在动",而不是
+        // 只有相机在动。
+        let (cdrive_x, cdrive_z, cdrive_v): (f64, f64, f64) = match game.player.get_vehicle() {
+            Some(index) => match game.traffic.get_cars_ref().get(index) {
+                Some(car) => {
+                    let at: Vec3 = car.get_position();
+                    (
+                        f64::from(at[0]),
+                        f64::from(at[2]),
+                        f64::from(car.get_speed()),
                     )
                 }
+                None => (0.0, 0.0, 0.0),
             },
-        },
-    };
-    // 最近的建筑实例位置:验收脚本要拿它当「推挤目标」,而不是写死
-    // 一个魔法坐标 —— 街区布局会变,写死的坐标早晚会推到空气上。
-    let bpos_json: String = json_point(game.nearest_building);
-    // ---- 战斗 / 通缉 / 任务 / 行人的探针:自动化验收靠这几个字段 ----
-    let enemies_json: String = {
-        let items: Vec<String> = game
-            .enemies
-            .iter()
-            .map(|enemy: &Enemy| {
-                let at: Vec3 = enemy.get_position();
-                format!(
-                    "{{\"x\":{:.2},\"z\":{:.2},\"hp\":{:.1},\"state\":\"{}\",\"fac\":{},\"alive\":{},\"flash\":{:.2},\"spd\":{:.2}}}",
-                    at[0],
-                    at[2],
-                    enemy.get_health(),
-                    enemy.get_state().label(),
-                    faction_code(enemy.get_faction()),
-                    enemy.is_alive(),
-                    enemy.get_flash(),
-                    enemy.length()
-                )
-            })
-            .collect();
-        format!("[{}]", items.join(JSON_COMMA))
-    };
-    let peds_json: String = {
-        let items: Vec<String> = game
-            .peds
-            .iter()
-            .map(|ped: &Pedestrian| {
-                let at: Vec3 = ped.get_position();
-                format!(
-                    "{{\"x\":{:.2},\"z\":{:.2},\"down\":{},\"gait\":{:.2}}}",
-                    at[0],
-                    at[2],
-                    ped.is_down(),
-                    ped.get_gait_amount()
-                )
-            })
-            .collect();
-        format!("[{}]", items.join(JSON_COMMA))
-    };
-    let wanted_json: String = format!(
-        "{{\"stars\":{},\"heat\":{:.3},\"unseen\":{:.2},\"hidden\":{},\"cooling\":{:.2}}}",
-        game.wanted.get_stars(),
-        game.wanted.get_heat(),
-        game.wanted.get_unseen(),
-        is_hidden(&game.hideouts, position),
-        game.wanted.get_unseen()
-    );
-    let combat_json: String = format!(
-        "{{\"weapon\":{},\"mag\":{},\"reload\":{},\"kills\":{},\"damage\":{:.2},\"hp\":{:.1},\"armor\":{:.1},\"cash\":{},\"missions\":{},\"mission_active\":{},\"mission_title\":\"{}\",\"respawn\":{:.2},\"hitmarker\":{:.2},\"aim\":[{:.3},{:.3}],\"pitch\":{:.3},\"fire_held\":{}}}",
-        game.arsenal.get_weapon() as u8,
-        game.arsenal.get_magazine(),
-        game.arsenal.is_reloading(),
-        game.kills,
-        game.hurt.get_since_hit(),
-        game.player.get_health(),
-        game.player.get_armor(),
-        game.player.get_cash(),
-        game.missions_done,
-        game.mission.is_active(),
-        game.mission.get_title(),
-        game.hurt.get_respawn(),
-        game.hitmarker,
-        game.arsenal.get_aim()[0],
-        game.arsenal.get_aim()[1],
-        game.aim_pitch,
-        game.input.fire_held
-    );
-    let limbs_json: String = {
-        let parts: Vec<String> = game
-            .player_batches
-            .iter()
-            .map(|limb: &PlayerLimbBatch| {
-                format!("{{\"part\":\"{}\",\"batch\":{}}}", limb.part, limb.batch)
-            })
-            .collect();
-        format!("[{}]", parts.join(JSON_COMMA))
-    };
-    let limb_model: String = {
-        let first: Option<&PlayerLimbBatch> = game.player_batches.first();
-        let batch_index: Option<usize> = first.map(|limb: &PlayerLimbBatch| limb.batch);
-        let instance: Option<&Instance> = match batch_index {
-            Some(index) => game
-                .scene
-                .batches
-                .get(index)
-                .and_then(|batch: &SceneBatch| batch.instances.first()),
-            None => None,
+            None => (0.0, 0.0, 0.0),
         };
-        let model: Option<Mat4Data> = instance.map(|inst: &Instance| *inst.get_model_ref());
-        match model {
-            Some(m) => json_f32s(&m),
-            None => String::from(JSON_NULL),
+        // 相机眼点:验收脚本靠它核对「回避之后眼点到底站在哪」。
+        let eye: Vec3 = game.camera.eye();
+        // 探针必须序列化成**合法 JSON**:`{:?}` 打出的是 Rust 的
+        // `Some([1.0, 2.0])`,在 JSON 里是非法的,整份 `window.__vcw`
+        // 会因此解析失败,自动化脚本就再也读不到任何状态。
+        // 验收探针:第一个不透明批次的实例矩阵与数量,用来判断「模型矩阵
+        // 是不是没写进去」。
+        let b0: String = match game.scene.batches.first() {
+            Some(batch) => format!(
+                "{:?} x{}",
+                batch
+                    .instances
+                    .first()
+                    .map(|i: &Instance| i.get_model_ref()),
+                batch.instances.len()
+            ),
+            None => String::from(crate::r#const::NO_BATCHES),
+        };
+        let bn: usize = game.scene.batches.len();
+        // 流式地面的当前生成中心:验收脚本用它证明地面跟着玩家走。
+        let stream_x: f32 = game.streamed_center[0];
+        let stream_z: f32 = game.streamed_center[1];
+        // 全量验收脚本要看「走到远处之后脚下还有没有地」,所以把三角形数
+        // 和击杀数一起挂出来:三角形塌成 0 就是几何没生成,击杀数用来确认
+        // 战斗回路是活的。
+        let tris: usize = game.scene.total_triangles;
+        let kills: u32 = game.kills;
+        let loaded: usize = game.loaded_assets;
+        // 验收脚本要导航到样板楼门口才能验证「进门 → 上楼」,所以把门外的
+        // 站位坐标一起挂出来。脚本自己从源码抄 `6.4` 的话,内墙改一次就得
+        // 跟着改脚本,迟早对不上。
+        let door_spec: &ShowcaseSpec = &showcase_specs()[0];
+        let door_at: Vec3 = showcase_door_approach(
+            door_spec.position[0],
+            door_spec.position[1],
+            door_spec.yaw,
+            1.6,
+        );
+        let route_points: Vec<[f32; 2]> = showcase_walk_route(0);
+        let mut route_parts: Vec<String> = Vec::new();
+        for point in route_points.iter() {
+            route_parts.push(format!("[{:.3},{:.3}]", point[0], point[1]));
         }
-    };
-    // 角色在屏幕上的包围盒:把「脚底」和「头顶」两个世界点投影出去。
-    // 有了这两个像素坐标,验收脚本能直接算出角色在画面里有多高、落在
-    // 画面的哪个位置 —— 不用靠肉眼判断「看没看见」。
-    let char_box: String = {
-        let size: (u32, u32) = game.canvas_size.get();
-        let (canvas_w, canvas_h): (f32, f32) = (size.0 as f32, size.1 as f32);
-        let base: Vec3 = game.player.get_position();
-        let head: Vec3 = [base[0], base[1] + PED_SCREEN_PROBE_HEIGHT, base[2]];
-        let feet: Option<(f32, f32, f32)> = game.camera.world_to_screen(base, canvas_w, canvas_h);
-        let crown: Option<(f32, f32, f32)> = game.camera.world_to_screen(head, canvas_w, canvas_h);
-        match (feet, crown) {
-            (Some(f), Some(c)) => {
-                format!("[{:.1},{:.1},{:.1},{:.1},{:.1}]", f.0, f.1, c.0, c.1, c.2)
+        let route_json: String = format!("[{}]", route_parts.join(","));
+        let door_json: String = format!(
+            "{{\"x\":{:.3},\"y\":{:.3},\"z\":{:.3},\"yaw\":{:.4},\"cx\":{:.3},\"cz\":{:.3}}}",
+            door_at[0],
+            door_at[1],
+            door_at[2],
+            door_spec.yaw,
+            door_spec.position[0],
+            door_spec.position[1]
+        );
+        let wheel_count: usize = game.car_wheel_batches.len();
+        // 车轮批次总数 + 第一个车轮的 Y 基向量(自转角的可观测代理):
+        // 停车时该向量是 [0,1,0];车轮滚动时会随转角在 XZ 平面里摆动。
+        let wheel_probe: String = match game.car_wheel_batches.first() {
+            None => String::from("[]"),
+            Some(wheel) => match game.scene.batches.get(wheel.batch) {
+                None => String::from("[]"),
+                Some(batch) => match batch.instances.first() {
+                    None => String::from("[]"),
+                    Some(instance) => {
+                        let m: Mat4Data = *instance.get_model_ref();
+                        format!(
+                            "[{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}]",
+                            m[4], m[5], m[6], m[1], m[2], m[3]
+                        )
+                    }
+                },
+            },
+        };
+        // 最近的建筑实例位置:验收脚本要拿它当「推挤目标」,而不是写死
+        // 一个魔法坐标 —— 街区布局会变,写死的坐标早晚会推到空气上。
+        let bpos_json: String = json_point(game.nearest_building);
+        // ---- 战斗 / 通缉 / 任务 / 行人的探针:自动化验收靠这几个字段 ----
+        let enemies_json: String = {
+            let items: Vec<String> = game
+                .enemies
+                .iter()
+                .map(|enemy: &Enemy| {
+                    let at: Vec3 = enemy.get_position();
+                    format!(
+                        "{{\"x\":{:.2},\"z\":{:.2},\"hp\":{:.1},\"state\":\"{}\",\"fac\":{},\"alive\":{},\"flash\":{:.2},\"spd\":{:.2}}}",
+                        at[0],
+                        at[2],
+                        enemy.get_health(),
+                        enemy.get_state().label(),
+                        faction_code(enemy.get_faction()),
+                        enemy.is_alive(),
+                        enemy.get_flash(),
+                        enemy.length()
+                    )
+                })
+                .collect();
+            format!("[{}]", items.join(JSON_COMMA))
+        };
+        let peds_json: String = {
+            let items: Vec<String> = game
+                .peds
+                .iter()
+                .map(|ped: &Pedestrian| {
+                    let at: Vec3 = ped.get_position();
+                    format!(
+                        "{{\"x\":{:.2},\"z\":{:.2},\"down\":{},\"gait\":{:.2}}}",
+                        at[0],
+                        at[2],
+                        ped.is_down(),
+                        ped.get_gait_amount()
+                    )
+                })
+                .collect();
+            format!("[{}]", items.join(JSON_COMMA))
+        };
+        let wanted_json: String = format!(
+            "{{\"stars\":{},\"heat\":{:.3},\"unseen\":{:.2},\"hidden\":{},\"cooling\":{:.2}}}",
+            game.wanted.get_stars(),
+            game.wanted.get_heat(),
+            game.wanted.get_unseen(),
+            is_hidden(&game.hideouts, position),
+            game.wanted.get_unseen()
+        );
+        let combat_json: String = format!(
+            "{{\"weapon\":{},\"mag\":{},\"reload\":{},\"kills\":{},\"damage\":{:.2},\"hp\":{:.1},\"armor\":{:.1},\"cash\":{},\"missions\":{},\"mission_active\":{},\"mission_title\":\"{}\",\"respawn\":{:.2},\"hitmarker\":{:.2},\"aim\":[{:.3},{:.3}],\"pitch\":{:.3},\"fire_held\":{}}}",
+            game.arsenal.get_weapon() as u8,
+            game.arsenal.get_magazine(),
+            game.arsenal.is_reloading(),
+            game.kills,
+            game.hurt.get_since_hit(),
+            game.player.get_health(),
+            game.player.get_armor(),
+            game.player.get_cash(),
+            game.missions_done,
+            game.mission.is_active(),
+            game.mission.get_title(),
+            game.hurt.get_respawn(),
+            game.hitmarker,
+            game.arsenal.get_aim()[0],
+            game.arsenal.get_aim()[1],
+            game.aim_pitch,
+            game.input.fire_held
+        );
+        let limbs_json: String = {
+            let parts: Vec<String> = game
+                .player_batches
+                .iter()
+                .map(|limb: &PlayerLimbBatch| {
+                    format!("{{\"part\":\"{}\",\"batch\":{}}}", limb.part, limb.batch)
+                })
+                .collect();
+            format!("[{}]", parts.join(JSON_COMMA))
+        };
+        let limb_model: String = {
+            let first: Option<&PlayerLimbBatch> = game.player_batches.first();
+            let batch_index: Option<usize> = first.map(|limb: &PlayerLimbBatch| limb.batch);
+            let instance: Option<&Instance> = match batch_index {
+                Some(index) => game
+                    .scene
+                    .batches
+                    .get(index)
+                    .and_then(|batch: &SceneBatch| batch.instances.first()),
+                None => None,
+            };
+            let model: Option<Mat4Data> = instance.map(|inst: &Instance| *inst.get_model_ref());
+            match model {
+                Some(m) => json_f32s(&m),
+                None => String::from(JSON_NULL),
             }
-            _ => String::from(JSON_NULL),
-        }
-    };
-    let ft: Vec<f32> = game.follow_target.to_vec();
+        };
+        // 角色在屏幕上的包围盒:把「脚底」和「头顶」两个世界点投影出去。
+        // 有了这两个像素坐标,验收脚本能直接算出角色在画面里有多高、落在
+        // 画面的哪个位置 —— 不用靠肉眼判断「看没看见」。
+        let char_box: String = {
+            let size: (u32, u32) = game.canvas_size.get();
+            let (canvas_w, canvas_h): (f32, f32) = (size.0 as f32, size.1 as f32);
+            let base: Vec3 = game.player.get_position();
+            let head: Vec3 = [base[0], base[1] + PED_SCREEN_PROBE_HEIGHT, base[2]];
+            let feet: Option<(f32, f32, f32)> =
+                game.camera.world_to_screen(base, canvas_w, canvas_h);
+            let crown: Option<(f32, f32, f32)> =
+                game.camera.world_to_screen(head, canvas_w, canvas_h);
+            match (feet, crown) {
+                (Some(f), Some(c)) => {
+                    format!("[{:.1},{:.1},{:.1},{:.1},{:.1}]", f.0, f.1, c.0, c.1, c.2)
+                }
+                _ => String::from(JSON_NULL),
+            }
+        };
+        let ft: Vec<f32> = game.follow_target.to_vec();
 
-    let tgt: Vec<f32> = game.camera.get_target().to_vec();
-    let ft_json: String = json_f32s(&ft);
-    let tgt_json: String = json_f32s(&tgt);
-    let mm: Vec<f32> = game.camera.view_projection(1.0).get_elements().to_vec();
-    let mm_json: String = json_f32s(&mm);
-    let probe_json: String = game
-        .probe
-        .iter()
-        .map(|p: &Option<[f32; 2]>| match p {
-            Some([x, y]) => format!("[{},{}]", x, y),
-            None => String::from(JSON_NULL),
-        })
-        .collect::<Vec<String>>()
-        .join(",");
-    let json: String = format!(
-        "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf}{DEBUG_CLOSE}",
-        x = position[0],
-        z = position[2],
-        yaw = game.player.get_yaw(),
-        cyaw = game.camera.get_yaw(),
-        phase = game.input.phase.as_str(),
-        pickup_pos = join_pickups(&game),
-        hp_at = match health_pack {
-            Some(at) => format!("[{},{}]", at[0], at[1]),
-            None => String::from(JSON_NULL),
-        },
-        hp = game.player.get_health(),
-        cash = game.player.get_cash(),
-        veh = match game.player.get_vehicle() {
-            Some(index) => format!("{index}"),
-            None => String::from(JSON_NULL),
-        },
-        gphase = game.player.get_gait_phase(),
-        gamount = game.player.get_gait_amount(),
-        mode = if game.third_person {
-            HUD_THIRD_PERSON
-        } else {
-            HUD_ORBIT
-        },
-        shapes = game.world.get_shapes().len(),
-        inside = game.world.contains_point([position[0], position[2]]),
-        cdist = game.camera.get_distance(),
-        cdist_target = game.camera.get_desired_distance(),
-        coccluded = game.camera.get_occluded(),
-        ceye_x = eye[0],
-        ceye_y = eye[1],
-        ceye_z = eye[2],
-        py = position[1],
-        grounded = game.player.get_grounded(),
-        wr0 = game.walk_request[0],
-        wr1 = game.walk_request[1],
-        vx = game.player.get_velocity()[0],
-        vz = game.player.get_velocity()[1],
-        rsp = game.hurt.get_respawn(),
-        saf = game.safe_mode,
-        vy = game.player.get_vertical_velocity(),
-        interiors_json = format!(
-            "{{\"count\":{},\"inSolid\":{}}}",
-            game.interiors.get_floors().len(),
-            game.interiors
-                .contains_interior_point([position[0], position[2]], position[1] + 0.5)
-        ),
-        cclear = game.camera.get_eye_clearance(),
-        cpitch = game.camera.get_pitch(),
-        car_x = join_f64(&car_x),
-        car_z = join_f64(&car_z),
-        car_speed = join_f64(&car_speed),
-        total = game.traffic.get_pickups_ref().len(),
-        taken = game.player.collected_count(),
-        hud = hud
-            .replace(CHAR_QUOTE, "")
-            .replace(CHAR_BACKSLASH, JSON_SLASH),
-        cdrive_x = cdrive_x,
-        cdrive_z = cdrive_z,
-        cdrive_v = cdrive_v,
-        throttle = axis(&game.input, KEYW, KEYS),
-        frames = game.frame_count,
-        enemies_json = enemies_json,
-        peds_json = peds_json,
-        wanted_json = wanted_json,
-        combat_json = combat_json,
-    );
-    let _ = set_window_json(DEBUG_HOOK_NAME, &json);
-    publish_visibility_state(&game, &char_box);
+        let tgt: Vec<f32> = game.camera.get_target().to_vec();
+        let ft_json: String = json_f32s(&ft);
+        let tgt_json: String = json_f32s(&tgt);
+        let mm: Vec<f32> = game.camera.view_projection(1.0).get_elements().to_vec();
+        let mm_json: String = json_f32s(&mm);
+        let probe_json: String = game
+            .probe
+            .iter()
+            .map(|p: &Option<[f32; 2]>| match p {
+                Some([x, y]) => format!("[{},{}]", x, y),
+                None => String::from(JSON_NULL),
+            })
+            .collect::<Vec<String>>()
+            .join(",");
+        let json: String = format!(
+            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf}{DEBUG_CLOSE}",
+            x = position[0],
+            z = position[2],
+            yaw = game.player.get_yaw(),
+            cyaw = game.camera.get_yaw(),
+            phase = game.input.phase.as_str(),
+            pickup_pos = join_pickups(&game),
+            hp_at = match health_pack {
+                Some(at) => format!("[{},{}]", at[0], at[1]),
+                None => String::from(JSON_NULL),
+            },
+            hp = game.player.get_health(),
+            cash = game.player.get_cash(),
+            veh = match game.player.get_vehicle() {
+                Some(index) => format!("{index}"),
+                None => String::from(JSON_NULL),
+            },
+            gphase = game.player.get_gait_phase(),
+            gamount = game.player.get_gait_amount(),
+            mode = if game.third_person {
+                HUD_THIRD_PERSON
+            } else {
+                HUD_ORBIT
+            },
+            shapes = game.world.get_shapes().len(),
+            inside = game.world.contains_point([position[0], position[2]]),
+            cdist = game.camera.get_distance(),
+            cdist_target = game.camera.get_desired_distance(),
+            coccluded = game.camera.get_occluded(),
+            ceye_x = eye[0],
+            ceye_y = eye[1],
+            ceye_z = eye[2],
+            py = position[1],
+            grounded = game.player.get_grounded(),
+            wr0 = game.walk_request[0],
+            wr1 = game.walk_request[1],
+            vx = game.player.get_velocity()[0],
+            vz = game.player.get_velocity()[1],
+            rsp = game.hurt.get_respawn(),
+            saf = game.safe_mode,
+            vy = game.player.get_vertical_velocity(),
+            interiors_json = format!(
+                "{{\"count\":{},\"inSolid\":{}}}",
+                game.interiors.get_floors().len(),
+                game.interiors
+                    .contains_interior_point([position[0], position[2]], position[1] + 0.5)
+            ),
+            cclear = game.camera.get_eye_clearance(),
+            cpitch = game.camera.get_pitch(),
+            car_x = join_f64(&car_x),
+            car_z = join_f64(&car_z),
+            car_speed = join_f64(&car_speed),
+            total = game.traffic.get_pickups_ref().len(),
+            taken = game.player.collected_count(),
+            hud = hud
+                .replace(CHAR_QUOTE, "")
+                .replace(CHAR_BACKSLASH, JSON_SLASH),
+            cdrive_x = cdrive_x,
+            cdrive_z = cdrive_z,
+            cdrive_v = cdrive_v,
+            throttle = axis(&game.input, KEYW, KEYS),
+            frames = game.frame_count,
+            enemies_json = enemies_json,
+            peds_json = peds_json,
+            wanted_json = wanted_json,
+            combat_json = combat_json,
+        );
+        // 可视化快照也是纯字符串拼接(读 `game` 但不写 `window`),所以在
+        // guard 还活着的这里一次算完。
+        let visibility: String = visibility_json(&game, &char_box);
+        (json, visibility)
+    };
+    let _: Result<(), euv::wasm_bindgen::JsValue> = set_window_json(DEBUG_HOOK_NAME, &json);
+    let _: Result<(), euv::wasm_bindgen::JsValue> =
+        set_window_json(DEBUG_VISIBILITY_HOOK_NAME, &visibility);
 }
 
-/// 把「角色可见性」这一组字段挂到 `window.__VCW_DEBUG__`。
+/// 把「角色可见性」这一组字段拼成 JSON 字面量。
 ///
 /// 与全量快照 [`publish_debug_state`] 分开维护:验收脚本判断「角色到底
 /// 画没画、画多大、在画面哪里」只需要这几个字段,不必去 parse 一整份
@@ -4486,11 +4581,20 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
 /// 可见(包围盒在画布内,但宽度接近整个画布)。所以额外要求角色高度
 /// 占画布的百分比落在 `CHAR_VISIBLE_MAX_SCREEN_PCT` 以下。
 ///
+/// **只拼串、不写 `window`**:写 `window` 走 `js_sys::JSON::parse` /
+/// `web_sys::window()`,是 §borrow 清单里的可重入调用。调用方在 `Ref` 还
+/// 活着的时候调它就会 panic,所以这个函数必须保持纯函数,写 `window`
+/// 的那一步留给 guard 已经放掉的调用方。
+///
 /// # Arguments
 ///
 /// - `&Game` - Game 的只读引用。
 /// - `&str` - 已算好的 `charBox` JSON 字面量。
-fn publish_visibility_state(game: &Game, char_box: &str) {
+///
+/// # Returns
+///
+/// - `String` - 挂到 `window.__VCW_DEBUG__` 的 JSON 字面量。
+fn visibility_json(game: &Game, char_box: &str) -> String {
     let size: (u32, u32) = game.canvas_size.get();
     let (canvas_w, canvas_h): (f32, f32) = (size.0 as f32, size.1 as f32);
     let feet: Vec3 = game.player.get_position();
@@ -4574,7 +4678,7 @@ fn publish_visibility_state(game: &Game, char_box: &str) {
         pickup_taken = game.player.collected_count(),
         frames = game.frame_count,
     );
-    let _ = set_window_json(DEBUG_VISIBILITY_HOOK_NAME, &json);
+    json
 }
 
 /// 把所有未拾取拾取物的 `[x, z]` 拼成 JSON 数组(验收脚本用来选目标)。
@@ -4608,7 +4712,10 @@ fn join_pickups(game: &Game) -> String {
 ///
 /// - `String` - 逗号分隔的数字串(不含方括号)。
 fn join_f64(values: &[f64]) -> String {
-    let parts: Vec<String> = values.iter().map(|value| format!("{value}")).collect();
+    let parts: Vec<String> = values
+        .iter()
+        .map(|value: &f64| format!("{value}"))
+        .collect();
     parts.join(",")
 }
 
@@ -4669,13 +4776,73 @@ fn format_hud(game: &Game, triangles: u32) -> String {
 /// - `&GameHandles` - 事件句柄。
 /// - `u32` - 本帧三角面数。
 fn sync_hud(handles: &GameHandles, triangles: u32) {
-    let game: std::cell::Ref<Game> = handles.game.borrow();
+    // 先把本帧要显示的**全部**文本在 borrow 内取出来,再写 DOM。
+    // `set_attribute` / `set_text_content` 是 web-sys 调用,会重入 JS;
+    // `game` 的 `Ref` 一直活到函数尾,期间任何重入 borrow 都会 panic
+    // (`BorrowMutError` 无法在 WASM 里 catch,直接白屏)。所以 guard 的
+    // 生命周期必须**短于**第一次 DOM 写入。
+    let (health_pct, armor_pct, ammo_text, cash_text, wanted_text, mission_text, opacity): (
+        f64,
+        f64,
+        String,
+        String,
+        String,
+        String,
+        &str,
+    ) = {
+        let game: std::cell::Ref<Game> = handles.game.borrow();
+        let health_pct: f64 = (f64::from(game.player.get_health()) / f64::from(PLAYER_MAX_HEALTH)
+            * 100.0)
+            .clamp(0.0, 100.0);
+        let armor_pct: f64 =
+            (f64::from(game.player.get_armor()) / f64::from(MAX_ARMOR) * 100.0).clamp(0.0, 100.0);
+        let weapon: Weapon = game.arsenal.get_weapon();
+        let ammo_text: String = if game.arsenal.is_reloading() {
+            format!("{} · RELOADING", weapon.label())
+        } else if weapon == Weapon::Bat {
+            format!("{} · melee", weapon.label())
+        } else {
+            format!(
+                "{} · {}/{}",
+                weapon.label(),
+                game.arsenal.get_magazine(),
+                game.arsenal.get_reserve()
+            )
+        };
+        let cash_text: String = format!("{CASH_SIGN}{}", game.player.get_cash());
+        let stars: u32 = game.wanted.get_stars();
+        // 亮星用实心 ★,熄星用空心 ☆ —— 形状本身就带信息,不只靠颜色。
+        let lit: String = HUD_STAR_ON.repeat(stars as usize);
+        let dark: String = HUD_STAR_OFF.repeat((WANTED_MAX - stars) as usize);
+        let wanted_text: String = format!("{lit}{dark}");
+        let mission_text: String = if game.mission.is_active() {
+            let target: Vec3 = game.mission.get_target();
+            let distance: f32 = flat_distance(target, game.player.get_position());
+            format!(
+                "{}· {}\ngoal {:.0} m away",
+                game.mission.get_title(),
+                mission_stage_label(game.mission.get_stage()),
+                distance
+            )
+        } else {
+            String::from(MISSION_IDLE)
+        };
+        let opacity: &str = if game.hitmarker > 0.0 {
+            HUD_OPACITY_ON
+        } else {
+            HUD_OPACITY_OFF
+        };
+        (
+            health_pct,
+            armor_pct,
+            ammo_text,
+            cash_text,
+            wanted_text,
+            mission_text,
+            opacity,
+        )
+    };
     // ---- 血条 / 护甲条 ----
-    let health_pct: f64 = (f64::from(game.player.get_health()) / f64::from(PLAYER_MAX_HEALTH)
-        * 100.0)
-        .clamp(0.0, 100.0);
-    let armor_pct: f64 =
-        (f64::from(game.player.get_armor()) / f64::from(MAX_ARMOR) * 100.0).clamp(0.0, 100.0);
     if let Some(bar) = &handles.health_bar {
         let _: Result<(), euv::wasm_bindgen::JsValue> = bar.set_attribute(
             ATTR_STYLE,
@@ -4690,64 +4857,27 @@ fn sync_hud(handles: &GameHandles, triangles: u32) {
     }
     // ---- 弹药 ----
     if let Some(element) = &handles.ammo {
-        let weapon: Weapon = game.arsenal.get_weapon();
-        let text: String = if game.arsenal.is_reloading() {
-            format!("{} · RELOADING", weapon.label())
-        } else if weapon == Weapon::Bat {
-            format!("{} · melee", weapon.label())
-        } else {
-            format!(
-                "{} · {}/{}",
-                weapon.label(),
-                game.arsenal.get_magazine(),
-                game.arsenal.get_reserve()
-            )
-        };
-        element.set_text_content(Some(&text));
+        element.set_text_content(Some(&ammo_text));
     }
     // ---- 现金 ----
     if let Some(element) = &handles.cash {
-        let text: String = format!("{CASH_SIGN}{}", game.player.get_cash());
-        element.set_text_content(Some(&text));
+        element.set_text_content(Some(&cash_text));
     }
     // ---- 通缉星 ----
     if let Some(element) = &handles.wanted {
-        let stars: u32 = game.wanted.get_stars();
-        // 亮星用实心 ★,熄星用空心 ☆ —— 形状本身就带信息,不只靠颜色。
-        let lit: String = HUD_STAR_ON.repeat(stars as usize);
-        let dark: String = HUD_STAR_OFF.repeat((WANTED_MAX - stars) as usize);
-        let out: String = format!("{lit}{dark}");
-        element.set_text_content(Some(&out));
+        element.set_text_content(Some(&wanted_text));
     }
     // ---- 任务 ----
     if let Some(element) = &handles.mission {
-        let text: String = if game.mission.is_active() {
-            let target: Vec3 = game.mission.get_target();
-            let distance: f32 = flat_distance(target, game.player.get_position());
-            format!(
-                "{}· {}\ngoal {:.0} m away",
-                game.mission.get_title(),
-                mission_stage_label(game.mission.get_stage()),
-                distance
-            )
-        } else {
-            String::from(MISSION_IDLE)
-        };
-        element.set_text_content(Some(&text));
+        element.set_text_content(Some(&mission_text));
     }
     // ---- 命中标记 ----
     if let Some(element) = &handles.hitmarker {
-        let opacity: &str = if game.hitmarker > 0.0 {
-            HUD_OPACITY_ON
-        } else {
-            HUD_OPACITY_OFF
-        };
         let _: Result<(), euv::wasm_bindgen::JsValue> = element.set_attribute(ATTR_STYLE, opacity);
     }
-    drop(game);
     // ---- 小地图 ----
     draw_minimap(handles);
-    let _ = triangles;
+    let _: u32 = triangles;
 }
 
 /// 任务阶段的中文短名。
@@ -4783,10 +4913,11 @@ fn draw_minimap(handles: &GameHandles) {
     let Some(context) = canvas.get_context("2d").ok().flatten() else {
         return;
     };
-    let context = match context.dyn_into::<euv::web_sys::CanvasRenderingContext2d>() {
-        Ok(value) => value,
-        Err(_) => return,
-    };
+    let context: euv::web_sys::CanvasRenderingContext2d =
+        match context.dyn_into::<euv::web_sys::CanvasRenderingContext2d>() {
+            Ok(value) => value,
+            Err(_) => return,
+        };
     let size: f64 = f64::from(MINIMAP_PX);
     context.clear_rect(0.0, 0.0, size, size);
     context.set_fill_style_str(COLOR_MINIMAP_BG);
@@ -4943,14 +5074,14 @@ fn build_hud_dom(document: &Document) -> Option<Element> {
     ) else {
         return None;
     };
-    let _ = vitals.append_child(&health);
-    let _ = vitals.append_child(&armor);
-    let _ = root.append_child(&vitals);
+    let _: Result<Node, euv::wasm_bindgen::JsValue> = vitals.append_child(&health);
+    let _: Result<Node, euv::wasm_bindgen::JsValue> = vitals.append_child(&armor);
+    let _: Result<Node, euv::wasm_bindgen::JsValue> = root.append_child(&vitals);
     // ---- 右上:通缉星 ----
     let Some(wanted) = make_element(document, TAG_DIV, ID_WANTED, STYLE_HUD_WANTED) else {
         return None;
     };
-    let _ = root.append_child(&wanted);
+    let _: Result<Node, euv::wasm_bindgen::JsValue> = root.append_child(&wanted);
     // ---- 右下:弹药 + 现金 ----
     let (Some(ammo), Some(cash)) = (
         make_element(document, TAG_DIV, ID_AMMO, STYLE_HUD_AMMO),
@@ -4958,13 +5089,13 @@ fn build_hud_dom(document: &Document) -> Option<Element> {
     ) else {
         return None;
     };
-    let _ = root.append_child(&ammo);
-    let _ = root.append_child(&cash);
+    let _: Result<Node, euv::wasm_bindgen::JsValue> = root.append_child(&ammo);
+    let _: Result<Node, euv::wasm_bindgen::JsValue> = root.append_child(&cash);
     // ---- 顶部中央:任务 ----
     let Some(mission) = make_element(document, TAG_DIV, ID_MISSION, STYLE_HUD_MISSION) else {
         return None;
     };
-    let _ = root.append_child(&mission);
+    let _: Result<Node, euv::wasm_bindgen::JsValue> = root.append_child(&mission);
     // ---- 右下角:小地图(独立 canvas,每帧 2D 重画)----
     if let Ok(map) = document.create_element(TAG_CANVAS)
         && let Ok(canvas) = map.dyn_into::<HtmlCanvasElement>()
@@ -4974,7 +5105,7 @@ fn build_hud_dom(document: &Document) -> Option<Element> {
         let _: Result<(), euv::wasm_bindgen::JsValue> = canvas.set_attribute(ATTR_ID, ID_MINIMAP);
         let _: Result<(), euv::wasm_bindgen::JsValue> =
             canvas.set_attribute(ATTR_STYLE, STYLE_HUD_MINIMAP);
-        let _ = root.append_child(&canvas);
+        let _: Result<Node, euv::wasm_bindgen::JsValue> = root.append_child(&canvas);
     }
     // ---- 屏幕中央:准星 + 命中标记 ----
     let (Some(crosshair), Some(marker)) = (
@@ -4983,9 +5114,9 @@ fn build_hud_dom(document: &Document) -> Option<Element> {
     ) else {
         return None;
     };
-    let _ = root.append_child(&crosshair);
-    let _ = root.append_child(&marker);
-    let _ = body.append_child(&root);
+    let _: Result<Node, euv::wasm_bindgen::JsValue> = root.append_child(&crosshair);
+    let _: Result<Node, euv::wasm_bindgen::JsValue> = root.append_child(&marker);
+    let _: Result<Node, euv::wasm_bindgen::JsValue> = body.append_child(&root);
     Some(root)
 }
 
@@ -5003,8 +5134,8 @@ fn build_hud_dom(document: &Document) -> Option<Element> {
 /// - `Option<Element>` - 新的节点;创建失败时为 `None`。
 fn make_element(document: &Document, tag: &str, id: &str, style: &str) -> Option<Element> {
     let element: Element = document.create_element(tag).ok()?;
-    let _ = element.set_attribute(ATTR_ID, id);
-    let _ = element.set_attribute(ATTR_STYLE, style);
+    let _: Result<(), euv::wasm_bindgen::JsValue> = element.set_attribute(ATTR_ID, id);
+    let _: Result<(), euv::wasm_bindgen::JsValue> = element.set_attribute(ATTR_STYLE, style);
     Some(element)
 }
 
@@ -5541,7 +5672,7 @@ fn step_enemies(game: &mut Game, dt: f32) {
             wanted,
             game.enemies[index].get_wander(),
         );
-        let fired: bool = apply_enemy(
+        let fired: bool = crate::enemy::apply(
             &mut game.enemies[index],
             &decision,
             dt,
@@ -5726,7 +5857,7 @@ fn toggle_mission(game: &mut Game) {
         return;
     }
     let player_at: Vec3 = game.player.get_position();
-    let blueprints = mission_blueprints();
+    let blueprints: Vec<(&'static str, u32, Vec3)> = mission_blueprints();
     let Some(entry) = blueprints.get(game.missions_done as usize % blueprints.len()) else {
         return;
     };
@@ -7134,7 +7265,7 @@ async fn load_assets_and_build(handles: GameHandles) {
         // 看起来像「凭空出现」。顺手做一次校验并打日志。
         let out_of_range: usize = TRAFFIC_LANES
             .iter()
-            .filter(|(_, _, start_z, _)| start_z.abs() > TRAFFIC_HALF)
+            .filter(|(_, _, start_z, _): &&(&str, f32, f32, f32)| start_z.abs() > TRAFFIC_HALF)
             .count();
         console_log(&format!(
             "[vcw] traffic loop half-length {TRAFFIC_HALF} m, {out_of_range} lane(s) out of range"
@@ -7348,10 +7479,10 @@ mod tests {
         MeshAsset, MeshPart, PLAYER_RADIUS, SHOWCASE_DOOR_HALF, SHOWCASE_GROUND_TOP,
         SHOWCASE_STAIR_LEAD, SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN, SHOWCASE_STAIR_STEPS,
         SHOWCASE_STAIR_WIDTH, SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH,
-        STREAM_REBUILD_STEP, STREET_HALF_WIDTH, STREET_PITCH, ShowcaseSpec, blocks_near,
-        build_city_buildings, build_collision_world, build_ground_near, build_showcase_interiors,
-        build_water_near, on_roadway, showcase_placements, showcase_specs, stream_needs_rebuild,
-        street_axis, street_indices_in, street_strips,
+        STREAM_REBUILD_STEP, STREET_HALF_WIDTH, STREET_PITCH, ShowcaseSpec, ShowcaseSpecs,
+        blocks_near, build_city_buildings, build_collision_world, build_ground_near,
+        build_showcase_interiors, build_water_near, on_roadway, showcase_placements,
+        showcase_specs, stream_needs_rebuild, street_axis, street_indices_in, street_strips,
     };
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
@@ -7363,7 +7494,7 @@ mod tests {
     const STAIR_TOTAL: f32 = SHOWCASE_STAIR_RISE * SHOWCASE_STAIR_STEPS as f32;
 
     fn world() -> FloorWorld {
-        let mut w = FloorWorld::new();
+        let mut w: FloorWorld = FloorWorld::new();
         build_showcase_interiors(&mut w);
         w
     }
@@ -7380,8 +7511,8 @@ mod tests {
 
     /// 本地 XZ 的**行向量**(切向),即门洞的左右方向。
     fn local_side(index: usize) -> Vec2 {
-        let specs = showcase_specs();
-        let (sin_yaw, cos_yaw) = specs[index].yaw.sin_cos();
+        let specs: ShowcaseSpecs = showcase_specs();
+        let (sin_yaw, cos_yaw): (f32, f32) = specs[index].yaw.sin_cos();
         [cos_yaw, -sin_yaw]
     }
 
@@ -7421,14 +7552,14 @@ mod tests {
 
     /// 楼梯最上一级的本地 Z(那一级的**前沿**,即顶面最高处)。
     fn stair_top_local_z(index: usize) -> f32 {
-        let span = showcase_specs()[index].span;
+        let span: Vec2 = showcase_specs()[index].span;
         span[1] * 0.5 - SHOWCASE_STAIR_LEAD
     }
 
     #[test]
     fn doorway_is_the_only_gap_in_the_front_facade() {
         for index in 0..2 {
-            let w = world();
+            let w: FloorWorld = world();
             let front: Vec2 = doorway(index);
             let normal: Vec2 = front_normal(index);
             let side: Vec2 = local_side(index);
@@ -7490,7 +7621,7 @@ mod tests {
         // 往街区里走就能同时看见两个开口,不用满城找。这里断言的是
         // 「门法线指向另一栋楼」,不是某一个具体方向:摆放一改(比如
         // 换成南北相向),这个不变量依然成立。
-        let specs = showcase_specs();
+        let specs: ShowcaseSpecs = showcase_specs();
         for (index, spec) in specs.iter().enumerate() {
             let normal: Vec2 = front_normal(index);
             let toward: Vec2 = [
@@ -7521,8 +7652,8 @@ mod tests {
         // 是「圆心 → 最近面」的正常结果,站在墙外的人本来就该被推得更靠外。
         // 这里守的不变量是「永不穿墙」,而不是某个方向。
         for index in 0..2 {
-            let w = world();
-            let span = showcase_specs()[index].span;
+            let w: FloorWorld = world();
+            let span: Vec2 = showcase_specs()[index].span;
             let front: Vec2 = doorway(index);
             let normal: Vec2 = front_normal(index);
             let side: Vec2 = local_side(index);
@@ -7633,9 +7764,9 @@ mod tests {
     #[test]
     fn the_showcase_doorway_sits_on_the_outer_wall() {
         for index in 0..2 {
-            let spec = &showcase_specs()[index];
-            let door = super::showcase_door_center(index);
-            let local = super::showcase_to_local(index, door);
+            let spec: &ShowcaseSpec = &showcase_specs()[index];
+            let door: Vec2 = super::showcase_door_center(index);
+            let local: Vec2 = super::showcase_to_local(index, door);
             let expected: f32 = spec.half[1] + SHOWCASE_WALL_THICKNESS;
             assert!(
                 (local[1] - expected).abs() < 1e-3,
@@ -7652,8 +7783,8 @@ mod tests {
         // 用与 `step_vertical` 完全相同的积分顺序跑一遍真实的水平速度:
         // 从门前往楼里走 4.6 m/s,最后必须站在二层楼板面上。
         for index in 0..2 {
-            let w = world();
-            let specs = showcase_specs();
+            let w: FloorWorld = world();
+            let specs: ShowcaseSpecs = showcase_specs();
             let normal: Vec2 = front_normal(index);
             let top_z: f32 = stair_top_local_z(index);
             let dt: f32 = 1.0 / 60.0;
@@ -7690,14 +7821,14 @@ mod tests {
                     }
                 }
             }
-            let _ = normal;
+            let _: Vec2 = normal;
             assert!(
                 (y - SHOWCASE_UPPER_TOP).abs() < 1e-2,
                 "{} {}",
                 T_SHOWCASE_WALKER_DIRECTION,
                 T_SHOWCASE_WALKER_REACHES_TOP
             );
-            let _ = specs;
+            let _: ShowcaseSpecs = specs;
         }
     }
 
@@ -8058,7 +8189,7 @@ mod tests {
 
     #[test]
     fn upper_slab_does_not_push_a_player_standing_below_it() {
-        let w = world();
+        let w: FloorWorld = world();
         for index in 0..2 {
             // 房间正中,脚踩首层楼板、头在二层楼板之下。
             let inside: Vec2 = to_world(index, [0.0, 0.0]);
@@ -8076,9 +8207,9 @@ mod tests {
     fn partition_splits_the_ground_floor_into_two_rooms() {
         // 隔墙必须真的挡人(首层分成两间),而且留出通往楼梯的过道。
         for index in 0..2 {
-            let w = world();
-            let specs = showcase_specs();
-            let span = specs[index].span;
+            let w: FloorWorld = world();
+            let specs: ShowcaseSpecs = showcase_specs();
+            let span: Vec2 = specs[index].span;
             let side: Vec2 = local_side(index);
             // 隔墙止于「楼梯左边缘再往回 1.70 m」,过道就在这两者之间。
             let partition_end: f32 =
@@ -8160,7 +8291,7 @@ mod tests {
         // 样板楼与程序化楼各推一个「外接 AABB」,必须互不相交。
         // 两者都进同一条 `CollisionWorld`,重叠会让玩家卡在两栋楼的
         // 夹缝里,车也会被隐形墙顶死。
-        let specs = showcase_specs();
+        let specs: ShowcaseSpecs = showcase_specs();
         for spec in specs.iter() {
             let (sin_yaw, cos_yaw) = spec.yaw.sin_cos();
             let half: Vec2 = [
@@ -8193,9 +8324,12 @@ mod tests {
         // `WebGlRenderer::upload_mesh` 是 push 语义:一个 mesh 只能上传
         // 一次。这条测试守住「样板楼各自用 `find_or_create_batch` 而不是
         // 各自新建批次」这个不变量 —— 双传会让所有后续批次下标错位。
-        let placements = showcase_placements();
+        let placements: Vec<BuildingPlacement> = showcase_placements();
         assert_eq!(placements.len(), 2);
-        let mut assets: Vec<&str> = placements.iter().map(|p| p.asset).collect();
+        let mut assets: Vec<&str> = placements
+            .iter()
+            .map(|p: &BuildingPlacement| p.asset)
+            .collect();
         assets.sort_unstable();
         assets.dedup();
         assert_eq!(assets.len(), 2);
@@ -8214,7 +8348,7 @@ mod tests {
                 },
             );
         }
-        let mut world = CollisionWorld::new();
+        let mut world: CollisionWorld = CollisionWorld::new();
         build_collision_world(&mut world, &bounds, 0.0, 0.0);
         for spec in showcase_specs() {
             let (sin_yaw, cos_yaw) = spec.yaw.sin_cos();

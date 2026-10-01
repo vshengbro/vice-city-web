@@ -171,7 +171,7 @@ const THUG_SPAWN_MAX: f32 = 62.0;
 pub fn spawn_peds(player_at: Vec3, count: usize, phase: f32) -> Vec<Pedestrian> {
     let mut out: Vec<Pedestrian> = Vec::new();
     for slot in 0..count {
-        let angle: f32 = phase * std::f32::consts::TAU + slot as f32 * 0.785_398;
+        let angle: f32 = phase * std::f32::consts::TAU + slot as f32 * std::f32::consts::FRAC_PI_4;
         let radius: f32 = 7.0 + (slot % 6) as f32 * 4.4;
         let at: Vec3 = [
             player_at[0] + angle.cos() * radius,
