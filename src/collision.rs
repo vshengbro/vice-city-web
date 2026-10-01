@@ -10,7 +10,10 @@
 //! 形状的最短分离向量,把圆心沿该向量推出 `penetration` 的距离。圆形站在
 //! AABB 角上时单次迭代可能残留一点重叠,所以固定迭代若干轮直到稳定。
 
-use crate::r#type::{Vec2, Vec3};
+use crate::{
+    r#const::PEDESTRIAN_PERSONAL_SPACE,
+    r#type::{Vec2, Vec3},
+};
 
 /// 分离迭代轮数(圆心站在 AABB 角上时单轮残留一点,多轮收敛)。
 const RESOLVE_ITERATIONS: usize = 4;
@@ -527,6 +530,9 @@ impl CollisionWorld {
                     }
                     // 完全重合时给一个确定的分离方向,避免除零后
                     // 所有人往同一个方向抖。
+                    // 行人之间额外留一点「个人空间」:两个人并排走时肩膀
+                    // 不会贴着 —— 真实街景里人本来就是有间距的。
+                    let reach: f32 = reach + same_kind_personal_space(a.get_kind(), b.get_kind());
                     let (normal, depth): (Vec2, f32) = if distance > INSIDE_EPSILON {
                         ([delta[0] / distance, delta[1] / distance], reach - distance)
                     } else {
@@ -681,6 +687,27 @@ fn distance_to_shape(shape: &Shape, point: Vec2) -> f32 {
             let dz: f32 = point[1] - center[1];
             ((dx * dx + dz * dz).sqrt() - *radius).max(0.0)
         }
+    }
+}
+
+/// 同类**人形**实体之间额外的「个人空间」(米)。
+///
+/// 人并排走时不会贴着,也不应该被推进另一个人的身体里。车辆之间不给
+/// 额外空间 —— 前后车就该紧贴着排队。
+///
+/// # Arguments
+///
+/// - `BodyKind` - 第一个实体的类型。
+/// - `BodyKind` - 第二个实体的类型。
+///
+/// # Returns
+///
+/// - `f32` - 需要额外拉开的距离(米)。
+pub fn same_kind_personal_space(a: BodyKind, b: BodyKind) -> f32 {
+    if a == b && matches!(a, BodyKind::Pedestrian | BodyKind::Enemy) {
+        PEDESTRIAN_PERSONAL_SPACE
+    } else {
+        0.0
     }
 }
 
@@ -897,6 +924,15 @@ impl DynamicBody {
     /// - `f32` - 质量(以「一个人」为单位)。
     pub fn get_mass(&self) -> f32 {
         self.mass
+    }
+
+    /// 该实体的类型。
+    ///
+    /// # Returns
+    ///
+    /// - `BodyKind` - 实体类型。
+    pub fn get_kind(&self) -> BodyKind {
+        self.kind
     }
 
     /// 该实体的碰撞半径。

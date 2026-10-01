@@ -218,6 +218,37 @@ const PED_MASS: f32 = 1.0;
 const ENEMY_MASS: f32 = 1.0;
 /// 轿车质量(单位:一个「人」;30 ≈ 1.5 t 对 75 kg)。
 const CAR_MASS: f32 = 30.0;
+
+// ---------------------------------------------------------------------------
+// 棕榈布置(修「树木位置不合理 + 高度同质化」)
+// ---------------------------------------------------------------------------
+//
+// 原来棕榈是 `step += 24.0` 的**刚性格点**,三个调用点各自用
+// `0.9 + (index % 3) * 0.08` 算缩放 —— 全城只有 3 档高度,而且第 N 棵
+// 永远和第 N+3 棵同高、同模型、同位置偏移。整条街看起来像复制粘贴。
+//
+// 现在:间距在 MIN..MAX 之间按种子抖动,每棵有独立的沿街 / 垂直偏移,
+// `scale` 走**连续区间**并且有「成簇的高个」(按 PALM_TALL_FRACTION 抽签),
+// 所以高度有起伏而不是一层层齐平。
+
+/// 沿街两棵棕榈的最小间距(米)。
+const PALM_PITCH_MIN: f32 = 17.0;
+/// 沿街两棵棕榈的最大间距(米)。
+const PALM_PITCH_MAX: f32 = 33.0;
+/// 沿街方向的随机抖动幅度(米):破掉人造的等距节奏。
+const PALM_PITCH_JITTER: f32 = 7.0;
+/// 垂直于街方向的随机抖动幅度(米):有的贴路沿、有的靠外侧。
+const PALM_SIDE_JITTER: f32 = 1.6;
+/// 抽中「高个」的概率(0..1):少量高树成簇,避免整片同高。
+const PALM_TALL_FRACTION: f32 = 0.22;
+/// 普通棕榈的最小缩放。
+const PALM_SCALE_MIN: f32 = 0.82;
+/// 普通棕榈的最大缩放。
+const PALM_SCALE_MAX: f32 = 1.08;
+/// 高个棕榈的最小缩放。
+const PALM_TALL_SCALE_MIN: f32 = 1.25;
+/// 高个棕榈的最大缩放。
+const PALM_TALL_SCALE_MAX: f32 = 1.65;
 /// 玩家出生点(世界坐标):X = 30 那条街的**路中间偏东的车道**,z = 45。
 ///
 /// 选点是拿截图试出来的,踩过三个坑:
@@ -1509,20 +1540,55 @@ fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
 /// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
 fn build_city_palms(cx: f32, cz: f32) -> PalmSpots {
-    let mut out: Vec<[f32; 2]> = Vec::new();
+    let mut out: Vec<[f32; 3]> = Vec::new();
+    // 原来这里是 `step += 24.0` 的**刚性格点**:所有棕榈严格等距、位置
+    // 完全确定、模型全同款,于是整条街的树像复制粘贴 —— 用户报的
+    // 「树木位置不合理 + 高度同质化」。现在改成:
+    //
+    // - 间距在 `PALM_PITCH_MIN..PALM_PITCH_MAX` 之间按种子抖动(不再等距);
+    // - 每棵带**独立的横纵向偏移**,不再整齐地贴在人行道同一根线上;
+    // - `scale` 走连续区间,高度不再一层层同高。
+    let mut seed: u32 = 0x7A1E_5EED;
     for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 26.0) {
         let mut step: f32 = strip_lo;
         while step < strip_hi {
-            out.push([line + STREET_HALF_WIDTH + SIDEWALK_WIDTH * 0.55, step]);
-            out.push([step, line - STREET_HALF_WIDTH - SIDEWALK_WIDTH * 0.55]);
-            step += 24.0;
+            seed = hash2(seed, 0x5EED);
+            // 沿街方向抖动,避免出现人造的等距节奏。
+            let along_jitter: f32 = (hash_unit(seed, 1) - 0.5) * PALM_PITCH_JITTER;
+            // 垂直于街的方向抖动:有的贴近路沿,有的靠外侧。
+            let side_jitter: f32 = (hash_unit(seed, 2) - 0.5) * PALM_SIDE_JITTER;
+            // 高度:连续变化 + 少量「成簇的高个」,避免整片同高。
+            let roll: f32 = hash_unit(seed, 3);
+            let tall: bool = roll > PALM_TALL_FRACTION;
+            let scale: f32 = if tall {
+                PALM_TALL_SCALE_MIN
+                    + hash_unit(seed, 4) * (PALM_TALL_SCALE_MAX - PALM_TALL_SCALE_MIN)
+            } else {
+                PALM_SCALE_MIN + hash_unit(seed, 4) * (PALM_SCALE_MAX - PALM_SCALE_MIN)
+            };
+            let offset: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH * 0.55 + side_jitter;
+            out.push([line + offset, step + along_jitter, scale]);
+            out.push([step + along_jitter, line - offset, scale]);
+            // 间距随机化,而不是固定 24 m。
+            let pitch: f32 =
+                PALM_PITCH_MIN + hash_unit(seed, 5) * (PALM_PITCH_MAX - PALM_PITCH_MIN);
+            step += pitch;
         }
     }
-    // 街区内院:每区两三棵,让内部空地不是一块死板。
+    // 街区内院:每区两三棵,让内部空地不是一块死板。位置同样抖动、
+    // 高度同样连续变化 —— 否则内院又是一排等高的复制品。
     for (bi, block) in block_layouts().into_iter().enumerate() {
         for k in 0..2 {
+            seed = hash2(seed, 0x9E37);
             let angle: f32 = (k as f32 * 2.2) + bi as f32 * 0.7;
-            out.push([block.cx + angle.sin() * 5.0, block.cz + angle.cos() * 5.0]);
+            let radius: f32 = 4.0 + hash_unit(seed, 6) * 3.5;
+            let scale: f32 =
+                PALM_SCALE_MIN + hash_unit(seed, 7) * (PALM_TALL_SCALE_MAX - PALM_SCALE_MIN);
+            out.push([
+                block.cx + angle.sin() * radius,
+                block.cz + angle.cos() * radius,
+                scale,
+            ]);
         }
     }
     out
@@ -2851,13 +2917,12 @@ fn build_scene(
             continue;
         };
         let batch: usize = find_or_create_batch(scene, mesh_index);
-        let scale: f32 = 0.9 + (index % 3) as f32 * 0.08;
         scene.push_instance(
             batch,
             Instance::new(
                 [position[0], 0.0, position[1]],
                 (index as f32) * 0.7,
-                scale,
+                position[2],
                 [0.97, 1.0, 0.95],
             ),
         );
@@ -3078,7 +3143,7 @@ fn rebuild_static_batches(
         let tint: [f32; 3] = [0.95, 1.0, 0.92];
         scene.push_instance(
             batch,
-            Instance::new([spot[0], 0.0, spot[1]], 0.0, 1.0, tint),
+            Instance::new([spot[0], 0.0, spot[1]], 0.0, spot[2], tint),
         );
     }
     for (asset, position, yaw) in build_city_signs(cx, cz) {
@@ -3178,7 +3243,7 @@ fn build_collision_world(
             prop_collider_scale(prop.asset),
         );
     }
-    for (index, spot) in build_city_palms(cx, cz).iter().enumerate() {
+    for spot in build_city_palms(cx, cz).iter() {
         // 棕榈的碰撞体是**树干**,不是树冠:资产包围盒的 XZ 最大跨度是
         // 展开的叶子(3 m+),拿它当碰撞半径会在车道中间立一圈看不见的
         // 树桩墙。树干半径固定,只挡人不挡车。
@@ -3187,8 +3252,9 @@ fn build_collision_world(
         if on_lane(spot[0]) || on_lane(spot[1]) {
             continue;
         }
-        let scale: f32 = 0.9 + (index % 3) as f32 * 0.08;
-        world.push_circle([spot[0], spot[1]], PALM_TRUNK_RADIUS * scale);
+        // 用生成阶段定下的**逐棵独立**缩放(而不是 `index % 3` 的
+        // 三档循环),否则碰撞体的粗细也在跟着复制粘贴。
+        world.push_circle([spot[0], spot[1]], PALM_TRUNK_RADIUS * spot[2]);
     }
     // 注意:**不**把 `build_city_vehicles()` 的静态摆件车放进碰撞世界。
     // 那些车已经��� `build_scene` 里被交通系统的动态车辆取代了(同一批

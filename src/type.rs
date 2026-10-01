@@ -48,8 +48,11 @@ pub type Vec2 = [f32; 2];
 ///
 /// # Returns
 ///
-/// - `Self` - 每个元素是一组 (x, z) 米制坐标。
-pub type PalmSpots = Vec<Vec2>;
+/// - `Self` - 每个元素是一组 (x, z, scale)。
+///
+/// 第三项是**逐棵独立的缩放**:整片树同高就是用户报的「高度同质化」,
+/// 而 `Vec2` 放不下。`scale` 直接乘进实例矩阵,不需要额外查表。
+pub type PalmSpots = Vec<[f32; 3]>;
 
 /// 场景蓝图里「资产 + 位置 + 朝向」的三元组,等价于
 /// `(&'static str, [f32; 3], f32)`。

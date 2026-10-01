@@ -360,6 +360,9 @@ pub const LOG_REPLACE_MESH_FAILED: &str = "[vcw] replace_mesh FAILED for mesh";
 /// 单次流式重建最多打印几条重传失败。
 pub const REPLACE_MESH_REPORT_LIMIT: usize = 4;
 
+/// 两个人形实体并排时额外的「个人空间」(米)。人不会贴着走。
+pub const PEDESTRIAN_PERSONAL_SPACE: f32 = 0.18;
+
 pub const EXPECT_FALLBACK_BLOCK: &str = "fallback block must be valid";
 
 pub const LOG_ALL_ASSETS_FAILED: &str =
