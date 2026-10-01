@@ -1803,5 +1803,21 @@ pub const DIR_LEFT: &str = "左";
 /// 上面那条模板里要填的「移向右边」分支。
 pub const DIR_RIGHT: &str = "右";
 
+/// 骨架回归测试:每节 limb 的顶点必须停在资产给定的**绝对高度**上。
+///
+/// 关节枢轴(`joint_pivot`)是从顶点包围盒推出来的,已经含有角色的绝对
+/// 高度(肩 y≈1.43)。顶点本来就在那个高度上,矩阵再平移一次就会把整节
+/// part 抬高一整个身高量级 —— 表现是「四肢飘在头顶上方、之间全是
+/// 空隙」。
+pub const T_LIMB_STAYS_AT_ASSET_HEIGHT: &str =
+    "{part} 被抬高了 {off:.3} m(实际 y {got:.2}..{got_hi:.2},资产给的是 {want:.2}..{want_hi:.2}): 关节枢轴不应再被当成平移量";
+
+/// 骨架回归测试:末端关节必须继承父关节的摆角(不能各转各的)。
+pub const T_DISTAL_INHERITS_PARENT_SWING: &str =
+    "末端关节没有继承父关节的摆角: 实得 {got},手算应为 {want}";
+
+/// 上面两条骨架模板里填 part 名的占位符键。
+pub const KEY_PART: &str = "part";
+
 /// 验收通道:传送 / 走位 / 加速 / 探针请求挂在这个 window 属性上。
 pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";

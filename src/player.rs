@@ -659,18 +659,38 @@ pub fn limb_chain_matrix(
     root_swing: f32,
     joint_swing: f32,
 ) -> Mat4 {
+    // **每个 part 的顶点本来就在角色空间的绝对高度上,不能再平移一次。**
+    //
+    // 旧实现是
+    //   `child = T(root) · Rx(root_swing) · T(joint) · Rx(joint_swing) · T(-joint)`
+    // 链根(上臂 / 大腿,`root_pivot == joint_pivot`)展开后多出一个
+    // `T(root) · T(-root)` 不成对,净效果是**把整节 part 抬高了
+    // root_pivot.y**;末端节(小臂 / 小腿)则额外吃了整个肩 / 髋的平移。
+    // 实测:上臂的局部 Y 范围是 1.095..1.431,加上多出来的 +1.431 之后
+    // 世界 Y 变成 2.52..2.88 —— 手臂被举到头顶**上方** 0.8 m,和躯干
+    // (0.84..1.56)、头(1.52..1.75)之间隔着一整段空隙。
+    // 这就是「13 摞碎片、彼此之间大片背景空隙」的直接成因。
+    //
+    // 正确写法是**每个关节各自绕自己的枢轴原地转**,不再移动顶点:
+    //   `M = T(origin) · Ry(yaw) · [T(root)·Rx(root_swing)·T(-root)] · [T(joint)·Rx(joint_swing)·T(-joint)]`
+    // 父子关系体现在「小臂的旋转作用在上臂已经转过的坐标系上」,
+    // 而这个串联效果由父节**自己的** `root_swing` 提供,不需要再平移。
     let placement: Mat4 = Mat4::translation(origin).multiply(&Mat4::rotation_y(yaw));
-    let root: Mat4 = Mat4::translation(root_pivot).multiply(&Mat4::rotation_x(root_swing));
-    // 末端关节:先在「已经随根关节转过」的坐标系里定位,再绕自身枢轴摆。
-    let child: Mat4 = root
-        .multiply(&Mat4::translation(joint_pivot))
+    let root: Mat4 = Mat4::translation(root_pivot)
+        .multiply(&Mat4::rotation_x(root_swing))
+        .multiply(&Mat4::translation([
+            -root_pivot[0],
+            -root_pivot[1],
+            -root_pivot[2],
+        ]));
+    let child: Mat4 = Mat4::translation(joint_pivot)
         .multiply(&Mat4::rotation_x(joint_swing))
         .multiply(&Mat4::translation([
             -joint_pivot[0],
             -joint_pivot[1],
             -joint_pivot[2],
         ]));
-    placement.multiply(&child)
+    placement.multiply(&root).multiply(&child)
 }
 
 /// 一个玩家肢体的 model matrix:整体位姿 × 绕枢轴的局部 X 轴摆动。
@@ -696,14 +716,27 @@ pub fn limb_matrix(origin: Vec3, yaw: f32, pivot: Vec3, swing: f32) -> Mat4 {
 mod tests {
     use crate::camera::Mat4;
     use crate::r#const::{
-        PART_LOWER_LEG_L, PART_UPPER_LEG_L, T_DISTAL_LIMB_HAS_PARENT, T_FACING_MATCHES_VELOCITY,
-        T_LEGS_ANTIPHASE, T_LIMBS_RELAX_TO_ZERO, T_PARENT_IN_PLAN, T_SAME_SIDE_IN_PHASE,
+        PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_UPPER_ARM_L, PART_UPPER_LEG_L,
+        T_DISTAL_INHERITS_PARENT_SWING, T_DISTAL_LIMB_HAS_PARENT, T_FACING_MATCHES_VELOCITY,
+        KEY_PART, T_LEGS_ANTIPHASE, T_LIMBS_RELAX_TO_ZERO, T_LIMB_STAYS_AT_ASSET_HEIGHT,
+        T_PARENT_IN_PLAN, T_SAME_SIDE_IN_PHASE,
     };
     use crate::player::{
-        GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, facing_yaw, limb_parent,
-        limb_swing,
+        GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, facing_yaw, limb_chain_matrix,
+        limb_parent, limb_swing,
     };
     use crate::r#type::{Mat4Data, Vec2, Vec3};
+
+    /// 把断言文案里的 `{名字}` 占位符替换成实际数值(与 `camera.rs` 同形)。
+    fn fill(template: &str, args: &[(&str, &str)]) -> String {
+        let mut out: String = template.to_string();
+        let mut index: usize = 0;
+        while index < args.len() {
+            out = out.replace(&format!("{{{}}}", args[index].0), args[index].1);
+            index += 1;
+        }
+        out
+    }
 
     /// 把列主序 `Mat4` 作用在一个点上。
     fn apply(m: &Mat4, v: Vec3) -> Vec3 {
@@ -749,6 +782,112 @@ mod tests {
             value += two_pi;
         }
         value
+    }
+
+    /// 每一节 limb 的顶点都必须停在资产给出的**绝对高度**上。
+    ///
+    /// 这是「角色渲染成 13 摞碎片」的直接回归测试。资产把
+    /// `upper_arm_L` 的顶点放在角色空间 y = 1.095..1.431(肩到肘),
+    /// `joint_pivot` 从包围盒推出 `[0.156, 1.431, 0.0]` —— 枢轴的 y
+    /// 就是肩高,顶点本来已经在那个高度上。矩阵若再乘一次
+    /// `T(joint_pivot)`,整节手臂会平移到 y = 2.53..2.87,举到头顶
+    /// 上方 0.8 m,和躯干之间留下一整段空隙。
+    ///
+    /// 断言用「摆角为 0」的最简情形:此时矩阵退化成纯位姿,变换后的
+    /// 包围盒必须和资产包围盒**逐轴相等**(平移 origin / 旋转 yaw 除外),
+    /// 即 `Ry(yaw)·(I)` 不改变局部高度。
+    #[test]
+    fn limb_vertices_stay_at_their_asset_height() {
+        // 实测自 `ped_suit` 资产的 `__VCW_DEBUG__.limbExtents`。
+        let cases: [(&str, Vec3, Vec3, Vec3); 4] = [
+            (
+                PART_UPPER_ARM_L,
+                [0.156, 1.095, -0.062],
+                [0.302, 1.431, 0.062],
+                [0.156, 1.431, 0.0],
+            ),
+            (
+                PART_LOWER_ARM_L,
+                [0.202, 0.769, -0.050],
+                [0.312, 1.103, 0.050],
+                [0.202, 1.103, 0.0],
+            ),
+            (
+                PART_UPPER_LEG_L,
+                [0.02, 0.946, -0.06],
+                [0.21, 1.43, 0.06],
+                [0.02, 1.43, 0.0],
+            ),
+            (
+                PART_SHOE_L,
+                [0.05, 0.098, -0.05],
+                [0.15, 0.25, 0.05],
+                [0.10, 0.25, 0.0],
+            ),
+        ];
+        for (part, lo, hi, pivot) in cases {
+            // 摆角为 0:矩阵应当只剩「绕原点平移 + 朝向」,不动局部高度。
+            let model: Mat4 = limb_chain_matrix([0.0, 0.0, 0.0], 0.0, pivot, pivot, 0.0, 0.0);
+            let want_lo: Vec3 = apply(&model, lo);
+            let want_hi: Vec3 = apply(&model, hi);
+            assert!(
+                (want_lo[1] - lo[1]).abs() < 1.0e-4 && (want_hi[1] - hi[1]).abs() < 1.0e-4,
+                "{}",
+                fill(
+                    T_LIMB_STAYS_AT_ASSET_HEIGHT,
+                    &[
+                        (KEY_PART, part),
+                        ("off", &format!("{:.3}", (want_lo[1] - lo[1]).abs())),
+                        ("got", &format!("{:.2}", want_lo[1])),
+                        ("got_hi", &format!("{:.2}", want_hi[1])),
+                        ("want", &format!("{:.2}", lo[1])),
+                        ("want_hi", &format!("{:.2}", hi[1])),
+                    ]
+                )
+            );
+        }
+    }
+
+    /// 父子串联的闭合性:小臂的旋转必须作用在上臂**已经转过**的坐标系上。
+    ///
+    /// 这条是 ab0610d 引入的原始意图,保留下来防止修高度时把串联也一起
+    /// 抹掉(那样又回到「大腿摆动时小腿原地不动」)。
+    #[test]
+    fn distal_limb_inherits_the_parents_swing() {
+        let origin: Vec3 = [0.0, 0.0, 0.0];
+        let shoulder: Vec3 = [0.156, 1.431, 0.0];
+        let elbow: Vec3 = [0.202, 1.103, 0.0];
+        let root_swing: f32 = 0.5;
+        let joint_swing: f32 = 0.0;
+        // 肘部世界位置:应当只受肩关节影响(小臂自身零摆角)。
+        let direct: Vec3 = apply(
+            &limb_chain_matrix(origin, 0.0, shoulder, elbow, root_swing, joint_swing),
+            elbow,
+        );
+        // 手算的串联值:先绕肩转肩到肘的向量。
+        let offset: Vec3 = [
+            elbow[0] - shoulder[0],
+            elbow[1] - shoulder[1],
+            elbow[2] - shoulder[2],
+        ];
+        let (sine, cosine): (f32, f32) = root_swing.sin_cos();
+        // `Mat4::rotation_x` 是列主序,其第 2、3 行给出
+        // `y' = y·cos - z·sin`、`z' = y·sin + z·cos`(手算要照这个约定)。
+        let hand: Vec3 = [
+            shoulder[0] + offset[0],
+            shoulder[1] + offset[1] * cosine - offset[2] * sine,
+            shoulder[2] + offset[1] * sine + offset[2] * cosine,
+        ];
+        assert!(
+            (direct[0] - hand[0]).abs() < 1.0e-4
+                && (direct[1] - hand[1]).abs() < 1.0e-4
+                && (direct[2] - hand[2]).abs() < 1.0e-4,
+            "{}",
+            fill(
+                T_DISTAL_INHERITS_PARENT_SWING,
+                &[("got", &format!("{direct:?}")), ("want", &format!("{hand:?}"))]
+            )
+        );
     }
 
     /// 左右必须反相:两条腿同时朝前迈步就是「四肢不协调」。
