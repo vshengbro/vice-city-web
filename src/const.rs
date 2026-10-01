@@ -1899,6 +1899,19 @@ pub const T_SHOWCASE_TOLERANCE_TWO_RISES: &str = "容差必须小于两级踏高
 /// 单元测试断言文案:模拟行走必须爬到二层。
 pub const T_SHOWCASE_WALKER_DIRECTION: &str = "走了 {frames} 帧,楼梯方向 (normal {:?}) 下的 y={y}";
 
+/// 单元测试断言文案:二层楼板不得盖住梯段。landing 顶面恒为二层楼板面,
+/// 一旦盖住梯段,`support_height` 每帧都中选它,人就钉死在二层高度。
+pub const T_SHOWCASE_LANDING_COVERS_RUN: &str =
+    "二层楼板第 2 片盖住了梯段(楼 {index} 梯段本地 z[{run_lo:.3},{run_hi:.3}] vs 楼板 z[{slab_lo:.3},{slab_hi:.3}]),脚下踩到 {support:.3} 而非 {tread:.3}";
+
+/// 单元测试断言文案:从二层 landing 下楼必须逐级降到首层。
+pub const T_SHOWCASE_DESCENT_REACHES_GROUND: &str =
+    "从二层 landing 下楼必须逐级降到首层(楼 {index}),实得 y 序列 {seq:?}";
+
+/// 单元测试断言文案:下楼过程中不得出现抬升(那是往回上楼)。
+pub const T_SHOWCASE_DESCENT_NO_CLIMB: &str =
+    "下楼过程中不得出现抬升(楼 {index} 在第 {frame} 帧从 {from:.3} 升到 {to:.3}),实得 y 序列 {seq:?}";
+
 /// 单元测试断言文案:头顶的楼板不得把玩家推开。
 pub const T_SHOWCASE_CEILING_PUSHED: &str = "楼 {index} 的头顶楼板把玩家推开了";
 
@@ -2047,6 +2060,26 @@ pub const T_INTERIOR_SPRINT_BASELINE_FAILS: &str =
 /// 逐帧给出同一个高度。
 pub const T_INTERIOR_SPRINT_NO_OP: &str =
     "60 fps 下新实现与「补查照旧」必须逐帧一致,每帧 {stride:.3} m 时新 {new} vs 旧 {old}";
+
+/// 二层 landing 压住整条梯段时,从 landing 下楼永远下不去 —— 自 `1ff7c38`
+/// (09-29)就存在的几何缺陷。二层楼板顶面恒为 3.20,`support_height` 取
+/// 「容差内最高的一块」时它恒中选,人钉在 3.20 一步都降不下来。
+pub const T_INTERIOR_LANDING_BLOCKS_DESCENT: &str =
+    "二层楼板不得盖住梯段,否则走不下楼梯;landing 压住 {heights:?}";
+
+/// 下楼必须真的逐级降到地面 —— 落到地面高度才算数,悬在梯段上不算。
+pub const T_INTERIOR_DESCENT_REACHES_GROUND: &str =
+    "从二层 landing 沿 +X 下楼必须逐级降到首层,实得 {heights:?}";
+
+/// 下楼过程中**不得出现抬升**。y 只降不升才是下楼;一旦某帧 dy > 0,说明
+/// 人是反过来爬上楼的(踩着 landing 往回爬),那条路径不算下楼。
+pub const T_INTERIOR_DESCENT_NO_CLIMB: &str =
+    "下楼过程中不得出现抬升(那是往回上楼),实得 {heights:?}";
+
+/// 楼梯井口必须真的空着:梯段每一级正上方都得是楼梯井(只有首层地板
+/// 够得着),头顶那块 3.20 的 landing 一旦盖回来这条就红。
+pub const T_INTERIOR_STAIRWELL_IS_OPEN: &str =
+    "楼梯井必须空着,踩在梯段上时脚下只能有那一级踏面,实得 {support:?}";
 
 /// 验收通道:传送 / 走位 / 加速 / 探针请求挂在这个 window 属性上。
 pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";

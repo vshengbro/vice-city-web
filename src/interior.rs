@@ -747,11 +747,14 @@ mod tests {
     use crate::r#const::{
         T_INTERIOR_BASELINE_AGREES, T_INTERIOR_BASELINE_STILL_FAILS, T_INTERIOR_BASELINE_TOKEN,
         T_INTERIOR_CEILING_INSIDE, T_INTERIOR_DOORWAY_BLOCKS, T_INTERIOR_DOORWAY_THROUGH,
-        T_INTERIOR_DT_TOKEN, T_INTERIOR_HEIGHT_TOKEN, T_INTERIOR_LONG_FRAME_HEIGHT,
+        T_INTERIOR_DESCENT_NO_CLIMB,
+        T_INTERIOR_DESCENT_REACHES_GROUND, T_INTERIOR_DT_TOKEN, T_INTERIOR_HEIGHT_TOKEN,
+        T_INTERIOR_LONG_FRAME_HEIGHT,
         T_INTERIOR_LONG_FRAME_LADDER, T_INTERIOR_NO_DOWNWARD_SNAP, T_INTERIOR_NO_SLAB_UNDER,
         T_INTERIOR_NORMAL_FRAME_DESCENT, T_INTERIOR_NORMAL_FRAME_UNCHANGED, T_INTERIOR_PEAK_TOKEN,
         T_INTERIOR_SPRINT_BASELINE_FAILS, T_INTERIOR_SPRINT_FRAME_CLIMBS, T_INTERIOR_SPRINT_NO_OP,
         T_INTERIOR_STAIR_CLIMBS, T_INTERIOR_STAIR_MONOTONIC, T_INTERIOR_STAIR_PAIR,
+        T_INTERIOR_STAIRWELL_IS_OPEN,
         T_INTERIOR_STRIDE_TOKEN, T_INTERIOR_UPPER_FLOOR_ABOVE, T_INTERIOR_WALL_BLOCKS,
         T_INTERIOR_WALL_PASSES,
     };
@@ -946,17 +949,57 @@ mod tests {
         T_INTERIOR_LONG_FRAME_HEIGHT.replace(T_INTERIOR_HEIGHT_TOKEN, &format!("{height}"))
     }
 
+    /// 楼梯世界的夹具,**几何与真实样板楼逐值一致**。
+    ///
+    /// **为什么必须用真实布局:**早先这个夹具的二层楼板只铺到
+    /// `z = 4.45`,而踏面从 `z = -4.55` 排到 `0.05` —— 两者在 z 上**完全
+    /// 不重叠**,于是「二层楼板盖住梯段」这件事在夹具上根本不成立。
+    /// 真实的楼(`push_showcase_interior`)里二层楼板第二片是
+    /// `x[sx0, hx] z[stair_end, hz]`,而梯段正好占 `z[stair_end, sz_last]`
+    /// 且 `stair_end < sz_last` —— **整条梯段都在 landing 底下**。缺陷
+    /// 是 09-29 引入的几何错误,夹具却因为摆错了形状而一直测不到它。
+    ///
+    /// 修好之后的真实布局(与 `assets/bldg_*_showcase.json` 的
+    /// `floor_upper` 顶面逐块对齐;夹具把 z 轴镜像成「沿 +z 上行」,
+    /// 两边 landing 与梯段的**相对关系**一致):
+    ///
+    /// ```text
+    /// 首层地板  x[-5.75, 5.75]  z[-4.75, 4.75]  顶面 0.150
+    /// 二层主片  x[-5.75, 4.45]  z[-4.75, 4.75]  顶面 3.200  (楼梯井左侧)
+    /// 二层第二片 x[4.45, 5.75]  z[-0.05, 4.75]  顶面 3.200  (梯顶那一侧)
+    /// 第 1..10 级 x[4.45, 5.75]  z[-4.55 .. 0.05]  0.455..3.200
+    /// ```
+    ///
+    /// **关键不变量:梯段占的 z 带与第二片 landing 的 z 带只在端点
+    /// `STAIR_TOP_Z = -0.05` 相接,不重叠。** 这正是修复要钉住的那一条 ——
+    /// 真实楼里 landing 在梯段的**后方**(更小的 z),这里镜像成**前方**,
+    /// 但两条要求在两个方向上是同一条。
     fn slab_world() -> FloorWorld {
         let mut w: FloorWorld = FloorWorld::new();
         w.push_slab([-5.75, 0.0, -4.75], [5.75, GROUND_TOP, 4.75]);
+        // 二层主片:楼梯井左侧的整片楼板。
         w.push_slab([-5.75, UPPER_BOT, -4.75], [4.45, UPPER_TOP, 4.75]);
+        // 梯段:沿 +z 上行,最低一级顶面 0.455,最高一级顶面 3.200。
         for i in 0..STAIR_STEPS {
-            let y0: f32 = -4.55 + i as f32 * STAIR_RUN;
+            let z1: f32 = -4.55 + i as f32 * STAIR_RUN;
             let top: f32 = GROUND_TOP + (i + 1) as f32 * STAIR_RISE;
-            w.push_slab([4.45, GROUND_TOP, y0], [5.75, top, y0 + STAIR_RUN]);
+            w.push_slab([4.45, GROUND_TOP, z1], [5.75, top, z1 + STAIR_RUN]);
         }
+        // 二层第二片:**从 `stair_end`(=-0.05)起往 +z 铺**,也就是梯顶的
+        // 另一侧。楼梯井留在 `z[-4.55, -0.05]` 那一段,整条梯段头顶是空的。
+        // 真实楼里这一片是 `z[-hz, stair_end]`,这里为了沿 +z 上行而镜像
+        // 成 `z[stair_end, hz]` —— 两边的**相对关系**一致:landing 永远
+        // 在梯段的「上坡方向之外」,不压住任何一级踏面。
+        w.push_slab([4.45, UPPER_BOT, STAIR_TOP_Z], [5.75, UPPER_TOP, 4.75]);
         w
     }
+
+    /// 梯顶那一级的**前沿** z(顶面最高处的边)——`stair_end`。
+    ///
+    /// 真实的 `push_showcase_interior` 里 `stair_end = sz_last - STEPS * RUN`,
+    /// 二层第二片 landing 就接在它**外侧**(更小的 z)。夹具用同一个值,
+    /// 于是「landing 会不会压住梯段」在夹具和真楼里是同一个问题。
+    const STAIR_TOP_Z: f32 = -0.05;
 
     fn height_at(w: &FloorWorld, x: f32, z: f32, from_y: f32) -> Option<f32> {
         w.support_height([x, z], from_y)
@@ -1113,6 +1156,13 @@ mod tests {
     /// 都已走下楼梯,读数都是 0.150,测试红了但缺陷其实并不存在。
     const STAIRS_FRAME_BUDGET: usize = 52;
 
+    /// 从 landing 走完整段梯段到地面要多少帧。
+    ///
+    /// 60 fps 每帧 0.077 m,梯段本身 4.5 m,加上起步那一格踏深,至少要
+    /// 60 帧。取 100:走过头之后脚下是首层地板(y 恒 0.15),判据仍然成立,
+    /// 而 52 帧只走到第 4 级就停了 —— 读数分不清「下到一半」和「下到地面」。
+    const DESCENT_FRAME_BUDGET: usize = 100;
+
     /// 正常帧率(60 fps)下楼梯必须照旧逐级抬升 —— 长帧修复不得改坏它。
     ///
     /// **为什么必须单独测这一条:**长帧修复的杠杆是「把一帧切成
@@ -1223,6 +1273,102 @@ mod tests {
         }
         // 必须真的降到首层,而不是被按在原高度。
         assert!(y <= GROUND_TOP + STAIR_RISE, "{}", descent_message(y));
+    }
+
+    /// **从二层 landing 往下走必须逐级降回地面** —— 「楼内走不下楼梯」这条
+    /// 真缺陷的回归。
+    ///
+    /// **实测缺陷(CDP,软件渲染,HUD 逐帧):** 二层楼板第二片 landing 写成了
+    /// `z[stair_end, hz]`,而梯段正好占 `z[stair_end, sz_last]` 且
+    /// `stair_end < sz_last` —— **整条梯段都在 landing 底下**。landing 顶面
+    /// 恒为 3.20,`support_height` 取「容差内最高的一块」时它每帧都中选,
+    /// 于是人站在梯段上永远是 y = 3.20:下楼沿 +X 走到 x = 27.4(墙)仍
+    /// y = 3.2,`descended_to_ground` 恒 false。
+    ///
+    /// **这条必须用 [`slab_world`] 而不是自造夹具:** 缺陷成立的**前提**是
+    /// 「二层 landing 的 z 带与梯段的 z 带重叠」。早先那个夹具的二层板止于
+    /// `z = 4.45`、踏面占 `z[-4.55, 0.05]`,两者不重叠 —— 缺陷在那个夹具
+    /// 上**永远测不到**,于是一条本该红的测试一直是绿的。现在夹具按真实
+    /// 布局重建,`STAIR_TOP_Z = -0.05` 就是 landing 的起始边:改之前
+    /// landing 从 `-4.75` 铺(压住整段),改之后从 `-0.05` 铺(让开梯段)。
+    ///
+    /// 三条判据一起钉:
+    /// 1. **梯段头顶是空的** —— 站在第 5 级上,脚下只能有那一级,不能是 3.20。
+    /// 2. **逐级降到地面** —— 走完整段楼梯后 y 必须真的落到首层。
+    /// 3. **全程不出现抬升** —— 下楼过程中 dy 一旦 > 0,那是踩着 landing
+    ///    往回爬,那条路径不算下楼。
+    #[test]
+    fn a_player_can_descend_from_the_upper_landing() {
+        let w: FloorWorld = slab_world();
+        // ---- 判据 1:楼梯井真的空着。
+        // 站在第 5 级(顶面 1.980)正上方查支撑:只有那一级够得着。
+        let mid_tread: f32 = GROUND_TOP + 5.0 * STAIR_RISE;
+        let over_run: Vec2 = [5.1, -4.55 + 4.5 * STAIR_RUN];
+        let got: Option<f32> = w.support_height(over_run, mid_tread);
+        assert_eq!(
+            got,
+            Some(mid_tread),
+            "{}",
+            fill(
+                T_INTERIOR_STAIRWELL_IS_OPEN,
+                &[("{support:?}", &format!("{got:?}"))]
+            )
+        );
+        // 顶住 landing 那条边界:landing 自己必须仍然站得住人(修复不能把
+        // 二层楼板整块删掉,那会让上楼也上不去)。
+        let on_landing: Vec2 = [5.1, STAIR_TOP_Z + 0.5 * STAIR_RUN];
+        assert_eq!(
+            w.support_height(on_landing, UPPER_TOP),
+            Some(UPPER_TOP),
+            "{}",
+            fill(
+                T_INTERIOR_STAIRWELL_IS_OPEN,
+                &[("{support:?}", "landing 顶面不是 3.20")]
+            )
+        );
+
+        // ---- 判据 2 + 3:从 landing 沿 -z 下行,逐级降到地面且不回头爬。
+        let dt: f32 = 1.0 / 60.0;
+        let stride: f32 = WALK_SPEED_60 * dt;
+        // 起步点在 landing 上(顶面 3.20),朝 -z 就是下坡。
+        let mut z: f32 = STAIR_TOP_Z + 0.5 * STAIR_RUN;
+        let mut y: f32 = UPPER_TOP;
+        let mut heights: Vec<f32> = vec![y];
+        // 下楼要走完整段梯段(4.5 m)再加 landing 那一格,60 fps 每帧
+        // 0.077 m,`STAIRS_FRAME_BUDGET`(=52)只够 4.0 m —— 会停在半路,
+        // 读数分不清「下到一半」和「下到地面」。下楼给足 100 帧。
+        for _ in 0..DESCENT_FRAME_BUDGET {
+            let from: Vec2 = [5.1, z];
+            z -= stride;
+            let to: Vec2 = [5.1, z];
+            let (_, stepped): (Option<f32>, f32) = w.support_along_frame(from, to, y);
+            y = stepped;
+            heights.push(y);
+        }
+        // 3. 不得出现抬升:任何一帧比上一帧高都算「往回上楼」。
+        let mut climbed: Vec<usize> = Vec::new();
+        for (index, pair) in heights.windows(2).enumerate() {
+            if pair[1] > pair[0] + 1e-3 {
+                climbed.push(index);
+            }
+        }
+        assert!(
+            climbed.is_empty(),
+            "{}",
+            fill(
+                T_INTERIOR_DESCENT_NO_CLIMB,
+                &[("{heights:?}", &format!("{heights:?}"))]
+            )
+        );
+        // 2. 必须真的降到首层,而不是悬在梯段上。
+        assert!(
+            y <= GROUND_TOP + 1e-2,
+            "{}",
+            fill(
+                T_INTERIOR_DESCENT_REACHES_GROUND,
+                &[("{heights:?}", &format!("{heights:?}"))]
+            )
+        );
     }
 
     /// 冲刺帧必须同样爬得上 —— 「下楼补查把刚抬上去的高度覆盖掉」的回归。
@@ -1419,12 +1565,31 @@ mod tests {
     #[test]
     fn support_height_reports_the_drop_when_walking_off_a_ledge() {
         let w: FloorWorld = slab_world();
-        // 站在二楼高度、脚下已经没有二层板的位置(楼梯井):仍然只有
-        // 0.15 m 的首层板够得着,返回值就是那 3.05 m 的落差。调用方据此
-        // 判断「该走上去」还是「该掉下去」。
-        let well: Vec2 = [5.1, 2.0];
+        // 站在二楼高度、脚下**没有**二层板的位置:楼梯井(梯段本身在
+        // 这里,但它的踏面顶面远低于二楼,`support_height` 取「容差内最高
+        // 的一块」时够不着,于是返回的是脚下唯一够得着的首层板 0.15)——
+        // 那 3.05 m 的落差就是调用方判断「该走上去」还是「该掉下去」的依据。
+        // **探针点必须在楼梯井里(二层板不存在的那一侧)。** `slab_world`
+        // 的二层主片只盖到 `x = 4.45`,探针的 `x = 5.1` 落在楼梯井这一侧,
+        // 头顶**没有** 3.20 的楼板 —— 这就是判据要验的:站在二楼高度,
+        // 脚下这块没有楼板接着,于是 `support_height` 返回的是**远低于**
+        // 二楼的最高一块(那一级踏面,或梯段外的首层地板),落差 3.05 m。
+        //
+        // `support_height` 只有上界(`from_y + STEP_UP_TOLERANCE`)没有下界,
+        // 所以「够不着二楼板」时它会给出脚下最高的那一块。早先的夹具在
+        // 这里**没有踏面**(二层板止于 4.45 而这条带是空的),读到的是
+        // 首层地板 0.15;现在夹具按真实布局铺满踏面,读到的是那一级踏面
+        // —— 两者都对,关键是**都不是 3.20**。
+        let well: Vec2 = [5.1, -3.0];
         let upper: Option<f32> = height_at(&w, well[0], well[1], UPPER_TOP);
-        assert_eq!(upper, Some(GROUND_TOP), "{}", T_INTERIOR_NO_SLAB_UNDER);
+        assert!(
+            upper.is_some_and(|height: f32| height < UPPER_TOP - STEP_UP_TOLERANCE),
+            "{}",
+            fill(
+                T_INTERIOR_STAIRWELL_IS_OPEN,
+                &[("{support:?}", &format!("{upper:?}"))]
+            )
+        );
         // 二层板之下再看:只有首层板够得着,这就是「该掉下去」的落差。
         assert_eq!(
             height_at(&w, 0.0, 0.0, GROUND_TOP + STEP_UP_TOLERANCE),
