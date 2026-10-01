@@ -250,6 +250,19 @@ pub const ERROR_BAR_STYLE: &str = "width: 100%; background: #ff4d6d";
 
 pub const EVENT_POINTERUP: &str = "pointerup";
 
+/// 指针锁变更通知(进入 / 退出指针锁时浏览器派发)。
+///
+/// 视角在锁定态下走 `MouseEvent.movement_x/y`,退出锁要靠这个事件把
+/// 拖拽状态复位,否则 Esc 之后相机还停在「正在拖」的分支里,下一次
+/// 鼠标移动会继续转视角。
+pub const EVENT_POINTERLOCKCHANGE: &str = "pointerlockchange";
+
+/// 点击事件:用来在**真实用户手势**里申请指针锁。
+///
+/// `request_pointer_lock` 必须由用户手势触发,启动时直接调会被浏览器
+/// 拒绝,所以只能挂在 click 上。
+pub const EVENT_CLICK: &str = "click";
+
 pub const EVENT_TOUCHMOVE: &str = "touchmove";
 
 pub const KEY_SHIFT_RIGHT: &str = "ShiftRight";
@@ -1778,6 +1791,17 @@ pub const K_TELEPORT_HOLD: &str = "hold";
 pub const K_AIM_WINDOW: &str = "__vcw_aim";
 /// 断言信息:路线的一段同时动了 X 和 Z(楼里有隔墙,斜线会撞上)。
 pub const T_ROUTE_LEG_DIAGONAL: &str = "a route leg moves on both axes";
+
+/// 视角方向的回归测试:鼠标右移必须让画面内容**左移**(视角右转),
+/// 而不是相反。
+pub const T_MOUSE_RIGHT_PANS_RIGHT: &str =
+    "鼠标右移后画面内容必须向左移(视角右转),实测内容移向了 {dir}";
+
+/// 上面那条模板里要填的「移向左边」分支。
+pub const DIR_LEFT: &str = "左";
+
+/// 上面那条模板里要填的「移向右边」分支。
+pub const DIR_RIGHT: &str = "右";
 
 /// 验收通道:传送 / 走位 / 加速 / 探针请求挂在这个 window 属性上。
 pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";

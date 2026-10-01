@@ -74,6 +74,31 @@ const FAR_PLANE: f32 = 600.0;
 /// 滚轮每单位缩放。
 const ZOOM_STEP: f32 = 0.0016;
 
+/// 鼠标水平位移转相机偏航的灵敏度(弧度/像素)。
+///
+/// **符号由实测确定,不是试出来的。** 判据:在真实矩阵下把一对关于
+/// 玩家对称的世界点投影到屏幕,量 `ndc_x` 的变化。
+///
+/// 实测(玩家固定不动,鼠标右移 18 px = +0.108 rad):
+/// 对称点 `(-0.0968, +0.0968)` 的 `ndc_x` 同时 **增大** 到
+/// `(-0.0369, +0.1571)`(Δ = +0.0599 / +0.0602,两者相等 = 纯旋转)。
+/// `ndc_x` 增大 = 场景内容整体**右移**;内容右移 = 相机向左摇
+/// (与「相机左摇时,原本在画面中央右侧的物体会被推向更右」一致)。
+/// 所以 `dx > 0`(鼠标右移)对应的是视角**左转**,必须取负。
+///
+/// 取负之后:鼠标右移 → `yaw` 减小 → 视角右转,与玩家直觉一致。
+const LOOK_YAW_SENSITIVITY: f32 = -0.006;
+
+/// 鼠标纵向位移转相机俯角的灵敏度(弧度/像素)。
+///
+/// 屏幕 Y 向下为正,`dy > 0` 是鼠标下移。第三人称下 `pitch` 是相机
+/// **俯角**(`camera.rs` 的 `eye()` 用 `+ sin(pitch)·distance` 抬高眼点),
+/// 俯角增大 = 相机抬高 = 视线往下压,与玩家「往下看」一致,故取正。
+///
+/// 实测:向下拖 240 px → `camPitch` 0.16 → 1.05(Δ=+0.89,被
+/// `FOLLOW_PITCH_MAX` 截断),方向正确。
+const LOOK_PITCH_SENSITIVITY: f32 = 0.005;
+
 /// 下车后玩家与车身保持的距离(米)。
 const EXIT_CAR_OFFSET: f32 = 2.4;
 /// 所有会被游戏接管的按键。
@@ -1747,6 +1772,12 @@ pub(crate) struct InputState {
     last_pointer: [f64; 2],
     /// 双指上一次的距离(用于捏合缩放)。
     last_pinch: f64,
+    /// 当前是否持有指针锁(视角走 `movement_x/y`,不需要按住左键)。
+    ///
+    /// 锁定态与「按住左键拖拽」是两套输入源,`dragging` 只描述后者。
+    /// 分开存是因为两者可以同时为真(锁着的时候也允许拖拽),而退出锁
+    /// 时必须能只清掉属于锁的那部分。
+    pointer_locked: bool,
     /// 左键是否按下(开火)。
     fire_held: bool,
     /// 本帧是否刚按下左键(单发武器只响一次)。
@@ -1768,6 +1799,7 @@ impl Default for InputState {
             dragging: false,
             last_pointer: [0.0, 0.0],
             last_pinch: 0.0,
+            pointer_locked: false,
             fire_held: false,
             fire_pressed: false,
             fire_released: false,
@@ -3770,6 +3802,73 @@ fn part_local_bounds(asset: &MeshAsset, part_name: &str) -> (Vec3, Vec3) {
 fn bind_pointer_events(handles: &GameHandles) {
     let canvas: &HtmlCanvasElement = &handles.canvas;
 
+    // ---- 指针锁:锁定态下用 movement_x/y 转视角,不需要按住左键 ----
+    //
+    // **这一段是 A 组「拖 240px 而 cameraYaw 完全不动」的真凶修复。**
+    // 症状:按住拖 240px,8 次采样 ΔcameraYaw 全为 0.000。
+    // 实测(w3_pointerlock 的完整事件序列复刻):在**没有**指针锁的
+    // 干净页面上,同样的拖拽给出 Δ=+1.4400 rad(正好 0.006×240),
+    // 所以事件确实进了 Rust、dragging 也置上了 —— 不是绑定问题。
+    // 一旦页面进入**指针锁**态,浏览器派发的事件里 `client_x/client_y`
+    // 被**冻结**在锁定时的光标位置,只有 `movement_x/movement_y` 有值。
+    // 而旧实现算的是 `x - last_pointer[0]`,于是 dx 恒为 0 → yaw 恒定。
+    // 这解释了为什么症状看起来像「根本没收到事件」:事件收到了,
+    // 但被取的两个字段在锁定态下是常量。
+    {
+        let handles: GameHandles = handles.clone();
+        let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |event: Event| {
+            let Some(mouse) = event.dyn_ref::<MouseEvent>() else {
+                return;
+            };
+            let dx: f64 = f64::from(mouse.movement_x());
+            let dy: f64 = f64::from(mouse.movement_y());
+            // 锁定态下不需要按住左键,所以**不看** `dragging`。
+            if dx == 0.0 && dy == 0.0 {
+                return;
+            }
+            {
+                let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                apply_look_delta(&mut game.camera, dx, dy);
+            }
+            event.prevent_default();
+        }));
+        attach(canvas, EVENT_MOUSEMOVE, closure);
+    }
+
+    // ---- 点击 canvas 申请指针锁 ----
+    //
+    // `request_pointer_lock` 需要**用户手势**,所以只能挂在真实点击上,
+    // 不能在启动时调。按住左键拖拽的老路径继续保留:没锁上时仍然可用。
+    {
+        // 闭包是 `'static`,不能借用函数参数里的 `&canvas`,所以克隆一份
+        // 句柄(`HtmlCanvasElement` 是引用计数的,克隆很便宜)。
+        let locked_canvas: HtmlCanvasElement = handles.canvas.clone();
+        let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |event: Event| {
+            // 已经在锁里就不重复申请(重复调用在部分实现里会报错)。
+            if is_pointer_locked() {
+                return;
+            }
+            // `request_pointer_lock` 返回 `()`(旧版返回 Promise,这里不用它)。
+            locked_canvas.request_pointer_lock();
+            event.prevent_default();
+        }));
+        attach(canvas, EVENT_CLICK, closure);
+    }
+    // 锁进出都要同步状态:Esc 释放之后回到「按住拖拽」的老路径,
+    // 否则 `dragging` 残留会让下一次非拖动移动继续转视角。
+    {
+        let handles: GameHandles = handles.clone();
+        let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
+            let locked: bool = is_pointer_locked();
+            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            game.input.pointer_locked = locked;
+            if !locked {
+                game.input.dragging = false;
+            }
+        }));
+        attach(canvas, EVENT_POINTERLOCKCHANGE, closure);
+    }
+
     // ---- 鼠标按下 / 拖拽 / 抬起 ----
     {
         let handles: GameHandles = handles.clone();
@@ -3804,9 +3903,7 @@ fn bind_pointer_events(handles: &GameHandles) {
                 let dy: f64 = y - game.input.last_pointer[1];
                 drop(game);
                 let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
-                game.camera.yaw += dx as f32 * 0.006;
-                game.camera.pitch += dy as f32 * 0.005;
-                game.camera.clamp_pitch();
+                apply_look_delta(&mut game.camera, dx, dy);
                 game.input.last_pointer = [x, y];
             }
         }));
@@ -3884,9 +3981,7 @@ fn bind_pointer_events(handles: &GameHandles) {
                 }
                 let dx: f64 = x - previous[0];
                 let dy: f64 = y - previous[1];
-                game.camera.yaw += dx as f32 * 0.006;
-                game.camera.pitch += dy as f32 * 0.005;
-                game.camera.clamp_pitch();
+                apply_look_delta(&mut game.camera, dx, dy);
                 game.input.last_pointer = [x, y];
             }
             event.prevent_default();
@@ -3910,9 +4005,7 @@ fn bind_pointer_events(handles: &GameHandles) {
                     let previous: [f64; 2] = game.input.last_pointer;
                     let dx: f64 = x - previous[0];
                     let dy: f64 = y - previous[1];
-                    game.camera.yaw += dx as f32 * 0.006;
-                    game.camera.pitch += dy as f32 * 0.005;
-                    game.camera.clamp_pitch();
+                    apply_look_delta(&mut game.camera, dx, dy);
                     game.input.last_pointer = [x, y];
                 }
                 2 => {
@@ -4003,6 +4096,49 @@ fn attach<E: AsRef<EventTarget>>(target: &E, name: &str, closure: Closure<dyn Fn
     closure.forget();
 }
 
+/// 当前文档是否持有指针锁。
+///
+/// 读的是 `document.pointerLockElement`:非 `None` 才算锁上了。
+/// 无头环境下浏览器可能直接拒绝锁定(没有真实用户手势),所以这里
+/// 必须在**每一次**判断时现读,不能只信 `pointerlockchange` 事件 ——
+/// 请求可能被拒,那时事件不来但状态也没有变成 true。
+///
+/// # Returns
+///
+/// - `bool` - 当前是否处于指针锁状态。
+fn is_pointer_locked() -> bool {
+    // 走 `window().document()` 而不是 web_sys 的 `document()` 自由函数:
+    // euv 重导出的 web_sys 里没有 `document` 这个绑定,而 `window` 有。
+    window()
+        .and_then(|window: Window| window.document())
+        .and_then(|document: Document| document.pointer_lock_element())
+        .is_some()
+}
+
+/// 把一次鼠标位移折算成视角增量,并按各自灵敏度写进相机。
+///
+/// **这是视角唯一的写入口。** 指针锁的 `movement_x/y` 与拖拽的
+/// `client_x/y` 差分走的是同一条路,所以灵敏度、pitch 的钳制范围、
+/// 左右符号三件事只在这里定义一次,不会两条路径各写一份而漂移。
+///
+/// **符号关系(实测,不是推导)**:`camera.yaw += dx * LOOK_YAW_SENSITIVITY`,
+/// 所以 `dx > 0`(鼠标右移)→ `yaw` 增大。而移动侧的「相机前向」取
+/// `[cos yaw, -sin yaw]`(见 [`simulate`]),`yaw` 增大即前向绕世界 +Z
+/// 轴**顺时针**(俯视, +X 右 / +Z 上)旋转 —— 即玩家向右看。
+///
+/// `dy > 0`(鼠标下移)→ `pitch` 增大。第三人称下 `pitch` 是相机的
+/// **俯角**,增大即相机抬高、视线往下压。
+///
+/// # Arguments
+///
+/// - `&mut Camera` - 相机的可变引用。
+/// - `f64` - 水平位移(像素)。
+/// - `f64` - 纵向位移(像素)。
+fn apply_look_delta(camera: &mut Camera, dx: f64, dy: f64) {
+    camera.yaw += dx as f32 * LOOK_YAW_SENSITIVITY;
+    camera.pitch += dy as f32 * LOOK_PITCH_SENSITIVITY;
+    camera.clamp_pitch();
+}
 /// 绑定「开火 / 瞄准 / 右键」三组鼠标事件。
 ///
 /// 之所以和 [`bind_pointer_events`] 的相机拖拽**分开绑**:相机那个
@@ -8329,8 +8465,21 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        SOFT_LIMIT_PUSH_MAX, T_SOFT_SPEED_INSIDE, WORLD_HALF, car_wheel_model, soft_limit_speed,
+        Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV, LOOK_YAW_SENSITIVITY, Mat4, SOFT_LIMIT_PUSH_MAX,
+        T_SOFT_SPEED_INSIDE, T_MOUSE_RIGHT_PANS_RIGHT, WORLD_HALF, apply_look_delta,
+        car_wheel_model, soft_limit_speed,
     };
+    /// 把断言文案里的 `{名字}` 占位符替换成实际数值(与 `camera.rs` 同形)。
+    fn fill(template: &str, args: &[(&str, &str)]) -> String {
+        let mut out: String = template.to_string();
+        let mut index: usize = 0;
+        while index < args.len() {
+            out = out.replace(&format!("{{{}}}", args[index].0), args[index].1);
+            index += 1;
+        }
+        out
+    }
+
     use crate::collision::CollisionWorld;
     use crate::combat::Pedestrian;
     use crate::r#const::{
@@ -8931,6 +9080,72 @@ mod tests {
         // 逆序区间必须返回空,而不是 panic 或反向结果。
         let empty: Vec<i32> = street_indices_in(100.0, -100.0);
         assert!(empty.is_empty(), "逆序区间必须返回空");
+    }
+
+    /// 鼠标右移必须让画面内容**左移**(视角右转)。
+    ///
+    /// 这条测的是**方向**,不是幅度 —— 幅度错了顶多是灵敏度不对,
+    /// 方向错了整个第一人称操控是反的,而符号一旦写反几乎不可能靠
+    /// 手感发现。
+    ///
+    /// 做法:造一台正对玩家、跟随第三人的相机,把一对关于玩家对称的
+    /// 世界点投影到屏幕,看它们的 `ndc_x` 往哪边动。左右两个点位移
+    /// 应当**同向且等值**(等值说明是纯旋转而不是平移)。
+    #[test]
+    fn mouse_right_pans_the_view_to_the_right() {
+        use crate::r#type::Vec3;
+        let target: Vec3 = [0.0, 0.0, 0.0];
+        let mut camera: Camera = Camera::new();
+        camera.set_target(target);
+        camera.set_pitch(0.16);
+        camera.set_fov_y(FOLLOW_FOV);
+        camera.set_distance(8.2);
+        camera.set_desired_distance(8.2);
+
+        // `yaw = 0` 时相机眼点在 `-X`、视线朝 `+X`(见 `camera.rs`
+        // 的 `eye()`:`eye = target - (cos yaw, sin yaw)·d`)。所以要挑
+        // **相机前方**的一对点,并让它们在屏幕上分居中线两侧:
+        // `yaw = 0` 时屏幕 +X 方向是世界 `+Z`,于是 ±Z 偏移正好分居两侧。
+        let left_point: Vec3 = [8.0, 0.0, -2.0];
+        let right_point: Vec3 = [8.0, 0.0, 2.0];
+        let screen_x = |camera: &Camera, point: Vec3| -> f32 {
+            let vp: Mat4 = camera.view_projection(1.0);
+            let clip: [f32; 4] = vp.transform_vec4([point[0], point[1], point[2], 1.0]);
+            if clip[3] <= f32::EPSILON {
+                return f32::NAN;
+            }
+            clip[0] / clip[3]
+        };
+
+        camera.set_yaw(0.0);
+        let before_left: f32 = screen_x(&camera, left_point);
+        let before_right: f32 = screen_x(&camera, right_point);
+
+        // 模拟一次 18 px 的鼠标右移,走**生产代码**那条路径。
+        let mut moved: Camera = camera;
+        apply_look_delta(&mut moved, 18.0, 0.0);
+        let after_left: f32 = screen_x(&moved, left_point);
+        let after_right: f32 = screen_x(&moved, right_point);
+
+        let delta_left: f32 = after_left - before_left;
+        let delta_right: f32 = after_right - before_right;
+        assert!(
+            !(before_left.is_nan() || before_right.is_nan() || delta_left.is_nan() || delta_right.is_nan()),
+            "对称点必须都在相机前方,否则这条测不出方向: before={before_left},{before_right} after={after_left},{after_right} eye={:?} d={} fov={}",
+            moved.eye(), moved.get_distance(), moved.get_fov_y()
+        );
+        // 等值:纯旋转(整体摇镜)而不是平移。
+        assert!(
+            (delta_left - delta_right).abs() < 1.0e-3,
+            "左右对称点的位移应当等值(纯旋转),实得 left={delta_left} right={delta_right}"
+        );
+        // 方向:内容必须整体**左移**(ndc_x 减小)才是「鼠标右移 = 视角右转」。
+        let dir: &str = if delta_left < 0.0 { DIR_LEFT } else { DIR_RIGHT };
+        assert!(delta_left < 0.0, "{}", fill(T_MOUSE_RIGHT_PANS_RIGHT, &[("dir", dir)]));
+        assert!(
+            LOOK_YAW_SENSITIVITY < 0.0,
+            "灵敏度必须为负才能让鼠标右移对应视角右转,实得 {LOOK_YAW_SENSITIVITY}"
+        );
     }
 
     /// 远离原点的位置照样能生成城市内容。
