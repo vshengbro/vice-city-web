@@ -74,6 +74,10 @@ async def main() -> int:
         await d.cmd("Page.navigate", {"url": URL})
         await asyncio.sleep(8)
         got = await d.ev(PROBE)
+        # euv 自己的同步探测也要看一眼 —— 方案的前提是它按设备返回,
+        # 不是恒 true。恒 true 的话「不支持提示」那条路就是死的。
+        euv = await d.ev("JSON.stringify({euv: (window.__vcwWebgpu||{}).euvWebgpuAvailable})")
+    print("euv is_available():", euv)
     print(json.dumps(got, ensure_ascii=False, indent=2))
     ok = bool(got and got.get("device"))
     print(f"  -> WebGPU usable: {ok}")
