@@ -2434,6 +2434,15 @@ pub struct WebGlRenderer {
     instance_capacity: usize,
     /// 复用缓冲:剔除近处实例时避免每次分配。
     scratch: Vec<Instance>,
+    /// 验收探针:GPU 侧资产表长度(与 `Scene::meshes` 对照用)。
+    ///
+    /// 两者必须**完全相等**。`draw_batch` 把 `SceneBatch::mesh_index`
+    /// 直接当本表下标取值,少传或多传一次都会让后面所有下标整体错位。
+    gpu_mesh_count: usize,
+    /// 验收探针:本批次实际准备画的索引数(0 = 被静默跳过)。
+    gpu_index_count: i32,
+    /// 验收探针:最近一次 `draw_batch` 的 `mesh_index` 是否越界。
+    gpu_mesh_index_oob: usize,
     /// 增强管线的全部离屏目标(按画布尺寸惰性分配 / 重建)。
     targets: PipelineTargets,
 }
@@ -3159,6 +3168,64 @@ impl WebGlRenderer {
         self.scratch = value;
     }
 
+    /// GPU 侧资产表长度(验收探针)。
+    ///
+    /// 必须和 `Scene::meshes.len()` **完全相等**:`SceneBatch::mesh_index`
+    /// 是直接拿当本表下标用的,少上传一次就让后面全部下标错位。
+    ///
+    /// # Returns
+    ///
+    /// - `usize` - 已上传的 GPU mesh 数量。
+    pub fn get_gpu_mesh_count(&self) -> usize {
+        self.gpu_mesh_count
+    }
+
+    /// 写入 GPU 侧资产表长度(验收探针,见 [`Self::get_gpu_mesh_count`])。
+    ///
+    /// # Arguments
+    ///
+    /// - `usize` - 本次 `draw_batch` 看到的 GPU 表长度。
+    pub fn set_gpu_mesh_count(&mut self, value: usize) {
+        self.gpu_mesh_count = value;
+    }
+
+    /// 越界批次累计数自增(验收探针,见 [`Self::get_gpu_mesh_index_oob`])。
+    ///
+    /// # Returns
+    ///
+    /// - `usize` - 自增后的累计越界次数。
+    pub fn set_gpu_mesh_index_oob_bumped(&mut self) -> usize {
+        self.gpu_mesh_index_oob += 1;
+        self.gpu_mesh_index_oob
+    }
+
+    /// 写入最近一次 `draw_batch` 的索引数(探针,见 [`Self::get_gpu_index_count`])。
+    ///
+    /// # Arguments
+    ///
+    /// - `i32` - 本批次实际要画的索引数。
+    pub fn set_gpu_index_count(&mut self, value: i32) {
+        self.gpu_index_count = value;
+    }
+
+    /// 最近一次 `draw_batch` 实际画的索引数(验收探针)。
+    ///
+    /// # Returns
+    ///
+    /// - `i32` - 索引数;0 表示该批次被静默跳过(没画任何三角形)。
+    pub fn get_gpu_index_count(&self) -> i32 {
+        self.gpu_index_count
+    }
+
+    /// `mesh_index` 越界的批次累计数(验收探针)。
+    ///
+    /// # Returns
+    ///
+    /// - `usize` - 越界次数;非 0 即表示 GPU 表与批次表已错位。
+    pub fn get_gpu_index_oob(&self) -> usize {
+        self.gpu_mesh_index_oob
+    }
+
     /// GPU 侧资产表的只读视图。
     ///
     /// # Returns
@@ -3585,6 +3652,9 @@ impl WebGlRenderer {
             instance_buffer,
             instance_capacity: INSTANCE_PREALLOC,
             scratch: Vec::new(),
+            gpu_mesh_count: 0,
+            gpu_index_count: 0,
+            gpu_mesh_index_oob: 0,
             targets: PipelineTargets::default(),
         };
         let _: &WebGl2RenderingContext = gl_context.as_ref();
@@ -4574,6 +4644,18 @@ impl WebGlRenderer {
             Some(mesh) => mesh.index_count,
             None => return 0,
         };
+        // **验收探针:记下 GPU 表长度与本批次的索引数。**
+        //
+        // 「批次有实例、模型矩阵正确、画面上却没有角色」只剩一种解释:
+        // `mesh_index` 越界或错位,`draw_batch` 在 `get_meshes().get()`
+        // 处静默 `return 0` —— 那条路径**一个三角形都不画,也不报错**。
+        // 验收脚本据此核对 GPU 表与 `Scene::meshes` 是否一一对应。
+        let table_len: usize = self.get_meshes().len();
+        self.set_gpu_mesh_count(table_len);
+        self.set_gpu_index_count(index_count);
+        if mesh_index >= table_len {
+            let _: usize = self.set_gpu_mesh_index_oob_bumped();
+        }
         let (vertex_array, index_buffer): (WebGlVertexArrayObject, WebGlBuffer) =
             match self.get_meshes().get(mesh_index) {
                 Some(mesh) => (mesh.vertex_array.clone(), mesh.index_buffer.clone()),

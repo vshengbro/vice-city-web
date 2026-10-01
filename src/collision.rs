@@ -665,17 +665,22 @@ impl CollisionWorld {
     }
 }
 
-/// 一个点到单个静态形状表面的最短距离(米);点落在形状内部时为 0。
+/// 一点到单个静态形状表面的最短距离(米);点落在形状内部时为 0。
+///
+/// 公开它是为了让验收探针能回答「**我为什么走不动**」:玩家被挡住时
+/// 圆心在碰撞体**外面**(贴着面),`contains_point` 返回 `false`,但本函数
+/// 会给出 0.0x m 这样的贴面距离。没有这个量,「站在墙前」和「陷进墙里」
+/// 在探针输出里长得一模一样。
 ///
 /// # Arguments
 ///
-/// - `&Shape` - 静态碰撞体。
+/// - `&Shape` - 静态碰撞体.
 /// - `Vec2` - 世界 XZ 坐标。
 ///
 /// # Returns
 ///
 /// - `f32` - 最短距离(米)。
-fn distance_to_shape(shape: &Shape, point: Vec2) -> f32 {
+pub fn shape_distance(shape: &Shape, point: Vec2) -> f32 {
     match shape {
         Shape::Aabb { center, half } => {
             let dx: f32 = ((point[0] - center[0]).abs() - half[0]).max(0.0);
@@ -688,6 +693,20 @@ fn distance_to_shape(shape: &Shape, point: Vec2) -> f32 {
             ((dx * dx + dz * dz).sqrt() - *radius).max(0.0)
         }
     }
+}
+
+/// 一个点到所有静态形状表面的最短距离(米)。
+///
+/// # Arguments
+///
+/// - `&Shape` - 静态碰撞体。
+/// - `Vec2` - 世界 XZ 坐标。
+///
+/// # Returns
+///
+/// - `f32` - 最短距离(米)。
+fn distance_to_shape(shape: &Shape, point: Vec2) -> f32 {
+    shape_distance(shape, point)
 }
 
 /// 同类**人形**实体之间额外的「个人空间」(米)。

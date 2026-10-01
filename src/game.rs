@@ -29,7 +29,7 @@ use euv::{
 };
 
 use crate::{
-    camera::{CAMERA_MIN_HEIGHT, Camera, Mat4},
+    camera::{CAMERA_MIN_HEIGHT, Camera, Mat4, OCCLUSION_MIN_DISTANCE, PRESS_IN_DISTANCE},
     collision::{BodyKind, CollisionWorld, DynamicBody, placement_box},
     combat::{
         AiState, Arsenal, Enemy, Faction, HurtState, Mission, Pedestrian, Wanted, Weapon,
@@ -4477,10 +4477,22 @@ fn apply_teleport_request(game: &mut Game) {
     if request.is_null() || request.is_undefined() {
         return;
     }
+    // 一次性通道:无论下面走哪个分支,请求都必须在**本帧**被清掉。
+    //
+    // 之前每个子命令各自 `return`,而 `__vcw_teleport` 一直留在 window 上,
+    // 于是 `{probe: true}` 之后通道里永远是那个请求,探针**每帧重跑**;
+    // 验收脚本再发 `{x: 23, z: 30}` 时,残留的 probe 分支先把整条请求吃掉
+    // 并 `return`,传送根本没执行 —— 表现就是「`__vcw_probe` 有时是空串、
+    // 人也没被传送」,两条症状同一个成因。
+    let _: bool = js_sys::Reflect::set(&window, &key, &JsValue::NULL).unwrap_or(false);
     // `speed` 子命令:设定时间加速倍率,一直有效到下次改。
+    //
+    // 判据是「字段存不存在」而不是「是不是 true」:脚本发的可能是
+    // `{speed: 6}`,而 `as_bool()` 对数字返回 `None`,整条加速请求会被
+    // 静默丢掉。这里和 `walk` 一样先判存在,再用 `as_f64()` 取值。
     if js_sys::Reflect::get(&request, &JsValue::from_str(K_TELEPORT_PROBE))
         .ok()
-        .and_then(|value: JsValue| value.as_bool())
+        .map(|value: JsValue| !value.is_undefined() && !value.is_null())
         .unwrap_or(false)
     {
         probe_nearby_shapes(game);
@@ -7254,12 +7266,27 @@ fn update_camera(game: &mut Game, delta: f32) {
         game.camera
             .resolve_occlusion_interior(&game.world, &game.interiors, wanted);
     let allowed: f32 = hit.unwrap_or(wanted);
-    game.camera.approach_distance(
+    // **室内允许压到贴脸,室外不许。** `approach_distance` 收尾把距离
+    // `clamp` 到 `OCCLUSION_MIN_DISTANCE`(2.2 m),而玩家贴着室内墙面站
+    // 时回避算出的允许距离是 0.00 —— 那个 2.2 m 的硬下限反而把眼点
+    // 顶**穿过**墙,变成「人在楼内、相机在楼外」。室外没有这个问题
+    // (那 2.2 m 是防穿楼的安全网),所以只在室内换用更近的下限。
+    let inside: bool = game.interiors.support_height(
+        [game.follow_target[0], game.follow_target[2]],
+        game.follow_target[1],
+    )
+    .is_some();
+    game.camera.approach_distance_within(
         allowed,
         FOLLOW_DISTANCE_MAX,
         delta,
         OCCLUSION_IN_RATE,
         OCCLUSION_OUT_RATE,
+        if inside {
+            PRESS_IN_DISTANCE
+        } else {
+            OCCLUSION_MIN_DISTANCE
+        },
     );
     // 地面不在碰撞世界里,单独夹一次眼点高度。
     game.camera.lift_above_ground();

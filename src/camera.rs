@@ -23,6 +23,23 @@ use crate::{
 /// `OCCLUSION_SKIN` 的贴墙余量,肉眼不可见。
 const INTERIOR_PROBE_STEP: f32 = CAMERA_PROBE_RADIUS / 3.0;
 
+/// 室内楼板被判定为遮挡前,它的**下表面**必须高过焦点这么多米(米)。
+///
+/// 玩家踩在首层楼板上时,焦点(胸口,`FOLLOW_HEIGHT = 1.45`)到楼板顶面
+/// (`SHOWCASE_GROUND_TOP = 0.15`)只差 1.30 m,而探针半径就有
+/// `CAMERA_PROBE_RADIUS = 0.32`。原来 `interior_ray_hit` 只判「采样点是否
+/// 落在某块碰撞体的竖直区间内」,于是**脚下这块楼板在 `t = 0` 就判定
+/// 命中**,每帧都把允许距离压到 0,相机被永久钉死在最近距离。
+///
+/// 判据必须是**下表面**而不是顶面,理由是楼梯:每一级台阶都是一个
+/// `y = [地面, 级高]` 的实心盒,顶面一级比一级高,但**下表面全都贴着地面**。
+/// 用顶面判的话,从 `y = [0.15, 2.28]` 到 `y = [0.15, 3.20]` 的各级台阶
+/// 会被逐级当成「越过头顶的楼板」,玩家在楼梯上每爬一级相机就再缩一截 ——
+/// 实测玩家站在第一级时 `cameraDist` 被压到 0.71 m(贴脸),而身后
+/// 明明是整条空楼梯。用下表面判,楼梯永远不挡自己,只有真正的**头顶楼板**
+/// (二层楼板 `y = [2.95, 3.20]`)才计入遮挡。
+const SLAB_HEADROOM: f32 = 0.10;
+
 /// 从 `origin` 沿 `dir` 推进一个球体探针,求撞上第一个室内碰撞体的距离。
 ///
 /// 走的是「球体推进」而不是零半径射线:探针半径当成相机本体的尺寸,
@@ -47,11 +64,6 @@ fn interior_ray_hit(
     dir: Vec3,
     max_distance: f32,
 ) -> Option<f32> {
-    // 探针沿射线推进时覆盖的高度区间:焦点高度与眼点高度之间,再向上下
-    // 各扩半个探针直径。`contains_interior_point` 判的是「这个点是否在
-    // 某块碰撞体的竖直区间内」,所以上下各扩一次就够了。
-    let low: f32 = origin[1].min(eye[1]) - CAMERA_PROBE_RADIUS;
-    let high: f32 = origin[1].max(eye[1]) + CAMERA_PROBE_RADIUS;
     let mut travelled: f32 = 0.0;
     while travelled <= max_distance {
         let point: Vec3 = [
@@ -68,7 +80,26 @@ fn interior_ray_hit(
                     crate::interior::Floor::Slab { min, max } => (*min, *max),
                     crate::interior::Floor::Wall { min, max } => (*min, *max),
                 };
-                if max[1] < low || min[1] > high {
+                // **脚下那块楼板不挡自己的视线。** 判据看**下表面**而不是
+                // 顶面:楼梯每一级都是 `y = [地面, 级高]` 的实心盒,下表面
+                // 全都贴着地面,所以用下表面判时楼梯永远不挡自己,只有真正
+                // 越过头顶的二层楼板才计入。
+                if let crate::interior::Floor::Slab { min, max } = floor {
+                    if min[1] <= origin[1] + SLAB_HEADROOM {
+                        return false;
+                    }
+                }
+                // **高度必须逐采样点判,不能用整条射线的总区间。**
+                // `low` / `high` 覆盖的是「焦点高度到眼点高度」的全程,
+                // 拿它筛碰撞体等于假设「凡是落在这条高度带里的墙都挡视线」。
+                // 但视线在途中会**钻到墙脚以下**:玩家站在楼梯上、相机在
+                // 身后偏低时,采样点的高度已经低于外墙(外墙下表面 y = 0)
+                // 之上但低于探针下沿,或者干脆从门洞下沿穿过去 —— 原来的
+                // 写法把整面墙算成命中,实测玩家在楼梯第一级时 `cameraDist`
+                // 被压到 0.71 m,而那条视线上一面墙都没有。
+                if point[1] < min[1] - CAMERA_PROBE_RADIUS
+                    || point[1] > max[1] + CAMERA_PROBE_RADIUS
+                {
                     return false;
                 }
                 at[0] >= min[0] - CAMERA_PROBE_RADIUS
@@ -365,6 +396,21 @@ pub const ORBIT_MAX_DISTANCE: f32 = 620.0;
 /// 返回 `t = 0`,相机被一路压到下限。此时正确的行为是「贴着角色站住、
 /// 接受一点墙面穿帮」,而不是把镜头怼进模型里。
 pub const OCCLUSION_MIN_DISTANCE: f32 = 2.2;
+
+/// 室内被墙贴脸时相机允许压到的**最近距离**(米)。
+///
+/// `OCCLUSION_MIN_DISTANCE = 2.2` 那条硬下限在**室外**是对的(宁可
+/// 糊脸也不穿楼),但在室内它是**穿墙的成因**:玩家贴着一面墙站时,
+/// 探针(半径 `CAMERA_PROBE_RADIUS`)把墙膨胀 0.32 m,于是射线起点就落在
+/// 膨胀盒内部,命中距离 0.13 m,减去 `OCCLUSION_SKIN` 之后允许距离是
+/// 0.00 —— 比任何硬下限都近。`approach_distance` 收尾把它 `clamp` 回
+/// 2.2 m,眼点顺势**穿过**那面墙落到壳外面。实测玩家站在楼梯脚下、
+/// 相机朝楼下时眼点在 `x = 29.47`,而整栋楼的壳只到 `x = 28.20`。
+///
+/// 室内空间本来就小,「贴着角色」比「跑到楼外」正确得多,所以这里允许
+/// 压到 `PRESS_IN_DISTANCE` —— 只要这个值小于「焦点到最近那面墙的
+/// 距离」,眼点就一定还在墙内。
+pub const PRESS_IN_DISTANCE: f32 = 0.45;
 
 /// 遮挡回避命中后**额外**保留的贴墙余量(米)。
 ///
@@ -818,11 +864,38 @@ impl Camera {
         in_rate: f32,
         out_rate: f32,
     ) {
+        self.approach_distance_within(target, max, dt, in_rate, out_rate, OCCLUSION_MIN_DISTANCE);
+    }
+
+    /// [`Self::approach_distance`] 的可调下限版本:把「最近能贴到多近」
+    /// 交给调用方按场景决定。
+    ///
+    /// 分成两个函数而不是加一个可选参数,是因为下限不是「有没有」的问题
+    /// 而是「哪里」的问题:室外 2.2 m 是防穿楼的安全网,室内 0.45 m 才是
+    /// 「贴墙时不穿墙」的正解。调用方必须显式说出自己处在哪一种场景里。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 本帧允许的目标距离(米)。
+    /// - `f32` - 距离硬上限(米)。
+    /// - `f32` - 本帧秒数增量。
+    /// - `f32` - 拉近速率(1/秒)。
+    /// - `f32` - 拉远速率(1/秒)。
+    /// - `f32` - 距离下限(米)。
+    pub fn approach_distance_within(
+        &mut self,
+        target: f32,
+        max: f32,
+        dt: f32,
+        in_rate: f32,
+        out_rate: f32,
+        floor: f32,
+    ) {
         let current: f32 = self.get_distance();
         let rate: f32 = if target < current { in_rate } else { out_rate };
         let blend: f32 = (1.0 - (-rate * dt).exp()).clamp(0.0, 1.0);
         let stepped: f32 = current + (target - current) * blend;
-        self.set_distance(stepped.clamp(OCCLUSION_MIN_DISTANCE, max));
+        self.set_distance(stepped.clamp(floor.min(max), max));
     }
 
     /// 把眼点抬到地面之上,避免相机沉进 `y = 0` 的地面网格。
