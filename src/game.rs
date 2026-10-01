@@ -3578,8 +3578,26 @@ fn push_player_part(scene: &mut Scene, asset: &MeshAsset, part_name: &str) -> us
 /// 算出一个车轮的 model matrix:先绕轮心自转,再随车身绕 Y 转并平移。
 ///
 /// 顺序很关键 —— 轮子网格已经被平移到「轮心在原点」,所以自转直接绕
-/// 本地 X 轴即可(车轮的轴就是 X)。自转之后再用车身朝向把安装位转到世界
-/// 空间,最后加上车身位置。
+/// 本地**轮轴**即可。自转之后再用车身朝向把安装位转到世界空间,
+/// 最后加上车身位置。
+///
+/// **轮轴是本地 Z,不是 X。** 这条是从资产实测出来的,不是抄注释:
+/// `car_coupe` 的 `tyres` part 分成 4 摞(前 / 后 × 左 / 右),每摞的
+/// 顶点范围是 `x 0.64 / y 0.64 / z 0.235` —— 最短的轴就是轮轴,
+/// 所以轮盘立在 **XY 平面**里、绕 **Z** 转。而车身前进方向是本地
+/// `+X`(`Instance::new` 的 `yaw = 0` 面向 `+X`)。
+///
+/// 旧实现绕本地 **X** 自转,而 X 正是车**前进的方向** —— 那等于让
+/// 车轮绕着行驶轴打转(拖拉机式的横向滚动),不是汽车。而且因为轮盘
+/// 在 XY 平面内、绕 X 转时顶点只会在 YZ 平面里扫,前进方向的投影
+/// **完全不动**:实测 `spin = +0.1` 时轮顶与轮底的世界 X 位移都是
+/// `+0.0000`,也就是轮子看起来根本没在滚。
+///
+/// 修正为绕 Z 自转后,`spin = +0.1` 时轮顶向 **+X** 走 `+0.0998`、
+/// 轮底向 **-X** 走 `-0.0998`。车往 `+X` 前进时接触点必须相对车体
+/// 向后(-X)滑,实测正是 `-0.0998` —— 无滑滚动成立,且与
+/// `advance_wheel_spin(travelled / WHEEL_RADIUS)`(travelled 恒为正)
+/// 同号,不需要额外取负。
 ///
 /// # Arguments
 ///
@@ -3601,12 +3619,12 @@ fn car_wheel_model(position: Vec3, yaw: f32, mount: Vec3, spin: f32) -> Mat4Data
         position[1] + mount[1],
         position[2] - mount[0] * sin_yaw + mount[2] * cos_yaw,
     ];
-    // 绕本地 X 轴自转:基向量 X 不动,Y/Z 在 (cos, sin) 平面里转。
+    // 绕本地 **Z**(轮轴)自转:基向量 Z 不动,X/Y 在 (cos, sin) 平面里转。
     // 再由 yaw 把这三个基向量转到世界。
     let local: [[f32; 3]; 3] = [
-        [1.0, 0.0, 0.0],
-        [0.0, cos_spin, sin_spin],
-        [0.0, -sin_spin, cos_spin],
+        [cos_spin, -sin_spin, 0.0],
+        [sin_spin, cos_spin, 0.0],
+        [0.0, 0.0, 1.0],
     ];
     let mut columns: [[f32; 3]; 3] = [[0.0; 3]; 3];
     for (row, column) in columns.iter_mut().enumerate() {
@@ -8469,6 +8487,24 @@ mod tests {
         T_SOFT_SPEED_INSIDE, T_MOUSE_RIGHT_PANS_RIGHT, WORLD_HALF, apply_look_delta,
         car_wheel_model, soft_limit_speed,
     };
+    /// 一个世界点投影后的屏幕 NDC x(未做像素映射)。
+    ///
+    /// 相机后方(`w <= 0`)返回 `NaN`,让「测不出方向」这件事在断言里
+    /// 显式失败,而不是悄悄当成 0 参与比较。
+    fn projected_ndc_x(camera: &Camera, point: Vec3) -> f32 {
+        let vp: Mat4 = camera.view_projection(1.0);
+        let clip: [f32; 4] = vp.transform_vec4([point[0], point[1], point[2], 1.0]);
+        if clip[3] <= f32::EPSILON {
+            return f32::NAN;
+        }
+        clip[0] / clip[3]
+    }
+
+    /// 一个轮子局部点在车轮矩阵下的世界 X。
+    fn wheel_world_x(mat: Mat4Data, local: Vec3) -> f32 {
+        mat[0] * local[0] + mat[4] * local[1] + mat[8] * local[2] + mat[12]
+    }
+
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值(与 `camera.rs` 同形)。
     fn fill(template: &str, args: &[(&str, &str)]) -> String {
         let mut out: String = template.to_string();
@@ -8482,6 +8518,7 @@ mod tests {
 
     use crate::collision::CollisionWorld;
     use crate::combat::Pedestrian;
+    use crate::r#type::{Mat4Data, Vec3};
     use crate::r#const::{
         GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, PED_SUIT, PED_TALK_SLOT_STEP, PLAYER_BODY_HEIGHT,
         T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT, T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS,
@@ -8495,7 +8532,8 @@ mod tests {
         T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE, T_SHOWCASE_STAIR_REACHES_TOP,
         T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_TOLERANCE_TOO_BIG,
         T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP, T_SHOWCASE_WALKER_DIRECTION,
-        T_SHOWCASE_WALKER_REACHES_TOP, TERMINAL_VELOCITY,
+        T_SHOWCASE_WALKER_REACHES_TOP, T_WHEEL_AXLE_STILL, T_WHEEL_CENTRE_FIXED,
+        T_WHEEL_ROLLS_FORWARD, T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
     };
     /// 只跑社交那一层,跳过走路 / 碰撞 —— 社交测试要的是「谁跟谁凑一局」
     /// 这个决定,不是他们有没有真的走到位。
@@ -8539,7 +8577,6 @@ mod tests {
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
     use crate::player::WALK_SPEED;
-    use crate::r#type::Mat4Data;
     use crate::r#type::Vec2;
 
     /// 两栋样板楼楼板 + 楼梯的期望顶面高度之和(级高 × 级数)。
@@ -9108,24 +9145,15 @@ mod tests {
         // `yaw = 0` 时屏幕 +X 方向是世界 `+Z`,于是 ±Z 偏移正好分居两侧。
         let left_point: Vec3 = [8.0, 0.0, -2.0];
         let right_point: Vec3 = [8.0, 0.0, 2.0];
-        let screen_x = |camera: &Camera, point: Vec3| -> f32 {
-            let vp: Mat4 = camera.view_projection(1.0);
-            let clip: [f32; 4] = vp.transform_vec4([point[0], point[1], point[2], 1.0]);
-            if clip[3] <= f32::EPSILON {
-                return f32::NAN;
-            }
-            clip[0] / clip[3]
-        };
-
         camera.set_yaw(0.0);
-        let before_left: f32 = screen_x(&camera, left_point);
-        let before_right: f32 = screen_x(&camera, right_point);
+        let before_left: f32 = projected_ndc_x(&camera, left_point);
+        let before_right: f32 = projected_ndc_x(&camera, right_point);
 
         // 模拟一次 18 px 的鼠标右移,走**生产代码**那条路径。
         let mut moved: Camera = camera;
         apply_look_delta(&mut moved, 18.0, 0.0);
-        let after_left: f32 = screen_x(&moved, left_point);
-        let after_right: f32 = screen_x(&moved, right_point);
+        let after_left: f32 = projected_ndc_x(&moved, left_point);
+        let after_right: f32 = projected_ndc_x(&moved, right_point);
 
         let delta_left: f32 = after_left - before_left;
         let delta_right: f32 = after_right - before_right;
@@ -9145,6 +9173,35 @@ mod tests {
         assert!(
             LOOK_YAW_SENSITIVITY < 0.0,
             "灵敏度必须为负才能让鼠标右移对应视角右转,实得 {LOOK_YAW_SENSITIVITY}"
+        );
+    }
+
+    /// 车轮必须绕**轮轴(本地 Z)**自转,且滚动方向满足无滑约束。
+    ///
+    /// 这条钉住两个事实:
+    /// 1. 轮轴是 Z(`car_coupe` 的 `tyres` 每摞 `x .64 / y .64 / z .235`,
+    ///    最短轴即轮轴),绕 X 转的话轮盘根本不在滚动平面里;
+    /// 2. `spin` 增大时轮底沿车体**后退** —— 车往 `+X` 前进时接触点
+    ///    必须相对车体向 `-X` 退,否则轮子是倒着转或者压根没转。
+    #[test]
+    fn wheels_roll_forward_about_the_real_axle() {
+        // 轮心取自 car_coupe 的前右轮(本地 (1.265, 0.32, 0.77))。
+        let mount: Vec3 = [1.265, 0.32, 0.77];
+        let origin: Vec3 = [0.0, 0.0, 0.0];
+        let spin: f32 = 0.1;
+        let at_rest: Mat4Data = car_wheel_model(origin, 0.0, mount, 0.0);
+        let spun: Mat4Data = car_wheel_model(origin, 0.0, mount, spin);
+        let top: f32 = wheel_world_x(spun, [0.0, 1.0, 0.0]) - wheel_world_x(at_rest, [0.0, 1.0, 0.0]);
+        let bottom: f32 =
+            wheel_world_x(spun, [0.0, -1.0, 0.0]) - wheel_world_x(at_rest, [0.0, -1.0, 0.0]);
+        // 绕 Z 转时轮顶 / 轮底的 X 投影必须真的动起来(绕 X 转时恒为 0)。
+        assert!(
+            top.abs() > 1.0e-3 && bottom.abs() > 1.0e-3 && bottom < 0.0 && top > 0.0,
+            "{}",
+            fill(
+                T_WHEEL_ROLLS_FORWARD,
+                &[("spin", &format!("{spin}")), ("bottom", &format!("{bottom:+.4}"))]
+            )
         );
     }
 
@@ -9256,38 +9313,51 @@ mod tests {
     }
 
     /// 车轮矩阵:自转角必须真的改变朝向矩阵,不能只平移。
+    ///
+    /// **轮轴是本地 Z,不是 X。** 这条原先断言「绕 X 自转时 X 基向量
+    /// 不变」—— 那等于把「X 是轮轴」当成规格,而 `car_coupe` 的
+    /// `tyres` 顶点实测是每摞 `x .64 / y .64 / z .235`(最短轴即轮轴)。
+    /// 车前进方向是本地 `+X`,绕 X 自转等于绕行驶轴打转,轮盘根本
+    /// 不在滚动平面里(实测位移恒为 0)。所以这里改成断言 Z 不变、
+    /// X / Y 在 (cos, sin) 平面里转。
     #[test]
     fn wheel_spin_rotates_the_axle() {
         let mount: [f32; 3] = crate::traffic::WHEEL_MOUNTS[0];
         let rest: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, 0.0);
         let turned: Mat4Data =
             car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, std::f32::consts::FRAC_PI_2);
-        // 绕本地 X 自转:X 基向量不动,Y/Z 两个基向量在 XZ 平面上转 90 度。
-        // 列主序下第一列是 X 基向量(model[0..3]),所以要看 **第二、三列**。
-        let y_rest: [f32; 3] = [rest[4], rest[5], rest[6]];
-        let y_turned: [f32; 3] = [turned[4], turned[5], turned[6]];
+        // 绕本地 Z 自转:Z 基向量不动,X/Y 两个基向量在 XY 平面上转 90 度。
+        // 列主序下第一列是 X 基向量(model[0..3]),所以要看 **第一、二列**。
+        let x_rest: [f32; 3] = [rest[0], rest[1], rest[2]];
+        let x_turned: [f32; 3] = [turned[0], turned[1], turned[2]];
         let delta: f32 = (0..3)
-            .map(|axis: usize| (y_rest[axis] - y_turned[axis]).powi(2))
+            .map(|axis: usize| (x_rest[axis] - x_turned[axis]).powi(2))
             .sum::<f32>()
             .sqrt();
         assert!(
             delta > 0.5,
-            "自转 90 度必须改变 Y 轴基向量,rest={:?} turned={:?}",
-            y_rest,
-            y_turned
+            "{}",
+            fill(
+                T_WHEEL_SPIN_MOVES_RIM,
+                &[("axis", &format!("{x_rest:?}")), ("turned", &format!("{x_turned:?}"))]
+            )
         );
-        // X 轴(轮轴方向)必须保持不变。
-        let x_rest: [f32; 3] = [rest[0], rest[1], rest[2]];
-        let x_turned: [f32; 3] = [turned[0], turned[1], turned[2]];
+        // Z 轴(轮轴方向)必须保持不变。
+        let z_rest: [f32; 3] = [rest[8], rest[9], rest[10]];
+        let z_turned: [f32; 3] = [turned[8], turned[9], turned[10]];
         let axle: f32 = (0..3)
-            .map(|axis: usize| (x_rest[axis] - x_turned[axis]).powi(2))
+            .map(|axis: usize| (z_rest[axis] - z_turned[axis]).powi(2))
             .sum::<f32>()
             .sqrt();
-        assert!(axle < 1e-5, "绕 X 自转不得转动 X 轴本身,变化量 {}", axle);
+        assert!(
+            axle < 1e-5,
+            "{}",
+            fill(T_WHEEL_AXLE_STILL, &[("delta", &format!("{axle}"))])
+        );
         // 旋转不改变轴心位置。
         let centre_delta: f32 =
             (rest[12] - turned[12]) + (rest[13] - turned[13]) + (rest[14] - turned[14]);
-        assert!(centre_delta.abs() < 1e-5, "自转不得移动轮心");
+        assert!(centre_delta.abs() < 1e-5, "{}", fill(T_WHEEL_CENTRE_FIXED, &[]));
     }
 
     /// 车身转向:同一个安装位在不同车身朝向下必须落在不同世界位置。

@@ -1819,5 +1819,23 @@ pub const T_DISTAL_INHERITS_PARENT_SWING: &str =
 /// 上面两条骨架模板里填 part 名的占位符键。
 pub const KEY_PART: &str = "part";
 
+/// 车轮滚动方向的回归测试:车前进时,轮底必须相对车体**向后**滑。
+///
+/// 无滑滚动的运动学约束:接触点相对地面瞬时不动,所以车往 `+X` 走时,
+/// 接触点沿轮缘向 `-X` 退。轮轴是本地 `Z`(实测自 `car_coupe` 的
+/// `tyres` 顶点:每只轮子 `x 0.64 / y 0.64 / z 0.235`,最短轴是 Z)。
+pub const T_WHEEL_ROLLS_FORWARD: &str =
+    "车轮滚动方向反了:spin={spin} 时轮底沿车体后退了 {bottom:+.4} m,应当为负(车往 +X 前进)";
+
+/// 自转 90 度必须带动轮缘基向量(X / Y 之一)改变方向。
+pub const T_WHEEL_SPIN_MOVES_RIM: &str =
+    "自转 90 度必须改变轮缘基向量:rest={axis} turned={turned}";
+
+/// 绕轮轴(Z)自转时,轮轴基向量本身不得改变。
+pub const T_WHEEL_AXLE_STILL: &str = "绕 Z 自转不得转动 Z 轴本身,变化量 {delta}";
+
+/// 自转只绕轮心,不得把轮心挪走。
+pub const T_WHEEL_CENTRE_FIXED: &str = "自转不得移动轮心";
+
 /// 验收通道:传送 / 走位 / 加速 / 探针请求挂在这个 window 属性上。
 pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";
