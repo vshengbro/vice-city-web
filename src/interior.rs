@@ -28,6 +28,15 @@ const RESOLVE_ITERATIONS: usize = 4;
 /// 判定「圆心落在盒内部」的向量长度阈值(米)。
 const INSIDE_EPSILON: f32 = 1e-5;
 
+/// `resolve_interior_slide` 里判定「墙没推我」/「没有切向可留」的阈值(米)。
+///
+/// 取 1e-3,与 `collision.rs` 的 `SLIDE_EPSILON` 同一个量级:比它再小,
+/// 浮点噪声会被当成真实推动,玩家会在墙面上微微抽搐。
+const INTERIOR_SLIDE_EPSILON: f32 = 1e-3;
+
+/// `blocks_sight` 里判定「视线与某轴平行」的位移阈值(米)。
+const INTERIOR_SIGHT_EPSILON: f32 = 1e-6;
+
 /// 室内垂直碰撞体:一块楼板或一段隔墙。
 #[derive(Clone, Copy, Debug)]
 pub enum Floor {
@@ -164,6 +173,175 @@ impl FloorWorld {
     ///
     /// - `Vec2` - 分离后的世界 XZ 坐标。
     pub fn resolve_interior(
+        &self,
+        point: Vec2,
+        body_min_y: f32,
+        body_max_y: f32,
+        radius: f32,
+    ) -> Vec2 {
+        self.separate_interior(point, body_min_y, body_max_y, radius)
+    }
+
+    /// [`Self::resolve_interior`] 的**带位移**版本:沿墙保留切向分量。
+    ///
+    /// 纯分离(不传 `delta`)有个致命的结构缺陷:它只知道「现在在哪儿」,
+    /// 不知道「这一帧想去哪儿」。于是玩家顶着隔墙走时,每帧的流程是
+    /// 「静态层前进 → 室内层沿法线原路弹回」,**切向位移被整个丢掉**。
+    /// 表现就是「有速度、无位移」:顶着墙几十帧推不动一毫米,而且
+    /// 斜着走也拐不过弯 —— 因为连「往旁边挪一点」这个动作都传不进去。
+    ///
+    /// 更糟的是这两层每帧互相抵消,位置在极限环上抖动:实测静态层把
+    /// 玩家送到 `z = 35.243`(已经陷进墙里 0.257 m),室内层再弹回
+    /// `z = 35.550`,`step_vertical` 把这个结果 `set_position` 写回 ——
+    /// 于是静态层下一帧又从墙里出发。静态层**从来不知道墙在这儿**,
+    /// 室内层**从来不知道想去哪儿**。
+    ///
+    /// 传入 `delta` 之后走标准两步 `move_and_slide`(与
+    /// [`crate::collision::CollisionWorld::resolve_slide`] 同一套思路):
+    /// 先按法线推出穿透深度拿到修正向量,把 `delta` 的法向分量扣掉,
+    /// **只保留切向**再走一遍。玩家于是顺着墙滑过去,而不是被钉在
+    /// 接触点上。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 待分离的世界 XZ 坐标。
+    /// - `Vec2` - 本帧想要的水平位移(米);纯分离时传 `[0.0, 0.0]`。
+    /// - `f32` - 身体底面高度(脚底,米)。
+    /// - `f32` - 身体顶面高度(头顶,米)。
+    /// - `f32` - 身体等效圆柱半径(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 分离(并保留切向位移)之后的世界 XZ 坐标。
+    pub fn resolve_interior_slide(
+        &self,
+        point: Vec2,
+        delta: Vec2,
+        body_min_y: f32,
+        body_max_y: f32,
+        radius: f32,
+    ) -> Vec2 {
+        // 先做一次纯分离,拿到「墙把人推了多远、往哪个方向推」。
+        let pushed: Vec2 = self.separate_interior(point, body_min_y, body_max_y, radius);
+        let correction: Vec2 = [pushed[0] - point[0], pushed[1] - point[1]];
+        let length: f32 = (correction[0] * correction[0] + correction[1] * correction[1]).sqrt();
+        // 没有推动 → 人本来就在合法位置,切向位移原样放行。
+        if length <= INTERIOR_SLIDE_EPSILON {
+            let free: Vec2 = [point[0] + delta[0], point[1] + delta[1]];
+            return self.separate_interior(free, body_min_y, body_max_y, radius);
+        }
+        // 推动方向指向墙的**外侧**,它就是法线。
+        let normal: Vec2 = [correction[0] / length, correction[1] / length];
+        let into: f32 = delta[0] * normal[0] + delta[1] * normal[1];
+        // 没有往墙里钻(只是擦边),分离结果已经正确。
+        if into >= 0.0 {
+            return pushed;
+        }
+        // 纯正面顶墙:没有切向可留,分离结果就是最终位置。
+        let tangent: Vec2 = [delta[0] - normal[0] * into, delta[1] - normal[1] * into];
+        let tangent_len: f32 = (tangent[0] * tangent[0] + tangent[1] * tangent[1]).sqrt();
+        if tangent_len <= INTERIOR_SLIDE_EPSILON {
+            return pushed;
+        }
+        // 沿墙走完切向位移之后再分离一次:防止「贴着走时切向一步
+        // 跨进了墙里」被下一次迭代当成正常位置。
+        let slid: Vec2 = [pushed[0] + tangent[0], pushed[1] + tangent[1]];
+        self.separate_interior(slid, body_min_y, body_max_y, radius)
+    }
+
+    /// 从 `from` 到 `to` 的水平线段是否被某段隔墙挡住(视线判定用)。
+    ///
+    /// **为什么必须有这个函数:**`CollisionWorld::has_line_of_sight` 只
+    /// 射线检测静态碰撞世界,而**楼板与隔墙住在另一个世界**
+    /// ([`FloorWorld`])。两套几何互不相交,所以一栋样板楼在静态世界里
+    /// 根本不存在 —— 射线从它中间穿过去,报告「视线通畅」。实测把
+    /// 玩家停进楼里(`interiors.inSolid == true`)、19 m 外的警察在
+    /// `attack` 状态持续开火,90 帧掉 31.8 血,门控计数器全程为 0。
+    ///
+    /// 这里用**线段 vs AABB 的 2D  slab 法**做精确相交,而不是采样或
+    /// 膨胀盒子:子弹是沿一条直线走的,采样会漏掉薄墙之间的缝隙。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 起点 XZ(敌人)。
+    /// - `Vec2` - 终点 XZ(玩家)。
+    /// - `f32` - 视线高度(米)—— 用它筛掉「脚下 / 头顶」的楼板。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - 被隔墙挡住为 `true`。
+    pub fn blocks_sight(&self, from: Vec2, to: Vec2, sight_y: f32) -> bool {
+        let dx: f32 = to[0] - from[0];
+        let dz: f32 = to[1] - from[1];
+        for floor in self.get_floors() {
+            let (min, max): (Vec3, Vec3) = match floor {
+                Floor::Slab { min, max } => (*min, *max),
+                Floor::Wall { min, max } => (*min, *max),
+            };
+            // 楼板只在视线正好平躺在板面高度上时才算遮挡,否则二楼
+            // 的地板会把一楼的人整片挡住(脚下 0.15 m 的地板同理)。
+            let is_slab: bool = matches!(floor, Floor::Slab { .. });
+            if is_slab
+                && (sight_y < min[1] - INTERIOR_SIGHT_EPSILON
+                    || sight_y > max[1] + INTERIOR_SIGHT_EPSILON)
+            {
+                continue;
+            }
+            // 线段 vs AABB:逐轴求进出参数区间,非空即相交。
+            let (lo, hi): (f32, f32) = (0.0, 1.0);
+            let mut enter: f32 = lo;
+            let mut exit: f32 = hi;
+            let mut clipped: bool = true;
+            for axis in 0..2 {
+                let (origin, delta, low, high): (f32, f32, f32, f32) = if axis == 0 {
+                    (from[0], dx, min[0], max[0])
+                } else {
+                    (from[1], dz, min[2], max[2])
+                };
+                if delta.abs() <= INTERIOR_SIGHT_EPSILON {
+                    // 与这一轴平行:起点不在板内就永远不相交。
+                    if origin < low || origin > high {
+                        clipped = false;
+                        break;
+                    }
+                    continue;
+                }
+                let mut t0: f32 = (low - origin) / delta;
+                let mut t1: f32 = (high - origin) / delta;
+                if t0 > t1 {
+                    std::mem::swap(&mut t0, &mut t1);
+                }
+                enter = enter.max(t0);
+                exit = exit.min(t1);
+                if enter > exit {
+                    clipped = false;
+                    break;
+                }
+            }
+            if clipped && enter <= exit {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 纯分离:把圆心推出所有与身体区间相交的隔墙(楼板不参与)。
+    ///
+    /// [`Self::resolve_interior_slide`] 的底层实现,迭代若干轮直到一轮
+    /// 没有任何墙推动圆心为止。**不动 Y** —— 垂直方向是重力的职责,
+    /// 这里越权会把玩家吸到墙面上。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 待分离的世界 XZ 坐标。
+    /// - `f32` - 身体底面高度(脚底,米)。
+    /// - `f32` - 身体顶面高度(头顶,米)。
+    /// - `f32` - 身体等效圆柱半径(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 分离后的世界 XZ 坐标。
+    fn separate_interior(
         &self,
         point: Vec2,
         body_min_y: f32,

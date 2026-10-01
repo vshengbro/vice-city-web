@@ -618,6 +618,50 @@ pub const GPU_STRIDE_FLOATS: usize = 12;
 /// 正是 GPU mesh 索引错位最典型的症状 —— 那种状态下投影盒仍然完整
 /// 落在画布内,只判「投影成功」会误报成可见。
 pub const CHAR_VISIBLE_MAX_SCREEN_PCT: f64 = 45.0;
+
+/// 验收探针:报出玩家周围这个半径(米)内的静态碰撞体。
+///
+/// 取 6 m:够覆盖「玩家贴面站着」这一情形(距离 0.0x m 就能看见),
+/// 又不会把整条街的碰撞体全倒进 JSON。半径太小的坏处是
+/// 「陷进楼里、被从内部推开」时报告为空,查不到是谁推的。
+pub const NEAR_SHAPE_REPORT_RADIUS: f32 = 6.0;
+
+/// 验收探针:最多报几个最近的静态碰撞体。
+///
+/// 取 8:够看清「一堵楼 + 几根行道树」这种典型组合,又不会让
+/// `__VCW_DEBUG__` 膨胀到每帧都要反序列化一大串。
+pub const NEAR_SHAPE_REPORT_COUNT: usize = 8;
+
+/// 验收探针:单段室内隔墙的 JSON 格式串。
+///
+/// 与静态碰撞体分开报(`nearShapes` vs `nearInteriors`):两者住在**互不
+/// 相交的两个碰撞世界**里,所以「静态报告为空而玩家被卡住」正是
+/// 「被隔墙推开」的指纹。`embed` 字段标出「圆心已经陷进墙里」——
+/// 那会让 `push_out_aabb` 走「点在盒内」分支,把玩家按 `radius + slack`
+/// 整个弹出去,是「有速度、无位移」的直接成因。
+/// 验收探针:单段隔墙 JSON 的键名骨架(数值用 `REPORT_TOKEN_*` 占位)。
+///
+/// §1.3c 要求 JSON 键名住在 `const.rs`,但 `format!` 只接受字符串**字面
+/// 量** —— 两者只能在这里会合:键名走常量、数值走 `replace` 填回去。
+/// 占位符全是 JSON 非法字符,保证填之前不可能是合法输出。
+pub const INTERIOR_REPORT_KEYS: &str =
+    "{\"d\":@D@,\"embed\":@E@,\"y\":[@Y0@,@Y1@],\"c\":[@CX@,@CZ@],\"h\":[@HX@,@HZ@]}";
+/// `INTERIOR_REPORT_KEYS` 里距离的占位符。
+pub const REPORT_TOKEN_D: &str = "@D@";
+/// `INTERIOR_REPORT_KEYS` 里「是否陷进墙里」的占位符。
+pub const REPORT_TOKEN_EMBED: &str = "@E@";
+/// `INTERIOR_REPORT_KEYS` 里墙脚高度的占位符。
+pub const REPORT_TOKEN_Y0: &str = "@Y0@";
+/// `INTERIOR_REPORT_KEYS` 里墙顶高度的占位符。
+pub const REPORT_TOKEN_Y1: &str = "@Y1@";
+/// `INTERIOR_REPORT_KEYS` 里墙中心 X 的占位符。
+pub const REPORT_TOKEN_CX: &str = "@CX@";
+/// `INTERIOR_REPORT_KEYS` 里墙中心 Z 的占位符。
+pub const REPORT_TOKEN_CZ: &str = "@CZ@";
+/// `INTERIOR_REPORT_KEYS` 里墙 X 半长的占位符。
+pub const REPORT_TOKEN_HX: &str = "@HX@";
+/// `INTERIOR_REPORT_KEYS` 里墙 Z 半长的占位符。
+pub const REPORT_TOKEN_HZ: &str = "@HZ@";
 // ===========================================================================
 // 实时光照增强:阴影 / SSAO / SSR / bloom
 //

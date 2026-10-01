@@ -1850,6 +1850,34 @@ pub struct Game {
     /// 批次表是**尾插**的,玩家骨架 / 车队 / 拾取物的批次在静态批次之后,
     /// 所以「静态段长度」就是把静态部分与动态部分分开的唯一依据。
     pub static_batch_count: usize,
+    /// 走完 `Player::step` 之后的玩家 XZ(验收探针用)。
+    ///
+    /// 「有速度、无位移」必须能分清是哪一层把人按住了:`Player::step`
+    /// 走 `resolve_slide`(静态),`resolve_dynamic_bodies` 之后还会
+    /// **无条件**把玩家 XZ 覆盖成分离结果。两者的输出都记下来,探针
+    /// 直接对比就知道是谁把位置钉住的 —— 只看最终坐标永远只能猜。
+    pub after_static_step: Vec2,
+    /// 走完 `resolve_dynamic_bodies` 之后的玩家 XZ(验收探针用)。
+    pub after_dynamic_step: Vec2,
+    /// 走完 `step_vertical` 之后的玩家 XZ(验收探针用)。
+    ///
+    /// `step_vertical` 名义上只管 Y,但它结尾是
+    /// `set_position([x, y, z])`,`x` / `z` 来自 `resolve_interior` ——
+    /// 于是它**会改写 XZ**。夹在静态层与动态层之间,不改写就看不到它。
+    pub after_vertical_step: Vec2,
+    /// 被静态几何挡住视线、因此**没有结算伤害**的敌人枪数(验收探针用)。
+    ///
+    /// 「隔墙掉血」的验收不能只看 `health` 没掉:掉血也可能是因为
+    /// 那一帧根本没有敌人开火。这个计数器区分「看得见但打偏」与
+    /// 「隔墙、这一枪被门控挡掉」,两者都需要在报告里出现。
+    pub shots_blocked_by_geometry: u32,
+    /// 走进 `step_vertical` **之前**玩家所在的 XZ(室内层要靠它还原位移)。
+    ///
+    /// `step_vertical` 需要知道「静态层这一帧把人推进了多远」,才能把
+    /// 切向分量从隔墙上滑过去而不是原路弹回。位置本身不含这个信息:
+    /// 拿不到上一帧位置就只能做纯分离,那正是「有速度、无位移」的
+    /// 成因。所以在 `Player::step` 之前先存一份。
+    pub previous_step_xz: Vec2,
     /// 输入状态。
     pub input: InputState,
     /// 渲染后端。
@@ -4811,6 +4839,97 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
         && screen_y >= 0.0
         && screen_y <= f64::from(canvas_h);
     let char_visible: bool = on_screen && screen_pct <= CHAR_VISIBLE_MAX_SCREEN_PCT;
+    // **把玩家附近最近的几个静态碰撞体报出来。**
+    //
+    // 「有速度、无位移」有两种完全不同的成因,只看 `playerInsideCollider`
+    // 分不开 —— 那个字段判的是「圆心落在盒内」,而撞墙时人站在**盒子
+    // 外面** 贴着面,仍然是 `false`。必须报最近表面的距离,以及沿
+    // 「本帧想走的方向」前方 1 m 处会被谁挡住。
+    //
+    // 这也是唯一能定位「路被哪根柱子堵了」的通道:光看 `collisionShapes`
+    // 的总数(1829)没有任何信息量。
+    //
+    // **以 `after_static_step` 为基准**,而不是最终位置:动态层会在静态
+    // 层之后再推一次,拿最终位置去问会得到「附近一个碰撞体都没有」这种
+    // 自相矛盾的结论(实测静态层停在 z=35.243、动态层把玩家顶到 35.550,
+    // 而 6 m 内报告为空 —— 因为查询点在墙的**另一边**)。
+    let near_shapes: String = {
+        let here: Vec2 = [game.after_static_step[0], game.after_static_step[1]];
+        let mut scored: Vec<(f32, String)> = game
+            .world
+            .get_shapes()
+            .iter()
+            .filter_map(|shape: &crate::r#collision::Shape| {
+                let distance: f32 = crate::r#collision::shape_distance(shape, here);
+                if distance > NEAR_SHAPE_REPORT_RADIUS {
+                    return None;
+                }
+                let text: String = match shape {
+                    crate::r#collision::Shape::Aabb { center, half } => format!(
+                        "AABB c=({:.2},{:.2}) half=({:.2},{:.2})",
+                        center[0], center[1], half[0], half[1]
+                    ),
+                    crate::r#collision::Shape::Circle { center, radius } => {
+                        format!("CIR c=({:.2},{:.2}) r={:.2}", center[0], center[1], radius)
+                    }
+                };
+                Some((distance, text))
+            })
+            .collect();
+        scored.sort_by(|a: &(f32, String), b: &(f32, String)| {
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let items: Vec<String> = scored
+            .iter()
+            .take(NEAR_SHAPE_REPORT_COUNT)
+            .map(|(distance, text): &(f32, String)| {
+                format!("{{\"d\":{distance:.3},\"shape\":\"{text}\"}}")
+            })
+            .collect();
+        format!("[{}]", items.join(JSON_COMMA))
+    };
+    // **每节骨骼实际写进了几个实例 + 它的平移分量。**
+    //
+    // 「角色不可见」只有三种成因,而这组字段正好把它们分开:
+    //
+    // - `n == 0` —— 实例表是空的(骨骼根本没被 `sync_dynamic_instances`
+    //   写,或者批次索引越界)。此时 `gpu_mesh_extent` 仍然是**正常**的
+    //   人形尺寸,所以「顶点数据看起来对」根本不能证明角色会被画出来。
+    // - `n > 0` 但平移不是玩家坐标 —— 模型矩阵写错了(例如 pivot 没跟着
+    //   角色走,人物被搬到原点或天上去)。
+    // - `n > 0` 且平移正确 —— 问题在渲染侧(批次被剔除 / 顶点缓冲没
+    //   传上去 / 深度把它挡了),要往 `render.rs` 看。
+    //
+    // 之前 `limbModel` 只导出**第一节**(torso)一个矩阵,证据力太弱。
+    let limb_state: String = {
+        let parts: Vec<String> = game
+            .player_batches
+            .iter()
+            .map(|limb: &PlayerLimbBatch| {
+                let count: usize = game
+                    .scene
+                    .batches
+                    .get(limb.batch)
+                    .map(|batch: &SceneBatch| batch.instances.len())
+                    .unwrap_or(0);
+                let translation: String = game
+                    .scene
+                    .batches
+                    .get(limb.batch)
+                    .and_then(|batch: &SceneBatch| batch.instances.first())
+                    .map(|instance: &Instance| {
+                        let m: Mat4Data = *instance.get_model_ref();
+                        format!("[{:.3},{:.3},{:.3}]", m[12], m[13], m[14])
+                    })
+                    .unwrap_or_else(|| String::from(JSON_NULL));
+                format!(
+                    "{{\"part\":\"{}\",\"batch\":{},\"n\":{count},\"t\":{translation}}}",
+                    limb.part, limb.batch
+                )
+            })
+            .collect();
+        format!("[{}]", parts.join(JSON_COMMA))
+    };
     // 每个骨架 part 的真实顶点包围盒:一旦某个盒子冒出几十米,就说明顶点
     // 数据真的被写坏了(而不是 GPU mesh 表错位)。见 `gpu_mesh_extent`。
     let limb_extents: String = {
@@ -4850,8 +4969,75 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
         .iter()
         .map(|car: &TrafficCar| f64::from(car.get_position()[2]))
         .collect();
+    // GPU 侧资产表与 `Scene::meshes` 的对照:两者必须**完全相等**。
+    // 不等就说明 `upload_mesh` 传多 / 传少了一次,之后所有
+    // `SceneBatch::mesh_index` 整体错位 —— 症状就是「批次有实例、
+    // 模型矩阵也对,画面上却什么都没有」,而 `draw_batch` 越界时是
+    // 静默 `return 0`,不报任何错。
+    let gpu_probe: String = match &game.renderer {
+        Some(Renderer::WebGl(webgl)) => format!(
+            "{{\"meshes\":{},\"oob\":{},\"lastIndexCount\":{}}}",
+            webgl.get_gpu_mesh_count(),
+            webgl.get_gpu_index_oob(),
+            webgl.get_gpu_index_count()
+        ),
+        Some(Renderer::Software(_)) => String::from(JSON_NULL),
+        None => String::from(JSON_NULL),
+    };
+    // **室内碰撞体(`FloorWorld`)。**
+    //
+    // `near_shapes` 查的是 `CollisionWorld`(静态 AABB / 圆),而**楼板与
+    // 隔墙住在另一个世界**:`FloorWorld`。两套几何**互不相交**,所以
+    // 「玩家被卡住、6 m 内一个静态碰撞体都没有」正是「被隔墙推开」的
+    // 指纹 —— 报告为空不是「附近没东西」,而是「推他的东西不住在这儿」。
+    //
+    // 只报 `Wall`(楼板不做横向分离,见 `resolve_interior`),并逐个
+    // 给出中心、半长与竖直区间,这样「谁把 0.307 m 推回去的」在
+    // JSON 里就能直接读出来,不用再猜。
+    let near_interiors: String = {
+        let here: Vec2 = [game.after_static_step[0], game.after_static_step[1]];
+        let body_min: f32 = game.player.get_position()[1];
+        let body_max: f32 = body_min + game.player.get_height();
+        let radius: f32 = game.world.get_player_radius();
+        let mut items: Vec<String> = Vec::new();
+        for floor in game.interiors.get_floors() {
+            let (min, max): (Vec3, Vec3) = match floor {
+                crate::interior::Floor::Slab { min, max } => continue,
+                crate::interior::Floor::Wall { min, max } => (*min, *max),
+            };
+            // 竖直区间不相交 → 这一段墙碰不到身体,不可能推人。
+            if max[1] <= body_min || min[1] >= body_max {
+                continue;
+            }
+            let center: Vec2 = [(min[0] + max[0]) * 0.5, (min[2] + max[2]) * 0.5];
+            let half: Vec2 = [(max[0] - min[0]) * 0.5, (max[2] - min[2]) * 0.5];
+            let distance: f32 = crate::r#collision::shape_distance(
+                &crate::r#collision::Shape::Aabb { center, half },
+                here,
+            );
+            if distance > NEAR_SHAPE_REPORT_RADIUS {
+                continue;
+            }
+            let embedded: bool = distance <= radius;
+            // §1.3c:JSON 键名必须住在 `const.rs`,而 `format!` 只接受
+            // 字符串**字面量** —— 两者只能在这里会合:键名用常量
+            // (`.replace` 无转义歧义),数值部分不带引号所以可以内联。
+            items.push(
+                String::from(INTERIOR_REPORT_KEYS)
+                    .replace(REPORT_TOKEN_D, &format!("{distance:.3}"))
+                    .replace(REPORT_TOKEN_EMBED, &format!("{embedded}"))
+                    .replace(REPORT_TOKEN_Y0, &format!("{:.2}", min[1]))
+                    .replace(REPORT_TOKEN_Y1, &format!("{:.2}", max[1]))
+                    .replace(REPORT_TOKEN_CX, &format!("{:.2}", center[0]))
+                    .replace(REPORT_TOKEN_CZ, &format!("{:.2}", center[1]))
+                    .replace(REPORT_TOKEN_HX, &format!("{:.2}", half[0]))
+                    .replace(REPORT_TOKEN_HZ, &format!("{:.2}", half[1])),
+            );
+        }
+        format!("[{}]", items.join(JSON_COMMA))
+    };
     let json: String = format!(
-        "{DEBUG_OPEN}\"charVisible\":{char_visible},\"charBoxHeightPct\":{painted},\"charBox\":{char_box},\"playerScreenX\":{screen_x},\"playerScreenY\":{screen_y},\"playerScreenPct\":{screen_pct},\"playerX\":{px},\"playerZ\":{pz},\"cameraDist\":{dist},\"camOccluded\":{occluded},\"camClearance\":{clearance},\"canvasWidth\":{canvas_w},\"canvasHeight\":{canvas_h},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"pickups\":{{\"total\":{pickup_total},\"taken\":{pickup_taken}}},\"frames\":{frames},\"limbExtents\":{limb_extents}{DEBUG_CLOSE}",
+        "{DEBUG_OPEN}\"charVisible\":{char_visible},\"charBoxHeightPct\":{painted},\"charBox\":{char_box},\"playerScreenX\":{screen_x},\"playerScreenY\":{screen_y},\"playerScreenPct\":{screen_pct},\"playerX\":{px},\"playerZ\":{pz},\"cameraDist\":{dist},\"camOccluded\":{occluded},\"camClearance\":{clearance},\"canvasWidth\":{canvas_w},\"canvasHeight\":{canvas_h},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"pickups\":{{\"total\":{pickup_total},\"taken\":{pickup_taken}}},\"frames\":{frames},\"sceneMeshes\":{scene_meshes},\"gpu\":{gpu_probe},\"afterStatic\":[{asx},{asz}],\"afterVertical\":[{avx},{avz}],\"afterDynamic\":[{adx},{adz}],\"nearShapes\":{near_shapes},\"nearInteriors\":{near_interiors},\"shotsBlocked\":{shots_blocked},\"limbState\":{limb_state},\"limbExtents\":{limb_extents}{DEBUG_CLOSE}",
         dist = game.camera.get_distance(),
         occluded = game.camera.get_occluded(),
         clearance = game.camera.get_eye_clearance(),
@@ -4869,6 +5055,14 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
         pickup_total = game.traffic.get_pickups_ref().len(),
         pickup_taken = game.player.collected_count(),
         frames = game.frame_count,
+        scene_meshes = game.scene.meshes.len(),
+        asx = game.after_static_step[0],
+        asz = game.after_static_step[1],
+        avx = game.after_vertical_step[0],
+        avz = game.after_vertical_step[1],
+        adx = game.after_dynamic_step[0],
+        adz = game.after_dynamic_step[1],
+        shots_blocked = game.shots_blocked_by_geometry,
     );
     json
 }
@@ -5480,11 +5674,26 @@ fn simulate(game: &mut Game, delta: f32) {
             let intent: Vec2 = [strafe_input, forward_input];
             let wanted: f32 = if running { RUN_SPEED } else { WALK_SPEED };
             let feet: Vec3 = game.player.get_position();
+            // 记下静态层动手**之前**的位置:`step_vertical` 要靠它算出
+            // 这一帧的位移,才能把切向分量沿隔墙滑过去。
+            game.previous_step_xz = [feet[0], feet[2]];
             let speed: f32 = soft_limit_speed(&game.world, [feet[0], feet[2]], wanted);
             game.player.step(intent, forward, dt, speed, &game.world);
+            // 静态层(`resolve_slide`)刚定下的位置:验收探针拿它和
+            // `after_dynamic_step` 对比,就知道是人被动态层按回去了,
+            // 还是静态层自己就没让他走。
+            let after_static: Vec3 = game.player.get_position();
+            game.after_static_step = [after_static[0], after_static[2]];
             // 垂直方向紧接着水平分离之后算:`Player::step` 刚刚定下
             // 了「这一帧人走到了哪」,现在才知道脚下是哪块板。
             step_vertical(game, dt);
+            // **`step_vertical` 内部会用 `resolve_interior` 的结果整体
+            // 覆盖 `set_position([x, y, z])`。** 也就是说它能**改写
+            // XZ** —— 而它跑在静态层之后、动态层之前,是「有速度、无位移」
+            // 的第三个嫌疑人,前两个探针都看不到它。`nearShapes` 查的是
+            // 静态碰撞世界,查不到隔墙。
+            let after_vertical: Vec3 = game.player.get_position();
+            game.after_vertical_step = [after_vertical[0], after_vertical[2]];
         }
     }
 
@@ -5502,6 +5711,10 @@ fn simulate(game: &mut Game, delta: f32) {
     // 各类实体跑完各自的静态碰撞后,统一过一次动态碰撞层 ——
     // 否则车穿车、人穿人、敌人站进人身体里。
     resolve_dynamic_bodies(game);
+    {
+        let after_dynamic: Vec3 = game.player.get_position();
+        game.after_dynamic_step = [after_dynamic[0], after_dynamic[2]];
+    }
     step_streamed_surface(game);
     update_camera(game, delta);
     // 注入的开火只持续一帧,到期后放开。
@@ -5631,9 +5844,24 @@ fn step_vertical(game: &mut Game, dt: f32) {
     // 站在街上时身体区间 y = 0..1.75 与楼板相交,但 `resolve_interior`
     // 对「脚底已经站到板面」和「板子在头顶」两种情况都直接跳过,所以
     // 不会在门外凭空出现一堵墙。
-    let pushed: Vec2 =
-        game.interiors
-            .resolve_interior([here[0], here[2]], body_min, body_max, radius);
+    //
+    // **必须把这一帧的位移一起传进去。** 纯分离只知道「现在在哪儿」,
+    // 不知道「想去哪儿」,于是玩家顶着隔墙走时,静态层刚推进来的那点
+    // 切向位移会被室内层连根拔掉,每帧净位移为零 —— 实测静态层走到
+    // `z = 35.243`、室内层弹回 `z = 35.550`,位置在极限环上抖动,
+    // 顶着墙几十帧推不动一毫米。`resolve_interior_slide` 走标准
+    // `move_and_slide`:法向扣掉、切向保留,玩家顺墙滑过去。
+    let travel: Vec2 = [
+        here[0] - game.previous_step_xz[0],
+        here[2] - game.previous_step_xz[1],
+    ];
+    let pushed: Vec2 = game.interiors.resolve_interior_slide(
+        [here[0], here[2]],
+        travel,
+        body_min,
+        body_max,
+        radius,
+    );
     let (x, z): (f32, f32) = (pushed[0], pushed[1]);
 
     // ---- 2. 支撑面:脚下那块板(含楼梯下一级)。
@@ -6021,6 +6249,35 @@ fn enemy_shot(game: &mut Game, index: usize) {
         shooter.mark_shot();
     }
     let player_at: Vec3 = game.player.get_position();
+    // **视线门控:敌人「看得见」才谈得上打中。**
+    //
+    // `decide` 层(`src/enemy.rs:76`)算过一次 `sees`,但那只用来决定
+    // AI 状态;**开火本身不继承它**。`enemy_shot` 拿到 `fired` 就直接
+    // 结算,于是警察隔着墙也能把子弹「打」到玩家身上 —— 玩家躲在
+    // 建筑另一侧,`hit_dot` 只要落在散布锥里就掉血。这就是用户报的
+    // 「隔墙掉血」。
+    //
+    // 门控必须落在**结算伤害之前**,而不是只依赖 `decide`:敌人与玩家
+    // 在同一帧里可能已经绕到了墙后(流式加载把新墙推入 `world`),而
+    // `decide` 的结果在这一帧之前就算好了。距离上限用
+    // `ENEMY_FIRE_RANGE` —— 超程的枪本来就打不着,不该结算。
+    //
+    // **两个世界都要查。** `has_line_of_sight` 只射线检测静态碰撞世界,
+    // 而样板楼的楼板与隔墙住在 `FloorWorld` 里,两套几何互不相交 ——
+    // 只查静态世界的话,射线会从整栋楼中间穿过去并报告「视线通畅」。
+    // 实测玩家停在楼里(`inSolid == true`)、19 m 外的警察持续开火,
+    // 90 帧掉 31.8 血,门控计数器全程为 0。`blocks_sight` 补上这一半。
+    let sight_y: f32 = from[1] + AIM_CHEST_HEIGHT;
+    if !has_line_of_sight(&game.world, from, player_at, ENEMY_FIRE_RANGE.max(1.0))
+        || game
+            .interiors
+            .blocks_sight([from[0], from[2]], [player_at[0], player_at[2]], sight_y)
+    {
+        // 记一笔,验收探针据此确认「这一枪是被视线挡掉的」而不是
+        // 别的分支提前 return 的。
+        game.shots_blocked_by_geometry += 1;
+        return;
+    }
     let center: Vec3 = [player_at[0], player_at[1] + AIM_CHEST_HEIGHT, player_at[2]];
     let spread: Vec2 = aim_with_spread(from, center, wander, shots);
     // 打偏:用散布方向与真实方向的夹角,超过阈值就没打中。
@@ -7541,6 +7798,11 @@ pub fn boot() {
         water_batch: 0,
         streamed_center: [SPAWN_POINT[0], SPAWN_POINT[2]],
         static_batch_count: 0,
+        after_static_step: [SPAWN_POINT[0], SPAWN_POINT[2]],
+        after_dynamic_step: [SPAWN_POINT[0], SPAWN_POINT[2]],
+        after_vertical_step: [SPAWN_POINT[0], SPAWN_POINT[2]],
+        shots_blocked_by_geometry: 0,
+        previous_step_xz: [SPAWN_POINT[0], SPAWN_POINT[2]],
         asset_index: HashMap::new(),
         hold_frames: 0,
         walk_request: [0.0, 0.0],
