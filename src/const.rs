@@ -377,6 +377,10 @@ pub const REPLACE_MESH_REPORT_LIMIT: usize = 4;
 pub const PEDESTRIAN_PERSONAL_SPACE: f32 = 0.18;
 
 /// 回归测试:界内玩家必须拿到满速(软边界不能误伤)。
+/// 流式世界没有边界:任何位置的速度上限都必须原样保留。
+pub const T_NO_SOFT_LIMIT: &str =
+    "流式世界不该限速:在 {at} 速度被削成 {got}";
+
 pub const T_SOFT_SPEED_INSIDE: &str = "界内玩家必须拿到满速,越界才减速";
 
 /// 回归测试:附近有伴时行人必须能开始聊天。

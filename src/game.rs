@@ -5903,34 +5903,30 @@ fn simulate(game: &mut Game, delta: f32) {
 ///
 /// - `f32` - 经软边界收缩后的速度上限(米/秒)。
 fn soft_limit_speed(world: &CollisionWorld, at: Vec2, speed: f32) -> f32 {
-    let limits: Vec2 = world.get_half_extent();
-    // 探针**两个分量都必须是 1.0**。`soft_limit` 是逐轴相乘的:
-    // `kept[i] = probe[i] * scale_i`,所以任何一个分量是 0,那个轴的
-    // `kept` 就是 0,再取 `min(kept[0], kept[1])` 当收缩系数就永远是 0
-    // —— 玩家在**界内**(两轴 scale 都是 1.0)也会被削成 0 速,推不动。
+    // **世界是流式无限的,这里没有边界,所以不减速。**
     //
-    // 这就是 p1 回归的根因:早先写的是 `[1.0, 0.0]`,于是
-    // `min(1.0, 0.0) = 0`,出生点 (33.5, 45) 明明离 150 m 的软边界还
-    // 差 100 多米,却一步都走不了(探针实测 `dbgSpeed=0`)。
-    let probe: Vec2 = [1.0, 1.0];
-    let kept: Vec2 = world.soft_limit(probe, at, limits, SOFT_LIMIT_SLACK);
-    // `soft_limit` 是逐轴收缩的,取两轴较小者当作整体收缩系数 ——
-    // 对角线越界时两个方向都得减速,取更严的那个不会漏。
-    let scale: f32 = kept[0].min(kept[1]).clamp(0.0, 1.0);
-    let limited: f32 = speed * scale;
-    if limited >= f32::EPSILON {
-        return limited;
-    }
-    // 速度被削到 0(越界超过一个余量)时给一个回推,保证玩家能被带回来
-    // 而不是永久卡死。回推速度随越界深度线性增长,封顶 `SOFT_LIMIT_PUSH_MAX`。
-    let push: Vec2 = world.soft_push(
-        at,
-        limits,
-        SOFT_LIMIT_SLACK,
-        SOFT_LIMIT_PUSH,
-        SOFT_LIMIT_PUSH_MAX,
-    );
-    push[0].abs().max(push[1].abs()).min(SOFT_LIMIT_PUSH_MAX)
+    // 早先这里按 `get_half_extent()`(= ±150 m)做软边界,越界就把速度上限
+    // 削到 0 再加一个回推。程序化世界本身根本没有边界,而流式地面
+    // (`step_streamed_surface`)会跟着玩家重新生成 —— 实测传到
+    // (1200, -800) 时流式中心已经跟到 (1200, -780),画面内容完整、
+    // 速度满值 |v| = 8.998。所以这个软边界是**凭空造出来的空气墙**。
+    //
+    // 实测后果:传送到 (1200, -800) 后**一个键都不按**,10 帧内玩家被
+    // 拖回 (-0.00, -0.80) —— 朝原点漂 0.80 m。玩家在 150 m 外走,会
+    // 被一只看不见的手持续往回拽,而且无论走多远都走不掉。
+    //
+    // 保留 `world` / `at` 两个参数是为了不动调用点;真正生效的是下面
+    // 这行:速度原样返回。
+    //
+    // 历史包袱留个记录:被删掉的实现按 `get_half_extent()`(±150 m)收缩
+    // 速度,越界再叠一个 `soft_push` 回推。它曾经有个更早的 bug ——
+    // 探针写成 `[1.0, 0.0]`,而 `soft_limit` 逐轴相乘,于是
+    // `min(1.0, 0.0) = 0`,出生点 (33.5, 45) 离边界还有 100 多米却
+    // 一步走不了。修好那个 bug 之后这个边界才真正开始生效,于是暴露出
+    // 它本身就不该存在:程序化世界没有边界,流式地面会跟着玩家重建。
+    // 参数保留是为了不动调用点;流式世界没有边界,速度原样返回。
+    let _ignored: (Vec2, Vec2) = (world.get_half_extent(), at);
+    speed
 }
 
 /// 玩家走出当前地面块时,把地面与水面重新生成到新中心。
@@ -8484,7 +8480,8 @@ mod tests {
 
     use super::{
         Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV, LOOK_YAW_SENSITIVITY, Mat4, SOFT_LIMIT_PUSH_MAX,
-        T_SOFT_SPEED_INSIDE, T_MOUSE_RIGHT_PANS_RIGHT, WORLD_HALF, apply_look_delta,
+        T_MOUSE_RIGHT_PANS_RIGHT, T_NO_SOFT_LIMIT, T_SOFT_SPEED_INSIDE, WORLD_HALF,
+        apply_look_delta,
         car_wheel_model, soft_limit_speed,
     };
     /// 一个世界点投影后的屏幕 NDC x(未做像素映射)。
@@ -9652,19 +9649,33 @@ mod tests {
         }
     }
 
-    /// 回归测试:越界之后速度必须**真的**被削,否则软边界形同虚设。
+    /// 流式世界**没有边界**:走多远都不许被减速,更不许被往回推。
+    ///
+    /// 这条取代了旧的「越界必须被削速」测试 —— 那条把一个不存在的
+    /// 边界当成了规格。实测它在 150 m 外生效的后果是:玩家**一个键都不按**
+    /// 也会被拖回原点(传送到 (1200, -800) 后 10 帧漂移 0.80 m),
+    /// 而流式地面早就跟着玩家重建好了(流式中心 (1200, -780))。
     #[test]
-    fn a_player_beyond_the_soft_boundary_is_slowed() {
+    fn a_player_far_outside_the_old_boundary_is_never_slowed() {
         let mut world: CollisionWorld = CollisionWorld::new();
         world.set_half_extent([WORLD_HALF, WORLD_HALF]);
-        let just_out: f32 = soft_limit_speed(&world, [WORLD_HALF + 1.0, 0.0], WALK_SPEED);
-        assert!(just_out < WALK_SPEED, "{}", T_SOFT_SPEED_INSIDE);
-        assert!(just_out > 0.0, "{}", T_SOFT_SPEED_INSIDE);
-        let far_out: f32 = soft_limit_speed(&world, [WORLD_HALF + 500.0, 0.0], WALK_SPEED);
-        assert!(
-            far_out <= SOFT_LIMIT_PUSH_MAX + 1.0e-4,
-            "{}",
-            T_SOFT_SPEED_INSIDE
-        );
+        // 旧边界之外、远得多的地方、以及四个对角,速度都必须原样保留。
+        for at in [
+            [WORLD_HALF + 1.0, 0.0],
+            [WORLD_HALF + 500.0, 0.0],
+            [0.0, WORLD_HALF + 900.0],
+            [1200.0, -800.0],
+            [-5000.0, 5000.0],
+        ] {
+            let got: f32 = soft_limit_speed(&world, at, WALK_SPEED);
+            assert!(
+                (got - WALK_SPEED).abs() < 1.0e-4,
+                "{}",
+                fill(
+                    T_NO_SOFT_LIMIT,
+                    &[("at", &format!("{at:?}")), ("got", &format!("{got:.4}"))]
+                )
+            );
+        }
     }
 }
