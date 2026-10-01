@@ -41,16 +41,21 @@ for g in $WANT; do
   pkill -9 -f "remote-debugging-port=${PORT}" 2>/dev/null
   sleep 2
   rm -rf "${SCRATCH}/serial"
+  # 注意:这里**不能**加 `--disable-gpu`。WebGPU 的 adapter 走的是
+  # 真实的 GPU 栈(实测 macOS 上拿到 `apple / metal-3`),而
+  # `--disable-gpu` 会让 `requestAdapter()` 直接返回 null —— 页面
+  # 上 `navigator.gpu` 还在,但一个 adapter 都没有。迁移到 euv 的
+  # WebGPU 之后,加了这个 flag 的探针会**全部**失败(而且失败原因
+  # 看起来像渲染层坏了,不是环境问题)。`--use-angle=swiftshader`
+  # 只影响 WebGL,不影响 WebGPU。
   nohup "$CHROME" \
-    # 注意:这里**不能**加 `--disable-gpu`。WebGPU 的 adapter 走的是
-    # 真实的 GPU 栈(实测 macOS 上拿到 `apple / metal-3`),而
-    # `--disable-gpu` 会让 `requestAdapter()` 直接返回 null —— 页面
-    # 上 `navigator.gpu` 还在,但一个 adapter 都没有。迁移到 euv 的
-    # WebGPU 之后,加了这个 flag 的探针会**全部**失败(而且失败原因
-    # 看起来像渲染层坏了,不是环境问题)。`--use-angle=swiftshader`
-    # 只影响 WebGL,不影响 WebGPU。
     --headless=new --no-sandbox \
     --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader \
+    --disable-features=Translate,BackForwardCache,CalculateNativeWinOcclusion \
+    --disable-component-update --disable-default-apps --disable-sync \
+    --no-first-run --no-default-browser-check --disable-extensions \
+    --metrics-recording-only --mute-audio --disable-breakpad \
+    --disable-background-networking \
     --remote-debugging-port="${PORT}" --remote-allow-origins='*' \
     --user-data-dir="${SCRATCH}/serial" \
     --hide-scrollbars --window-size=1280,800 \
