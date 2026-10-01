@@ -283,7 +283,25 @@ impl FloorWorld {
         // 往下走一级:再扫一遍整段,但允许落点比**这一帧起点**的脚底低
         // 至多一个踏高。基准必须是起点而不是抬升后的高度 —— 后者会让
         // 补查把同一帧里刚抬上去的那一级又退回来(实测长帧上楼卡在 2.895)。
-        if let Some(top) = self.step_down_along(from, to, from_y) {
+        //
+        // **但这一帧只要抬升过,补查就必须让位。** 一个冲刺帧长 1.1 m,
+        // 抬升阶段会顺着 6 个子步一级一级爬到 1.370;这时补查的下界是
+        // 「帧起点 0.455 往下 0.355 = 0.100」,而**首层地板 0.150 正好落在
+        // 这个窗口里** —— 楼梯底端那一段扫掠必然会采到它。于是补查把刚爬
+        // 上去的 1.370 覆盖回 0.150,人钉死在首层,冲出梯顶再从楼梯井掉
+        // 回地面(实测 peak_y=0.455、end_x 一路飞到 -6)。
+        //
+        // 关键在于**扫掠窗口和实际走过的段落不同**:抬升只看「不低于脚底」的
+        // 那一格,补查却扫**整帧**并允许比帧起点低一个踏高。帧越长,补查
+        // 越可能扫到低处那块铺满全场的首层地板;帧短的时候(步行 0.31 m)
+        // 扫不到,于是缺陷只在使用冲刺时暴露。
+        //
+        // 语义上也说得通:「这一帧踩着更高的一级」与「这一帧往下一级」是
+        // 互斥的,一帧之内两者不可能同时成立。因此抬升生效时直接返回,
+        // 下楼的那一帧(抬升不生效)照旧补查。
+        if y <= from_y + SUPPORT_CATCH_EPSILON
+            && let Some(top) = self.step_down_along(from, to, from_y)
+        {
             y = top;
             best = Some(top);
         }
@@ -732,11 +750,12 @@ mod tests {
         T_INTERIOR_DT_TOKEN, T_INTERIOR_HEIGHT_TOKEN, T_INTERIOR_LONG_FRAME_HEIGHT,
         T_INTERIOR_LONG_FRAME_LADDER, T_INTERIOR_NO_DOWNWARD_SNAP, T_INTERIOR_NO_SLAB_UNDER,
         T_INTERIOR_NORMAL_FRAME_DESCENT, T_INTERIOR_NORMAL_FRAME_UNCHANGED, T_INTERIOR_PEAK_TOKEN,
+        T_INTERIOR_SPRINT_BASELINE_FAILS, T_INTERIOR_SPRINT_FRAME_CLIMBS, T_INTERIOR_SPRINT_NO_OP,
         T_INTERIOR_STAIR_CLIMBS, T_INTERIOR_STAIR_MONOTONIC, T_INTERIOR_STAIR_PAIR,
         T_INTERIOR_STRIDE_TOKEN, T_INTERIOR_UPPER_FLOOR_ABOVE, T_INTERIOR_WALL_BLOCKS,
         T_INTERIOR_WALL_PASSES,
     };
-    use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
+    use crate::interior::{FloorWorld, STEP_UP_TOLERANCE, SUPPORT_SUBSTEP_DISTANCE};
     use crate::r#type::Vec2;
 
     const STAIR_RISE: f32 = 0.305;
@@ -799,6 +818,40 @@ mod tests {
         fill(
             T_INTERIOR_BASELINE_STILL_FAILS,
             &[(T_INTERIOR_HEIGHT_TOKEN, &format!("{height:.3}"))],
+        )
+    }
+
+    fn sprint_frame_message(stride: f32, height: f32) -> String {
+        let stride_token: &str = T_INTERIOR_STRIDE_TOKEN;
+        fill(
+            T_INTERIOR_SPRINT_FRAME_CLIMBS,
+            &[
+                (stride_token, &format!("{stride:.3}")),
+                (T_INTERIOR_HEIGHT_TOKEN, &format!("{height:.3}")),
+            ],
+        )
+    }
+
+    fn sprint_baseline_message(stride: f32, height: f32) -> String {
+        let stride_token: &str = T_INTERIOR_STRIDE_TOKEN;
+        fill(
+            T_INTERIOR_SPRINT_BASELINE_FAILS,
+            &[
+                (stride_token, &format!("{stride:.3}")),
+                (T_INTERIOR_HEIGHT_TOKEN, &format!("{height:.3}")),
+            ],
+        )
+    }
+
+    fn no_op_message(stride: f32, new: f32, old: f32) -> String {
+        let stride_token: &str = T_INTERIOR_STRIDE_TOKEN;
+        fill(
+            T_INTERIOR_SPRINT_NO_OP,
+            &[
+                (stride_token, &format!("{stride:.3}")),
+                (T_INTERIOR_PEAK_TOKEN, &format!("{new:.3}")),
+                (T_INTERIOR_BASELINE_TOKEN, &format!("{old:.3}")),
+            ],
         )
     }
 
@@ -907,6 +960,39 @@ mod tests {
 
     fn height_at(w: &FloorWorld, x: f32, z: f32, from_y: f32) -> Option<f32> {
         w.support_height([x, z], from_y)
+    }
+
+    /// **首层地板铺到梯脚之外**的楼梯世界(沿 -x 上行,与真实样板楼一致)。
+    ///
+    /// 之所以要另建一个夹具,是因为 [`slab_world`] 的地板和踏面**在 X 上
+    /// 完全重叠**(地板到 5.75,踏面 4.45..5.75),于是「首层地板」永远不
+    /// 可能是任何一点的最高支撑,补查扫不到它 —— 缺陷在那个夹具上根本不
+    /// 成立。真实的楼(从 wasm 里 dump 出来的实测值)是:
+    ///
+    /// ```text
+    /// 首层地板  x[18.250, 27.750]  y 顶面 0.150
+    /// 第 1 级   x[27.100, 27.550]  y 顶面 0.455
+    /// 第 2 级   x[26.650, 27.100]  y 顶面 0.760
+    /// ...                              0.45 一级,往 -x 一路升到 3.200
+    /// 二层楼板  x[18.250, 27.750]  y 顶面 3.200
+    /// ```
+    ///
+    /// 关键差异:**地板比第一级踏面还往 +x 延伸 0.20 m**,而第一级踏面
+    /// 只在 `x ≥ 27.10` 才开始。所以楼梯底端那一小段(27.55 → 27.10)同时
+    /// 压在首层地板和第一级踏面上 —— 冲刺帧的整段补查必然采到地板 0.150,
+    /// 把刚抬升上去的高度覆盖掉。这条重叠是缺陷成立的前提。
+    fn overhanging_ground_world() -> FloorWorld {
+        let mut w: FloorWorld = FloorWorld::new();
+        // 地板往 +x 一直铺到 27.75,比第一级踏面(27.55)多 0.20。
+        w.push_slab([-5.75, 0.0, -0.65], [27.75, GROUND_TOP, 0.65]);
+        for i in 0..STAIR_STEPS {
+            let x1: f32 = 27.55 - i as f32 * STAIR_RUN;
+            let top: f32 = GROUND_TOP + (i + 1) as f32 * STAIR_RISE;
+            w.push_slab([x1 - STAIR_RUN, GROUND_TOP, -0.65], [x1, top, 0.65]);
+        }
+        // 梯顶一侧的二层楼板:与最后一级齐平。
+        w.push_slab([-5.75, UPPER_BOT, -0.65], [27.75, UPPER_TOP, 0.65]);
+        w
     }
 
     fn step_along_stair(w: &FloorWorld) -> Vec<f32> {
@@ -1137,6 +1223,133 @@ mod tests {
         }
         // 必须真的降到首层,而不是被按在原高度。
         assert!(y <= GROUND_TOP + STAIR_RISE, "{}", descent_message(y));
+    }
+
+    /// 冲刺帧必须同样爬得上 —— 「下楼补查把刚抬上去的高度覆盖掉」的回归。
+    ///
+    /// **实测缺陷(CDP,软件渲染,冲刺 8.4 m/s + dt 钳到 `FIXED_DT * 4`):**
+    /// 步行每帧 0.307 m,冲刺每帧 **1.13 m**。长帧下抬升阶段顺着子步爬到
+    /// 1.370 是对的,坏就坏在**下楼补查**:它的下界取「帧起点脚底低一个踏高」
+    /// (`0.455 - 0.355 = 0.100`),而首层地板顶面 0.150 正好落在窗口内,楼梯
+    /// 底端那一段扫掠必然采到它。于是 1.370 被覆盖回 0.150,人钉死在首层,
+    /// 冲出梯顶再掉回地面 —— 实测 `peak_y = 0.455`、`end_x` 一路飞到 -6。
+    ///
+    /// **为什么步行不受影响:** 0.307 m 的帧短到扫不到首层地板那块 XZ,
+    /// 补查返回 `None`,缺陷只在帧长跨过整段梯脚时才暴露。所以这条必须用
+    /// 冲刺步长测,拿行走的步长测永远是绿的。
+    ///
+    /// 用 [`overhanging_ground_world`] 而不是 [`slab_world`]:缺陷成立的
+    /// 前提是「首层地板比第一级踏面还往梯脚方向多铺一截」,`slab_world`
+    /// 的地板与踏面在 X 上完全重叠,复现不出来。
+    #[test]
+    fn a_sprinting_frame_still_reaches_the_top() {
+        let w: FloorWorld = overhanging_ground_world();
+        // 冲刺实测步长:8.4 m/s × dt 0.0667 s(软件渲染 + dt 钳位)。
+        let stride: f32 = 1.1269;
+        let mut x: f32 = 27.3;
+        let mut y: f32 = GROUND_TOP + STAIR_RISE;
+        let mut heights: Vec<f32> = vec![y];
+        for _ in 0..24 {
+            let from: Vec2 = [x, 0.0];
+            x -= stride;
+            let to: Vec2 = [x, 0.0];
+            let (_, stepped): (Option<f32>, f32) = w.support_along_frame(from, to, y);
+            y = stepped;
+            heights.push(y);
+        }
+        let peak: f32 = heights.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            (peak - UPPER_TOP).abs() < 1e-3,
+            "{}",
+            sprint_frame_message(stride, peak)
+        );
+    }
+
+    /// 修复前那一版(下楼补查无条件覆盖)在这个步长下确实爬不上去 ——
+    /// 没有这一条,「新实现爬上去了」就分不清是修好了还是本来就能爬。
+    ///
+    /// **必须用「首层地板铺到梯脚之外」的世界,不能用 [`slab_world`]。**
+    /// 后者的地板只到 `x = 5.75`,而踏面正好占 `x ∈ [4.45, 5.75]`,两者
+    /// 重叠 —— 补查在踏面下面永远采不到首层地板,缺陷在那个夹具上根本
+    /// 复现不出来。真实的楼里首层地板铺满全场(到 `x = 27.75`),第一级踏面
+    /// 才开始(27.10),楼梯底端那一段**同时压在两块板上**,这才是缺陷成立
+    /// 的前提。
+    #[test]
+    fn the_step_down_pass_alone_kills_a_sprinting_frame() {
+        let w: FloorWorld = overhanging_ground_world();
+        // 冲刺实测步长:8.4 m/s × dt 0.0667 s(软件渲染 + dt 钳位)。
+        let stride: f32 = 1.1269;
+        let mut x: f32 = 27.3;
+        let mut y: f32 = GROUND_TOP + STAIR_RISE;
+        for _ in 0..24 {
+            let from: Vec2 = [x, 0.0];
+            x -= stride;
+            let to: Vec2 = [x, 0.0];
+            // 旧行为:先逐级抬升,再让整帧下楼补查无条件覆盖。
+            let mut raised: f32 = y;
+            let substeps: usize =
+                ((stride / SUPPORT_SUBSTEP_DISTANCE).ceil() as usize).max(1);
+            let mut cursor: Vec2 = from;
+            for index in 0..substeps {
+                let t: f32 = (index + 1) as f32 / substeps as f32;
+                let probe: Vec2 = [from[0] + (to[0] - from[0]) * t, 0.0];
+                if let Some(top) = w.support_height_along(cursor, probe, raised) {
+                    raised = top;
+                }
+                cursor = probe;
+            }
+            y = w.step_down_along(from, to, y).unwrap_or(raised);
+        }
+        assert!(
+            y < UPPER_TOP - 1.0,
+            "{}",
+            sprint_baseline_message(stride, y)
+        );
+    }
+
+    /// 60 fps 下新实现与「补查照旧」的实现必须逐帧一致。
+    ///
+    /// 修复只在「这一帧抬升过」时跳过补查,而 60 fps 步行每帧只走
+    /// 0.077 m(远小于一个子步 0.225 m),**抬升永远不生效**,所以补查照旧
+    /// 执行 —— 新路径必须与修复前逐帧相同。软件渲染下每帧 0.6 m,
+    /// 观察不到这个差异,只能靠单测钉住。
+    #[test]
+    fn the_sprint_fix_is_a_no_op_at_sixty_fps() {
+        let w: FloorWorld = slab_world();
+        let stride: f32 = WALK_SPEED_60 / 60.0;
+        for (from, to, y0) in [
+            ([5.1f32, -4.55f32 + 0.5 * STAIR_RUN], 0.0f32, GROUND_TOP),
+            ([5.1, -4.55 + 8.0 * STAIR_RUN], 0.0, GROUND_TOP + 9.0 * STAIR_RISE),
+        ] {
+            let from: Vec2 = [from[0], from[1] + to];
+            let mut new_y: f32 = y0;
+            let mut old_y: f32 = y0;
+            for _ in 0..STAIRS_FRAME_BUDGET {
+                let a: Vec2 = from;
+                let b: Vec2 = [from[0], from[1] + stride];
+                let (_, stepped) = w.support_along_frame(a, b, new_y);
+                new_y = stepped;
+                // 旧实现:同样的抬升,补查无条件执行。
+                let mut raised: f32 = old_y;
+                let substeps: usize =
+                    ((stride / SUPPORT_SUBSTEP_DISTANCE).ceil() as usize).max(1);
+                let mut cursor: Vec2 = a;
+                for index in 0..substeps {
+                    let t: f32 = (index + 1) as f32 / substeps as f32;
+                    let probe: Vec2 = [a[0], a[1] + (b[1] - a[1]) * t];
+                    if let Some(top) = w.support_height_along(cursor, probe, raised) {
+                        raised = top;
+                    }
+                    cursor = probe;
+                }
+                old_y = w.step_down_along(a, b, old_y).unwrap_or(raised);
+            }
+            assert!(
+                (new_y - old_y).abs() < 1e-6,
+                "{}",
+                no_op_message(stride, new_y, old_y)
+            );
+        }
     }
 
     /// 旧实现在**大 dt** 下确实爬不上去 —— 没有这一条,上面三条的「新实现

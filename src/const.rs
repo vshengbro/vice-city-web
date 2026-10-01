@@ -2033,5 +2033,20 @@ pub const T_INTERIOR_DT_TOKEN: &str = "{dt:.4}";
 /// 断言模板里「每帧水平位移」的占位符。
 pub const T_INTERIOR_STRIDE_TOKEN: &str = "{stride:.3}";
 
+/// 冲刺帧(每帧位移跨过两级以上)必须同样爬到顶 —— 实测 peak_y 只有 0.455、
+/// 人被钉回首层地板然后冲出梯顶的那条回归。
+pub const T_INTERIOR_SPRINT_FRAME_CLIMBS: &str =
+    "冲刺帧(每帧 {stride:.3} m)必须同样爬到二层楼板面,实得峰值 {height}";
+
+/// 修复前那一版(下楼补查无条件覆盖)在冲刺步长下必须仍爬不上去,否则上面
+/// 那条回归测试证明不了任何东西。
+pub const T_INTERIOR_SPRINT_BASELINE_FAILS: &str =
+    "补查无条件覆盖的基线在冲刺步长({stride:.3} m)下必须爬不上楼(否则回归测试无效),实得 {height}";
+
+/// 冲刺帧的修复不得改坏 60 fps:每帧只走 0.077 m,抬升不生效,两条路径必须
+/// 逐帧给出同一个高度。
+pub const T_INTERIOR_SPRINT_NO_OP: &str =
+    "60 fps 下新实现与「补查照旧」必须逐帧一致,每帧 {stride:.3} m 时新 {new} vs 旧 {old}";
+
 /// 验收通道:传送 / 走位 / 加速 / 探针请求挂在这个 window 属性上。
 pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";
