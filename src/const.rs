@@ -363,6 +363,9 @@ pub const REPLACE_MESH_REPORT_LIMIT: usize = 4;
 /// 两个人形实体并排时额外的「个人空间」(米)。人不会贴着走。
 pub const PEDESTRIAN_PERSONAL_SPACE: f32 = 0.18;
 
+/// 回归测试:界内玩家必须拿到满速(软边界不能误伤)。
+pub const T_SOFT_SPEED_INSIDE: &str = "界内玩家必须拿到满速,越界才减速";
+
 /// 回归测试:附近有伴时行人必须能开始聊天。
 pub const T_PEDS_GATHER_AND_TALK: &str = "附近有伴时行人必须能开始聊天";
 

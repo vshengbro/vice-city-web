@@ -5520,7 +5520,15 @@ fn simulate(game: &mut Game, delta: f32) {
 /// - `f32` - 经软边界收缩后的速度上限(米/秒)。
 fn soft_limit_speed(world: &CollisionWorld, at: Vec2, speed: f32) -> f32 {
     let limits: Vec2 = world.get_half_extent();
-    let probe: Vec2 = [1.0, 0.0];
+    // 探针**两个分量都必须是 1.0**。`soft_limit` 是逐轴相乘的:
+    // `kept[i] = probe[i] * scale_i`,所以任何一个分量是 0,那个轴的
+    // `kept` 就是 0,再取 `min(kept[0], kept[1])` 当收缩系数就永远是 0
+    // —— 玩家在**界内**(两轴 scale 都是 1.0)也会被削成 0 速,推不动。
+    //
+    // 这就是 p1 回归的根因:早先写的是 `[1.0, 0.0]`,于是
+    // `min(1.0, 0.0) = 0`,出生点 (33.5, 45) 明明离 150 m 的软边界还
+    // 差 100 多米,却一步都走不了(探针实测 `dbgSpeed=0`)。
+    let probe: Vec2 = [1.0, 1.0];
     let kept: Vec2 = world.soft_limit(probe, at, limits, SOFT_LIMIT_SLACK);
     // `soft_limit` 是逐轴收缩的,取两轴较小者当作整体收缩系数 ——
     // 对角线越界时两个方向都得减速,取更严的那个不会漏。
@@ -8041,7 +8049,9 @@ pub fn app_root() -> VirtualNode {
 mod tests {
     use std::collections::HashMap;
 
-    use super::car_wheel_model;
+    use super::{
+        SOFT_LIMIT_PUSH_MAX, T_SOFT_SPEED_INSIDE, WORLD_HALF, car_wheel_model, soft_limit_speed,
+    };
     use crate::collision::CollisionWorld;
     use crate::combat::Pedestrian;
     use crate::r#const::{
@@ -9053,5 +9063,44 @@ mod tests {
             let gap: f32 = (pair[1] - pair[0]).abs();
             assert!(gap > 1.0e-3, "{}: slots={slots:?}", T_PEDS_DISTINCT_SLOTS);
         }
+    }
+
+    /// 回归测试:界内玩家**必须**拿到满速。
+    ///
+    /// 这条是被 p1 探针抓出来的真回归:软边界的收缩系数是用一个「单位
+    /// 探针」跑 `soft_limit` 再取两轴 `min` 得到的,而探针当时写成
+    /// `[1.0, 0.0]` —— `soft_limit` 逐轴相乘,Z 轴乘 0 得 0,
+    /// `min(1.0, 0.0) = 0`,于是**界内**玩家也被削成 0 速,一步都走不了
+    /// (p1 报 `moved 0.0 m`,p4 因为走不动同样失败)。
+    #[test]
+    fn a_player_inside_the_soft_boundary_keeps_full_speed() {
+        let mut world: CollisionWorld = CollisionWorld::new();
+        world.set_half_extent([WORLD_HALF, WORLD_HALF]);
+        for at in [
+            [33.5, 45.0],
+            [0.0, 0.0],
+            [-100.0, 40.0],
+            [0.0, -149.0],
+            [149.0, 0.0],
+        ] {
+            let got: f32 = soft_limit_speed(&world, at, WALK_SPEED);
+            assert!(got >= WALK_SPEED - 1.0e-4, "{}", T_SOFT_SPEED_INSIDE);
+        }
+    }
+
+    /// 回归测试:越界之后速度必须**真的**被削,否则软边界形同虚设。
+    #[test]
+    fn a_player_beyond_the_soft_boundary_is_slowed() {
+        let mut world: CollisionWorld = CollisionWorld::new();
+        world.set_half_extent([WORLD_HALF, WORLD_HALF]);
+        let just_out: f32 = soft_limit_speed(&world, [WORLD_HALF + 1.0, 0.0], WALK_SPEED);
+        assert!(just_out < WALK_SPEED, "{}", T_SOFT_SPEED_INSIDE);
+        assert!(just_out > 0.0, "{}", T_SOFT_SPEED_INSIDE);
+        let far_out: f32 = soft_limit_speed(&world, [WORLD_HALF + 500.0, 0.0], WALK_SPEED);
+        assert!(
+            far_out <= SOFT_LIMIT_PUSH_MAX + 1.0e-4,
+            "{}",
+            T_SOFT_SPEED_INSIDE
+        );
     }
 }
