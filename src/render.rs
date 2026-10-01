@@ -673,7 +673,7 @@ pub fn tonemap(value: Vec3, exposure: f32, white: f32) -> Vec3 {
 
 /// 两个后端共用的平面着色公式。
 ///
-/// ```
+/// ```text
 /// base    = albedo * tint
 /// hemi    = mix(ground_ambient, sky_ambient, n.y * 0.5 + 0.5)
 /// ambient = mix(ambient, hemi, ambient_hemi)
@@ -1599,7 +1599,7 @@ void main() {
 /// 任何一侧偏离,WebGL 与 Canvas2D 回退就会画出两种颜色。
 ///
 /// 完整的「光追视觉」近似链:
-/// ```
+/// ```text
 /// shadow = pcf_shadow(world)                         // 阴影贴图
 /// ao     = texture(u_ao_map, screen_uv)              // SSAO
 /// hemi   = mix(ground_ambient, sky_ambient, n.y)     // 半球环境光
