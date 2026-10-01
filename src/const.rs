@@ -306,6 +306,15 @@ pub const CANVAS2D_UNAVAILABLE: &str = "Canvas2D unavailable";
 
 pub const CREATE_BUFFER_FAILED: &str = "create_buffer failed";
 
+/// `replace_mesh` 的下标越界错误前缀(见 `WebGlRenderer::replace_mesh`)。
+pub const REPLACE_MESH_OUT_OF_RANGE: &str = "replace_mesh index out of range";
+
+/// 流式重建后 GPU 网格重传失败时记的日志前缀。
+pub const LOG_REPLACE_MESH_FAILED: &str = "[vcw] replace_mesh FAILED for mesh";
+
+/// 单次流式重建最多打印几条重传失败。
+pub const REPLACE_MESH_REPORT_LIMIT: usize = 4;
+
 pub const EXPECT_FALLBACK_BLOCK: &str = "fallback block must be valid";
 
 pub const LOG_ALL_ASSETS_FAILED: &str =

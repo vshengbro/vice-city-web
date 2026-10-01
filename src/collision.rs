@@ -199,11 +199,7 @@ impl CollisionWorld {
                 break;
             }
         }
-        let limits: Vec2 = self.get_half_extent();
-        [
-            current[0].clamp(-limits[0], limits[0]),
-            current[1].clamp(-limits[1], limits[1]),
-        ]
+        current
     }
 
     /// 圆 vs 静态形状的**滑动**分离:沿墙保留切向位移。
@@ -232,7 +228,6 @@ impl CollisionWorld {
     ///
     /// - `Vec2` - 本帧实际走到的世界 XZ 坐标(已钳进世界边界)。
     pub fn resolve_slide(&self, here: Vec2, delta: Vec2, radius: f32) -> Vec2 {
-        let limits: Vec2 = self.get_half_extent();
         // 逐段推进:把这一帧想走的位移切成若干小步,每步都从**上一步的
         // 合法位置**出发做分离。
         //
@@ -247,7 +242,7 @@ impl CollisionWorld {
         // 1/60 s),也就是 1~2 步,开销可以忽略。
         let want_len: f32 = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
         if want_len <= SLIDE_EPSILON {
-            return self.clamp_to_world(here, limits);
+            return here;
         }
         let steps: usize = (want_len / SLIDE_STEP).ceil().max(1.0) as usize;
         let step: Vec2 = [delta[0] / steps as f32, delta[1] / steps as f32];
@@ -275,7 +270,7 @@ impl CollisionWorld {
             current = self.slide_step(current, step, resolved, radius);
             break;
         }
-        self.clamp_to_world(current, limits)
+        current
     }
 
     /// 被挡住时的切向滑动:从 `before` 出发,沿 `want` 的切向分量走。
@@ -350,21 +345,72 @@ impl CollisionWorld {
         })
     }
 
-    /// 把坐标钳进世界边界。
+    /// 把速度按**软边界**削一刀:越界越多,允许的速度越小。
+    ///
+    /// 旧实现是 `point.clamp(-half, half)` —— 一个**硬钳制**。在城市是
+    /// 程序化无限生成的前提下,硬钳制就是用户报的「地图非无限大,触碰空气
+    /// 墙无法前进」:走到 150 m 处坐标被死死钉住,几十帧推不动一毫米。
+    ///
+    /// 软边界的语义是「**你最多只能领先已生成世界这么远**」,不是「世界到
+    /// 这儿为止」:
+    ///
+    /// - `radius + slack` 以内 —— 完全不干预(绝大多数时候都在这里);
+    /// - 超出部分按 `excess / slack` 线性收缩速度上限,越界越深跑越慢;
+    /// - 超出 `2 × slack` 时速度上限为 0 —— 玩家**到不了**那里,自然
+    ///   被限制在「已生成世界 + 一圈缓冲」里,不会掉进虚空。
+    ///
+    /// 它不做位置钳制,所以永远不可能把玩家「传送」回某个点:推力只改变
+    /// 速度,玩家的位置始终是他自己走出来的。
     ///
     /// # Arguments
     ///
-    /// - `Vec2` - 世界 XZ 坐标。
-    /// - `Vec2` - 世界半边长。
+    /// - `Vec2` - 待削的速度(世界 XZ,米/秒)。
+    /// - `Vec2` - 当前所在位置(世界 XZ,米)。
+    /// - `Vec2` - 世界软边界半径(X / Z 各一半,米)。
+    /// - `f32` - 允许越界的余量(米)。
     ///
     /// # Returns
     ///
-    /// - `Vec2` - 钳进边界后的世界 XZ 坐标。
-    fn clamp_to_world(&self, point: Vec2, limits: Vec2) -> Vec2 {
-        [
-            point[0].clamp(-limits[0], limits[0]),
-            point[1].clamp(-limits[1], limits[1]),
-        ]
+    /// - `Vec2` - 收缩后的速度。
+    pub fn soft_limit(&self, velocity: Vec2, at: Vec2, limits: Vec2, slack: f32) -> Vec2 {
+        // 收缩从**软边界本身**(`limits`)开始,不是从 `limits + slack`:
+        // 一旦越过 `limits`,速度就在一个余量的距离内从满速线性降到 0。
+        // 两个轴各自收缩 —— 沿对角线越界时两个方向都要减速,只削一个轴
+        // 会让玩家斜着「蹭」出边界。
+        let over_x: f32 = ((at[0].abs() - limits[0]) / slack).clamp(0.0, 1.0);
+        let over_z: f32 = ((at[1].abs() - limits[1]) / slack).clamp(0.0, 1.0);
+        let scale_x: f32 = 1.0 - over_x;
+        let scale_z: f32 = 1.0 - over_z;
+        [velocity[0] * scale_x, velocity[1] * scale_z]
+    }
+
+    /// 软边界产生的回推速度(米/秒),方向指向世界中心。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 当前所在位置(世界 XZ,米)。
+    /// - `Vec2` - 世界软边界半径(X / Z 各一半,米)。
+    /// - `f32` - 允许越界的余量(米)。
+    /// - `f32` - 回推增益(1/秒)。
+    /// - `f32` - 回推速度上限(米/秒)。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 回推速度;完全在界内时为零向量。
+    pub fn soft_push(&self, at: Vec2, limits: Vec2, slack: f32, gain: f32, max_push: f32) -> Vec2 {
+        let over_x: f32 = at[0].abs() - (limits[0] + slack);
+        let over_z: f32 = at[1].abs() - (limits[1] + slack);
+        if over_x <= 0.0 && over_z <= 0.0 {
+            return [0.0, 0.0];
+        }
+        let mut push: Vec2 = [0.0, 0.0];
+        if over_x > 0.0 {
+            push[0] = -at[0].signum() * (over_x * gain).min(max_push);
+        }
+        if over_z > 0.0 {
+            push[1] = -at[1].signum() * (over_z * gain).min(max_push);
+        }
+        push
     }
 
     /// 用车辆半径做分离(玩家开车时的碰撞体更大)。
@@ -402,11 +448,7 @@ impl CollisionWorld {
                 break;
             }
         }
-        let limits: Vec2 = self.get_half_extent();
-        [
-            current[0].clamp(-limits[0], limits[0]),
-            current[1].clamp(-limits[1], limits[1]),
-        ]
+        current
     }
 
     /// 用车辆半径做分离 —— [`Self::resolve_with_radius`] 的固定版本。
@@ -854,5 +896,103 @@ mod tests {
                 at[0]
             );
         }
+    }
+
+    /// 软边界在界内时必须**完全**不干预 —— 否则玩家在正常街区里就
+    /// 会被减速。
+    #[test]
+    fn soft_limit_does_not_touch_anyone_inside_the_boundary() {
+        let world: CollisionWorld = CollisionWorld::new();
+        let velocity: Vec2 = [4.6, -3.2];
+        let limits: Vec2 = world.get_half_extent();
+        for at in [[0.0, 0.0], [10.0, -20.0], [limits[0], limits[1]]] as [Vec2; 3] {
+            let kept: Vec2 = world.soft_limit(velocity, at, limits, 24.0);
+            assert!(
+                (kept[0] - velocity[0]).abs() < 1.0e-6 && (kept[1] - velocity[1]).abs() < 1.0e-6,
+                "界内位置 {at:?} 的速度被削成 {kept:?},应保持 {velocity:?}"
+            );
+        }
+    }
+
+    /// 越界时速度必须按比例收缩 —— 这是「软」的核心:不是墙,是减速带。
+    #[test]
+    fn soft_limit_shrinks_speed_more_the_further_out_you_go() {
+        let world: CollisionWorld = CollisionWorld::new();
+        let limits: Vec2 = world.get_half_extent();
+        let slack: f32 = 24.0;
+        // 探针只带 **Z** 分量:越界是沿 Z 发生的,X 轴不该被削。
+        let probe: Vec2 = [0.0, 1.0];
+        let inside: Vec2 = world.soft_limit(probe, [0.0, 0.0], limits, slack);
+        let edge: f32 = limits[1];
+        // 刚好越过软边界一点点 / 越过一半余量 / 越过一个完整余量。
+        let middle: Vec2 = world.soft_limit(probe, [0.0, edge + 1.0], limits, slack);
+        let deep: Vec2 = world.soft_limit(probe, [0.0, edge + slack * 0.5], limits, slack);
+        let far: Vec2 = world.soft_limit(probe, [0.0, edge + slack], limits, slack);
+        assert!((inside[1] - 1.0).abs() < 1.0e-6, "界内不该被削");
+        assert!(
+            (middle[0] - probe[0]).abs() < 1.0e-6,
+            "沿 Z 越界不该削 X 分量,得到 {middle:?}"
+        );
+        assert!(middle[1] < inside[1], "刚越界就该开始减速");
+        assert!(deep[1] < middle[1], "越深越慢");
+        assert!(far[1] <= 1.0e-6, "越界超过一个余量后必须归零:{far:?}");
+    }
+
+    /// 越界一个余量以上时速度**归零** —— 玩家到不了那里,于是不会掉进
+    /// 「还没生成出来的虚空」。这是「无限世界」能成立的前提。
+    #[test]
+    fn soft_limit_stops_the_player_before_the_unstreamed_void() {
+        let world: CollisionWorld = CollisionWorld::new();
+        let limits: Vec2 = world.get_half_extent();
+        let push: Vec2 = world.soft_push([0.0, 400.0], limits, 24.0, 1.6, 9.0);
+        assert!(
+            push[1] < 0.0,
+            "z 严重越界时回推必须指向世界中心,得到 {push:?}"
+        );
+        assert!(push[1].abs() <= 9.0, "回推速度必须封顶,得到 {push:?}");
+    }
+
+    /// 界内不得有任何回推 —— 靠这个保证玩家不会被「温柔地拽走」。
+    #[test]
+    fn soft_push_is_zero_inside_the_boundary() {
+        let world: CollisionWorld = CollisionWorld::new();
+        let limits: Vec2 = world.get_half_extent();
+        // 「界内」= 半径 + 余量之内,而不是 `limits` 之内 —— 后者还要再加
+        // 一个余量的缓冲。
+        let slack: f32 = 24.0;
+        for at in [
+            [0.0, 0.0],
+            [limits[0], limits[1]],
+            [limits[0] + slack - 1.0, limits[1] + slack - 1.0],
+        ] as [Vec2; 3]
+        {
+            let push: Vec2 = world.soft_push(at, limits, slack, 1.6, 9.0);
+            assert!(
+                push[0].abs() < 1.0e-6 && push[1].abs() < 1.0e-6,
+                "界内 {at:?} 不该有回推,得到 {push:?}"
+            );
+        }
+    }
+
+    /// **这是「无限世界」的核心回归测试**:分离不得再做位置钳制。
+    ///
+    /// 旧实现最后一步是 `clamp(-150, 150)`,于是玩家走到边界处位移恒为
+    /// 零 —— 有速度、无位移,几十帧推不动一毫米(用户报的空气墙)。
+    #[test]
+    fn separation_no_longer_clamps_the_player_inside_the_world() {
+        let mut world: CollisionWorld = CollisionWorld::new();
+        world.set_player_radius(RADIUS);
+        // 空碰撞世界,让分离完全不介入。
+        let far: Vec2 = [900.0, -900.0];
+        let resolved: Vec2 = world.resolve(far);
+        assert!(
+            (resolved[0] - far[0]).abs() < 1.0e-6 && (resolved[1] - far[1]).abs() < 1.0e-6,
+            "空碰撞世界不该动玩家,得到 {resolved:?}"
+        );
+        let slid: Vec2 = world.resolve_slide(far, [3.0, 3.0], RADIUS);
+        assert!(
+            slid[0] > far[0] + 2.0,
+            "远离原点时滑动必须真的走起来,得到 {slid:?}"
+        );
     }
 }

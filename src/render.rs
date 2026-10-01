@@ -2342,6 +2342,9 @@ impl RenderTarget {
 struct GlMesh {
     /// 顶点属性数组,里面绑定了 instance buffer 的除数设置。
     vertex_array: WebGlVertexArrayObject,
+    /// 顶点缓冲。`replace_mesh` 就地重传时要它(`upload_mesh` 建 VAO 时
+    /// 创建,但那时只把 VAO 存了下来)。
+    vertex_buffer: WebGlBuffer,
     /// 元素索引缓冲。
     index_buffer: WebGlBuffer,
     /// 索引个数(= `triangle_count * 3`)。
@@ -3692,10 +3695,78 @@ impl WebGlRenderer {
         let index_count: i32 = mesh.indices.len() as i32;
         self.get_meshes_mut().push(GlMesh {
             vertex_array,
+            vertex_buffer,
             index_buffer,
             index_count,
         });
         Ok(self.get_meshes().len() - 1)
+    }
+
+    /// 就地替换某个已上传 mesh 的顶点 / 索引数据。
+    ///
+    /// **这是程序化无限世界的前提。** `upload_mesh` 是 `push` 语义,只能
+    /// 在启动时把 `Scene::meshes` 一一对应地传上 GPU 一次。但地面 / 水面
+    /// 跟着玩家流式重建(`rebuild_streamed_surface` 原地改写
+    /// `scene.meshes[i]`),CPU 侧的网格换了而 GPU 缓冲还指着旧数据 ——
+    /// 走出街区边界后画出来的仍是出生点那块地。
+    ///
+    /// 这里**不能**改用 `upload_mesh` 重传:那是 `push` 语义,GPU 表会
+    /// 多出一整条,而 `SceneBatch::mesh_index` 是直接当 GPU 表下标用的
+    ///(`draw_batch`),之后所有批次整体错位一格 —— 角色 / 车会取到别人
+    /// 的网格,表现就是「移动时丢失建模、只剩轮子」。原地重传保持 GPU
+    /// 表长度不变,下标**永久有效**。
+    ///
+    /// # Arguments
+    ///
+    /// - `usize` - `Scene::meshes` 的下标(即批次里的 `mesh_index`)。
+    /// - `&MeshAssetGpu` - 新的顶点 / 索引数据。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 下标越界时的错误信息。
+    pub fn replace_mesh(&mut self, mesh_index: usize, mesh: &MeshAssetGpu) -> Result<(), String> {
+        let context: WebGl2RenderingContext = self.get_context();
+        let Some(slot) = self.get_meshes_mut().get_mut(mesh_index) else {
+            return Err(format!(
+                "{}: {mesh_index} of {}",
+                REPLACE_MESH_OUT_OF_RANGE,
+                self.get_meshes().len()
+            ));
+        };
+        // 顶点:先绑 VAO(索引缓冲是它的状态),再重传并重设属性指针。
+        context.bind_vertex_array(Some(&slot.vertex_array));
+        context.bind_buffer(
+            WebGl2RenderingContext::ARRAY_BUFFER,
+            Some(&slot.vertex_buffer),
+        );
+        context.buffer_data_with_u8_array(
+            WebGl2RenderingContext::ARRAY_BUFFER,
+            f32_slice_to_bytes(&mesh.vertices),
+            WebGl2RenderingContext::DYNAMIC_DRAW,
+        );
+        let stride: i32 = (STRIDE_FLOATS * 4) as i32;
+        for attribute in 0..4u32 {
+            context.vertex_attrib_pointer_with_i32(
+                attribute,
+                3,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                stride,
+                (attribute as i32) * 12,
+            );
+        }
+        context.bind_buffer(
+            WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
+            Some(&slot.index_buffer),
+        );
+        context.buffer_data_with_u8_array(
+            WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER,
+            crate::mesh::u32_slice_to_bytes(&mesh.indices),
+            WebGl2RenderingContext::DYNAMIC_DRAW,
+        );
+        context.bind_vertex_array(None);
+        slot.index_count = mesh.indices.len() as i32;
+        Ok(())
     }
 
     /// 保证 instance buffer 至少能装下 `capacity` 个实例。

@@ -172,8 +172,29 @@ const FOLLOW_HEIGHT: f32 = 1.45;
 const FOLLOW_DAMPING: f32 = 9.0;
 /// 玩家碰撞圆半径(米)。
 const PLAYER_RADIUS: f32 = 0.35;
-/// 世界半边长(米):玩家不许走出这个范围。
+
+/// 世界的**软边界**半径(米):玩家不许走出这个圆。
+///
+/// 这不是硬墙。城市是**程序化无限生成**的(见
+/// `step_streamed_surface` / `rebuild_streamed_surface`),任何一条硬边界都
+/// 等于在无限世界里砌一堵看不见的墙 —— 走到那儿就再也推不动,用户报的
+/// 「地图非无限大,触碰空气墙无法前进」正是它。
+///
+/// 真正需要保留的是**软边界**的唯一职责:玩家跑得比区块流式生成快时,
+/// 别掉进「脚下什么都没有」的虚空。所以它的语义是
+/// **「你最多只能领先当前已生成世界这么远」**,而不是「世界到这儿为止」。
+/// 见 `crate::collision::CollisionWorld::soft_limit`。
 const WORLD_HALF: f32 = 150.0;
+/// 玩家超出软边界的距离(米)之后开始被**推回**。
+///
+/// 软边界不是一堵墙:超出 `SOFT_LIMIT_SLACK` 之后每帧按比例回推,越超
+/// 越猛,最终速度上限收敛到 0。所以玩家仍然能**慢慢**挪到边界外(比如
+/// 故意往外跑去看生成中的新区块长什么样),但不可能一路跑到无限远。
+const SOFT_LIMIT_SLACK: f32 = 24.0;
+/// 软边界回推的增益(1/秒):每超出 1 m 产生多少 m/s 的回推速度。
+const SOFT_LIMIT_PUSH: f32 = 1.6;
+/// 软边界回推速度的上限(米/秒),保证回推不会比跑还快到失控。
+const SOFT_LIMIT_PUSH_MAX: f32 = 9.0;
 /// 玩家出生点(世界坐标):X = 30 那条街的**路中间偏东的车道**,z = 45。
 ///
 /// 选点是拿截图试出来的,踩过三个坑:
@@ -2883,6 +2904,12 @@ fn stream_needs_rebuild(player: Vec2, center: Vec2) -> bool {
 /// - `f32` - 新的生成中心 Z(米)。
 /// - `&HashMap<String, usize>` - 资产 id → 场景网格索引。
 /// - `usize` - 静态批次占用的长度。
+///
+/// # Returns
+///
+/// - `Vec<usize>` - **被改写过的 `Scene::meshes` 下标**。调用方必须把
+///   这些网格重新传到 GPU(`WebGlRenderer::replace_mesh`),否则画面上
+///   仍是旧地面 —— CPU 侧换了数据而 GPU 缓冲没换,且**没有任何报错**。
 pub fn rebuild_streamed_surface(
     scene: &mut Scene,
     ground_batch: usize,
@@ -2891,8 +2918,9 @@ pub fn rebuild_streamed_surface(
     cz: f32,
     index_map: &HashMap<String, usize>,
     static_batch_count: usize,
-) {
+) -> Vec<usize> {
     rebuild_static_batches(scene, index_map, static_batch_count, cx, cz);
+    let mut rewritten: Vec<usize> = Vec::new();
     let surfaces: [(usize, MeshAsset); 2] = [
         (ground_batch, build_ground_near(cx, cz)),
         (water_batch, build_water_near(cx, cz)),
@@ -2918,7 +2946,54 @@ pub fn rebuild_streamed_surface(
         let Ok(mesh) = expand_asset(&asset) else {
             continue;
         };
-        scene.meshes[mesh_index] = build_gpu_mesh(&mesh, &emissive);
+        let Some(slot) = scene.meshes.get_mut(mesh_index) else {
+            continue;
+        };
+        *slot = build_gpu_mesh(&mesh, &emissive);
+        rewritten.push(mesh_index);
+    }
+    rewritten
+}
+
+/// 把流式重建改写过的网格重新上传到 GPU。
+///
+/// **必须原地重传,不能 `upload_mesh` 追加。** `upload_mesh` 是 `push`
+/// 语义,GPU 表多出一条之后,`SceneBatch::mesh_index`(直接当 GPU 表下标
+/// 用)会整体错位一格 —— 角色 / 车取到别人的网格,表现成「移动时丢失
+/// 建模、只剩轮子」。`replace_mesh` 复用同一个 `GlMesh`,GPU 表长度不变。
+///
+/// 失败必须暴露(`console_log` + 计数),不能静默跳过:重传失败时画面
+/// 停在旧街区,而日志里如果什么都没有,排查会绕整整一圈。
+///
+/// # Arguments
+///
+/// - `&mut Renderer` - 渲染后端。
+/// - `&Scene` - 场景(提供新网格数据)。
+/// - `&[usize]` - 被改写过的 `Scene::meshes` 下标。
+fn reupload_streamed_meshes(renderer: &mut Renderer, scene: &Scene, rewritten: &[usize]) {
+    let Renderer::WebGl(webgl) = renderer else {
+        // 纯软件后端的 `draw` 直接读 `scene.meshes`,没有第二份 GPU 拷贝。
+        return;
+    };
+    let mut failures: usize = 0;
+    for index in rewritten {
+        let Some(mesh) = scene.meshes.get(*index) else {
+            continue;
+        };
+        if let Err(error) = webgl.replace_mesh(*index, mesh) {
+            failures += 1;
+            if failures <= REPLACE_MESH_REPORT_LIMIT {
+                console_log(&format!(
+                    "{LOG_REPLACE_MESH_FAILED} {index} ({} verts): {error}",
+                    mesh.vertices.len()
+                ));
+            }
+        }
+    }
+    if failures > 0 {
+        console_log(&format!(
+            "[vcw] {failures} streamed mesh(es) failed GPU re-upload"
+        ));
     }
 }
 
@@ -5271,7 +5346,9 @@ fn simulate(game: &mut Game, delta: f32) {
             // 方向,所以这里必须传**原始的按键轴**,不能预先旋转一次 ——
             // 预旋转会导致两次旋转,按下 W 时角色会朝侧面走。
             let intent: Vec2 = [strafe_input, forward_input];
-            let speed: f32 = if running { RUN_SPEED } else { WALK_SPEED };
+            let wanted: f32 = if running { RUN_SPEED } else { WALK_SPEED };
+            let feet: Vec3 = game.player.get_position();
+            let speed: f32 = soft_limit_speed(&game.world, [feet[0], feet[2]], wanted);
             game.player.step(intent, forward, dt, speed, &game.world);
             // 垂直方向紧接着水平分离之后算:`Player::step` 刚刚定下
             // 了「这一帧人走到了哪」,现在才知道脚下是哪块板。
@@ -5301,6 +5378,51 @@ fn simulate(game: &mut Game, delta: f32) {
     }
 }
 
+/// 世界的软边界:越界时**缩放速度上限**并叠加一个回推速度。
+///
+/// 旧的 `CollisionWorld` 把坐标 `clamp` 在 ±`WORLD_HALF`,那在程序化
+/// 无限世界里就是一堵看不见的空气墙 —— 玩家走到 150 m 处再也推不动
+/// 一毫米(用户报的「地图非无限大,触碰空气墙无法前进」)。
+///
+/// 现在只改**速度**、绝不改位置:位置永远是玩家自己走出来的,不可能出现
+/// 「被传送」。越界越深,允许的速度越小;叠加的回推则把玩家缓缓带回
+/// 已生成的世界范围内。
+///
+/// 返回值直接喂给 [`Player::step`] 的 `speed` 参数,于是转向 / 步态 /
+/// 碰撞分离全都自动按被削过的速度工作,不需要任何特判。
+///
+/// # Arguments
+///
+/// - `&CollisionWorld` - 碰撞世界(提供软边界半径)。
+/// - `Vec2` - 玩家当前位置的世界 XZ。
+/// - `f32` - 期望的速度上限(米/秒)。
+///
+/// # Returns
+///
+/// - `f32` - 经软边界收缩后的速度上限(米/秒)。
+fn soft_limit_speed(world: &CollisionWorld, at: Vec2, speed: f32) -> f32 {
+    let limits: Vec2 = world.get_half_extent();
+    let probe: Vec2 = [1.0, 0.0];
+    let kept: Vec2 = world.soft_limit(probe, at, limits, SOFT_LIMIT_SLACK);
+    // `soft_limit` 是逐轴收缩的,取两轴较小者当作整体收缩系数 ——
+    // 对角线越界时两个方向都得减速,取更严的那个不会漏。
+    let scale: f32 = kept[0].min(kept[1]).clamp(0.0, 1.0);
+    let limited: f32 = speed * scale;
+    if limited >= f32::EPSILON {
+        return limited;
+    }
+    // 速度被削到 0(越界超过一个余量)时给一个回推,保证玩家能被带回来
+    // 而不是永久卡死。回推速度随越界深度线性增长,封顶 `SOFT_LIMIT_PUSH_MAX`。
+    let push: Vec2 = world.soft_push(
+        at,
+        limits,
+        SOFT_LIMIT_SLACK,
+        SOFT_LIMIT_PUSH,
+        SOFT_LIMIT_PUSH_MAX,
+    );
+    push[0].abs().max(push[1].abs()).min(SOFT_LIMIT_PUSH_MAX)
+}
+
 /// 玩家走出当前地面块时,把地面与水面重新生成到新中心。
 ///
 /// 世界是无限的,而地面是一块固定尺寸、跟着玩家平移的网格块。判定
@@ -5323,7 +5445,7 @@ fn step_streamed_surface(game: &mut Game) {
     let next_z: f32 = street_axis((player[1] / STREET_PITCH).round() as i32);
     let index_map: HashMap<String, usize> = game.asset_index.clone();
     let static_count: usize = game.static_batch_count;
-    rebuild_streamed_surface(
+    let rewritten: Vec<usize> = rebuild_streamed_surface(
         &mut game.scene,
         game.ground_batch,
         game.water_batch,
@@ -5332,6 +5454,11 @@ fn step_streamed_surface(game: &mut Game) {
         &index_map,
         static_count,
     );
+    // 地面 / 水面的顶点数据换了,GPU 缓冲必须跟着换 —— 否则玩家走出街区
+    // 边界后看到的还是出生点那块地,而 CPU 侧探针报告的却是新数据。
+    if let Some(renderer) = game.renderer.as_mut() {
+        reupload_streamed_meshes(renderer, &game.scene, &rewritten);
+    }
     game.streamed_center = [next_x, next_z];
 }
 
