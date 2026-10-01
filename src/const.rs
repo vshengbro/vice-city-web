@@ -2005,5 +2005,33 @@ pub const T_INTERIOR_HEIGHT_TOKEN: &str = "{height}";
 pub const T_INTERIOR_NO_DOWNWARD_SNAP: &str =
     "脚下的板低于脚底时必须判为无支撑(首层地板会把人吸回地面)";
 
+/// 正常帧率下楼梯行为不得被长帧修复改坏。
+pub const T_INTERIOR_NORMAL_FRAME_UNCHANGED: &str =
+    "正常帧率({dt:.4} s, 每帧 {stride:.3} m)下楼梯必须逐级抬升到二层楼板面,实得 {height}";
+
+/// 正常帧率下走下楼梯必须逐级下降,不得悬空或自由落体。
+pub const T_INTERIOR_NORMAL_FRAME_DESCENT: &str = "正常帧率下下楼必须逐级降到首层,实得 {height}";
+
+/// 修复前(单点采样)在同一 dt 下必须真的爬不上去 —— 否则这条回归测试
+/// 证明不了任何东西:它若在旧实现上也通过,就说明测的不是那个缺陷。
+pub const T_INTERIOR_BASELINE_STILL_FAILS: &str =
+    "单点采样的基线实现必须仍爬不上楼(否则回归测试无效),实得 {height}";
+
+/// 正常帧率下新实现与旧基线必须给出同一个峰值。
+pub const T_INTERIOR_BASELINE_AGREES: &str =
+    "60 fps 下新实现与旧基线的峰值必须一致,新 {new} vs 旧 {old}";
+
+/// 断言模板里「新实现峰值」的占位符。
+pub const T_INTERIOR_PEAK_TOKEN: &str = "{new}";
+
+/// 断言模板里「旧基线峰值」的占位符。
+pub const T_INTERIOR_BASELINE_TOKEN: &str = "{old}";
+
+/// 断言模板里「帧间隔」的占位符。
+pub const T_INTERIOR_DT_TOKEN: &str = "{dt:.4}";
+
+/// 断言模板里「每帧水平位移」的占位符。
+pub const T_INTERIOR_STRIDE_TOKEN: &str = "{stride:.3}";
+
 /// 验收通道:传送 / 走位 / 加速 / 探针请求挂在这个 window 属性上。
 pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";

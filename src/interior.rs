@@ -239,6 +239,29 @@ impl FloorWorld {
     ///
     /// - `(Option<f32>, f32)` - `(最终支撑高度, 逐级抬升后的脚底高度)`。
     ///   支撑为 `None` 表示这一路都没有合法板,调用方按自由落体处理。
+    ///
+    /// # 下楼怎么处理的
+    ///
+    /// 每一小步做**扫掠抬升**(上楼时把脚底一级一级顶上去);全部小步走完后,
+    /// **再补一次「允许往下落一��」的整体查询**,这才是下楼能一级一级
+    /// 往下走的原因。
+    ///
+    /// **为什么必须补这一次:**扫掠的判据是「不接受低于脚底的面」,那是
+    /// 为了挡住首层地板把楼梯中段的人吸回地面(楼内地板铺满全场)。但同
+    /// 一条判据也会把**下一级踏面**(低一个踏高 0.305 m)一起拒掉 ——
+    /// 于是往回走时每一小步都只认得脚下当前那一级,脚底一格都不降,人
+    /// 就**悬在楼梯上横着往下挪**,直到走出梯段才掉进楼梯井。单测
+    /// `a_normal_frame_descends_the_stairs_one_tread_at_a_time` 钉的就是
+    /// 这一条(修复前它停在 2.895 不动)。
+    ///
+    /// **为什么补查必须带下界、不能直接用 [`Self::support_height`]。**
+    /// `support_height` 只有上界没有下界,长帧(0.613 m/帧)下落点早已越过
+    /// 好几级踏面,查出来的是**首层地板 0.15**,于是一路辛苦抬到 2.895
+    /// 又被这一脚拉回地面 —— 正是组 1 最初那个缺陷的翻版(实测
+    /// `a_long_frame_per_stride_still_reaches_the_top` 从 3.200 掉到 0.150)。
+    /// 所以补查的下界取**一个踏高** [`STEP_DOWN_TOLERANCE`]:只放行
+    /// 「往下一级」,不放行「掉到楼下」。首层地板离楼梯中段足有 2.4 m,
+    /// 两个目标因此不会互相打架。
     pub fn support_along_frame(&self, from: Vec2, to: Vec2, from_y: f32) -> (Option<f32>, f32) {
         let span: f32 = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
         let substeps: usize = ((span / SUPPORT_SUBSTEP_DISTANCE).ceil() as usize).max(1);
@@ -257,7 +280,58 @@ impl FloorWorld {
             }
             cursor = probe;
         }
+        // 往下走一级:再扫一遍整段,但允许落点比**这一帧起点**的脚底低
+        // 至多一个踏高。基准必须是起点而不是抬升后的高度 —— 后者会让
+        // 补查把同一帧里刚抬上去的那一级又退回来(实测长帧上楼卡在 2.895)。
+        if let Some(top) = self.step_down_along(from, to, from_y) {
+            y = top;
+            best = Some(top);
+        }
         (best, y)
+    }
+
+    /// 沿整段找「比脚底低、但不超过一个踏高」的最高一块板(下楼用)。
+    ///
+    /// **只在确实比脚底更低时才返回。** 抬升阶段已经处理过「比脚底高」
+    /// 的面,所以这里返回非 `None` 就等价于「这一帧在往下走」。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 这一帧起点 XZ。
+    /// - `Vec2` - 这一帧落点 XZ。
+    /// - `f32` - **这一帧开始时**的脚底高度(米),不是抬升后的高度。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<f32>` - 可站的下一级高度;这一路上没有「往下一级」那么
+    ///   深的面时为 `None`(调用方保持原高度,由重力处理)。
+    fn step_down_along(&self, from: Vec2, to: Vec2, from_y: f32) -> Option<f32> {
+        let ceiling: f32 = from_y + STEP_UP_TOLERANCE;
+        let floor: f32 = from_y - STEP_DOWN_TOLERANCE;
+        let span: f32 = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
+        let steps: usize = ((span / (SHOWCASE_STAIR_RUN * 0.25)).ceil() as usize).max(1);
+        let mut best: Option<f32> = None;
+        for index in 0..=steps {
+            let t: f32 = index as f32 / steps as f32;
+            let point: Vec2 = [
+                from[0] + (to[0] - from[0]) * t,
+                from[1] + (to[1] - from[1]) * t,
+            ];
+            let Some(top) = self.support_height(point, from_y) else {
+                continue;
+            };
+            if top > ceiling || top < floor {
+                continue;
+            }
+            // 只接受**确实更低**的那一块,否则它与抬升阶段的结果重复。
+            if top >= from_y - SUPPORT_CATCH_EPSILON {
+                continue;
+            }
+            if best.is_none_or(|current: f32| top > current) {
+                best = Some(top);
+            }
+        }
+        best
     }
 
     /// 把一个圆形身体推出所有与它身体区间相交的隔墙与楼板。
@@ -581,6 +655,24 @@ pub const STEP_UP_TOLERANCE: f32 = 0.45;
 /// 放到踏高(0.305)以上,站在楼梯中段就会被首层地板重新吸回地面。
 pub const SUPPORT_CATCH_EPSILON: f32 = 0.001;
 
+/// 往下走一级台阶的最大高度(米)。
+///
+/// 抬升扫掠([`FloorWorld::support_height_along`])只接受「不低于脚底」的
+/// 面,否则首层地板会把楼梯中段的人吸回地面。但那一条判据同时也把
+/// **下一级踏面**拒掉了 —— 走下楼梯时脚底一格都不降,人悬在楼梯上横着
+/// 挪。这个常量就是给「往下一级」单独开的口子。
+///
+/// **取 `SHOWCASE_STAIR_RISE`(0.305 m)加 5 cm 余量**,理由:
+///
+/// - **必须 ≥ 一个踏高**,否则下不了楼(下一级恰好低 0.305 m)。
+/// - **必须远小于到首层地板的落差**。站在第 8 级时首层地板在脚下 2.44 m
+///   处,取 0.355 与它相去甚远,所以「往下一级」和「掉到楼下」不会混淆 ——
+///   这正是长帧修复要避免的第二个失效模式。
+///
+/// 上界仍然是 `STEP_UP_TOLERANCE`,两者一起构成一个以脚底为心的窗口
+/// `[y - 0.355, y + 0.45]`。
+pub const STEP_DOWN_TOLERANCE: f32 = crate::r#const::SHOWCASE_STAIR_RISE + 0.05;
+
 /// 竖直解算把一帧切分成多小的水平小步(米)。
 ///
 /// **取半个踏面**(`SHOWCASE_STAIR_RUN / 2`):保证每小步至少踩到一级踏面,
@@ -635,11 +727,14 @@ fn push_out_aabb(center: Vec2, half: Vec2, point: Vec2, radius: f32) -> Option<(
 #[cfg(test)]
 mod tests {
     use crate::r#const::{
+        T_INTERIOR_BASELINE_AGREES, T_INTERIOR_BASELINE_STILL_FAILS, T_INTERIOR_BASELINE_TOKEN,
         T_INTERIOR_CEILING_INSIDE, T_INTERIOR_DOORWAY_BLOCKS, T_INTERIOR_DOORWAY_THROUGH,
-        T_INTERIOR_HEIGHT_TOKEN, T_INTERIOR_LONG_FRAME_HEIGHT, T_INTERIOR_LONG_FRAME_LADDER,
-        T_INTERIOR_NO_DOWNWARD_SNAP, T_INTERIOR_NO_SLAB_UNDER, T_INTERIOR_STAIR_CLIMBS,
-        T_INTERIOR_STAIR_MONOTONIC, T_INTERIOR_STAIR_PAIR, T_INTERIOR_UPPER_FLOOR_ABOVE,
-        T_INTERIOR_WALL_BLOCKS, T_INTERIOR_WALL_PASSES,
+        T_INTERIOR_DT_TOKEN, T_INTERIOR_HEIGHT_TOKEN, T_INTERIOR_LONG_FRAME_HEIGHT,
+        T_INTERIOR_LONG_FRAME_LADDER, T_INTERIOR_NO_DOWNWARD_SNAP, T_INTERIOR_NO_SLAB_UNDER,
+        T_INTERIOR_NORMAL_FRAME_DESCENT, T_INTERIOR_NORMAL_FRAME_UNCHANGED, T_INTERIOR_PEAK_TOKEN,
+        T_INTERIOR_STAIR_CLIMBS, T_INTERIOR_STAIR_MONOTONIC, T_INTERIOR_STAIR_PAIR,
+        T_INTERIOR_STRIDE_TOKEN, T_INTERIOR_UPPER_FLOOR_ABOVE, T_INTERIOR_WALL_BLOCKS,
+        T_INTERIOR_WALL_PASSES,
     };
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::r#type::Vec2;
@@ -655,6 +750,57 @@ mod tests {
     const WALL_T: f32 = 0.25;
     const BODY_TOP: f32 = 1.90;
     const RADIUS: f32 = 0.35;
+    /// 60 fps 步行速度(米/秒),与 `crate::player::WALK_SPEED` 同值。
+    const WALK_SPEED_60: f32 = 4.6;
+
+    /// 把断言模板里的占位符换成实际数值。
+    ///
+    /// 占位符本身来自 `crate::r#const` 的 `T_INTERIOR_*_TOKEN` 常量,
+    /// 与仓库既有做法一致(见 [`long_frame_height_message`])。
+    fn fill(template: &str, args: &[(&str, &str)]) -> String {
+        let mut out: String = template.to_string();
+        for (key, value) in args {
+            out = out.replace(key, value);
+        }
+        out
+    }
+
+    fn normal_frame_message(dt: f32, stride: f32, height: f32) -> String {
+        let dt_token: &str = T_INTERIOR_DT_TOKEN;
+        let stride_token: &str = T_INTERIOR_STRIDE_TOKEN;
+        fill(
+            T_INTERIOR_NORMAL_FRAME_UNCHANGED,
+            &[
+                (dt_token, &format!("{dt:.4}")),
+                (stride_token, &format!("{stride:.3}")),
+                (T_INTERIOR_HEIGHT_TOKEN, &format!("{height:.3}")),
+            ],
+        )
+    }
+
+    fn baseline_agrees_message(new: f32, old: f32) -> String {
+        fill(
+            T_INTERIOR_BASELINE_AGREES,
+            &[
+                (T_INTERIOR_PEAK_TOKEN, &format!("{new:.3}")),
+                (T_INTERIOR_BASELINE_TOKEN, &format!("{old:.3}")),
+            ],
+        )
+    }
+
+    fn descent_message(height: f32) -> String {
+        fill(
+            T_INTERIOR_NORMAL_FRAME_DESCENT,
+            &[(T_INTERIOR_HEIGHT_TOKEN, &format!("{height:.3}"))],
+        )
+    }
+
+    fn baseline_fails_message(height: f32) -> String {
+        fill(
+            T_INTERIOR_BASELINE_STILL_FAILS,
+            &[(T_INTERIOR_HEIGHT_TOKEN, &format!("{height:.3}"))],
+        )
+    }
 
     /// 一面横墙:z ∈ [10.0, 10.2],x ∈ [-5, 5],高 0..6.4。
     fn cross_wall() -> FloorWorld {
@@ -856,6 +1002,159 @@ mod tests {
         let here: Vec2 = [5.1, -4.55 + 7.5 * STAIR_RUN];
         let got: Option<f32> = w.support_height_along(here, here, on_step_eight);
         assert_eq!(got, Some(on_step_eight), "{}", T_INTERIOR_NO_DOWNWARD_SNAP);
+    }
+
+    /// 修复前的基线:单点采样,**只看落点**。
+    ///
+    /// **这个函数只存在于测试里**,因为它就是被换掉的那版实现
+    /// (`step_vertical` 原来每帧只调一次 `support_height(落点, y)`)。留着
+    /// 它是为了让断言有对照:只有当旧实现在大 dt 下确实爬不上去时,新的
+    /// 爬得上才说明缺陷被修了,而不是两个实现本来都一样。
+    ///
+    /// **只查落点,不查起点** —— 这是缺陷的关键。早先的版本把起点也算
+    /// 进去,等于给旧实现多送一级台阶,于是它在大 dt 下也能爬上去,这条
+    /// 对照测试就失去了意义(实测:多送起点后基线也能到 3.20)。
+    fn single_point_baseline(w: &FloorWorld, to: Vec2, y: f32) -> f32 {
+        w.support_height(to, y).unwrap_or(y)
+    }
+
+    /// 走完整个楼梯要多少帧 —— 60 fps 下每帧 0.077 m,整段楼梯 4.275 m。
+    ///
+    /// **必须刚好够走完、且不能走过头。** 楼梯在 z = -0.05 处到头,再往前
+    /// 一格就没有支撑了,`support_height` 只会返回首层地板 —— 于是两种
+    /// 实现都会从 3.20 掉回 0.15。所以断言必须盯**过程中的最高点**,
+    /// 不能盯最后一帧:第一版盯了末帧,60 fps 走到第 55 帧时两种实现
+    /// 都已走下楼梯,读数都是 0.150,测试红了但缺陷其实并不存在。
+    const STAIRS_FRAME_BUDGET: usize = 52;
+
+    /// 正常帧率(60 fps)下楼梯必须照旧逐级抬升 —— 长帧修复不得改坏它。
+    ///
+    /// **为什么必须单独测这一条:**长帧修复的杠杆是「把一帧切成
+    /// `SUPPORT_SUBSTEP_DISTANCE` 的小步」。60 fps 下每帧只走
+    /// `WALK_SPEED / 60 = 0.077 m`,远小于一个子步(0.225 m),于是
+    /// `substeps == 1`,新路径**退化成**旧路径。若这一步悄悄变了(比如
+    /// 子步取 0.05 m),60 fps 的楼梯手感就会被无声改掉,而软件渲染下
+    /// 每帧 0.6 m,根本观察不到这个差异 —— 所以只能在单测里钉住。
+    #[test]
+    fn a_normal_frame_still_climbs_one_tread_at_a_time() {
+        let w: FloorWorld = slab_world();
+        // 60 fps 步行:4.6 m/s ÷ 60 = 0.0767 m/帧。
+        let dt: f32 = 1.0 / 60.0;
+        let stride: f32 = WALK_SPEED_60 * dt;
+        let mut z: f32 = -4.55 + 0.5 * STAIR_RUN;
+        let mut y: f32 = GROUND_TOP;
+        let mut heights: Vec<f32> = vec![y];
+        for _ in 0..STAIRS_FRAME_BUDGET {
+            let from: Vec2 = [5.1, z];
+            z += stride;
+            let to: Vec2 = [5.1, z];
+            let (_, stepped): (Option<f32>, f32) = w.support_along_frame(from, to, y);
+            y = stepped;
+            heights.push(y);
+        }
+        // 走到梯顶之前单调不降,且最高点正好是二层楼板面。
+        //
+        // 盯**峰值**而不是末帧:预算 52 帧刚好走完 4.0 m 楼梯,再多一格
+        // 就会走出梯顶掉回首层,末帧读数将失去意义。
+        let peak: f32 = heights.iter().copied().fold(f32::MIN, f32::max);
+        let climbed: Vec<f32> = heights
+            .iter()
+            .copied()
+            .take_while(|value: &f32| *value < UPPER_TOP - 1e-4)
+            .collect();
+        for pair in climbed.windows(2) {
+            assert!(
+                pair[1] >= pair[0] - 1e-4,
+                "{}",
+                T_INTERIOR_LONG_FRAME_LADDER
+            );
+        }
+        assert!(
+            (peak - UPPER_TOP).abs() < 1e-3,
+            "{}",
+            normal_frame_message(dt, stride, peak)
+        );
+    }
+
+    /// 同一个 60 fps 步长下,**旧的单点采样也爬得上去** —— 因为每帧只走
+    /// 0.077 m,远小于一个踏深 0.45 m,根本不会跨级。
+    ///
+    /// 这条把两种 dt 的分工钉死:缺陷只存在于「每帧位移 > 单级踏高」的
+    /// 长帧;正常帧率下两种实现等价,所以长帧修复对 60 fps 必须是
+    /// no-op(和上一条一起证明)。
+    #[test]
+    fn the_baseline_agrees_with_the_fix_at_sixty_fps() {
+        let w: FloorWorld = slab_world();
+        let dt: f32 = 1.0 / 60.0;
+        let stride: f32 = WALK_SPEED_60 * dt;
+        let mut z: f32 = -4.55 + 0.5 * STAIR_RUN;
+        let mut y_new: f32 = GROUND_TOP;
+        let mut y_old: f32 = GROUND_TOP;
+        // 逐帧比较**峰值**,不是末帧:两种实现走过头都会从梯顶掉回首层,
+        // 末帧读数于是都是 0.15,分不出高下。
+        let mut peak_new: f32 = y_new;
+        let mut peak_old: f32 = y_old;
+        for _ in 0..STAIRS_FRAME_BUDGET {
+            let from: Vec2 = [5.1, z];
+            z += stride;
+            let to: Vec2 = [5.1, z];
+            let (_, stepped): (Option<f32>, f32) = w.support_along_frame(from, to, y_new);
+            y_new = stepped;
+            y_old = single_point_baseline(&w, to, y_old);
+            peak_new = peak_new.max(y_new);
+            peak_old = peak_old.max(y_old);
+        }
+        assert!(
+            (peak_new - peak_old).abs() < 1e-3,
+            "{}",
+            baseline_agrees_message(peak_new, peak_old)
+        );
+    }
+
+    /// 正常帧率下走下楼梯必须逐级下降,不得被「只接受不低于脚底的面」
+    /// 卡成悬空,也不得自由落体。
+    ///
+    /// 起步点取**第 9 级**而不是第 10 级:第 10 级那一段被二层楼板压着
+    ///(`slab_world` 的二层板顶面同为 `UPPER_TOP`),从它起步时脚下有两块
+    ///同高的板,测不到「下一级比脚底低」这件事 —— 那是本条真正要验的
+    ///判据(低于脚底的面在 `support_height_along` 里会被拒绝)。
+    #[test]
+    fn a_normal_frame_descends_the_stairs_one_tread_at_a_time() {
+        let w: FloorWorld = slab_world();
+        let dt: f32 = 1.0 / 60.0;
+        let stride: f32 = WALK_SPEED_60 * dt;
+        // 站在第 9 级(顶面 2.895),朝 -z 下行。下一级 2.590 比脚底低。
+        let mut z: f32 = -4.55 + 8.0 * STAIR_RUN;
+        let mut y: f32 = GROUND_TOP + 9.0 * STAIR_RISE;
+        let mut heights: Vec<f32> = vec![y];
+        for _ in 0..STAIRS_FRAME_BUDGET {
+            let from: Vec2 = [5.1, z];
+            z -= stride;
+            let to: Vec2 = [5.1, z];
+            let (_, stepped): (Option<f32>, f32) = w.support_along_frame(from, to, y);
+            y = stepped;
+            heights.push(y);
+        }
+        // 必须真的降到首层,而不是被按在原高度。
+        assert!(y <= GROUND_TOP + STAIR_RISE, "{}", descent_message(y));
+    }
+
+    /// 旧实现在**大 dt** 下确实爬不上去 —— 没有这一条,上面三条的「新实现
+    /// 爬上去了」就分不清是修好了还是本来就能爬。
+    #[test]
+    fn the_baseline_still_fails_on_a_long_frame() {
+        let w: FloorWorld = slab_world();
+        // 软件渲染实测:dt 被钳到 FIXED_DT * 4,步行每帧 0.307 m。
+        let stride: f32 = 0.307;
+        let mut z: f32 = -4.55 + 0.5 * STAIR_RUN;
+        let mut y: f32 = GROUND_TOP;
+        for _ in 0..24 {
+            let from: Vec2 = [5.1, z];
+            z += stride;
+            let to: Vec2 = [5.1, z];
+            y = single_point_baseline(&w, to, y);
+        }
+        assert!(y < UPPER_TOP - 1.0, "{}", baseline_fails_message(y));
     }
 
     #[test]
