@@ -798,7 +798,9 @@ mod tests {
     use crate::collision::CollisionWorld;
     use crate::r#const::{
         T_COLLISION_SLIDE_KEEPS_TANGENT, T_COLLISION_SLIDE_OPEN_GROUND_X,
-        T_COLLISION_SLIDE_OPEN_GROUND_Z, T_COLLISION_SLIDE_STOPS_AT_WALL,
+        T_COLLISION_SLIDE_OPEN_GROUND_Z, T_COLLISION_SLIDE_STOPS_AT_WALL, T_NO_POSITION_CLAMP,
+        T_SOFT_LIMIT_RAMP, T_SOFT_LIMIT_SPARE_INSIDE, T_SOFT_LIMIT_STOPS_AT_VOID,
+        T_SOFT_PUSH_ZERO_INSIDE,
     };
     use crate::r#type::Vec2;
 
@@ -909,7 +911,7 @@ mod tests {
             let kept: Vec2 = world.soft_limit(velocity, at, limits, 24.0);
             assert!(
                 (kept[0] - velocity[0]).abs() < 1.0e-6 && (kept[1] - velocity[1]).abs() < 1.0e-6,
-                "界内位置 {at:?} 的速度被削成 {kept:?},应保持 {velocity:?}"
+                "{T_SOFT_LIMIT_SPARE_INSIDE}"
             );
         }
     }
@@ -928,14 +930,11 @@ mod tests {
         let middle: Vec2 = world.soft_limit(probe, [0.0, edge + 1.0], limits, slack);
         let deep: Vec2 = world.soft_limit(probe, [0.0, edge + slack * 0.5], limits, slack);
         let far: Vec2 = world.soft_limit(probe, [0.0, edge + slack], limits, slack);
-        assert!((inside[1] - 1.0).abs() < 1.0e-6, "界内不该被削");
-        assert!(
-            (middle[0] - probe[0]).abs() < 1.0e-6,
-            "沿 Z 越界不该削 X 分量,得到 {middle:?}"
-        );
-        assert!(middle[1] < inside[1], "刚越界就该开始减速");
-        assert!(deep[1] < middle[1], "越深越慢");
-        assert!(far[1] <= 1.0e-6, "越界超过一个余量后必须归零:{far:?}");
+        assert!((inside[1] - 1.0).abs() < 1.0e-6, "{T_SOFT_LIMIT_RAMP}");
+        assert!((middle[0] - probe[0]).abs() < 1.0e-6, "{T_SOFT_LIMIT_RAMP}");
+        assert!(middle[1] < inside[1], "{T_SOFT_LIMIT_RAMP}");
+        assert!(deep[1] < middle[1], "{T_SOFT_LIMIT_RAMP}");
+        assert!(far[1] <= 1.0e-6, "{T_SOFT_LIMIT_STOPS_AT_VOID}");
     }
 
     /// 越界一个余量以上时速度**归零** —— 玩家到不了那里,于是不会掉进
@@ -945,11 +944,8 @@ mod tests {
         let world: CollisionWorld = CollisionWorld::new();
         let limits: Vec2 = world.get_half_extent();
         let push: Vec2 = world.soft_push([0.0, 400.0], limits, 24.0, 1.6, 9.0);
-        assert!(
-            push[1] < 0.0,
-            "z 严重越界时回推必须指向世界中心,得到 {push:?}"
-        );
-        assert!(push[1].abs() <= 9.0, "回推速度必须封顶,得到 {push:?}");
+        assert!(push[1] < 0.0, "{T_SOFT_LIMIT_STOPS_AT_VOID}");
+        assert!(push[1].abs() <= 9.0, "{T_SOFT_LIMIT_STOPS_AT_VOID}");
     }
 
     /// 界内不得有任何回推 —— 靠这个保证玩家不会被「温柔地拽走」。
@@ -969,7 +965,7 @@ mod tests {
             let push: Vec2 = world.soft_push(at, limits, slack, 1.6, 9.0);
             assert!(
                 push[0].abs() < 1.0e-6 && push[1].abs() < 1.0e-6,
-                "界内 {at:?} 不该有回推,得到 {push:?}"
+                "{T_SOFT_PUSH_ZERO_INSIDE}"
             );
         }
     }
@@ -987,12 +983,9 @@ mod tests {
         let resolved: Vec2 = world.resolve(far);
         assert!(
             (resolved[0] - far[0]).abs() < 1.0e-6 && (resolved[1] - far[1]).abs() < 1.0e-6,
-            "空碰撞世界不该动玩家,得到 {resolved:?}"
+            "{T_NO_POSITION_CLAMP}"
         );
         let slid: Vec2 = world.resolve_slide(far, [3.0, 3.0], RADIUS);
-        assert!(
-            slid[0] > far[0] + 2.0,
-            "远离原点时滑动必须真的走起来,得到 {slid:?}"
-        );
+        assert!(slid[0] > far[0] + 2.0, "{T_NO_POSITION_CLAMP}");
     }
 }

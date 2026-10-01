@@ -85,7 +85,7 @@ pub const LIMB_PLAN: &[(&str, &str, f32, f32)] = &[
 ///
 /// # Returns
 ///
-/// - `&str` - 父 part 名;链根(或不在计划表里)返回空串。
+/// - `&'static str` - 父 part 名;链根(或不在计划表里)返回空串。
 pub fn limb_parent(part: &str) -> &'static str {
     LIMB_PLAN
         .iter()
@@ -695,7 +695,10 @@ pub fn limb_matrix(origin: Vec3, yaw: f32, pivot: Vec3, swing: f32) -> Mat4 {
 #[cfg(test)]
 mod tests {
     use crate::camera::Mat4;
-    use crate::r#const::{PART_LOWER_LEG_L, PART_UPPER_LEG_L};
+    use crate::r#const::{
+        PART_LOWER_LEG_L, PART_UPPER_LEG_L, T_DISTAL_LIMB_HAS_PARENT, T_FACING_MATCHES_VELOCITY,
+        T_LEGS_ANTIPHASE, T_LIMBS_RELAX_TO_ZERO, T_PARENT_IN_PLAN, T_SAME_SIDE_IN_PHASE,
+    };
     use crate::player::{
         GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, facing_yaw, limb_parent,
         limb_swing,
@@ -722,7 +725,7 @@ mod tests {
             let yaw: f32 = facing_yaw(velocity);
             assert!(
                 wrap(yaw - want).abs() < 1.0e-4,
-                "速度 {velocity:?} 应得到 yaw={want},实得 {yaw}"
+                "{T_FACING_MATCHES_VELOCITY}: 速度 {velocity:?} 应得 yaw={want},实得 {yaw}"
             );
             // 再用渲染矩阵复核一次:本地 +Z 落到世界后必须与速度同向。
             let forward: Vec3 = apply(&Mat4::rotation_y(yaw), [0.0, 0.0, 1.0]);
@@ -730,7 +733,8 @@ mod tests {
             assert!(
                 (forward[0] / len - velocity[0]).abs() < 1.0e-4
                     && (forward[2] / len - velocity[1]).abs() < 1.0e-4,
-                "yaw={yaw} 下资产正面朝 {forward:?},与速度 {velocity:?} 不符"
+                "{}",
+                T_FACING_MATCHES_VELOCITY
             );
         }
     }
@@ -755,16 +759,16 @@ mod tests {
         let right: f32 = limb_swing(crate::r#const::PART_UPPER_LEG_R, phase, 1.0);
         assert!(
             left * right < 0.0,
-            "左右大腿必须反相(左={left} 右={right}),同相就是齐步走"
+            "{T_LEGS_ANTIPHASE}: 左={left} 右={right}"
         );
         assert!(
             (left + right).abs() < 1.0e-5,
-            "左右大腿摆角应互为相反数,实得 {left} / {right}"
+            "{T_LEGS_ANTIPHASE}: 摆角应互为相反数,实得 {left} / {right}"
         );
         let phase_gap: f32 = (GAIT_PHASE_R - GAIT_PHASE_L).abs();
         assert!(
             (phase_gap - std::f32::consts::PI).abs() < 1.0e-6,
-            "左右相位必须差 π,实得 {phase_gap}"
+            "{T_LEGS_ANTIPHASE}: 左右相位必须差 π,实得 {phase_gap}"
         );
     }
 
@@ -776,7 +780,7 @@ mod tests {
         let shin: f32 = limb_swing(PART_LOWER_LEG_L, phase, 1.0);
         assert!(
             thigh * shin > 0.0,
-            "同侧大腿({thigh})与小腿({shin})必须同相"
+            "{T_SAME_SIDE_IN_PHASE}: 大腿 {thigh} 小腿 {shin}"
         );
     }
 
@@ -786,7 +790,7 @@ mod tests {
         for (part, _, _, _) in LIMB_PLAN {
             assert!(
                 limb_swing(part, 2.3, 0.0).abs() < 1.0e-9,
-                "{part} 在停下时摆角必须为 0"
+                "{T_LIMBS_RELAX_TO_ZERO}: {part}"
             );
         }
     }
@@ -797,7 +801,7 @@ mod tests {
         assert_eq!(limb_parent(PART_LOWER_LEG_L), PART_UPPER_LEG_L);
         assert!(
             limb_parent(PART_UPPER_LEG_L).is_empty(),
-            "大腿是链根,没有父关节"
+            "{T_DISTAL_LIMB_HAS_PARENT}: 大腿是链根,没有父关节"
         );
         // 每一项要么是链根,要么其父 part 也在计划表里(不能指向表外)。
         for (part, parent, _, _) in LIMB_PLAN {
@@ -807,7 +811,7 @@ mod tests {
             let known: bool = LIMB_PLAN
                 .iter()
                 .any(|(name, _, _, _): &(&str, &str, f32, f32)| name == parent);
-            assert!(known, "{part} 的父 part {parent} 不在 LIMB_PLAN 里");
+            assert!(known, "{T_PARENT_IN_PLAN}: {part} 的父 {parent}");
         }
         // 手臂 / 腿两条链都必须是「上段有父、下段有父」的结构。
         let chained: usize = LIMB_PLAN
@@ -817,6 +821,6 @@ mod tests {
                 part.contains(PART_ARM) || part.contains(PART_LEG)
             })
             .count();
-        assert_eq!(chained, 8, "四肢共 8 个 part 必须全部在计划表里");
+        assert_eq!(chained, 8, "{T_DISTAL_LIMB_HAS_PARENT}");
     }
 }

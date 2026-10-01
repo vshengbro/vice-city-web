@@ -3929,10 +3929,13 @@ fn bind_combat_mouse(handles: &GameHandles) {
     }
     {
         // 右键菜单会吞掉右键,这里屏蔽掉,免得开火中断。
+        // `handles` 只需要保持 move 进闭包以维持所有权(原代码写的是
+        // `let _ = handles;`,而那个 `let` 没有显式类型标注,违反 §5.1)。
+        // 改用 `drop(&handles)` 只丢借用,闭包仍是 `FnMut`。
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |event: Event| {
             event.prevent_default();
-            let _ = handles;
+            drop(&handles);
         }));
         attach(canvas, EVENT_CONTEXTMENU, closure);
     }

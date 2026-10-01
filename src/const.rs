@@ -306,6 +306,39 @@ pub const CANVAS2D_UNAVAILABLE: &str = "Canvas2D unavailable";
 
 pub const CREATE_BUFFER_FAILED: &str = "create_buffer failed";
 
+/// `facing_yaw` 回归测试:渲染矩阵算出的正面必须与速度同向。
+pub const T_FACING_MATCHES_VELOCITY: &str = "yaw 下资产正面方向必须与速度同向,而不是差 90°";
+
+/// 回归测试:左右腿必须反相(同相就是齐步走)。
+pub const T_LEGS_ANTIPHASE: &str = "左右腿必须反相迈步";
+
+/// 回归测试:同一侧的大腿 / 小腿必须同相位。
+pub const T_SAME_SIDE_IN_PHASE: &str = "同侧大腿与小腿必须同相";
+
+/// 回归测试:停下时所有关节必须归零。
+pub const T_LIMBS_RELAX_TO_ZERO: &str = "停下时所有肢体摆角必须归零";
+
+/// 回归测试:末端 limb 必须声明父关节,否则腿会断成两截。
+pub const T_DISTAL_LIMB_HAS_PARENT: &str = "末端 limb 必须声明父关节";
+
+/// 回归测试:父 part 必须也在计划表里。
+pub const T_PARENT_IN_PLAN: &str = "父 part 必须也在 LIMB_PLAN 里";
+
+/// 回归测试:软边界不得干预界内的人。
+pub const T_SOFT_LIMIT_SPARE_INSIDE: &str = "软边界不该干预界内的人";
+
+/// 回归测试:越界越深速度必须越小。
+pub const T_SOFT_LIMIT_RAMP: &str = "越界越深速度必须单调变小";
+
+/// 回归测试:越界超过一个余量后速度归零。
+pub const T_SOFT_LIMIT_STOPS_AT_VOID: &str = "软边界必须在虚空之前把人按住";
+
+/// 回归测试:界内不得有任何回推。
+pub const T_SOFT_PUSH_ZERO_INSIDE: &str = "界内不该有回推";
+
+/// 回归测试:分离不得再做位置钳制(否则就是空气墙)。
+pub const T_NO_POSITION_CLAMP: &str = "碰撞分离不得再钳位置(那是空气墙)";
+
 /// `replace_mesh` 的下标越界错误前缀(见 `WebGlRenderer::replace_mesh`)。
 pub const REPLACE_MESH_OUT_OF_RANGE: &str = "replace_mesh index out of range";
 
