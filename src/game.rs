@@ -64,6 +64,7 @@ use crate::{
 
 /// 固定步长:1/60 秒。
 const FIXED_DT: f32 = 1.0 / 60.0;
+
 /// 单帧最大累积时间(秒),超过就丢弃(标签页切回来时不追赶)。
 const MAX_FRAME_TIME: f32 = 0.25;
 /// 远裁剪面距离(米)。
@@ -4146,12 +4147,28 @@ fn is_pointer_locked() -> bool {
 /// 左右符号三件事只在这里定义一次,不会两条路径各写一份而漂移。
 ///
 /// **符号关系(实测,不是推导)**:`camera.yaw += dx * LOOK_YAW_SENSITIVITY`,
-/// 所以 `dx > 0`(鼠标右移)→ `yaw` 增大。而移动侧的「相机前向」取
-/// `[cos yaw, -sin yaw]`(见 [`simulate`]),`yaw` 增大即前向绕世界 +Z
-/// 轴**顺时针**(俯视, +X 右 / +Z 上)旋转 —— 即玩家向右看。
+/// 而 [`LOOK_YAW_SENSITIVITY`] 是**负**的,所以 `dx > 0`(鼠标右移)→
+/// `yaw` **减小**。
 ///
-/// `dy > 0`(鼠标下移)→ `pitch` 增大。第三人称下 `pitch` 是相机的
-/// **俯角**,增大即相机抬高、视线往下压。
+/// **为什么必须取负,以及两个基的关系。** 鼠标的 `dx` 与 `yaw` 定义在
+/// **两个不同的基**上,直接同号相乘会把方向反掉:
+///
+/// - **输入基**:屏幕像素,`+x` 指向屏幕**右**。
+/// - **渲染基**:`ndc_x`,相机空间的横向分量,`+x` 指向画面**右**;它由
+///   视图矩阵乘世界点算出来。
+///
+/// 判据是「世界点往哪边动」,不是「数字往哪边变」。实测(玩家不动,鼠标
+/// 右移 18 px = +0.108 rad):一对关于玩家对称的世界点的 `ndc_x` **同时
+/// 增大**(+0.0599 / +0.0602,两者相等 = 纯旋转没有平移)。`ndc_x` 增大
+/// = 场景内容整体**左移** = 画面转到了这些点的**左边** = 相机**右摇**。
+/// 所以 `dx > 0` 对应的正是视角右转,而 `yaw` 减小恰好是右摇(见
+/// `simulate` 里前向 `[cos yaw, -sin yaw]`:`yaw` 减小 → 前向 +X 分量增大)。
+/// 负号就是把「输入的右」翻译成「渲染的右」的那一次符号翻转;取正会把
+/// 鼠标右移变成视角左转。
+///
+/// 下面正文的 `dy > 0`(鼠标下移)→ `pitch` 增大不受这条约束:两个基在
+/// 纵向恰好同向(屏幕 y 向下即俯角增大),所以取正,见
+/// [`LOOK_PITCH_SENSITIVITY`] 的注释。
 ///
 /// # Arguments
 ///
@@ -4918,7 +4935,7 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
             mode = if game.third_person {
                 HUD_THIRD_PERSON
             } else {
-                HUD_ORBIT
+                HUD_FIRST_PERSON
             },
             shapes = game.world.get_shapes().len(),
             inside = game.world.contains_point([position[0], position[2]]),
@@ -5320,7 +5337,7 @@ fn format_hud(game: &Game, triangles: u32) -> String {
     let mode: &str = if game.third_person {
         HUD_THIRD_PERSON
     } else {
-        HUD_ORBIT
+        HUD_FIRST_PERSON
     };
     let notice: String = game.player.get_notice().to_string();
     let notice_part: String = if notice.is_empty() {
@@ -5934,7 +5951,6 @@ fn simulate(game: &mut Game, delta: f32) {
     }
 }
 
-
 /// 玩家走出当前地面块时,把地面与水面重新生成到新中心。
 ///
 /// 世界是无限的,而地面是一块固定尺寸、跟着玩家平移的网格块。判定
@@ -6021,13 +6037,27 @@ fn step_vertical(game: &mut Game, dt: f32) {
     let (x, z): (f32, f32) = (pushed[0], pushed[1]);
 
     // ---- 2. 支撑面:脚下那块板(含楼梯下一级)。
-    let support: f32 = game
-        .interiors
-        .support_height([x, z], body_min)
-        .unwrap_or(GROUND_LEVEL);
-    let on_slab: bool = game.interiors.support_height([x, z], body_min).is_some();
-
-    let mut y: f32 = here[1];
+    //
+    // **这一帧必须切成一串小步走,不能只查落点。**
+    //
+    // 实测(CDP,软件渲染):rAF ≈ 1.1 fps,一帧水平位移 **0.613 m**
+    // (`WALK_SPEED 4.6 × dt 0.133 s`),而每级踏面只有
+    // `SHOWCASE_STAIR_RUN = 0.45 m` 深 —— **一帧跨过 1.36 级**。楼梯坡度
+    // 是 `0.305 / 0.45 = 0.678 m/m`,走 0.613 m 本该升 0.415 m;而
+    // `support_height` 每次只返回「容差内最高的一块」,**一帧最多抬一级**
+    // (0.305 m)。抬升速率追不上前进速率,亏空逐帧累积,等到脚下每一级
+    // 都高出 0.45 m 以上时支撑彻底丢失,`y` 塌回首层地板 —— 实测正是
+    // 「第 4 级 y=1.370 之后一步掉回 0.150,之后 33 帧不动」。
+    //
+    // `support_along_frame` 负责切分与逐级抬升;60 fps 的一帧只有一个
+    // 小步,行为与修复前完全一致。
+    let from: Vec2 = [game.previous_step_xz[0], game.previous_step_xz[1]];
+    let (found, stepped): (Option<f32>, f32) =
+        game.interiors.support_along_frame(from, [x, z], here[1]);
+    let support: f32 = found.unwrap_or(GROUND_LEVEL);
+    let on_slab: bool = found.is_some();
+    // 逐级抬升后的脚底高度(没有支撑时保持原值,交给下面的自由落体)。
+    let mut y: f32 = stepped;
     // ---- 2a. 起跳 ----
     //
     // **判据不是「现在 y 等于多少」,而是「这一帧之前有没有踩着东西」。**
@@ -8771,9 +8801,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV, LOOK_YAW_SENSITIVITY, Mat4,
-        T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK, T_RUN_SPEED_PICK,
-        T_WALK_SPEED_PICK, RUN_OVER_WALK_MIN, apply_look_delta, car_wheel_model,
+        Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV, LOOK_YAW_SENSITIVITY, Mat4, RUN_OVER_WALK_MIN,
+        T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK, T_RUN_SPEED_PICK, T_WALK_SPEED_PICK,
+        apply_look_delta, car_wheel_model,
     };
     /// 一个世界点投影后的屏幕 NDC x(未做像素映射)。
     ///
@@ -8857,14 +8887,14 @@ mod tests {
     }
 
     use crate::game::{
-        BLOCK_VIEW_RADIUS, BlockLayout, BuildingPlacement, GROUND_SPAN,
-        MeshAsset, MeshPart, PLAYER_RADIUS, SHOWCASE_DOOR_HALF, SHOWCASE_GROUND_TOP,
-        SHOWCASE_STAIR_LEAD, SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN, SHOWCASE_STAIR_STEPS,
-        SHOWCASE_STAIR_WIDTH, SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH,
-        STREAM_REBUILD_STEP, STREET_HALF_WIDTH, STREET_PITCH, ShowcaseSpec, ShowcaseSpecs,
-        blocks_near, build_city_buildings, build_collision_world, build_ground_near,
-        build_showcase_interiors, build_water_near, on_roadway, showcase_placements,
-        showcase_specs, stream_needs_rebuild, street_axis, street_indices_in,
+        BLOCK_VIEW_RADIUS, BlockLayout, BuildingPlacement, GROUND_SPAN, MeshAsset, MeshPart,
+        PLAYER_RADIUS, SHOWCASE_DOOR_HALF, SHOWCASE_GROUND_TOP, SHOWCASE_STAIR_LEAD,
+        SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN, SHOWCASE_STAIR_STEPS, SHOWCASE_STAIR_WIDTH,
+        SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH, STREAM_REBUILD_STEP,
+        STREET_HALF_WIDTH, STREET_PITCH, ShowcaseSpec, ShowcaseSpecs, blocks_near,
+        build_city_buildings, build_collision_world, build_ground_near, build_showcase_interiors,
+        build_water_near, on_roadway, showcase_placements, showcase_specs, stream_needs_rebuild,
+        street_axis, street_indices_in,
     };
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
@@ -9449,10 +9479,20 @@ mod tests {
 
         let delta_left: f32 = after_left - before_left;
         let delta_right: f32 = after_right - before_right;
+        // 条件先算好再传进 `assert!`:这样断言的**第一个**参数就是格式串,
+        // 符合 `verify_hardcoded_strings` 对格式宏的豁免规则;写成
+        // `assert!(!(a.is_nan() || b.is_nan()), "...")` 的话条件会占掉第一个
+        // 参数位,格式串落到第二位而被判成 §1.3c 违规。
+        let degenerate: bool = before_left.is_nan()
+            || before_right.is_nan()
+            || delta_left.is_nan()
+            || delta_right.is_nan();
         assert!(
-            !(before_left.is_nan() || before_right.is_nan() || delta_left.is_nan() || delta_right.is_nan()),
+            !degenerate,
             "对称点必须都在相机前方,否则这条测不出方向: before={before_left},{before_right} after={after_left},{after_right} eye={:?} d={} fov={}",
-            moved.eye(), moved.get_distance(), moved.get_fov_y()
+            moved.eye(),
+            moved.get_distance(),
+            moved.get_fov_y()
         );
         // 等值:纯旋转(整体摇镜)而不是平移。
         assert!(
@@ -10105,7 +10145,10 @@ mod tests {
             "{}",
             fill(
                 T_WALK_SPEED_PICK,
-                &[("got", &format!("{wanted:.4}")), ("want", &format!("{WALK_SPEED:.4}"))]
+                &[
+                    ("got", &format!("{wanted:.4}")),
+                    ("want", &format!("{WALK_SPEED:.4}"))
+                ]
             )
         );
         let running: f32 = if true { RUN_SPEED } else { WALK_SPEED };

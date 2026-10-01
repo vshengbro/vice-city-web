@@ -561,7 +561,17 @@ pub const HUD_ON_FOOT: &str = "ON FOOT";
 
 pub const HUD_THIRD_PERSON: &str = "third-person";
 
-pub const HUD_ORBIT: &str = "orbit";
+/// 第一人称(按 V 切过去)时 HUD 显示的模式标签。
+///
+/// **为什么必须有这个常量:**以前 `!third_person` 那一支一律输出
+/// `"orbit"`,于是 V 进第一人称后 HUD 写的是「orbit」—— 标签与实际
+/// 渲染形态对不上(实测 V 之后 `camDist 8.2 -> 0`、无人身、只有准星,
+/// 那明显是第一人称,不是环绕机位)。读数的人只能凭标签猜模式,猜错。
+///
+/// 判据仍是 `third_person` 这一个布尔量:它同时决定相机走
+/// `update_camera`(第三人称)还是直接早退(第一人称)、以及近处剔除半径,
+/// 所以它就是「当前到底是什么视角」的唯一真相源,不需要另设一个模式枚举。
+pub const HUD_FIRST_PERSON: &str = "first-person";
 
 pub const NO_WINDOW: &str = "no window";
 
@@ -1979,6 +1989,21 @@ pub const T_WHEEL_AXLE_STILL: &str = "绕 Z 自转不得转动 Z 轴本身,变�
 
 /// 自转只绕轮心,不得把轮心挪走。
 pub const T_WHEEL_CENTRE_FIXED: &str = "自转不得移动轮心";
+
+/// 长帧跨过多级踏面时,支撑面必须被认出来(线上「上到第 4 级就卡住」的回归)。
+pub const T_INTERIOR_LONG_FRAME_LADDER: &str =
+    "一帧跨过多级踏面时支撑面必须仍能认出踏面,否则楼梯会塌回首层";
+
+/// 长帧抬升必须真的爬到顶,而不只是认出踏面。
+pub const T_INTERIOR_LONG_FRAME_HEIGHT: &str =
+    "长帧跨过 1.36 级后脚底必须累积升到二层楼板面,实得 {height}";
+
+/// 上面那条模板里待替换的高度占位符。
+pub const T_INTERIOR_HEIGHT_TOKEN: &str = "{height}";
+
+/// 支撑面不得低于脚底 —— 否则首层地板会把人从楼梯中段拽回地面。
+pub const T_INTERIOR_NO_DOWNWARD_SNAP: &str =
+    "脚下的板低于脚底时必须判为无支撑(首层地板会把人吸回地面)";
 
 /// 验收通道:传送 / 走位 / 加速 / 探针请求挂在这个 window 属性上。
 pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";

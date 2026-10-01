@@ -20,7 +20,10 @@
 //!    一级 0.305 m 的台阶在容差内,于是走过去就自动抬升。
 //! 3. 分��是纯水平(XZ)的,垂直方向交给重力 —— 不会把玩家「吸」到墙上。
 
-use crate::r#type::{Vec2, Vec3};
+use crate::{
+    r#const::SHOWCASE_STAIR_RUN,
+    r#type::{Vec2, Vec3},
+};
 
 /// 水平分离的迭代轮数(圆心站在墙角上时单轮会残留一点)。
 const RESOLVE_ITERATIONS: usize = 4;
@@ -149,6 +152,112 @@ impl FloorWorld {
             }
         }
         best
+    }
+
+    /// 沿**这一帧走过的整段**线段找脚下该踩的高度(楼梯的正解)。
+    ///
+    /// [`Self::support_height`] 是**单点**查询,而 `step_vertical` 只在
+    /// 一帧走完之后才调它一次。软件渲染下 rAF 只有约 1.1 fps,一帧的
+    /// 水平位移是 `WALK_SPEED * dt ≈ 0.61 m`(CDP 实测 `0.613 m/frame`),
+    /// 而**每一级踏面只有 `SHOWCASE_STAIR_RUN = 0.45 m` 深** —— 一帧就跨过
+    /// 1.43 级。落点已经越过了容差内的所有踏面,单点查询只剩首层地板
+    /// (顶面 0.15)可选,于是爬到第 4 级之后再也上不去。
+    ///
+    /// 这里改成沿线段**扫**一遍,取「不低于脚底、且在容差内」的最高一块
+    /// 踏面。扫过的那几级正是玩家真实踩过的,逐级抬升因此恢复。
+    ///
+    /// **判据同时钉死了「不许往下吸」。** 低于脚底的板一律不算支撑 ——
+    /// 首层地板铺满整个楼内,少了这条判据,站在第 8 级时脚底 2.59 会被
+    /// 首层地板(0.15)当成合法支撑直接吸下去,那正是「y 一步掉回地面
+    /// 0.15」的形态。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 这一帧起点 XZ(玩家的旧位置)。
+    /// - `Vec2` - 这一帧落点 XZ(玩家的新位置)。
+    /// - `f32` - 玩家当前脚底高度(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<f32>` - 该段上可站的高度(米);脚下没有任何合法板时为
+    ///   `None`(调用方按自由落体处理)。
+    pub fn support_height_along(&self, from: Vec2, to: Vec2, from_y: f32) -> Option<f32> {
+        let ceiling: f32 = from_y + STEP_UP_TOLERANCE;
+        let span: f32 = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
+        // 步长取踏深的四分之一:保证每一级至少被采到三个点,又不会把采样
+        // 数随帧率放大(1.84 m 的一帧也只有 17 次查询)。
+        let steps: usize = ((span / (SHOWCASE_STAIR_RUN * 0.25)).ceil() as usize).max(1);
+        let mut best: Option<f32> = None;
+        for index in 0..=steps {
+            let t: f32 = index as f32 / steps as f32;
+            let point: Vec2 = [
+                from[0] + (to[0] - from[0]) * t,
+                from[1] + (to[1] - from[1]) * t,
+            ];
+            let Some(top) = self.support_height(point, from_y) else {
+                continue;
+            };
+            // 只认「不高于脚底容差上限、也不低于脚底」的那块。
+            if top > ceiling || top < from_y - SUPPORT_CATCH_EPSILON {
+                continue;
+            }
+            if best.is_none_or(|current: f32| top > current) {
+                best = Some(top);
+            }
+        }
+        best
+    }
+
+    /// 沿**这一帧走过的整段**线段找脚下该踩的高度(楼梯的正解)。
+    ///
+    /// [`Self::support_height`] 是**单点**查询,而 `step_vertical` 只在
+    /// 一帧走完之后才调它一次。软件渲染下 rAF 只有约 1.1 fps,一帧的
+    /// 水平位移是 0.613 m(CDP 实测),而**每一级踏面只有
+    /// `SHOWCASE_STAIR_RUN = 0.45 m` 深** —— 一帧跨过 1.36 级。
+    ///
+    /// 关键在于**抬升速率**:楼梯坡度是 `0.305 / 0.45 = 0.678 m/m`,走
+    /// 0.613 m 本该升 0.415 m;而单次 `support_height` 每次只返回「容差内
+    /// 最高的一块」,**一次最多抬一级**(0.305 m,第二级就超出容差)。只查
+    /// 一次的话,抬升速率追不上前进速率,亏空逐帧累积,最终脚下每一级都
+    /// 高出容差,支撑彻底丢失,`y` 塌回首层地板 —— 实测正是「第 4 级
+    /// y=1.370 之后一步掉回 0.150,之后 33 帧不动」。
+    ///
+    /// 所以这里把一帧切成一串 [`SUPPORT_SUBSTEP_DISTANCE`] 的小步,
+    /// **每小步用当步的脚底重新取一次支撑并抬高**,抬升这才跟得上坡度。
+    ///
+    /// **判据同时钉死了「不许往下吸」。** 低于脚底的板一律不算支撑 ——
+    /// 首层地板铺满整个楼内,少了这条判据,站在楼梯中段时脚底会被地板
+    /// 重新拽回地面 0.15。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 这一帧起点 XZ(玩家的旧位置)。
+    /// - `Vec2` - 这一帧落点 XZ(玩家的新位置)。
+    /// - `f32` - 玩家当前脚底高度(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `(Option<f32>, f32)` - `(最终支撑高度, 逐级抬升后的脚底高度)`。
+    ///   支撑为 `None` 表示这一路都没有合法板,调用方按自由落体处理。
+    pub fn support_along_frame(&self, from: Vec2, to: Vec2, from_y: f32) -> (Option<f32>, f32) {
+        let span: f32 = ((to[0] - from[0]).powi(2) + (to[1] - from[1]).powi(2)).sqrt();
+        let substeps: usize = ((span / SUPPORT_SUBSTEP_DISTANCE).ceil() as usize).max(1);
+        let mut y: f32 = from_y;
+        let mut best: Option<f32> = None;
+        let mut cursor: Vec2 = from;
+        for index in 0..substeps {
+            let t: f32 = (index + 1) as f32 / substeps as f32;
+            let probe: Vec2 = [
+                from[0] + (to[0] - from[0]) * t,
+                from[1] + (to[1] - from[1]) * t,
+            ];
+            if let Some(top) = self.support_height_along(cursor, probe, y) {
+                y = top;
+                best = Some(top);
+            }
+            cursor = probe;
+        }
+        (best, y)
     }
 
     /// 把一个圆形身体推出所有与它身体区间相交的隔墙与楼板。
@@ -461,6 +570,28 @@ impl Default for FloorWorld {
 /// 又远低于门洞 2.30 m 与层高 3.05 m(所以不会一步跨上二层楼板)。
 pub const STEP_UP_TOLERANCE: f32 = 0.45;
 
+/// 「脚下的板」允许比脚底低多少仍然算支撑(米)。
+///
+/// 逐级抬升会把脚底**精确**放到踏面顶面(`support_height` 返回的就是
+/// `max[1]`),所以稳定态下这个差值是 0。但浮点与「人正好站在两级交界」
+/// 都会产生零点几毫米的负差,留 1 mm 余量,免得站在踏面正中间时被判成
+/// 「脚下没有板」而开始自由落体。
+///
+/// **它必须远小于 `STEP_UP_TOLERANCE`**:首层地板铺满整个楼内,容差一旦
+/// 放到踏高(0.305)以上,站在楼梯中段就会被首层地板重新吸回地面。
+pub const SUPPORT_CATCH_EPSILON: f32 = 0.001;
+
+/// 竖直解算把一帧切分成多小的水平小步(米)。
+///
+/// **取半个踏面**(`SHOWCASE_STAIR_RUN / 2`):保证每小步至少踩到一级踏面,
+/// 同时抬升粒度仍比单级踏高细,不会一次跨两级(两级 0.61 m 已经超出
+/// `STEP_UP_TOLERANCE = 0.45`)。
+///
+/// 换算成帧率:0.225 m 的小步在 `WALK_SPEED = 4.6` 下是 49 ms 一级,远
+/// 快于 60 fps 的一帧(77 ms),所以真机上**大部分帧只有一个小步**,行为与
+/// 修复前完全一致 —— 这条只影响长帧(低帧率 / 冲刺),不会引入回归。
+pub const SUPPORT_SUBSTEP_DISTANCE: f32 = 0.225;
+
 /// 圆形 vs 轴对齐盒的分离量(只读 XZ)。
 ///
 /// # Arguments
@@ -505,9 +636,10 @@ fn push_out_aabb(center: Vec2, half: Vec2, point: Vec2, radius: f32) -> Option<(
 mod tests {
     use crate::r#const::{
         T_INTERIOR_CEILING_INSIDE, T_INTERIOR_DOORWAY_BLOCKS, T_INTERIOR_DOORWAY_THROUGH,
-        T_INTERIOR_NO_SLAB_UNDER, T_INTERIOR_STAIR_CLIMBS, T_INTERIOR_STAIR_MONOTONIC,
-        T_INTERIOR_STAIR_PAIR, T_INTERIOR_UPPER_FLOOR_ABOVE, T_INTERIOR_WALL_BLOCKS,
-        T_INTERIOR_WALL_PASSES,
+        T_INTERIOR_HEIGHT_TOKEN, T_INTERIOR_LONG_FRAME_HEIGHT, T_INTERIOR_LONG_FRAME_LADDER,
+        T_INTERIOR_NO_DOWNWARD_SNAP, T_INTERIOR_NO_SLAB_UNDER, T_INTERIOR_STAIR_CLIMBS,
+        T_INTERIOR_STAIR_MONOTONIC, T_INTERIOR_STAIR_PAIR, T_INTERIOR_UPPER_FLOOR_ABOVE,
+        T_INTERIOR_WALL_BLOCKS, T_INTERIOR_WALL_PASSES,
     };
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::r#type::Vec2;
@@ -610,6 +742,11 @@ mod tests {
         assert!(world.blocks_sight([-4.0, 0.0], [4.0, 0.0], UPPER_BOT));
     }
 
+    /// 把长帧的实测高度填进断言消息(§1.3c:字面量只在 `const.rs` 定义)。
+    fn long_frame_height_message(height: f32) -> String {
+        T_INTERIOR_LONG_FRAME_HEIGHT.replace(T_INTERIOR_HEIGHT_TOKEN, &format!("{height}"))
+    }
+
     fn slab_world() -> FloorWorld {
         let mut w: FloorWorld = FloorWorld::new();
         w.push_slab([-5.75, 0.0, -4.75], [5.75, GROUND_TOP, 4.75]);
@@ -662,6 +799,63 @@ mod tests {
         let storey: f32 = UPPER_TOP - GROUND_TOP;
         assert!(tolerance > rise, "{}", T_INTERIOR_STAIR_CLIMBS);
         assert!(tolerance < storey, "{}", T_INTERIOR_UPPER_FLOOR_ABOVE);
+    }
+
+    /// 一帧跨过多级踏面时,楼梯仍然爬得上去(线上「上到第 4 级就卡住」的回归)。
+    ///
+    /// 线上实测(CDP,软件渲染):rAF ≈ 1.1 fps,一帧水平位移 **0.613 m**,
+    /// 而每级踏面只有 `STAIR_RUN = 0.45 m` 深 —— 一帧跨过 1.43 级。旧的
+    /// 单点查询只看**落点**,那里早已越过了容差内的所有踏面,只剩首层地板
+    /// (顶面 `GROUND_TOP = 0.15`)可选,于是 `y` 被压回地面后再也上不去。
+    ///
+    /// **注意判据是「跨多帧累积升到顶」,不是「一帧跨多级」。** 单帧仍然
+    /// 只抬一级(踏高 0.305 m 在容差 0.45 m 内,第二级就超了),这是容差
+    /// 的定义决定的正确行为;被测的是逐帧抬升能不能累积上去。
+    #[test]
+    fn a_long_frame_per_stride_still_reaches_the_top() {
+        let w: FloorWorld = slab_world();
+        // 线上实测的一帧水平位移:跨 0.613 / 0.45 = 1.43 级。
+        let stride: f32 = 0.613;
+        // 本测试世界的踏面随 i 向 **+z** 升高(`slab_world` 里
+        // `y0 = -4.55 + i * STAIR_RUN`),所以上行方向是 +z。
+        let mut z: f32 = -4.55 + 0.5 * STAIR_RUN;
+        let mut y: f32 = GROUND_TOP;
+        let mut heights: Vec<f32> = vec![y];
+        for _ in 0..24 {
+            let from: Vec2 = [5.1, z];
+            z += stride;
+            let to: Vec2 = [5.1, z];
+            // 走线上真实的那条路径:整帧切分 + 逐级抬升。
+            let (_, stepped): (Option<f32>, f32) = w.support_along_frame(from, to, y);
+            y = stepped;
+            heights.push(y);
+        }
+        // 一帧之内最多抬一级(容差的定义),所以是单调不降而不是单调升。
+        for pair in heights.windows(2) {
+            assert!(
+                pair[1] >= pair[0] - 1e-4,
+                "{}",
+                T_INTERIOR_LONG_FRAME_LADDER
+            );
+        }
+        // 但必须真的爬到顶,而不是停在首层楼板上。
+        assert!(
+            (y - UPPER_TOP).abs() < 1e-3,
+            "{}",
+            long_frame_height_message(y)
+        );
+    }
+
+    /// 支撑面**绝不能低于脚底** —— 首层地板铺满整个楼内,一旦允许往下吸,
+    /// 站在楼梯中段就会被地板拽回地面(线上「y 一步掉回 0.15」的形态)。
+    #[test]
+    fn a_surface_below_the_feet_is_never_support() {
+        let w: FloorWorld = slab_world();
+        // 站在第 8 级(顶面 2.590)上,脚下就是首层地板。
+        let on_step_eight: f32 = GROUND_TOP + 8.0 * STAIR_RISE;
+        let here: Vec2 = [5.1, -4.55 + 7.5 * STAIR_RUN];
+        let got: Option<f32> = w.support_height_along(here, here, on_step_eight);
+        assert_eq!(got, Some(on_step_eight), "{}", T_INTERIOR_NO_DOWNWARD_SNAP);
     }
 
     #[test]
