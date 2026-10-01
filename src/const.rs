@@ -391,11 +391,21 @@ pub const REPLACE_MESH_REPORT_LIMIT: usize = 4;
 /// 两个人形实体并排时额外的「个人空间」(米)。人不会贴着走。
 pub const PEDESTRIAN_PERSONAL_SPACE: f32 = 0.18;
 
-/// 回归测试:界内玩家必须拿到满速(软边界不能误伤)。
-/// 流式世界没有边界:任何位置的速度上限都必须原样保留。
-pub const T_NO_SOFT_LIMIT: &str = "流式世界不该限速:在 {at} 速度被削成 {got}";
+/// 回归测试:走路 / 冲刺必须选中两个不同的速度上限。
+///
+/// 取代原先两条软边界消息(`T_NO_SOFT_LIMIT` / `T_SOFT_SPEED_INSIDE`)——
+/// 流式世界没有边界,那两条断言恒为真,测不出任何东西。
+pub const T_WALK_SPEED_PICK: &str = "走路必须选中 WALK_SPEED,实得 {got},应为 {want}";
 
-pub const T_SOFT_SPEED_INSIDE: &str = "界内玩家必须拿到满速,越界才减速";
+pub const T_RUN_SPEED_PICK: &str = "按住 Shift 必须选中 RUN_SPEED,实得 {got},应为 {want}";
+
+pub const T_RUN_FASTER_THAN_WALK: &str = "冲刺必须明显快于走路:实测比值 {ratio},下限 {min}";
+
+/// 走 / 跑速度上限之比的下限。
+///
+/// 取 1.5(真实值 8.4/4.6 = 1.83):远低于 1.83 留出浮点余量,又足够高 ——
+/// 「两者被压成同一个值」时比值是 1.0,这条断言能抓住。
+pub const RUN_OVER_WALK_MIN: f32 = 1.5;
 
 /// 回归测试:附近有伴时行人必须能开始聊天。
 pub const T_PEDS_GATHER_AND_TALK: &str = "附近有伴时行人必须能开始聊天";

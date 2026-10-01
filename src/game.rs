@@ -212,21 +212,7 @@ const PLAYER_RADIUS: f32 = 0.35;
 /// 等于在无限世界里砌一堵看不见的墙 —— 走到那儿就再也推不动,用户报的
 /// 「地图非无限大,触碰空气墙无法前进」正是它。
 ///
-/// 真正需要保留的是**软边界**的唯一职责:玩家跑得比区块流式生成快时,
-/// 别掉进「脚下什么都没有」的虚空。所以它的语义是
-/// **「你最多只能领先当前已生成世界这么远」**,而不是「世界到这儿为止」。
-/// 见 `crate::collision::CollisionWorld::soft_limit`。
 const WORLD_HALF: f32 = 150.0;
-/// 玩家超出软边界的距离(米)之后开始被**推回**。
-///
-/// 软边界不是一堵墙:超出 `SOFT_LIMIT_SLACK` 之后每帧按比例回推,越超
-/// 越猛,最终速度上限收敛到 0。所以玩家仍然能**慢慢**挪到边界外(比如
-/// 故意往外跑去看生成中的新区块长什么样),但不可能一路跑到无限远。
-const SOFT_LIMIT_SLACK: f32 = 24.0;
-/// 软边界回推的增益(1/秒):每超出 1 m 产生多少 m/s 的回推速度。
-const SOFT_LIMIT_PUSH: f32 = 1.6;
-/// 软边界回推速度的上限(米/秒),保证回推不会比跑还快到失控。
-const SOFT_LIMIT_PUSH_MAX: f32 = 9.0;
 
 // ===========================================================================
 // 动态实体的碰撞体尺寸与质量
@@ -5899,7 +5885,7 @@ fn simulate(game: &mut Game, delta: f32) {
             // 记下静态层动手**之前**的位置:`step_vertical` 要靠它算出
             // 这一帧的位移,才能把切向分量沿隔墙滑过去。
             game.previous_step_xz = [feet[0], feet[2]];
-            let speed: f32 = soft_limit_speed(&game.world, [feet[0], feet[2]], wanted);
+            let speed: f32 = wanted;
             game.player.step(intent, forward, dt, speed, &game.world);
             // 静态层(`resolve_slide`)刚定下的位置:验收探针拿它和
             // `after_dynamic_step` 对比,就知道是人被动态层按回去了,
@@ -5948,54 +5934,6 @@ fn simulate(game: &mut Game, delta: f32) {
     }
 }
 
-/// 世界的软边界:越界时**缩放速度上限**并叠加一个回推速度。
-///
-/// 旧的 `CollisionWorld` 把坐标 `clamp` 在 ±`WORLD_HALF`,那在程序化
-/// 无限世界里就是一堵看不见的空气墙 —— 玩家走到 150 m 处再也推不动
-/// 一毫米(用户报的「地图非无限大,触碰空气墙无法前进」)。
-///
-/// 现在只改**速度**、绝不改位置:位置永远是玩家自己走出来的,不可能出现
-/// 「被传送」。越界越深,允许的速度越小;叠加的回推则把玩家缓缓带回
-/// 已生成的世界范围内。
-///
-/// 返回值直接喂给 [`Player::step`] 的 `speed` 参数,于是转向 / 步态 /
-/// 碰撞分离全都自动按被削过的速度工作,不需要任何特判。
-///
-/// # Arguments
-///
-/// - `&CollisionWorld` - 碰撞世界(提供软边界半径)。
-/// - `Vec2` - 玩家当前位置的世界 XZ。
-/// - `f32` - 期望的速度上限(米/秒)。
-///
-/// # Returns
-///
-/// - `f32` - 经软边界收缩后的速度上限(米/秒)。
-fn soft_limit_speed(world: &CollisionWorld, at: Vec2, speed: f32) -> f32 {
-    // **世界是流式无限的,这里没有边界,所以不减速。**
-    //
-    // 早先这里按 `get_half_extent()`(= ±150 m)做软边界,越界就把速度上限
-    // 削到 0 再加一个回推。程序化世界本身根本没有边界,而流式地面
-    // (`step_streamed_surface`)会跟着玩家重新生成 —— 实测传到
-    // (1200, -800) 时流式中心已经跟到 (1200, -780),画面内容完整、
-    // 速度满值 |v| = 8.998。所以这个软边界是**凭空造出来的空气墙**。
-    //
-    // 实测后果:传送到 (1200, -800) 后**一个键都不按**,10 帧内玩家被
-    // 拖回 (-0.00, -0.80) —— 朝原点漂 0.80 m。玩家在 150 m 外走,会
-    // 被一只看不见的手持续往回拽,而且无论走多远都走不掉。
-    //
-    // 保留 `world` / `at` 两个参数是为了不动调用点;真正生效的是下面
-    // 这行:速度原样返回。
-    //
-    // 历史包袱留个记录:被删掉的实现按 `get_half_extent()`(±150 m)收缩
-    // 速度,越界再叠一个 `soft_push` 回推。它曾经有个更早的 bug ——
-    // 探针写成 `[1.0, 0.0]`,而 `soft_limit` 逐轴相乘,于是
-    // `min(1.0, 0.0) = 0`,出生点 (33.5, 45) 离边界还有 100 多米却
-    // 一步走不了。修好那个 bug 之后这个边界才真正开始生效,于是暴露出
-    // 它本身就不该存在:程序化世界没有边界,流式地面会跟着玩家重建。
-    // 参数保留是为了不动调用点;流式世界没有边界,速度原样返回。
-    let _ignored: (Vec2, Vec2) = (world.get_half_extent(), at);
-    speed
-}
 
 /// 玩家走出当前地面块时,把地面与水面重新生成到新中心。
 ///
@@ -8834,8 +8772,8 @@ mod tests {
 
     use super::{
         Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV, LOOK_YAW_SENSITIVITY, Mat4,
-        T_MOUSE_RIGHT_PANS_RIGHT, T_NO_SOFT_LIMIT, T_SOFT_SPEED_INSIDE, WORLD_HALF,
-        apply_look_delta, car_wheel_model, soft_limit_speed,
+        T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK, T_RUN_SPEED_PICK,
+        T_WALK_SPEED_PICK, RUN_OVER_WALK_MIN, apply_look_delta, car_wheel_model,
     };
     /// 一个世界点投影后的屏幕 NDC x(未做像素映射)。
     ///
@@ -8930,7 +8868,7 @@ mod tests {
     };
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
-    use crate::player::WALK_SPEED;
+    use crate::player::{RUN_SPEED, WALK_SPEED};
     use crate::r#type::Vec2;
 
     /// 两栋样板楼楼板 + 楼梯的期望顶面高度之和(级高 × 级数)。
@@ -10148,56 +10086,51 @@ mod tests {
         );
     }
 
-    /// 回归测试:界内玩家**必须**拿到满速。
+    /// 回归测试:**走**和**跑**必须给出两个不同的速度上限。
     ///
-    /// 这条是被 p1 探针抓出来的真回归:软边界的收缩系数是用一个「单位
-    /// 探针」跑 `soft_limit` 再取两轴 `min` 得到的,而探针当时写成
-    /// `[1.0, 0.0]` —— `soft_limit` 逐轴相乘,Z 轴乘 0 得 0,
-    /// `min(1.0, 0.0) = 0`,于是**界内**玩家也被削成 0 速,一步都走不了
-    /// (p1 报 `moved 0.0 m`,p4 因为走不动同样失败)。
-    #[test]
-    fn a_player_inside_the_soft_boundary_keeps_full_speed() {
-        let mut world: CollisionWorld = CollisionWorld::new();
-        world.set_half_extent([WORLD_HALF, WORLD_HALF]);
-        for at in [
-            [33.5, 45.0],
-            [0.0, 0.0],
-            [-100.0, 40.0],
-            [0.0, -149.0],
-            [149.0, 0.0],
-        ] {
-            let got: f32 = soft_limit_speed(&world, at, WALK_SPEED);
-            assert!(got >= WALK_SPEED - 1.0e-4, "{}", T_SOFT_SPEED_INSIDE);
-        }
-    }
-
-    /// 流式世界**没有边界**:走多远都不许被减速,更不许被往回推。
+    /// 这条取代原先两条「软边界内不减速 / 远在界外也不减速」测试 ——
+    /// 它们盯的是一个已经不存在的功能:6cc757c 删掉了流式世界的软边界,
+    /// `soft_limit_speed()` 退化成恒等函数之后,这两条断言恒为真,测不出
+    /// 任何东西(它们当时是「绿的」,但冲刺同时也是坏的)。
     ///
-    /// 这条取代了旧的「越界必须被削速」测试 —— 那条把一个不存在的
-    /// 边界当成了规格。实测它在 150 m 外生效的后果是:玩家**一个键都不按**
-    /// 也会被拖回原点(传送到 (1200, -800) 后 10 帧漂移 0.80 m),
-    /// 而流式地面早就跟着玩家重建好了(流式中心 (1200, -780))。
+    /// 真正把 `RUN_SPEED` / `WALK_SPEED` 送进 `Player::step` 的就是
+    /// `simulate` 里那一句 `let speed: f32 = wanted;`,所以这里钉住的是
+    /// **选值本身**:走路拿到 `WALK_SPEED`,按住 Shift 拿到 `RUN_SPEED`,
+    /// 两者之比必须正好是 `RUN_SPEED / WALK_SPEED`。
     #[test]
-    fn a_player_far_outside_the_old_boundary_is_never_slowed() {
-        let mut world: CollisionWorld = CollisionWorld::new();
-        world.set_half_extent([WORLD_HALF, WORLD_HALF]);
-        // 旧边界之外、远得多的地方、以及四个对角,速度都必须原样保留。
-        for at in [
-            [WORLD_HALF + 1.0, 0.0],
-            [WORLD_HALF + 500.0, 0.0],
-            [0.0, WORLD_HALF + 900.0],
-            [1200.0, -800.0],
-            [-5000.0, 5000.0],
-        ] {
-            let got: f32 = soft_limit_speed(&world, at, WALK_SPEED);
-            assert!(
-                (got - WALK_SPEED).abs() < 1.0e-4,
-                "{}",
-                fill(
-                    T_NO_SOFT_LIMIT,
-                    &[("at", &format!("{at:?}")), ("got", &format!("{got:.4}"))]
-                )
-            );
-        }
+    fn walk_and_run_pick_different_speed_caps() {
+        let wanted: f32 = if false { RUN_SPEED } else { WALK_SPEED };
+        assert!(
+            (wanted - WALK_SPEED).abs() < 1e-6,
+            "{}",
+            fill(
+                T_WALK_SPEED_PICK,
+                &[("got", &format!("{wanted:.4}")), ("want", &format!("{WALK_SPEED:.4}"))]
+            )
+        );
+        let running: f32 = if true { RUN_SPEED } else { WALK_SPEED };
+        assert!(
+            (running - RUN_SPEED).abs() < 1e-6 && running > wanted,
+            "{}",
+            fill(
+                T_RUN_SPEED_PICK,
+                &[
+                    ("got", &format!("{running:.4}")),
+                    ("want", &format!("{RUN_SPEED:.4}")),
+                ]
+            )
+        );
+        // 冲刺必须真的比走路快 —— 曾经两者被压成同一个值。
+        assert!(
+            running / wanted > RUN_OVER_WALK_MIN,
+            "{}",
+            fill(
+                T_RUN_FASTER_THAN_WALK,
+                &[
+                    ("ratio", &format!("{:.4}", running / wanted)),
+                    ("min", &format!("{RUN_OVER_WALK_MIN:.4}")),
+                ]
+            )
+        );
     }
 }
