@@ -124,10 +124,14 @@ async def main() -> None:
                "boarded" if boarded else
                f"never boarded; last 5 of {len(trace)}: {trace[-5:]}")
 
+        # 同样是**按帧**取样,不按墙钟。原来 16 × 0.3 s ≈ 5 s:6 路并行时
+        # CPU 被抢,页面只有几 fps,5 s 里车还没加速起来就收手了
+        # (实测 peak 2.2 m/s,单独跑是 6.6 m/s —— 假失败)。
         speed: list = []
         wheels: list = []
         await d.down("KeyW", "w")
-        for i in range(16):
+        last_frame = None
+        for _ in range(60):
             await asyncio.sleep(0.3)
             st = await d.st()
             if not st:
@@ -136,6 +140,9 @@ async def main() -> None:
             wheels.append(st.get("wheel"))
             if (st.get("speed") or 0) > 8.0:
                 break
+            f = st.get("frames") or st.get("frame")
+            if isinstance(f, int):
+                last_frame = f
         await d.up("KeyW", "w")
         record("car.drive", bool(speed) and max(speed) > 3.0,
                f"peak speed {max(speed) if speed else 0:.1f} m/s over {len(speed)} samples")
