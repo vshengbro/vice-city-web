@@ -39,7 +39,9 @@ use crate::{
     enemy::{aim_with_spread, decide, is_active},
     interior::{FloorWorld, STEP_UP_TOLERANCE},
     mesh::{Bounds, GpuMesh, MeshAsset, MeshError, MeshPart, expand_asset},
-    player::{Player, RUN_SPEED, WALK_SPEED, joint_pivot, limb_matrix, limb_swing},
+    player::{
+        Player, RUN_SPEED, WALK_SPEED, joint_pivot, limb_chain_matrix, limb_parent, limb_swing,
+    },
     render::{
         AdaptiveQuality, DayPhase, Instance, MeshAssetGpu, NEAR_CULL_RADIUS,
         NEAR_CULL_RADIUS_FOLLOW, Renderer, Scene, SceneBatch, SceneLighting, SoftwareRenderer,
@@ -1824,6 +1826,12 @@ pub struct PlayerLimbBatch {
     pub part: String,
     /// 关节枢轴的资产本地坐标。
     pub pivot: Vec3,
+    /// 父关节(肩 / 胯)枢轴的资产本地坐标;无父关节时等于 `pivot`。
+    ///
+    /// 资产把上臂 / 小臂切成两个独立 part,各自带绝对局部坐标,
+    /// 所以渲染一节 limb 需要**两个**枢轴:自己的(肘 / 膝)与父关节的
+    /// (肩 / 胯)。见 [`crate::player::limb_chain_matrix`]。
+    pub root_pivot: Vec3,
     /// 该 part 在场景批次表里的索引。
     pub batch: usize,
 }
@@ -6397,9 +6405,18 @@ fn spawn_player_traffic_pickups(
             continue;
         }
         let pivot: Vec3 = joint_pivot(part_name, part_local_bounds(ped, part_name));
+        // 父关节枢轴:有父 part 时取父 part 的关节(肩 / 胯),链根则与自身
+        // 相同。渲染时用 `limb_chain_matrix` 把两级摆动串起来。
+        let parent: &str = limb_parent(part_name);
+        let root_pivot: Vec3 = if parent.is_empty() {
+            pivot
+        } else {
+            joint_pivot(parent, part_local_bounds(ped, parent))
+        };
         game.player_batches.push(PlayerLimbBatch {
             part: (*part_name).to_string(),
             pivot,
+            root_pivot,
             batch,
         });
     }
@@ -6509,6 +6526,10 @@ fn sync_dynamic_instances(game: &mut Game) {
     let amount: f32 = game.player.get_gait_amount();
 
     // 玩家骨架:四肢按步态相位摆动;上车时整批隐藏。
+    //
+    // 每节 limb 走 `limb_chain_matrix`:根关节(肩 / 胯)先转,末端关节
+    // (肘 / 膝)再在**已经转过根关节**的坐标系里多转一点。少了这一步,
+    // 大腿摆动时小腿会原地不动 —— 就是「四肢不协调」。
     for limb in game.player_batches.clone() {
         let Some(scene_batch) = game.scene.batches.get_mut(limb.batch) else {
             continue;
@@ -6518,7 +6539,14 @@ fn sync_dynamic_instances(game: &mut Game) {
             continue;
         }
         let swing: f32 = limb_swing(&limb.part, phase, amount);
-        let model: Mat4 = limb_matrix(origin, yaw, limb.pivot, swing);
+        let parent: &str = limb_parent(&limb.part);
+        let root_swing: f32 = if parent.is_empty() {
+            0.0
+        } else {
+            limb_swing(parent, phase, amount)
+        };
+        let model: Mat4 =
+            limb_chain_matrix(origin, yaw, limb.root_pivot, limb.pivot, root_swing, swing);
 
         scene_batch
             .instances

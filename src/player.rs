@@ -36,24 +36,68 @@ pub const PLANAR_EPSILON: f32 = 0.05;
 /// 玩家初始生命值。
 pub const MAX_HEALTH: f32 = 100.0;
 
-/// 玩家的全部骨架 part(与 `ped_suit` 的 part 划分一一对应)。
+/// 玩家的全部**可动**骨架 part(与 `ped_suit` 的 part 划分一一对应)。
 ///
-/// 枢轴由 [`build_rig`] 从资产包围盒推导,这里只声明「哪些 part 怎么摆」。
-pub const LIMB_PLAN: &[(&str, f32, f32)] = &[
-    (PART_UPPER_ARM_L, GAIT_PHASE_L, LIMB_SWING),
-    (PART_LOWER_ARM_L, GAIT_PHASE_L, LIMB_SWING * 0.8),
-    (PART_UPPER_ARM_R, GAIT_PHASE_R, LIMB_SWING),
-    (PART_LOWER_ARM_R, GAIT_PHASE_R, LIMB_SWING * 0.8),
-    (PART_UPPER_LEG_L, GAIT_PHASE_L, LIMB_SWING),
-    (PART_LOWER_LEG_L, GAIT_PHASE_L, LIMB_SWING * 0.9),
-    (PART_UPPER_LEG_R, GAIT_PHASE_R, LIMB_SWING),
-    (PART_LOWER_LEG_R, GAIT_PHASE_R, LIMB_SWING * 0.9),
+/// 每一项是 `(part 名, 父 part 名, 相位偏移, 摆动幅度)`。
+///
+/// **`parent` 不能省。** 资产把 `upper_leg_L` / `lower_leg_L` 切成两个
+/// 独立 part,各自带**绝对**局部坐标。渲染一节 limb 时必须知道它的父
+/// part 叫什么,才能把父关节的摆角叠加进来(见 [`limb_chain_matrix`])。
+/// 躯干 / 头 / 鞋这类没有父关节的 part 用空串表示「就是链根」。
+///
+/// 相位:左右反相(`GAIT_PHASE_R = π`),同一侧上下同相位,形成对角步态。
+pub const LIMB_PLAN: &[(&str, &str, f32, f32)] = &[
+    (PART_UPPER_ARM_L, "", GAIT_PHASE_L, LIMB_SWING),
+    (
+        PART_LOWER_ARM_L,
+        PART_UPPER_ARM_L,
+        GAIT_PHASE_L,
+        LIMB_SWING * 0.8,
+    ),
+    (PART_UPPER_ARM_R, "", GAIT_PHASE_R, LIMB_SWING),
+    (
+        PART_LOWER_ARM_R,
+        PART_UPPER_ARM_R,
+        GAIT_PHASE_R,
+        LIMB_SWING * 0.8,
+    ),
+    (PART_UPPER_LEG_L, "", GAIT_PHASE_L, LIMB_SWING),
+    (
+        PART_LOWER_LEG_L,
+        PART_UPPER_LEG_L,
+        GAIT_PHASE_L,
+        LIMB_SWING * 0.9,
+    ),
+    (PART_UPPER_LEG_R, "", GAIT_PHASE_R, LIMB_SWING),
+    (
+        PART_LOWER_LEG_R,
+        PART_UPPER_LEG_R,
+        GAIT_PHASE_R,
+        LIMB_SWING * 0.9,
+    ),
 ];
 
-/// 某个 part 在当前步态相位下的摆动角度(弧度)。
+/// 查某个 part 的父 part 名。
+///
+/// # Arguments
+///
+/// - `&str` - part 名。
+///
+/// # Returns
+///
+/// - `&str` - 父 part 名;链根(或不在计划表里)返回空串。
+pub fn limb_parent(part: &str) -> &'static str {
+    LIMB_PLAN
+        .iter()
+        .find(|(name, _, _, _): &&(&str, &str, f32, f32)| *name == part)
+        .map_or("", |(_, parent, _, _): &(&str, &str, f32, f32)| parent)
+}
+
+/// 某个 part 在当前步态相位下的**相对父关节**摆动角度(弧度)。
 ///
 /// 上下臂同相位、上下腿同相位、左右反相,形成对角的步态;幅度随
-/// `gait_amount` 缩放,所以停下时全部归零。
+/// `gait_amount` 缩放,所以停下时全部归零。返回的是**相对角** —— 上一
+/// 节的绝对摆角由渲染端在父关节变换之上再乘进来。
 ///
 /// # Arguments
 ///
@@ -63,11 +107,11 @@ pub const LIMB_PLAN: &[(&str, f32, f32)] = &[
 ///
 /// # Returns
 ///
-/// - `f32` - 该 part 的关节摆角(弧度)。
+/// - `f32` - 该 part 相对父关节的摆角(弧度)。
 pub fn limb_swing(part: &str, phase: f32, amount: f32) -> f32 {
-    let Some((_, offset, scale)) = LIMB_PLAN
+    let Some((_, _, offset, scale)) = LIMB_PLAN
         .iter()
-        .find(|(name, _, _): &&(&str, f32, f32)| *name == part)
+        .find(|(name, _, _, _): &&(&str, &str, f32, f32)| *name == part)
     else {
         return 0.0;
     };
@@ -482,7 +526,7 @@ impl Player {
         // 实际速度:蹭着墙走时手脚照样摆,只是真的走不动 —— 这才符合直觉。
         let planar: f32 = (velocity[0] * velocity[0] + velocity[1] * velocity[1]).sqrt();
         if planar > PLANAR_EPSILON {
-            let desired: f32 = -velocity[1].atan2(velocity[0]);
+            let desired: f32 = facing_yaw(velocity);
             let turning: f32 = wrap_angle(desired - self.get_yaw()) * TURN_RATE * dt;
             self.set_yaw(self.get_yaw() + turning);
         }
@@ -504,6 +548,32 @@ impl Player {
         }
         self.set_gait_amount(self.get_gait_amount().clamp(0.0, 1.0));
     }
+}
+
+/// 把角速度折成**朝向角**,使角色正面朝着它走的方向。
+///
+/// **朝向约定(全项目唯一的真源):`yaw = 0` 面向 `+Z`,且朝向向量为
+/// `(sin yaw, cos yaw)`。** 这与渲染侧完全一致:
+///
+/// - `Mat4::rotation_y` 是列主序,第 3 列是 `(sin yaw, 0, cos yaw)`,
+///   也就是资产本地 `+Z` 轴在世界里的落点;
+/// - 行人资产的正面确实是本地 `+Z`:`ped_suit` 的鞋尖在
+///   `z = +0.126 .. +0.378`(脚跟 z < 脚尖 z),`body` 零件同理。
+///
+/// 之前的实现写的是 `-vz.atan2(vx)`,那个约定是 **`yaw = 0` 面向 `+X`**,
+/// 与渲染差**正好 90°**。后果:玩家朝 `+X` 走时 `yaw` 算成 0,渲染出来正面
+/// 朝着 `+Z` —— 也就是「前进时侧身面向正前方」。这也解释了为什么转向动画
+/// 本身看着是对的(`wrap_angle` 在两套约定下都自洽),但人在世界里永远斜着走。
+///
+/// # Arguments
+///
+/// - `Vec2` - 世界 XZ 速度(米/秒);长度任意,只取方向。
+///
+/// # Returns
+///
+/// - `f32` - 让资产正面朝向该速度的 `yaw`(弧度)。
+pub fn facing_yaw(velocity: Vec2) -> f32 {
+    velocity[0].atan2(velocity[1])
 }
 
 /// 把角度折到 (−π, π],避免转身走远路。
@@ -550,12 +620,68 @@ pub fn joint_pivot(part: &str, bounds: (Vec3, Vec3)) -> Vec3 {
     [0.0, 0.0, 0.0]
 }
 
-/// 一个玩家肢体的 model matrix:整体位姿 × 绕枢轴的局部 X 轴摆动。
+/// 一个玩家肢体的 model matrix:整体位姿 × **父子串联**的关节链摆动。
+///
+/// **串联是必须的,不是可选的。** 资产里 `upper_leg_L` 与 `lower_leg_L`
+/// 是两个**独立**的 part,各自在资产空间里有绝对坐标(大腿
+/// `y = 0.485 .. 0.946`,小腿 `y = 0.098 .. 0.486`)。如果两者各自绕
+/// **同一个局部枢轴**摆动,大腿转 30° 时小腿不会跟着转 —— 膝盖以下整体
+/// 原地不动,表现就是「两条腿像被切断又拼回去」。真实的人腿是**串联**的:
+/// 髋转带动整条腿,膝再在髁的基础上多转一点。
+///
+/// 两条链各有两节,深度固定,所以用两个标量参数表达:
+///
+/// - `hip` / `knee` —— 髋关节摆角(整条腿绕胯)与膝关节摆角(小腿在
+///   **已经转过 `hip` 的躯干**上再绕膝);
+/// - `shoulder` / `elbow` —— 肩关节摆角与肘关节摆角。
+///
+/// 顺序固定为 `M = T(origin) · Ry(yaw) · T(hip) · Rx(hip_a) · T(knee)
+/// · Rx(knee_a) · T(-knee)` —— 注意 `T(-knee)` 之前**必须**已经乘过
+/// `Rx(hip_a)`,这样膝盖枢轴才是「跟随大腿转过之后」的位置。
 ///
 /// # Arguments
 ///
 /// - `Vec3` - 玩家脚下世界坐标。
-/// - `f32` - 玩家朝向(弧度)。
+/// - `f32` - 玩家朝向(弧度,`0` 面向 `+Z`)。
+/// - `Vec3` - 根关节(肩 / 胯)枢轴的资产本地坐标。
+/// - `Vec3` - 末端关节(肘 / 膝)枢轴的资产本地坐标。
+/// - `f32` - 根关节摆角(弧度)。
+/// - `f32` - 末端关节相对父关节的摆角(弧度)。
+///
+/// # Returns
+///
+/// - `Mat4` - 列主序 model matrix。
+pub fn limb_chain_matrix(
+    origin: Vec3,
+    yaw: f32,
+    root_pivot: Vec3,
+    joint_pivot: Vec3,
+    root_swing: f32,
+    joint_swing: f32,
+) -> Mat4 {
+    let placement: Mat4 = Mat4::translation(origin).multiply(&Mat4::rotation_y(yaw));
+    let root: Mat4 = Mat4::translation(root_pivot).multiply(&Mat4::rotation_x(root_swing));
+    // 末端关节:先在「已经随根关节转过」的坐标系里定位,再绕自身枢轴摆。
+    let child: Mat4 = root
+        .multiply(&Mat4::translation(joint_pivot))
+        .multiply(&Mat4::rotation_x(joint_swing))
+        .multiply(&Mat4::translation([
+            -joint_pivot[0],
+            -joint_pivot[1],
+            -joint_pivot[2],
+        ]));
+    placement.multiply(&child)
+}
+
+/// 一个玩家肢体的 model matrix:整体位姿 × 绕枢轴的局部 X 轴摆动。
+///
+/// 单关节版本(躯干 / 头 / 鞋这类没有父子关系的 part 用它):
+/// `M = T(origin) · Ry(yaw) · T(pivot) · Rx(swing) · T(-pivot)`。
+///
+/// # Arguments
+///
+/// - `Vec3` - 玩家脚下世界坐标。
+/// - `f32` - 玩家朝向(弧度,`0` 面向 `+Z`)。
 /// - `Vec3` - 关节枢轴的资产本地坐标。
 /// - `f32` - 该关节的摆角(弧度)。
 ///
@@ -563,9 +689,134 @@ pub fn joint_pivot(part: &str, bounds: (Vec3, Vec3)) -> Vec3 {
 ///
 /// - `Mat4` - 列主序 model matrix。
 pub fn limb_matrix(origin: Vec3, yaw: f32, pivot: Vec3, swing: f32) -> Mat4 {
-    let placement: Mat4 = Mat4::translation(origin).multiply(&Mat4::rotation_y(yaw));
-    let joint: Mat4 = Mat4::translation(pivot)
-        .multiply(&Mat4::rotation_x(swing))
-        .multiply(&Mat4::translation([-pivot[0], -pivot[1], -pivot[2]]));
-    placement.multiply(&joint)
+    limb_chain_matrix(origin, yaw, pivot, pivot, swing, 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::camera::Mat4;
+    use crate::r#const::{PART_LOWER_LEG_L, PART_UPPER_LEG_L};
+    use crate::player::{
+        GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, facing_yaw, limb_parent,
+        limb_swing,
+    };
+    use crate::r#type::{Mat4Data, Vec2, Vec3};
+
+    /// 把列主序 `Mat4` 作用在一个点上。
+    fn apply(m: &Mat4, v: Vec3) -> Vec3 {
+        let e: &Mat4Data = m.get_elements();
+        [0, 1, 2].map(|r: usize| e[r] * v[0] + e[4 + r] * v[1] + e[8 + r] * v[2] + e[12 + r])
+    }
+
+    /// 朝向角必须让资产的正面(`+Z`)朝着速度方向 —— 这是玩家「前进时侧身」
+    /// 的回归测试。`yaw = 0` 面向 `+Z`,所以朝 `+Z` 走必须是 0、朝 `+X`
+    /// 走必须是 `+π/2`。旧的 `-vz.atan2(vx)` 恰好把这两条对调了 90°。
+    #[test]
+    fn facing_yaw_points_the_model_along_the_velocity() {
+        for (velocity, want) in [
+            (Vec2::from([0.0, 1.0]), 0.0),
+            (Vec2::from([1.0, 0.0]), std::f32::consts::FRAC_PI_2),
+            (Vec2::from([0.0, -1.0]), std::f32::consts::PI),
+            (Vec2::from([-1.0, 0.0]), -std::f32::consts::FRAC_PI_2),
+        ] {
+            let yaw: f32 = facing_yaw(velocity);
+            assert!(
+                wrap(yaw - want).abs() < 1.0e-4,
+                "速度 {velocity:?} 应得到 yaw={want},实得 {yaw}"
+            );
+            // 再用渲染矩阵复核一次:本地 +Z 落到世界后必须与速度同向。
+            let forward: Vec3 = apply(&Mat4::rotation_y(yaw), [0.0, 0.0, 1.0]);
+            let len: f32 = (forward[0] * forward[0] + forward[2] * forward[2]).sqrt();
+            assert!(
+                (forward[0] / len - velocity[0]).abs() < 1.0e-4
+                    && (forward[2] / len - velocity[1]).abs() < 1.0e-4,
+                "yaw={yaw} 下资产正面朝 {forward:?},与速度 {velocity:?} 不符"
+            );
+        }
+    }
+
+    /// 把角度折到 (−π, π],避免断言时被 ±2π 干扰。
+    fn wrap(angle: f32) -> f32 {
+        let two_pi: f32 = 2.0 * std::f32::consts::PI;
+        let mut value: f32 = angle % two_pi;
+        if value > std::f32::consts::PI {
+            value -= two_pi;
+        } else if value < -std::f32::consts::PI {
+            value += two_pi;
+        }
+        value
+    }
+
+    /// 左右必须反相:两条腿同时朝前迈步就是「四肢不协调」。
+    #[test]
+    fn left_and_right_legs_swing_in_opposite_phase() {
+        let phase: f32 = 1.1;
+        let left: f32 = limb_swing(PART_UPPER_LEG_L, phase, 1.0);
+        let right: f32 = limb_swing(crate::r#const::PART_UPPER_LEG_R, phase, 1.0);
+        assert!(
+            left * right < 0.0,
+            "左右大腿必须反相(左={left} 右={right}),同相就是齐步走"
+        );
+        assert!(
+            (left + right).abs() < 1.0e-5,
+            "左右大腿摆角应互为相反数,实得 {left} / {right}"
+        );
+        let phase_gap: f32 = (GAIT_PHASE_R - GAIT_PHASE_L).abs();
+        assert!(
+            (phase_gap - std::f32::consts::PI).abs() < 1.0e-6,
+            "左右相位必须差 π,实得 {phase_gap}"
+        );
+    }
+
+    /// 同一侧的大腿 / 小腿必须同相位(否则就是抽搐而不是摆腿)。
+    #[test]
+    fn thigh_and_shin_on_one_side_share_a_phase() {
+        let phase: f32 = 0.7;
+        let thigh: f32 = limb_swing(PART_UPPER_LEG_L, phase, 1.0);
+        let shin: f32 = limb_swing(PART_LOWER_LEG_L, phase, 1.0);
+        assert!(
+            thigh * shin > 0.0,
+            "同侧大腿({thigh})与小腿({shin})必须同相"
+        );
+    }
+
+    /// 停下(`gait_amount = 0`)时所有关节必须归零。
+    #[test]
+    fn every_limb_relaxes_to_zero_when_the_player_stops() {
+        for (part, _, _, _) in LIMB_PLAN {
+            assert!(
+                limb_swing(part, 2.3, 0.0).abs() < 1.0e-9,
+                "{part} 在停下时摆角必须为 0"
+            );
+        }
+    }
+
+    /// 小腿 / 小臂必须挂在父 part 上 —— 没有父关节的串联,腿会断成两截。
+    #[test]
+    fn distal_limbs_declare_their_parent_joint() {
+        assert_eq!(limb_parent(PART_LOWER_LEG_L), PART_UPPER_LEG_L);
+        assert!(
+            limb_parent(PART_UPPER_LEG_L).is_empty(),
+            "大腿是链根,没有父关节"
+        );
+        // 每一项要么是链根,要么其父 part 也在计划表里(不能指向表外)。
+        for (part, parent, _, _) in LIMB_PLAN {
+            if parent.is_empty() {
+                continue;
+            }
+            let known: bool = LIMB_PLAN
+                .iter()
+                .any(|(name, _, _, _): &(&str, &str, f32, f32)| name == parent);
+            assert!(known, "{part} 的父 part {parent} 不在 LIMB_PLAN 里");
+        }
+        // 手臂 / 腿两条链都必须是「上段有父、下段有父」的结构。
+        let chained: usize = LIMB_PLAN
+            .iter()
+            .filter(|entry: &&(&str, &str, f32, f32)| {
+                let (part, _, _, _): (&str, &str, f32, f32) = *(*entry);
+                part.contains(PART_ARM) || part.contains(PART_LEG)
+            })
+            .count();
+        assert_eq!(chained, 8, "四肢共 8 个 part 必须全部在计划表里");
+    }
 }
