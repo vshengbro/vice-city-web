@@ -339,6 +339,18 @@ pub const T_SOFT_PUSH_ZERO_INSIDE: &str = "界内不该有回推";
 /// 回归测试:分离不得再做位置钳制(否则就是空气墙)。
 pub const T_NO_POSITION_CLAMP: &str = "碰撞分离不得再钳位置(那是空气墙)";
 
+/// 回归测试:动态分离必须按质量加权(轻的弹开、重的几乎不动)。
+pub const T_DYNAMIC_MASS_WEIGHTED: &str = "动态分离必须按质量加权";
+
+/// 回归测试:不重叠的动态体不得被移动。
+pub const T_DYNAMIC_NO_MOVE_WHEN_CLEAR: &str = "不重叠的动态体不该被移动";
+
+/// 回归测试:同类实体之间也必须分开(人不能穿人)。
+pub const T_DYNAMIC_SAME_KIND_SEPARATES: &str = "同类动态实体之间也必须分开";
+
+/// 回归测试:动态层也必须把实体从静态形状里推出来。
+pub const T_DYNAMIC_STATIC_TOO: &str = "动态体也必须被推出静态形状";
+
 /// `replace_mesh` 的下标越界错误前缀(见 `WebGlRenderer::replace_mesh`)。
 pub const REPLACE_MESH_OUT_OF_RANGE: &str = "replace_mesh index out of range";
 

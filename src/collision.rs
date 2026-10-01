@@ -486,6 +486,154 @@ impl CollisionWorld {
         })
     }
 
+    /// 两两分离一组动态实体,返回各自被推开后的新位置。
+    ///
+    /// **为什么要「按质量分」而不是「各推一半」:** 各推一半意味着撞上一辆
+    /// 停着的车时,人会像撞上另一堵墙一样被弹开,而 1.5 t 的车却纹丝不动
+    /// —— 这既不真实,手感也差(人被车「顶」住却推不动车)。按质量反比
+    /// 分配,轻的那个几乎弹开、重的那个纹丝不动,才符合直觉。
+    ///
+    /// 动量守恒在这里是「穿透深度的分配」:总推开量 = 穿透深度,各自承担
+    /// `m_other / (m_a + m_b)` 与 `m_a / (m_a + m_b)`。两车质量相同时各
+    /// 承担一半(对撞后各退一半);人(1)撞车(30)时人承担 30/31、车承担
+    /// 1/31 —— 人被弹飞、车几乎不动。
+    ///
+    /// 迭代若干轮直到稳定:三个人挤成一团时单轮只能解开一部分。
+    ///
+    /// # Arguments
+    ///
+    /// - `&[DynamicBody]` - 本帧所有动态实体。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec<Vec2>` - 与输入同序的新位置(已互相分离)。
+    pub fn resolve_dynamic(&self, bodies: &[DynamicBody]) -> Vec<Vec2> {
+        let mut out: Vec<Vec2> = bodies
+            .iter()
+            .map(|body: &DynamicBody| body.position)
+            .collect();
+        for _ in 0..RESOLVE_ITERATIONS {
+            let mut moved: bool = false;
+            for i in 0..bodies.len() {
+                for j in (i + 1)..bodies.len() {
+                    let (Some(a), Some(b)) = (bodies.get(i), bodies.get(j)) else {
+                        continue;
+                    };
+                    let reach: f32 = a.get_radius() + b.get_radius();
+                    let delta: Vec2 = [out[i][0] - out[j][0], out[i][1] - out[j][1]];
+                    let distance: f32 = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+                    if distance >= reach {
+                        continue;
+                    }
+                    // 完全重合时给一个确定的分离方向,避免除零后
+                    // 所有人往同一个方向抖。
+                    let (normal, depth): (Vec2, f32) = if distance > INSIDE_EPSILON {
+                        ([delta[0] / distance, delta[1] / distance], reach - distance)
+                    } else {
+                        ([1.0, 0.0], reach)
+                    };
+                    let mass_a: f32 = a.get_mass().max(0.01);
+                    let mass_b: f32 = b.get_mass().max(0.01);
+                    let total: f32 = mass_a + mass_b;
+                    // 质量大的少让位 —— 推 `j` 的比例 = a 的质量占比。
+                    // 质量加权:`i` 让位 `m_j/(m_i+m_j)`,`j` 让位
+                    // `m_i/(m_i+m_j)`。轻的弹开、重的几乎不动。
+                    let push_a: f32 = depth * (mass_b / total);
+                    let push_b: f32 = depth * (mass_a / total);
+                    // `normal` 指向 `i - j`(由 `out[i] - out[j]` 得到),
+                    // 所以让 `i` 沿 `+normal` 退、`j` 沿 `-normal` 退。
+                    out[i][0] += normal[0] * push_a;
+                    out[i][1] += normal[1] * push_a;
+                    out[j][0] -= normal[0] * push_b;
+                    out[j][1] -= normal[1] * push_b;
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        out
+    }
+
+    /// 把一组动态实体既与静态形状分离、又互相分离,返回最终位置。
+    ///
+    /// 这是动态层的**唯一入口**:车穿房子、树穿人、两个人穿在一起都在这里
+    /// 一次解决。顺序是「先静态后动态」—— 先把每个体从墙里推出来,再让
+    /// 它们互相让位;反过来的话,动态让位可能又把谁推进墙里。
+    ///
+    /// # Arguments
+    ///
+    /// - `&[DynamicBody]` - 本帧所有动态实体。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec<Vec2>` - 与输入同序的最终世界 XZ 位置。
+    pub fn resolve_all(&self, bodies: &[DynamicBody]) -> Vec<Vec2> {
+        let mut placed: Vec<DynamicBody> = bodies.to_vec();
+        // 静态分离:每个体用自己的半径走一遍已有的迭代分离。
+        for body in placed.iter_mut() {
+            let mut current: Vec2 = body.position;
+            for _ in 0..RESOLVE_ITERATIONS {
+                let mut moved: bool = false;
+                for shape in self.get_shapes() {
+                    let hit: Option<(Vec2, f32)> = match shape {
+                        Shape::Aabb { center, half } => {
+                            push_out_aabb(*center, *half, current, body.get_radius())
+                        }
+                        Shape::Circle {
+                            center,
+                            radius: other,
+                        } => push_out_circle(*center, *other, current, body.get_radius()),
+                    };
+                    if let Some((direction, depth)) = hit {
+                        current[0] += direction[0] * depth;
+                        current[1] += direction[1] * depth;
+                        moved = true;
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+            body.position = current;
+        }
+        // 动态分离:质量加权的两两分离(玩家按玩家半径,车按车半径……)。
+        let separated: Vec<Vec2> = self.resolve_dynamic(&placed);
+        for (body, at) in placed.iter_mut().zip(separated.iter()) {
+            body.position = *at;
+        }
+        // 动态让位可能又把谁推进了墙,最后再对静态收敛一次。
+        let mut out: Vec<Vec2> = Vec::with_capacity(placed.len());
+        for body in &placed {
+            let mut current: Vec2 = body.position;
+            for _ in 0..RESOLVE_ITERATIONS {
+                let mut moved: bool = false;
+                for shape in self.get_shapes() {
+                    let hit: Option<(Vec2, f32)> = match shape {
+                        Shape::Aabb { center, half } => {
+                            push_out_aabb(*center, *half, current, body.get_radius())
+                        }
+                        Shape::Circle {
+                            center,
+                            radius: other,
+                        } => push_out_circle(*center, *other, current, body.get_radius()),
+                    };
+                    if let Some((direction, depth)) = hit {
+                        current[0] += direction[0] * depth;
+                        current[1] += direction[1] * depth;
+                        moved = true;
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+            out.push(current);
+        }
+        out
+    }
+
     /// 一点到所有静态形状表面的最短距离(米)。
     ///
     /// 落在某个形状**内部**时该形状贡献 0,整体取最小值 —— 所以返回值
@@ -687,6 +835,80 @@ impl Default for CollisionWorld {
     }
 }
 
+/// 一个动态碰撞体的**身份**。
+///
+/// 分离力的大小按质量比分配(见 [`CollisionWorld::resolve_dynamic`]),
+/// 所以「谁在撞谁」必须可判定 —— 同一类实体之间同样要分开,否则两个人
+/// 走在一起会互相穿过去。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyKind {
+    /// 玩家角色。
+    Player,
+    /// 交通车辆。
+    Car,
+    /// 行人。
+    Pedestrian,
+    /// 敌对 / 警察 NPC。
+    Enemy,
+}
+
+/// 一个参与动态分离的实体(圆形足迹 + 质量)。
+///
+/// 质量是物理分离的唯一输入:撞静止的车时人会被弹开而车几乎不动,
+/// 两辆车相撞则按质量比分配速度。质量单位取「人」的整数倍,便于读数。
+#[derive(Clone, Copy, Debug)]
+pub struct DynamicBody {
+    /// 实体类型(决定同类之间是否也要分开)。
+    pub kind: BodyKind,
+    /// 圆心世界 XZ 坐标。
+    pub position: Vec2,
+    /// 碰撞圆半径(米)。
+    pub radius: f32,
+    /// 质量(以「一个人」为单位,1.0 = 一个人)。
+    pub mass: f32,
+}
+
+impl DynamicBody {
+    /// 构造一个动态碰撞体。
+    ///
+    /// # Arguments
+    ///
+    /// - `BodyKind` - 实体类型。
+    /// - `Vec2` - 圆心世界 XZ 坐标。
+    /// - `f32` - 碰撞圆半径(米)。
+    /// - `f32` - 质量(以「一个人」为单位)。
+    ///
+    /// # Returns
+    ///
+    /// - `Self` - 就绪的动态碰撞体。
+    pub const fn new(kind: BodyKind, position: Vec2, radius: f32, mass: f32) -> Self {
+        Self {
+            kind,
+            position,
+            radius,
+            mass,
+        }
+    }
+
+    /// 该实体的质量。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 质量(以「一个人」为单位)。
+    pub fn get_mass(&self) -> f32 {
+        self.mass
+    }
+
+    /// 该实体的碰撞半径。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 半径(米)。
+    pub fn get_radius(&self) -> f32 {
+        self.radius
+    }
+}
+
 /// 圆形 vs AABB 的分离量。
 ///
 /// # Arguments
@@ -795,12 +1017,13 @@ pub fn placement_box(min: Vec3, max: Vec3, yaw: f32, scale: f32, position: Vec3)
 
 #[cfg(test)]
 mod tests {
-    use crate::collision::CollisionWorld;
+    use crate::collision::{BodyKind, CollisionWorld, DynamicBody};
     use crate::r#const::{
         T_COLLISION_SLIDE_KEEPS_TANGENT, T_COLLISION_SLIDE_OPEN_GROUND_X,
-        T_COLLISION_SLIDE_OPEN_GROUND_Z, T_COLLISION_SLIDE_STOPS_AT_WALL, T_NO_POSITION_CLAMP,
-        T_SOFT_LIMIT_RAMP, T_SOFT_LIMIT_SPARE_INSIDE, T_SOFT_LIMIT_STOPS_AT_VOID,
-        T_SOFT_PUSH_ZERO_INSIDE,
+        T_COLLISION_SLIDE_OPEN_GROUND_Z, T_COLLISION_SLIDE_STOPS_AT_WALL, T_DYNAMIC_MASS_WEIGHTED,
+        T_DYNAMIC_NO_MOVE_WHEN_CLEAR, T_DYNAMIC_SAME_KIND_SEPARATES, T_DYNAMIC_STATIC_TOO,
+        T_NO_POSITION_CLAMP, T_SOFT_LIMIT_RAMP, T_SOFT_LIMIT_SPARE_INSIDE,
+        T_SOFT_LIMIT_STOPS_AT_VOID, T_SOFT_PUSH_ZERO_INSIDE,
     };
     use crate::r#type::Vec2;
 
@@ -987,5 +1210,110 @@ mod tests {
         );
         let slid: Vec2 = world.resolve_slide(far, [3.0, 3.0], RADIUS);
         assert!(slid[0] > far[0] + 2.0, "{T_NO_POSITION_CLAMP}");
+    }
+
+    /// 人撞静止的车:人必须被弹开,车几乎不动 —— 这就是质量分离。
+    #[test]
+    fn a_person_bounces_off_a_car_but_the_car_barely_moves() {
+        let world: CollisionWorld = CollisionWorld::new();
+        // 人与车重叠 0.4 m。
+        let overlap: f32 = 0.4;
+        let person_radius: f32 = 0.35;
+        let car_radius: f32 = 1.25;
+        let gap: f32 = person_radius + car_radius - overlap;
+        let bodies: [DynamicBody; 2] = [
+            DynamicBody::new(BodyKind::Player, [0.0, 0.0], person_radius, 1.0),
+            DynamicBody::new(BodyKind::Car, [gap, 0.0], car_radius, 30.0),
+        ];
+        let out: Vec<Vec2> = world.resolve_dynamic(&bodies);
+        let person_moved: f32 = (out[0][0] - 0.0).abs();
+        let car_moved: f32 = (out[1][0] - gap).abs();
+        assert!(
+            person_moved > 0.3,
+            "{}: 人应被弹开,实得 {person_moved} m",
+            T_DYNAMIC_MASS_WEIGHTED
+        );
+        assert!(
+            car_moved < person_moved * 0.1,
+            "{}: 车几乎不该动(人 {person_moved} / 车 {car_moved})",
+            T_DYNAMIC_MASS_WEIGHTED
+        );
+    }
+
+    /// 两车对撞:质量相同,各退一半。
+    #[test]
+    fn two_equal_cars_split_the_separation_evenly() {
+        let world: CollisionWorld = CollisionWorld::new();
+        let radius: f32 = 1.25;
+        let gap: f32 = radius * 2.0 - 0.4;
+        let bodies: [DynamicBody; 2] = [
+            DynamicBody::new(BodyKind::Car, [0.0, 0.0], radius, 10.0),
+            DynamicBody::new(BodyKind::Car, [gap, 0.0], radius, 10.0),
+        ];
+        let out: Vec<Vec2> = world.resolve_dynamic(&bodies);
+        // 0 号在左、1 号在右,`normal` 指向 `+X`,所以 0 号退向 −X
+        // (位移为负)、1 号退向 +X(位移为正)。用带符号的位移量。
+        let left: f32 = -out[0][0];
+        let right: f32 = out[1][0] - gap;
+        assert!(
+            (left - right).abs() < 1.0e-4,
+            "{}: 等质量应各退一半,实得 {left} / {right}",
+            T_DYNAMIC_MASS_WEIGHTED
+        );
+        assert!(
+            (left + right - 0.4).abs() < 1.0e-3,
+            "{}: 分离总量应等于穿透深度 0.4,实得 {}",
+            T_DYNAMIC_MASS_WEIGHTED,
+            left + right
+        );
+    }
+
+    /// 完全不重叠时不得产生任何位移。
+    #[test]
+    fn separated_bodies_are_left_alone() {
+        let world: CollisionWorld = CollisionWorld::new();
+        let bodies: [DynamicBody; 2] = [
+            DynamicBody::new(BodyKind::Player, [0.0, 0.0], 0.35, 1.0),
+            DynamicBody::new(BodyKind::Player, [10.0, 0.0], 0.35, 1.0),
+        ];
+        let out: Vec<Vec2> = world.resolve_dynamic(&bodies);
+        assert!(
+            (out[0][0] - 0.0).abs() < 1.0e-6 && (out[1][0] - 10.0).abs() < 1.0e-6,
+            "{}: 不重叠就不该动,得到 {out:?}",
+            T_DYNAMIC_NO_MOVE_WHEN_CLEAR
+        );
+    }
+
+    /// 同类实体之间**也要**分开 —— 两个人不能互相穿过。
+    #[test]
+    fn pedestrians_cannot_walk_through_each_other() {
+        let world: CollisionWorld = CollisionWorld::new();
+        let bodies: [DynamicBody; 2] = [
+            DynamicBody::new(BodyKind::Pedestrian, [0.0, 0.0], 0.35, 1.0),
+            DynamicBody::new(BodyKind::Pedestrian, [0.3, 0.0], 0.35, 1.0),
+        ];
+        let out: Vec<Vec2> = world.resolve_dynamic(&bodies);
+        let gap: f32 = (out[0][0] - out[1][0]).abs();
+        assert!(
+            gap >= 0.7 - 1.0e-3,
+            "{}: 两个行人应被分开到直径,实得 {gap} m",
+            T_DYNAMIC_SAME_KIND_SEPARATES
+        );
+    }
+
+    /// 动态层必须也能把人从**静态墙**里推出来(车穿房子)。
+    #[test]
+    fn dynamic_bodies_are_pushed_out_of_static_shapes_too() {
+        let mut world: CollisionWorld = CollisionWorld::new();
+        // 墙占 x ∈ [-10, 0],玩家圆心在 x = -0.2(陷进墙里 0.15 m)。
+        world.push_aabb([-5.0, 0.0], [5.0, 10.0]);
+        let bodies: [DynamicBody; 1] = [DynamicBody::new(BodyKind::Car, [-0.2, 0.0], 1.25, 10.0)];
+        let out: Vec<Vec2> = world.resolve_all(&bodies);
+        assert!(
+            out[0][0] >= 1.25 - 1.0e-3,
+            "{}: 车应被推出墙外,实得 x={}",
+            T_DYNAMIC_STATIC_TOO,
+            out[0][0]
+        );
     }
 }
