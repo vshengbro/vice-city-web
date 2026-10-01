@@ -249,6 +249,17 @@ const PALM_SCALE_MAX: f32 = 1.08;
 const PALM_TALL_SCALE_MIN: f32 = 1.25;
 /// 高个棕榈的最大缩放。
 const PALM_TALL_SCALE_MAX: f32 = 1.65;
+
+/// 棕榈树干与可进入样板楼门洞之间必须留出的净距(米)。
+///
+/// 内院棕榈的散布半径抖动到 7.5 m 之后,树干会长到门洞里去;碰撞体
+/// 又跟着 `scale` 一起放大(高个 ×1.65),把门彻底堵死。留 6 m 净距。
+const PALM_SHOWCASE_CLEARANCE: f32 = 6.0;
+/// 棕榈碰撞半径最多按缩放放大到几倍(1.0 = 固定粗细)。
+///
+/// 树干粗细随树高走合理,但不能无上限:高个 ×1.65 再乘基准半径,
+/// 靠墙的树就把过道挤没了。这里封顶。
+const PALM_TRUNK_SCALE_CAP: f32 = 1.25;
 /// 玩家出生点(世界坐标):X = 30 那条街的**路中间偏东的车道**,z = 45。
 ///
 /// 选点是拿截图试出来的,踩过三个坑:
@@ -1584,11 +1595,17 @@ fn build_city_palms(cx: f32, cz: f32) -> PalmSpots {
             let radius: f32 = 4.0 + hash_unit(seed, 6) * 3.5;
             let scale: f32 =
                 PALM_SCALE_MIN + hash_unit(seed, 7) * (PALM_TALL_SCALE_MAX - PALM_SCALE_MIN);
-            out.push([
-                block.cx + angle.sin() * radius,
-                block.cz + angle.cos() * radius,
-                scale,
-            ]);
+            let px: f32 = block.cx + angle.sin() * radius;
+            let pz: f32 = block.cz + angle.cos() * radius;
+            // **必须让开可进入的样板楼。** 内院棕榈原本落在固定 5 m 圆
+            // 上,和样板楼门口的距离是「碰巧够用」;半径一抖动到 7.5 m,
+            // 树干就长到门洞里去了 —— 碰撞体(半径随 scale 放大到
+            // 1.65 倍)把门口堵死,p4 的 showcase.climb 于是卡在
+            // (25.82, 36.00) 上不了楼(`best y=0.15 m`)。
+            if hits_a_showcase(px, pz, PALM_SHOWCASE_CLEARANCE) {
+                continue;
+            }
+            out.push([px, pz, scale]);
         }
     }
     out
