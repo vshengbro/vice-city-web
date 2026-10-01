@@ -68,7 +68,15 @@ async def main() -> None:
 # ---- 4/5. car + wheel spin -----------------------------------
         await d.release()
         boarded = False
-        for _ in range(90):
+        trace = []
+        # 预算**按帧算**,不按墙钟算。原来写死 90 轮 × 0.22 s ≈ 20 s,
+        # 但无头探针现在走真 GPU 栈(metal-3),页面只有几 fps,20 s 里
+        # 玩家其实只挪了几米 —— 车明明已经 1.6 m 了,循环却先耗尽。
+        # 于是 `car.board` 在换 flag 之后假性失败。
+        # 改成:只要帧号还在推进就继续走,给个硬上限兜底。
+        last_frame = None
+        stuck = 0
+        for _ in range(240):
             st = await d.st()
             veh = st.get("veh")
             if isinstance(veh, (int, float)) and veh >= 0:
@@ -83,6 +91,18 @@ async def main() -> None:
                 " return {d:best,x:bx,z:bz};})()")
             if not near or not st:
                 break
+            f = st.get("frames") or st.get("frame")
+            if isinstance(f, int):
+                # 连续 40 轮帧号不动 = 页面卡死,不是「走得慢」,收手。
+                if last_frame is not None and f <= last_frame:
+                    stuck += 1
+                    if stuck > 40:
+                        break
+                else:
+                    stuck = 0
+                last_frame = f
+            trace.append([round(st.get("px") or 0, 2), round(st.get("pz") or 0, 2),
+                          round(near["d"], 2), f])
             if near["d"] < 2.2:
                 await d.down("KeyF", "f")
                 await d.up("KeyF", "f")
@@ -100,7 +120,9 @@ async def main() -> None:
                 await d.down("KeyD", "d")
             await asyncio.sleep(0.22)
         await d.release()
-        record("car.board", boarded, "boarded" if boarded else "never boarded")
+        record("car.board", boarded,
+               "boarded" if boarded else
+               f"never boarded; last 5 of {len(trace)}: {trace[-5:]}")
 
         speed: list = []
         wheels: list = []
