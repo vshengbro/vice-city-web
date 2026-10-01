@@ -31,7 +31,7 @@ mod r#spawn;
 mod r#traffic;
 mod r#type;
 
-use euv::{App, wasm_bindgen::prelude::*};
+pub use euv::{App, wasm_bindgen::prelude::*};
 
 /// 挂载静态视图树并启动游戏循环。
 ///

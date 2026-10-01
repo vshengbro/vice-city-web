@@ -3307,7 +3307,7 @@ impl WebGlRenderer {
             (crate::r#const::GL_ATTR_ANTIALIAS, false),
             (crate::r#const::GL_ATTR_PRESERVE_DRAWING_BUFFER, true),
         ] {
-            let _ = js_sys::Reflect::set(
+            let _: Result<bool, JsValue> = js_sys::Reflect::set(
                 &attributes,
                 &JsValue::from_str(name),
                 &JsValue::from_bool(value),
@@ -4219,7 +4219,7 @@ impl WebGlRenderer {
         }
 
         // ---- 3) 主 pass(阴影 + AO + SSR 全部在这一个 program 里)----
-        let scene_target = self
+        let scene_target: &RenderTarget = self
             .targets
             .scene
             .as_ref()

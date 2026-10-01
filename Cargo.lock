@@ -9,6 +9,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2fb6cfd47bf496ff64095c20eaba0c201404ee38714d4142fcfa1dc334fcc7a"
 
 [[package]]
+name = "bin-encode-decode"
+version = "1.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6797b04678b394dd53deb7b94cf246cef372ad5a1d08fe0c50659a271f8066f6"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -38,9 +44,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "euv"
-version = "0.28.2"
+version = "0.28.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac2505f5a8eafc9555edcf43f882524d03d76980dbdcf5cb9930083eafdccd90"
+checksum = "a8e8d48fbcd0a3872724b10404b189ee8ca8e19842375b835fb7a2f325a17112"
 dependencies = [
  "alloc-no-stdlib",
  "console_error_panic_hook",
@@ -55,10 +61,11 @@ dependencies = [
 
 [[package]]
 name = "euv-core"
-version = "0.28.2"
+version = "0.28.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "846eb98dae1d4aabf174900e26c252907e00b38ee1b3cbf6c2c3caf907af2f1d"
+checksum = "ad17a5895e407363f70e3c9001c18b2d83560e1518a2b1bc53ea26814489ddaf"
 dependencies = [
+ "bin-encode-decode",
  "js-sys",
  "lombok-macros",
  "wasm-bindgen",
@@ -68,9 +75,9 @@ dependencies = [
 
 [[package]]
 name = "euv-engine"
-version = "0.28.2"
+version = "0.28.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5b8fd145f33e91d538e147472ddede2365b95ce38168f58e87e7d752af39a50"
+checksum = "c5d75756606435b34f4879544b76865a5e6b62821aa6e1181e6bd1f31146a571"
 dependencies = [
  "euv",
  "js-sys",
@@ -82,9 +89,9 @@ dependencies = [
 
 [[package]]
 name = "euv-macros"
-version = "0.28.2"
+version = "0.28.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43ac722315468d04df6d98cc99bd7f784166bffc259b53854ff7b7835700ed78"
+checksum = "1d1caa62ada61e112e9d8c0115ff295cd3e15fc5f2b3657926fccee7bf6cc8e5"
 dependencies = [
  "lombok-macros",
  "proc-macro2",
@@ -154,9 +161,9 @@ dependencies = [
 
 [[package]]
 name = "lombok-macros"
-version = "10.2.0"
+version = "10.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "389d0468212c6945940f21ed591de82a7f6dc23028e5319cffd89da77163b1ca"
+checksum = "32ee85ac6d974db9a53efa4556b36b6d647cd1d998ff5f1f3243202688c0359b"
 dependencies = [
  "proc-macro2",
  "quote",
