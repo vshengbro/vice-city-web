@@ -1185,6 +1185,25 @@ fn push_showcase_interior(interiors: &mut FloorWorld, spec: &ShowcaseSpec) {
     let stair_end: f32 = sz_last - SHOWCASE_STAIR_STEPS as f32 * SHOWCASE_STAIR_RUN;
 
     // ---- 二层楼板:两片 L 形,给楼梯留一个真的井口 -------------------
+    //
+    // 楼梯**跑段占的本地 z 是 `[stair_end, sz_last]`**(`stair_end < sz_last`),
+    // 也就是楼梯底端到梯顶那一整条。井口必须让开它。
+    //
+    // 自 `1ff7c38`(09-29)起第二片写的是 `[sx0, stair_end] -> [hx, hz]`,
+    // **z 上界从 `stair_end` 一直铺到 `hz`**,于是它把整条梯段连同梯脚
+    // 一起盖住:梯段每级踏面顶面是 0.455..3.200,而这片楼板顶面恒为
+    // 3.20,`support_height` 取「容差内最高的一块」时它**恒中选** ——
+    // 于是人在梯段上永远是 y=3.20,而 `support_along_frame` 的下楼补查
+    // 下界只放行「比脚底低一个踏高」,3.20 那块也满足,于是**下楼的每一
+    // 帧都被这块楼板吸回 3.20**。人钉在二层高度,往梯脚走完整段梯段也
+    // 一步都降不下来。第二片 z 应该是 `[-hz, stair_end]`:井口在楼梯
+    // **后方**(本地 -Z 一侧),那里才看得见楼板。
+    //
+    // 资产是这么摆的:`assets/bldg_*_showcase.json` 的 `floor_upper` 只有
+    // 24 个三角形,顶面(y=3.20)只有两块 —— 主片 `x[-5.75,4.45] z[-4.75,4.75]`
+    // 与第二片 `x[4.45,5.75] z[-4.75,0.05]`。梯段正好落在
+    // `z[0.05,4.55]`,第二片压根**没有**盖住它。所以这里改的是碰撞体,
+    // **不是**把可见楼板改小 —— 改反了会让玩家看见一块空气楼板。
     push(
         [-hx, -hz],
         [sx0, hz],
@@ -1193,8 +1212,8 @@ fn push_showcase_interior(interiors: &mut FloorWorld, spec: &ShowcaseSpec) {
         true,
     );
     push(
-        [sx0, stair_end],
-        [hx, hz],
+        [sx0, -hz],
+        [hx, stair_end],
         SHOWCASE_UPPER_BOTTOM,
         SHOWCASE_UPPER_TOP,
         true,
@@ -8846,6 +8865,8 @@ mod tests {
         T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL,
         T_SHOWCASE_DOOR_OUTSIDE_BLOCKED, T_SHOWCASE_DOORS_FACE_EACH_OTHER,
         T_SHOWCASE_DOORWAY_2D_BLOCKED, T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING,
+        T_SHOWCASE_DESCENT_NO_CLIMB, T_SHOWCASE_DESCENT_REACHES_GROUND,
+        T_SHOWCASE_LANDING_COVERS_RUN,
         T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE,
         T_SHOWCASE_PARTITION_LET_THROUGH, T_SHOWCASE_PIER_LET_PLAYER_THROUGH,
         T_SHOWCASE_PUSHED_INTO_WALL, T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE,
@@ -9242,6 +9263,105 @@ mod tests {
             let _: ShowcaseSpecs = specs;
         }
     }
+
+    /// **楼内走不下楼梯** —— 二层楼板第 2 片盖住了整条梯段。
+    ///
+    /// **实测缺陷(CDP,软件渲染,HUD 逐帧,自 `1ff7c38` / 09-29 起):**
+    /// `push_showcase_interior` 铺二层楼板第 2 片时写的是
+    /// `z[stair_end, hz]`,而梯段正好占 `z[stair_end, sz_last]` 且
+    /// `stair_end < sz_last` —— **整条梯段都在那片楼板底下**。楼板顶面
+    /// 恒为 `UPPER_TOP = 3.20`,`support_height` 取「容差内最高的一块」,
+    /// 于是人站在梯段上永远是 y = 3.20:下楼沿 +X 走到 x = 27.4(墙)仍
+    /// y = 3.2,一步都下不去。
+    ///
+    /// **为什么必须用 `world()` 而不是 `interior` 里的夹具:** 缺陷在
+    /// `push_showcase_interior` 的几何里,夹具是另抄的一份,两者不联动
+    /// —— 改回去夹具还是绿的。这条直接问 `build_showcase_interiors` 铺出来
+    /// 的**真实**碰撞世界,修几何前后必然一红一绿。
+    ///
+    /// 三条判据:
+    /// 1. **梯段头顶是空的** —— 站在第 5 级上,脚下只能是那一级。
+    /// 2. **逐级降到地面** —— 走完整段梯段后 y 真的落到首层。
+    /// 3. **全程不出现抬升** —— 下楼途中 dy 一旦 > 0,那是往回爬。
+    #[test]
+    fn the_upper_floor_leaves_the_stair_run_open() {
+        let w: FloorWorld = world();
+        let dt: f32 = 1.0 / 60.0;
+        let stride: f32 = WALK_SPEED * dt;
+        for index in 0..2 {
+            let spec: &ShowcaseSpec = &showcase_specs()[index];
+            let (hx, hz): (f32, f32) = (spec.span[0] * 0.5, spec.span[1] * 0.5);
+            let sx0: f32 = hx - SHOWCASE_STAIR_WIDTH;
+            let sz_last: f32 = hz - SHOWCASE_STAIR_LEAD;
+            let stair_end: f32 =
+                sz_last - SHOWCASE_STAIR_STEPS as f32 * SHOWCASE_STAIR_RUN;
+            let stair_x: f32 = (sx0 + hx) * 0.5;
+
+            // ---- 判据 1:梯段每一级头顶都是空的。
+            for step in 0..SHOWCASE_STAIR_STEPS {
+                let z1: f32 = sz_last - step as f32 * SHOWCASE_STAIR_RUN;
+                let tread: f32 =
+                    SHOWCASE_GROUND_TOP + (step as f32 + 1.0) * SHOWCASE_STAIR_RISE;
+                let at: Vec2 = super::showcase_to_world(index, [stair_x, z1 - 0.5 * SHOWCASE_STAIR_RUN]);
+                let got: Option<f32> = w.support_height(at, tread);
+                assert!(
+                    got.is_some_and(|height: f32| (height - tread).abs() < 1e-3),
+                    "{}",
+                    T_SHOWCASE_LANDING_COVERS_RUN
+                        .replace("{index}", &format!("{index}"))
+                        .replace("{run_lo:.3}", &format!("{stair_end:.3}"))
+                        .replace("{run_hi:.3}", &format!("{sz_last:.3}"))
+                        .replace("{slab_lo:.3}", &format!("{stair_end:.3}"))
+                        .replace("{slab_hi:.3}", &format!("{hz:.3}"))
+                        .replace("{support:.3}", &format!("{:.3}", got.unwrap_or(-1.0)))
+                        .replace("{tread:.3}", &format!("{tread:.3}"))
+                );
+            }
+
+            // ---- 判据 2 + 3:从梯顶 landing 往梯脚走,逐级降到地面。
+            //
+            // 方向:**上坡是本地 -z**(tread9 顶面 3.20 在 `z = stair_end`,
+            // tread0 顶面 0.455 在 `z = sz_last`),所以下楼是**本地 +z**。
+            // 起步点落在二层楼板第 2 片上(它现在占 `z[-hz, stair_end]`,
+            // 梯顶那一侧),脚下是 3.20;往 +z 走出 landing 就踩上第 10 级。
+            let mut local_z: f32 = stair_end - 0.20;
+            let mut y: f32 = SHOWCASE_UPPER_TOP;
+            let mut seq: Vec<f32> = vec![y];
+            for _ in 0..DESCENT_BUDGET {
+                let from: Vec2 = super::showcase_to_world(index, [stair_x, local_z]);
+                local_z += stride;
+                let to: Vec2 = super::showcase_to_world(index, [stair_x, local_z]);
+                let (_, stepped): (Option<f32>, f32) = w.support_along_frame(from, to, y);
+                y = stepped;
+                seq.push(y);
+            }
+            for (frame, pair) in seq.windows(2).enumerate() {
+                assert!(
+                    pair[1] <= pair[0] + 1e-3,
+                    "{}",
+                    T_SHOWCASE_DESCENT_NO_CLIMB
+                        .replace("{index}", &format!("{index}"))
+                        .replace("{frame}", &format!("{frame}"))
+                        .replace("{from:.3}", &format!("{:.3}", pair[0]))
+                        .replace("{to:.3}", &format!("{:.3}", pair[1]))
+                        .replace("{seq:?}", &format!("{seq:?}"))
+                );
+            }
+            assert!(
+                y <= SHOWCASE_GROUND_TOP + 1e-2,
+                "{}",
+                T_SHOWCASE_DESCENT_REACHES_GROUND
+                    .replace("{index}", &format!("{index}"))
+                    .replace("{seq:?}", &format!("{seq:?}"))
+            );
+        }
+    }
+
+    /// 从二层 landing 走完整段梯段到地面要多少帧(60 fps)。
+    ///
+    /// 梯段 10 级 × 0.45 m = 4.5 m,每帧 `WALK_SPEED / 60 = 0.077 m`,
+    /// 至少 60 帧;取 100 留出余量,走过头之后脚下是首层地板(判据仍成立)。
+    const DESCENT_BUDGET: usize = 100;
 
     /// 端到端:从门外一路走上二层楼板。
     ///
