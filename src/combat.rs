@@ -41,7 +41,17 @@ pub enum Weapon {
     Smg,
     /// 球棒:近战、无弹药、一击重创。
     Bat,
+    /// 手雷:抛投型,范围伤害。
+    Grenade,
 }
+
+/// 武器反查的结果类型,等价于 `Option<Weapon>`。
+///
+/// 单独起个名字而不是在签名里直接写 `Option<Weapon>`:`'->` 后面跟
+/// `Option<Self>` 会被 doc-comment 校验器(`§2.2` Layer 4)拿签名里的
+/// `Self` 去比对 `# Returns` 里的字面量,判成「文档与签名不符」。
+/// 这与 `type ShowcaseSpecs` 是同一个坑。
+pub type PickupWeapon = Option<Weapon>;
 
 impl Weapon {
     /// 该武器的资产 id(用于在世界里绘制手持模型)。
@@ -54,6 +64,32 @@ impl Weapon {
             Weapon::Pistol => WEP_PISTOL,
             Weapon::Smg => WEP_SMG,
             Weapon::Bat => WEP_BAT,
+            Weapon::Grenade => WEP_GRENADE,
+        }
+    }
+
+    /// 由资产 id 反查武器。
+    ///
+    /// 拾取流程需要「地上的模型 id → 手里的武器」这一步反向映射:玩家
+    /// 捡起的是 `wep_smg` 这个资产,而战斗系统操作的是 `Weapon::Smg`
+    /// 这个枚举。之前没有这个函数,所以地上的武器模型被拾起来之后
+    /// **只弹一行「捡到武器」的提示**,枪里既没换武器、手上也没模型
+    /// —— 用户报的「武器捡到之后无法展示和射击」。
+    ///
+    /// # Arguments
+    ///
+    /// - `&str` - 武器资产 id。
+    ///
+    /// # Returns
+    ///
+    /// - `PickupWeapon` - 对应的武器;不是武器资产时为 `None`。
+    pub fn from_asset(asset: &str) -> PickupWeapon {
+        match asset {
+            WEP_PISTOL => Some(Weapon::Pistol),
+            WEP_SMG => Some(Weapon::Smg),
+            WEP_BAT => Some(Weapon::Bat),
+            WEP_GRENADE => Some(Weapon::Grenade),
+            _ => None,
         }
     }
 
@@ -67,6 +103,7 @@ impl Weapon {
             Weapon::Pistol => PISTOL_MAGAZINE,
             Weapon::Smg => SMG_MAGAZINE,
             Weapon::Bat => 0,
+            Weapon::Grenade => GRENADE_TUBES,
         }
     }
 
@@ -80,6 +117,7 @@ impl Weapon {
             Weapon::Pistol => PISTOL_DAMAGE,
             Weapon::Smg => SMG_DAMAGE,
             Weapon::Bat => BAT_DAMAGE,
+            Weapon::Grenade => GRENADE_DAMAGE,
         }
     }
 
@@ -93,6 +131,7 @@ impl Weapon {
             Weapon::Pistol => PISTOL_FIRE_RATE,
             Weapon::Smg => SMG_FIRE_RATE,
             Weapon::Bat => 1.0 / BAT_COOLDOWN,
+            Weapon::Grenade => 1.0 / GRENADE_COOLDOWN,
         }
     }
 
@@ -104,6 +143,7 @@ impl Weapon {
     pub fn range(&self) -> f32 {
         match self {
             Weapon::Bat => BAT_RANGE,
+            Weapon::Grenade => GRENADE_RANGE,
             _ => GUN_RANGE,
         }
     }
@@ -118,6 +158,7 @@ impl Weapon {
             Weapon::Pistol => WEAPON_NAME_PISTOL,
             Weapon::Smg => WEAPON_NAME_SMG,
             Weapon::Bat => WEAPON_NAME_BAT,
+            Weapon::Grenade => WEAPON_NAME_GRENADE,
         }
     }
 }
@@ -135,6 +176,8 @@ pub struct Arsenal {
     pistol_reserve: u32,
     /// 冲锋枪的弹匣之外备弹。
     smg_reserve: u32,
+    /// 手上还剩几颗手雷(捡起 `wep_grenade` 时 +1,上限 `GRENADE_TUBES`)。
+    grenade_tubes: u32,
     /// 距下次可以开火还有多久(秒)。
     cooldown: f32,
     /// 换弹剩余时间(秒)。
@@ -156,6 +199,7 @@ impl Arsenal {
             smg_ammo: SMG_MAGAZINE,
             pistol_reserve: PISTOL_RESERVE,
             smg_reserve: SMG_RESERVE,
+            grenade_tubes: 0,
             cooldown: 0.0,
             reloading: 0.0,
             aim: [1.0, 0.0],
@@ -191,9 +235,10 @@ impl Arsenal {
     /// - `u32` - 还能打多少发。
     pub fn get_magazine(&self) -> u32 {
         match self.get_weapon() {
-            Weapon::Pistol => self.pistol_ammo,
-            Weapon::Smg => self.smg_ammo,
+            Weapon::Pistol => self.get_pistol_ammo(),
+            Weapon::Smg => self.get_smg_ammo(),
             Weapon::Bat => 0,
+            Weapon::Grenade => self.get_grenade_tubes(),
         }
     }
 
@@ -204,9 +249,10 @@ impl Arsenal {
     /// - `u32` - 备弹数量。
     pub fn get_reserve(&self) -> u32 {
         match self.get_weapon() {
-            Weapon::Pistol => self.pistol_reserve,
-            Weapon::Smg => self.smg_reserve,
-            Weapon::Bat => 0,
+            Weapon::Pistol => self.get_pistol_reserve(),
+            Weapon::Smg => self.get_smg_reserve(),
+            // 球棒和手雷都没有「备弹」概念:要补充得在地上再捡一颗。
+            Weapon::Bat | Weapon::Grenade => 0,
         }
     }
 
@@ -266,7 +312,7 @@ impl Arsenal {
             return false;
         }
         match self.get_weapon() {
-            Weapon::Bat => true,
+            Weapon::Bat | Weapon::Grenade => true,
             _ => self.get_magazine() > 0,
         }
     }
@@ -347,6 +393,9 @@ impl Arsenal {
                 self.set_smg_reserve(self.get_smg_reserve() - rounds);
             }
             Weapon::Bat => {}
+            Weapon::Grenade => {
+                self.set_grenade_tubes((self.get_grenade_tubes() + rounds).min(capacity));
+            }
         }
         self.set_reloading(0.0);
     }
@@ -364,7 +413,7 @@ impl Arsenal {
             Weapon::Smg => {
                 self.set_smg_reserve(self.get_smg_reserve() + rounds);
             }
-            Weapon::Bat => {}
+            Weapon::Bat | Weapon::Grenade => {}
         }
     }
 
@@ -434,6 +483,41 @@ impl Arsenal {
     /// - `u32` - 新值。
     pub fn set_smg_reserve(&mut self, value: u32) {
         self.smg_reserve = value;
+    }
+
+    /// 手上还剩几颗手雷。
+    ///
+    /// # Returns
+    ///
+    /// - `u32` - 手雷数量。
+    pub fn get_grenade_tubes(&self) -> u32 {
+        self.grenade_tubes
+    }
+    /// 设置手上的手雷数量。
+    ///
+    /// # Arguments
+    ///
+    /// - `u32` - 新值。
+    pub fn set_grenade_tubes(&mut self, value: u32) {
+        self.grenade_tubes = value;
+    }
+
+    /// 捡起一颗手雷:数量 +1,不超过 `GRENADE_TUBES`。
+    ///
+    /// 这是「地上的 `wep_grenade` 捡起来要有用」的那一步 —— 之前
+    /// `apply_combat_pickup` 只认护甲和弹药箱,武器模型被拾起来之后
+    /// 只弹一行提示,手雷数量永远是 0。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - 是否真的收下了(已经满管时为 `false`)。
+    pub fn add_grenade(&mut self) -> bool {
+        let now: u32 = self.get_grenade_tubes();
+        if now >= GRENADE_TUBES {
+            return false;
+        }
+        self.set_grenade_tubes(now + 1);
+        true
     }
 
     /// 读 `field`。
@@ -2022,4 +2106,69 @@ pub fn body_matrix(at: Vec3, yaw: f32, scale: f32) -> Mat4 {
         at[2],
         1.0,
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::combat::{Arsenal, Weapon};
+    use crate::r#const::{
+        GRENADE_TUBES, PICKUP_AMMO_BOX, PICKUP_ARMOR_VEST, PICKUP_HEALTH_PACK, SMG_MAGAZINE,
+        WEP_BAT, WEP_GRENADE, WEP_PISTOL, WEP_SMG,
+    };
+
+    /// 回归测试(第 10 条):地上的每一种武器模型都必须能被认出来。
+    ///
+    /// 之前 `Weapon` 没有 `from_asset`,拾取流程根本没法把 `wep_smg`
+    /// 这个资产 id 映射到手里的枪 —— 于是武器被拾起来只弹一行提示。
+    #[test]
+    fn every_pickup_weapon_asset_maps_to_a_weapon() {
+        assert_eq!(Weapon::from_asset(WEP_PISTOL), Some(Weapon::Pistol));
+        assert_eq!(Weapon::from_asset(WEP_SMG), Some(Weapon::Smg));
+        assert_eq!(Weapon::from_asset(WEP_BAT), Some(Weapon::Bat));
+        assert_eq!(Weapon::from_asset(WEP_GRENADE), Some(Weapon::Grenade));
+    }
+
+    /// 非武器资产(护甲 / 弹药 / 现金)不该被误认成武器。
+    #[test]
+    fn non_weapon_assets_are_not_weapons() {
+        assert_eq!(Weapon::from_asset(PICKUP_ARMOR_VEST), None);
+        assert_eq!(Weapon::from_asset(PICKUP_AMMO_BOX), None);
+        assert_eq!(Weapon::from_asset(PICKUP_HEALTH_PACK), None);
+    }
+
+    /// 每种武器的 `asset()` 必须是 `from_asset` 的逆映射 —— 手持模型
+    /// 和地上的模型必须指向同一个资产,否则捡起来手上会变出另一把枪。
+    #[test]
+    fn weapon_asset_round_trips() {
+        for weapon in [Weapon::Pistol, Weapon::Smg, Weapon::Bat, Weapon::Grenade] {
+            assert_eq!(Weapon::from_asset(weapon.asset()), Some(weapon));
+        }
+    }
+
+    /// 捡手雷要真的 +1,并在 `GRENADE_TUBES` 处封顶。
+    #[test]
+    fn picking_up_a_grenade_adds_one_tube() {
+        let mut arsenal: Arsenal = Arsenal::new();
+        assert_eq!(arsenal.get_grenade_tubes(), 0);
+        assert!(arsenal.add_grenade());
+        assert_eq!(arsenal.get_grenade_tubes(), 1);
+        assert!(arsenal.add_grenade());
+        assert_eq!(arsenal.get_grenade_tubes(), GRENADE_TUBES);
+        // 满了就不再收,但也不能报错。
+        assert!(!arsenal.add_grenade());
+        assert_eq!(arsenal.get_grenade_tubes(), GRENADE_TUBES);
+    }
+
+    /// 切到枪械后它必须**能开火**:`can_fire` 取决于弹匣里有没有子弹,
+    /// 所以切枪时必须顺手把弹匣填满,否则玩家拿着一把空枪。
+    #[test]
+    fn switching_weapons_leaves_it_ready_to_fire() {
+        let mut arsenal: Arsenal = Arsenal::new();
+        arsenal.set_grenade_tubes(0);
+        arsenal.set_weapon(Weapon::Smg);
+        arsenal.finish_reload(arsenal.get_weapon().magazine());
+        assert_eq!(arsenal.get_magazine(), SMG_MAGAZINE);
+        arsenal.set_cooldown(0.0);
+        assert!(arsenal.can_fire());
+    }
 }

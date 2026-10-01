@@ -363,6 +363,21 @@ pub const REPLACE_MESH_REPORT_LIMIT: usize = 4;
 /// 两个人形实体并排时额外的「个人空间」(米)。人不会贴着走。
 pub const PEDESTRIAN_PERSONAL_SPACE: f32 = 0.18;
 
+// ---------------------------------------------------------------------------
+// 手雷(第 10 条:地上的 `wep_grenade` 捡起来要有用)
+// ---------------------------------------------------------------------------
+
+/// 手雷同时能携带几颗。
+pub const GRENADE_TUBES: u32 = 2;
+/// 手雷爆炸中心的伤害(米,不是半径)。
+pub const GRENADE_DAMAGE: f32 = 90.0;
+/// 两次投掷之间的最小间隔(秒)。
+pub const GRENADE_COOLDOWN: f32 = 1.2;
+/// 手雷的有效投掷距离(米)。
+pub const GRENADE_RANGE: f32 = 24.0;
+/// HUD 上显示的手雷名。
+pub const WEAPON_NAME_GRENADE: &str = "grenade";
+
 pub const EXPECT_FALLBACK_BLOCK: &str = "fallback block must be valid";
 
 pub const LOG_ALL_ASSETS_FAILED: &str =

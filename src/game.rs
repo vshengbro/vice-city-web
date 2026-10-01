@@ -5178,6 +5178,29 @@ fn apply_combat_pickup(game: &mut Game, asset: &'static str) {
     } else if asset == PICKUP_AMMO_BOX {
         game.arsenal.add_ammo(AMMO_PICKUP_GAIN);
         game.player.set_notice(String::from(NOTICE_AMMO));
+    } else if let Some(weapon) = Weapon::from_asset(asset) {
+        // **第 10 条的根因。** 地上摆着 `wep_pistol` / `wep_smg` /
+        // `wep_bat` / `wep_grenade`(见 `PICKUP_PLACEMENTS`),但这个函数
+        // 原来只认护甲和弹药箱 —— 武器模型被拾起来之后只弹一行
+        // 「捡到武器」提示,手里的枪**根本没换**,手上也不会出现模型。
+        // 三处必须一起做,缺一个就是「捡到但不能用」:
+        //
+        // 1. 手雷是**数量**型,捡一颗 +1;枪械是**替换**型,直接切过去;
+        // 2. `rebind_weapon_batch` 把手持批次绑到新 mesh —— 不调的话
+        //    手上还是上一把枪的模型(切枪键走的是同一条路径,所以这条
+        //    路径本来就有现成实现,拾取流程只是忘了接);
+        // 3. 切枪后给满弹匣,否则新枪是空的,照样「无法射击」。
+        if weapon == Weapon::Grenade {
+            if game.arsenal.add_grenade() {
+                game.arsenal.set_weapon(Weapon::Grenade);
+            }
+        } else {
+            game.arsenal.set_weapon(weapon);
+        }
+        rebind_weapon_batch(game);
+        game.arsenal
+            .finish_reload(game.arsenal.get_weapon().magazine());
+        game.player.set_notice(String::from(NOTICE_WEAPON));
     }
 }
 
