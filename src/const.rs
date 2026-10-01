@@ -363,6 +363,18 @@ pub const REPLACE_MESH_REPORT_LIMIT: usize = 4;
 /// 两个人形实体并排时额外的「个人空间」(米)。人不会贴着走。
 pub const PEDESTRIAN_PERSONAL_SPACE: f32 = 0.18;
 
+/// 回归测试:附近有伴时行人必须能开始聊天。
+pub const T_PEDS_GATHER_AND_TALK: &str = "附近有伴时行人必须能开始聊天";
+
+/// 回归测试:聊天必须会结束并进入冷却。
+pub const T_PEDS_TALK_ENDS: &str = "聊天必须会结束并进入冷却";
+
+/// 回归测试:被撞倒 / 逃跑的行人���参与聊天。
+pub const T_PEDS_DOWNED_NO_CHAT: &str = "被撞倒或逃跑的行人不该聊天";
+
+/// 回归测试:扎堆之后每人站位角必须互不相同。
+pub const T_PEDS_DISTINCT_SLOTS: &str = "扎堆后每人的站位角必须互不相同";
+
 // ---------------------------------------------------------------------------
 // 手雷(第 10 条:地上的 `wep_grenade` 捡起来要有用)
 // ---------------------------------------------------------------------------
@@ -1226,6 +1238,24 @@ pub const PED_GAIT_RATE: f32 = 2.4;
 pub const PED_RELAX_RATE: f32 = 6.0;
 /// 车判定「撞到行人」的半径(米)。
 pub const CAR_HIT_RADIUS: f32 = 2.0;
+
+/// 两行人相距小于这个距离就算「同一堆人」(米)。
+pub const PED_GATHER_RADIUS: f32 = 4.5;
+/// 凑成「一堆人」所需的最小行人数(算上自己)。
+pub const PED_GATHER_MIN_CROWD: usize = 2;
+/// 扎堆聊天的最短时长(秒):到了点也不能立刻散架。
+pub const PED_TALK_MIN_SECONDS: f32 = 2.5;
+/// 扎堆聊天的最长时长(秒):聊太久会显得卡住。
+pub const PED_TALK_MAX_SECONDS: f32 = 9.0;
+/// 聊天时围成的圈子半径(米):不贴脸,也不站成一排。
+pub const PED_TALK_RING_RADIUS: f32 = 1.6;
+/// 一堆人聊完之后,过多久才允许再凑一局(秒)。防止整城挤成一团。
+pub const PED_GATHER_COOLDOWN: f32 = 6.0;
+/// 聊天时长按人数折算时的「满员」人数:超过这么多就不再加长。
+pub const PED_GATHER_MAX_CROWD: f32 = 5.0;
+/// 每个人加入圈子时站位角度的递增量(弧度)。取 2π/5,让最多五个人
+/// 正好均匀占满一圈互不重叠。
+pub const PED_TALK_SLOT_STEP: f32 = 1.256_637_1;
 
 /// 医院点坐标(XZ),分��在城市四角与中心附近。
 pub const HOSPITAL_SPOTS: &[[f32; 3]] = &[

@@ -1429,6 +1429,16 @@ pub struct Pedestrian {
     knock: Vec2,
     /// 使用的行人模型 id(4 选 1)。
     model: &'static str,
+    /// 正在扎堆聊天时,围成的那个圈子的圆心(XZ)。没在聊天时无意义。
+    talk_center: Vec2,
+    /// 还要聊多久(秒)。> 0 表示「正在聊天」。
+    talk_timer: f32,
+    /// 这次扎堆要聊多久(秒),进圈时定下来。
+    talk_total: f32,
+    /// 聊天时站在圈上的哪个角度(弧度),避免所有人挤在同一个点。
+    talk_slot: f32,
+    /// 距离下一次**主动**找伴扎堆还要等多久(秒)。
+    gather_cooldown: f32,
 }
 
 impl Pedestrian {
@@ -1458,7 +1468,112 @@ impl Pedestrian {
             has_fallen: false,
             knock: [0.0, 0.0],
             model,
+            talk_center: goal,
+            talk_timer: 0.0,
+            talk_total: 0.0,
+            // 用相位错开每个人的站位,否则同一堆人会全部挤到圆心一点上。
+            talk_slot: gait_phase,
+            gather_cooldown: 0.0,
         }
+    }
+
+    /// 还在聊天吗。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - `talk_timer > 0` 时为真。
+    pub fn is_talking(&self) -> bool {
+        self.get_talk_timer() > 0.0
+    }
+
+    /// 聊天的圆心(XZ)。不在聊天时是上次聊天留下的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 圈子圆心。
+    pub fn get_talk_center(&self) -> Vec2 {
+        self.talk_center
+    }
+
+    /// 还要聊多久(秒)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 剩余秒数。
+    pub fn get_talk_timer(&self) -> f32 {
+        self.talk_timer
+    }
+
+    /// 设置还要聊多久(秒)。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 新值。
+    pub fn set_talk_timer(&mut self, value: f32) {
+        self.talk_timer = value;
+    }
+
+    /// 本次扎堆计划聊多久(秒)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 总时长。
+    pub fn get_talk_total(&self) -> f32 {
+        self.talk_total
+    }
+
+    /// 设置本次扎堆计划聊多久(秒)。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 新值。
+    pub fn set_talk_total(&mut self, value: f32) {
+        self.talk_total = value;
+    }
+
+    /// 在圈上的站位角度(弧度)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 角度。
+    pub fn get_talk_slot(&self) -> f32 {
+        self.talk_slot
+    }
+
+    /// 设置在圈上的站位角度(弧度)。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 新值。
+    pub fn set_talk_slot(&mut self, value: f32) {
+        self.talk_slot = value;
+    }
+
+    /// 设置聊天的圆心(XZ)。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 新圆心。
+    pub fn set_talk_center(&mut self, value: Vec2) {
+        self.talk_center = value;
+    }
+
+    /// 距离下次主动找伴还要等多久(秒)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 剩余秒数。
+    pub fn get_gather_cooldown(&self) -> f32 {
+        self.gather_cooldown
+    }
+
+    /// 设置「下次主动找伴」的冷却(秒)。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 新值。
+    pub fn set_gather_cooldown(&mut self, value: f32) {
+        self.gather_cooldown = value;
     }
 
     /// 世界坐标。
@@ -1589,8 +1704,20 @@ impl Pedestrian {
         if fleeing {
             self.set_flee_timer(self.get_flee_timer() - dt);
         }
-        // 目标:逃跑时背对玩家,否则走向巡航点;到点就换一个。
+        // 目标:逃跑时背对玩家;正在聊天就走向圈上的站位;否则走向
+        // 巡航点,到点换一个。
         let mut target: Vec2 = self.get_goal();
+        if self.is_talking() {
+            // 站进圈子:目标是「圈心 + 自己那个方位」。走到位之后
+            // `set_goal` 每次都把它压回同一个点,于是行人自然停住 ——
+            // 不需要额外的「站定」分支,行为由目标点唯一决定。
+            let center: Vec2 = self.get_talk_center();
+            let slot: f32 = self.get_talk_slot();
+            target = [
+                center[0] + slot.cos() * PED_TALK_RING_RADIUS,
+                center[1] + slot.sin() * PED_TALK_RING_RADIUS,
+            ];
+        }
         if fleeing {
             let dx: f32 = self.get_position()[0] - player_at[0];
             let dz: f32 = self.get_position()[2] - player_at[2];
@@ -1599,7 +1726,7 @@ impl Pedestrian {
                 self.get_position()[0] + dx / length * 8.0,
                 self.get_position()[2] + dz / length * 8.0,
             ];
-        } else {
+        } else if !self.is_talking() {
             let reached: f32 =
                 crate::combat::flat_distance(self.get_position(), [target[0], 0.0, target[1]]);
             if reached < 1.4 {
@@ -1632,7 +1759,15 @@ impl Pedestrian {
         // 朝向 + 步态:用「打算走的方向」,所以贴着墙走时手脚照样摆。
         let planar: f32 = (to[0] * to[0] + to[1] * to[1]).sqrt();
         if planar > 0.05 {
-            let desired: f32 = -to[1].atan2(to[0]);
+            // 聊天时面朝**圈心**(同伴),而不是面朝走路方向 —— 一堆人
+            // 背对背「聊天」是最明显的假信号。
+            let desired: f32 = if self.is_talking() {
+                let center: Vec2 = self.get_talk_center();
+                let facing: Vec2 = [center[0] - here[0], center[1] - here[2]];
+                -facing[1].atan2(facing[0])
+            } else {
+                -to[1].atan2(to[0])
+            };
             self.set_yaw(
                 self.get_yaw() + wrap_angle(desired - self.get_yaw()) * PED_TURN_RATE * dt,
             );

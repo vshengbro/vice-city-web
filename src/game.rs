@@ -5680,6 +5680,8 @@ fn step_combat(game: &mut Game, dt: f32) {
     fire_weapon(game);
     step_enemies(game, dt);
     step_peds(game, dt);
+    // 社交是群体行为,必须在所有行人各自步进完之后统一算一次。
+    update_ped_social(&mut game.peds, dt);
     update_wanted(game, dt);
     update_mission(game, dt);
     if game.hitmarker > 0.0 {
@@ -6139,6 +6141,8 @@ fn step_peds(game: &mut Game, dt: f32) {
         },
         None => ([0.0, 0.0, 0.0], 0.0),
     };
+    // 先各自跑完「走 / 逃 / 撞倒」,再由 `update_ped_social` 统一决定
+    // 谁去找谁聊天 —— 社交是群体行为,必须在个体步进之后。
     for ped in &mut game.peds {
         ped.step(dt, &game.world, player_at, game.player.get_driving());
         // 撞飞判定:车在动,而且行人就在车身附近。
@@ -6461,6 +6465,180 @@ fn resolve_dynamic_bodies(game: &mut Game) {
         }
         cursor += 1;
     }
+}
+
+/// 市民的社交调度:让附近的行人**扎堆聊天**,而不是各走各的。
+///
+/// `Pedestrian::step` 只知道「我的巡航点在哪」,看不到邻居,所以一群
+/// 市民会永远各走各的平行线 —— 街上一眼看去没有「人群」,也没有
+/// 「有人在说话」。这一层是**群体行为**:每个行人自己算一次
+///
+/// ```text
+/// neighbors = 半径 PED_GATHER_RADIUS 内的其他行人
+/// ```
+///
+/// - 有人在聊天 → 新来的走上前,站进圈子空位,然后一起倒计时;
+/// - 没人在聊天但邻居够 `PED_GATHER_MIN_CROWD` 人 → 挑一个起头的人,
+///   圈子定在这堆人的几何中心;
+/// - 聊满 `talk_total` 秒 → 各自散开,`gather_cooldown` 之后才允许
+///   再凑一局(否则整城的人会挤成一团永不分开的奇观)。
+///
+/// 圈心是**几何中心**而不是第一个人脚下,所以三个人会自然围成一个
+/// 三角形而不是排成一列。每个人的站位角度由自己的 `talk_slot` 决定
+/// (初始化时用步态相位错开),所以不会挤在同一点上。
+///
+/// **逃跑与撞倒优先于社交**:被打 / 被车撞的行人不参与聊天,见
+/// `update_ped_social` 里的两个提前返回。
+///
+/// # Arguments
+///
+/// - `&mut [Pedestrian]` - 本帧所有市民(可变切片)。
+/// - `f32` - 本帧秒数。
+fn update_ped_social(peds: &mut [Pedestrian], dt: f32) {
+    let count: usize = peds.len();
+    if count < PED_GATHER_MIN_CROWD {
+        return;
+    }
+    // 快照:一帧内所有判定都基于帧初的位置,不做「边遍历边改」的
+    // 顺序依赖 —— 否则第 0 个人已经决定聊天、第 5 个人看到的还是
+    // 老状态,同一帧里的决策会互相矛盾。
+    let spots: Vec<Vec2> = peds
+        .iter()
+        .map(|ped: &Pedestrian| {
+            let at: Vec3 = ped.get_position();
+            [at[0], at[2]]
+        })
+        .collect();
+    // 被打 / 被撞倒 / 正在逃跑的行人不参与社交。
+    let ready: Vec<bool> = peds
+        .iter()
+        .map(|ped: &Pedestrian| !ped.is_down() && ped.get_flee_timer() <= 0.0)
+        .collect();
+    let talking: Vec<bool> = peds.iter().map(Pedestrian::is_talking).collect();
+    // 本帧「谁的圈子已经定下来了」。被领走的人立刻置位。
+    let mut claimed: Vec<bool> = vec![false; count];
+
+    for index in 0..count {
+        if !ready[index] {
+            continue;
+        }
+        // 本帧已经被人拉进某个圈子的人,不再参与后续的「自己起一局」——
+        // 否则同一个人会在同一帧里被两组先后赋予不同的站位角,后一组
+        // 覆盖前一组。实测三个人会得到 `[3.77, 3.77, 6.28]`。
+        if claimed[index] {
+            continue;
+        }
+        // 正在聊的:倒计时,并且**站住不动**(步态幅度归零,看起来是
+        // 站着说话而不是一边聊一边滑行)。
+        if talking[index] {
+            let ped: &mut Pedestrian = &mut peds[index];
+            let left: f32 = ped.get_talk_timer() - dt;
+            if left <= 0.0 {
+                ped.set_talk_timer(0.0);
+                ped.set_gather_cooldown(PED_GATHER_COOLDOWN);
+            } else {
+                ped.set_talk_timer(left);
+            }
+            continue;
+        }
+        // 冷却中的:什么都不做,继续走原来的巡航点。
+        if peds[index].get_gather_cooldown() > 0.0 {
+            let ped: &mut Pedestrian = &mut peds[index];
+            let cd: f32 = ped.get_gather_cooldown() - dt;
+            ped.set_gather_cooldown(cd.max(0.0));
+            continue;
+        }
+        // 找邻居:已经在聊的人(加入现有圈子)+ 还没聊的人(凑新局)。
+        let mut neighbors: Vec<usize> = Vec::new();
+        for other in 0..count {
+            if other == index || !ready[other] {
+                continue;
+            }
+            let dx: f32 = spots[other][0] - spots[index][0];
+            let dz: f32 = spots[other][1] - spots[index][1];
+            if dx * dx + dz * dz <= PED_GATHER_RADIUS * PED_GATHER_RADIUS {
+                neighbors.push(other);
+            }
+        }
+        if neighbors.is_empty() {
+            continue;
+        }
+        // 优先加入一个已经成立的圈子;圈子圆心直接用发起者的。
+        let host: Option<usize> = neighbors
+            .iter()
+            .copied()
+            .find(|other: &usize| talking[*other]);
+        if let Some(host_index) = host {
+            let center: Vec2 = peds[host_index].get_talk_center();
+            let total: f32 = peds[host_index].get_talk_total();
+            // 序号取「圈里已有的人数」,新来的人排在队尾,不撞位。
+            let taken: usize = (0..count)
+                .filter(|other: &usize| *other != index && talking[*other])
+                .count();
+            join_talk(peds, index, taken, center, total);
+            claimed[index] = true;
+            continue;
+        }
+        // 没有现成圈子,但人数够了才开一局 —— 一个人自说自话不算。
+        if neighbors.len() + 1 < PED_GATHER_MIN_CROWD {
+            continue;
+        }
+        // 圆心 = 这一堆人的几何中心(取所有参与者的均值)。
+        let mut sum_x: f32 = spots[index][0];
+        let mut sum_z: f32 = spots[index][1];
+        for other in &neighbors {
+            sum_x += spots[*other][0];
+            sum_z += spots[*other][1];
+        }
+        let people: f32 = neighbors.len() as f32 + 1.0;
+        let center: Vec2 = [sum_x / people, sum_z / people];
+        // 聊天时长用「人数越多聊越久」,而且带一点随机,免得整城同
+        // 一时刻散场。
+        let crowd: f32 = people.min(PED_GATHER_MAX_CROWD) / PED_GATHER_MAX_CROWD;
+        let span: f32 = PED_TALK_MAX_SECONDS - PED_TALK_MIN_SECONDS;
+        let total: f32 = PED_TALK_MIN_SECONDS + span * crowd;
+        // 序号 = 在这一堆人里的排位,保证一圈人各占不同方位。
+        for (slot, other) in neighbors
+            .iter()
+            .copied()
+            .chain(std::iter::once(index))
+            .enumerate()
+        {
+            join_talk(peds, other, slot, center, total);
+        }
+    }
+}
+
+/// 让一个行人站进聊天圈。
+///
+/// # Arguments
+///
+/// - `&mut [Pedestrian]` - 本帧所有市民(可变切片)。
+/// - `usize` - 市民在切片里的索引。
+/// - `usize` - 这个人在圈里的序号(决定站位角)。
+/// - `Vec2` - 圈子圆心。
+/// - `f32` - 本次扎堆的总时长(秒)。
+fn join_talk(peds: &mut [Pedestrian], index: usize, slot: usize, center: Vec2, total: f32) {
+    let Some(ped) = peds.get_mut(index) else {
+        return;
+    };
+    ped.set_talk_center(center);
+    ped.set_talk_total(total);
+    ped.set_talk_timer(total);
+    ped.set_gather_cooldown(0.0);
+    // 站位角度由**这个人在圈里的序号**决定,而不是「把自己那个计数器
+    // 加一」。加一在两种情况下会撞:同一个人一帧内被 `join_talk` 调两次
+    // (自己起头 + 又被邻居拉进来),两次都从同一个旧值加一,和同批另一
+    // 个人得到完全相同的角度 —— 实测三个人算出 `[3.77, 3.77, 6.28]`,
+    // 两个人被安排到同一个点。
+    let slot: f32 = slot as f32 * PED_TALK_SLOT_STEP;
+    ped.set_talk_slot(slot);
+    // 目标点 = 圈子上的自己的位置。`Pedestrian::step` 会朝它走,
+    // 走到位之后它就停在原地(见 `talk_target`)。
+    ped.set_goal([
+        center[0] + slot.cos() * PED_TALK_RING_RADIUS,
+        center[1] + slot.sin() * PED_TALK_RING_RADIUS,
+    ]);
 }
 
 /// 把敌人与行人的姿态写回场景批次。
@@ -7865,11 +8043,13 @@ mod tests {
 
     use super::car_wheel_model;
     use crate::collision::CollisionWorld;
+    use crate::combat::Pedestrian;
     use crate::r#const::{
-        GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, PLAYER_BODY_HEIGHT, T_ROUTE_LEG_DIAGONAL,
-        T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DOOR_CENTER_BLOCKED,
-        T_SHOWCASE_DOOR_INSIDE, T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING,
-        T_SHOWCASE_DOOR_ON_OUTER_WALL, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
+        GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, PED_SUIT, PED_TALK_SLOT_STEP, PLAYER_BODY_HEIGHT,
+        T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT, T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS,
+        T_ROUTE_LEG_DIAGONAL, T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED,
+        T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE, T_SHOWCASE_DOOR_NO_SLAB,
+        T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
         T_SHOWCASE_DOORS_FACE_EACH_OTHER, T_SHOWCASE_DOORWAY_2D_BLOCKED,
         T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING, T_SHOWCASE_LANE_BLOCKED,
         T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
@@ -7879,6 +8059,35 @@ mod tests {
         T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP, T_SHOWCASE_WALKER_DIRECTION,
         T_SHOWCASE_WALKER_REACHES_TOP, TERMINAL_VELOCITY,
     };
+    /// 只跑社交那一层,跳过走路 / 碰撞 —— 社交测试要的是「谁跟谁凑一局」
+    /// 这个决定,不是他们有没有真的走到位。
+    ///
+    /// 直接对 `&mut [Pedestrian]` 跑,不构造 `Game`:社交逻辑只读行人
+    /// 的位置 / 状态,不碰世界、玩家、批次。`Game` 二十多个字段互相咬合,
+    /// 在测试里拼一份既啰嗦又脆,而这里一个都用不上。
+    pub fn update_ped_social_for_test(peds: &mut [Pedestrian], dt: f32) {
+        super::update_ped_social(peds, dt);
+    }
+
+    /// 造两个相距约 1 m 的行人,各自的目标点甩在 9 m 外。
+    ///
+    /// 巡航点甩远是为了让测试只看见「社交」这一个变量:如果目标点就在
+    /// 脚下,行人永远「已到达」,聊天与否会跟巡航逻辑缠在一起。
+    fn ped_pair(ax: f32, az: f32, bx: f32, bz: f32) -> Vec<Pedestrian> {
+        [[ax, az], [bx, bz]]
+            .iter()
+            .map(|at: &[f32; 2]| {
+                Pedestrian::new(
+                    [at[0], 0.0, at[1]],
+                    0.0,
+                    [at[0] + 9.0, at[1]],
+                    PED_SUIT,
+                    0.0,
+                )
+            })
+            .collect()
+    }
+
     use crate::game::{
         BLOCK_VIEW_RADIUS, BlockLayout, BuildingPlacement, GROUND_CELL_ALIGN, GROUND_SPAN,
         MeshAsset, MeshPart, PLAYER_RADIUS, SHOWCASE_DOOR_HALF, SHOWCASE_GROUND_TOP,
@@ -8769,6 +8978,80 @@ mod tests {
                 T_SHOWCASE_DOOR_INSIDE,
                 spec.asset
             );
+        }
+    }
+
+    /// 回归测试(第 9 条):附近有伴时,行人必须能**真的**开始聊天。
+    #[test]
+    fn pedestrians_gather_and_start_talking() {
+        let mut peds: Vec<Pedestrian> = ped_pair(10.0, 10.0, 11.0, 10.0);
+        update_ped_social_for_test(peds.as_mut_slice(), 0.016);
+        let talking: usize = peds.iter().filter(|p: &&Pedestrian| p.is_talking()).count();
+        assert!(talking == 2, "{}", T_PEDS_GATHER_AND_TALK);
+    }
+
+    /// 回归测试:孤身一人的行人**不会**自己跟自己聊天。
+    #[test]
+    fn a_lone_pedestrian_never_starts_talking() {
+        let mut peds: Vec<Pedestrian> = vec![Pedestrian::new(
+            [10.0, 0.0, 10.0],
+            0.0,
+            [19.0, 10.0],
+            PED_SUIT,
+            0.0,
+        )];
+        update_ped_social_for_test(peds.as_mut_slice(), 0.016);
+        assert!(!peds[0].is_talking(), "{}", T_PEDS_GATHER_AND_TALK);
+    }
+
+    /// 回归测试:聊满约定时长之后必须**散场**,并进入冷却。
+    #[test]
+    fn a_conversation_ends_and_goes_on_cooldown() {
+        let mut peds: Vec<Pedestrian> = ped_pair(10.0, 10.0, 11.0, 10.0);
+        update_ped_social_for_test(peds.as_mut_slice(), 0.016);
+        assert!(peds.iter().all(|p: &Pedestrian| p.is_talking()));
+        for _ in 0..600 {
+            update_ped_social_for_test(peds.as_mut_slice(), 0.05);
+        }
+        assert!(
+            peds.iter().all(|p: &Pedestrian| !p.is_talking()),
+            "{}",
+            T_PEDS_TALK_ENDS
+        );
+        assert!(
+            peds.iter()
+                .all(|p: &Pedestrian| p.get_gather_cooldown() > 0.0),
+            "{}",
+            T_PEDS_TALK_ENDS
+        );
+    }
+
+    /// 回归测试:被撞倒的行人不参与聊天。
+    #[test]
+    fn downed_pedestrians_do_not_chat() {
+        let mut peds: Vec<Pedestrian> = ped_pair(10.0, 10.0, 11.0, 10.0);
+        peds[0].knock_down([1.0, 0.0]);
+        update_ped_social_for_test(peds.as_mut_slice(), 0.016);
+        assert!(!peds[0].is_talking(), "{}", T_PEDS_DOWNED_NO_CHAT);
+    }
+
+    /// 回归测试:扎堆之后每个人的**站位角度必须不同**,否则全挤在一点。
+    #[test]
+    fn each_pedestrian_takes_a_distinct_place_in_the_circle() {
+        let mut peds: Vec<Pedestrian> = ped_pair(10.0, 10.0, 11.0, 10.2);
+        peds.push(Pedestrian::new(
+            [10.3, 0.0, 11.1],
+            0.0,
+            [19.3, 11.1],
+            PED_SUIT,
+            2.0 * PED_TALK_SLOT_STEP,
+        ));
+        update_ped_social_for_test(peds.as_mut_slice(), 0.016);
+        let mut slots: Vec<f32> = peds.iter().map(Pedestrian::get_talk_slot).collect();
+        slots.sort_by(|a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        for pair in slots.windows(2) {
+            let gap: f32 = (pair[1] - pair[0]).abs();
+            assert!(gap > 1.0e-3, "{}: slots={slots:?}", T_PEDS_DISTINCT_SLOTS);
         }
     }
 }
