@@ -30,7 +30,7 @@ use euv::{
 
 use crate::{
     camera::{CAMERA_MIN_HEIGHT, Camera, Mat4},
-    collision::{CollisionWorld, placement_box},
+    collision::{BodyKind, CollisionWorld, DynamicBody, placement_box},
     combat::{
         AiState, Arsenal, Enemy, Faction, HurtState, Mission, Pedestrian, Wanted, Weapon,
         apply_damage, body_matrix, falloff, flat_distance, has_line_of_sight, regen_armor,
@@ -195,6 +195,29 @@ const SOFT_LIMIT_SLACK: f32 = 24.0;
 const SOFT_LIMIT_PUSH: f32 = 1.6;
 /// 软边界回推速度的上限(米/秒),保证回推不会比跑还快到失控。
 const SOFT_LIMIT_PUSH_MAX: f32 = 9.0;
+
+// ===========================================================================
+// 动态实体的碰撞体尺寸与质量
+// ===========================================================================
+//
+// 质量以「一个人 = 1.0」为单位,方便直观比较。轿车取 30(1.5 t 量级对
+// 75 kg 的人),所以人被车顶开时人承担 30/31 的分离量、车只承担 1/31 ——
+// 手感上是「人被撞飞、车几乎不动」。
+
+/// 行人 / 玩家的等效碰撞圆半径(米)。
+const PED_RADIUS: f32 = 0.35;
+/// 敌人的等效碰撞圆半径(米)。
+const ENEMY_RADIUS: f32 = 0.35;
+/// 车辆的等效碰撞圆半径(米)。
+const CAR_RADIUS: f32 = 1.25;
+/// 玩家质量(单位:一个「人」)。
+const PLAYER_MASS: f32 = 1.0;
+/// 行人质量(单位:一个「人」)。
+const PED_MASS: f32 = 1.0;
+/// 敌人质量(单位:一个「人」)。
+const ENEMY_MASS: f32 = 1.0;
+/// 轿车质量(单位:一个「人」;30 ≈ 1.5 t 对 75 kg)。
+const CAR_MASS: f32 = 30.0;
 /// 玩家出生点(世界坐标):X = 30 那条街的**路中间偏东的车道**,z = 45。
 ///
 /// 选点是拿截图试出来的,踩过三个坑:
@@ -5370,6 +5393,9 @@ fn simulate(game: &mut Game, delta: f32) {
     }
     collect_pickups(game);
     step_combat(game, dt);
+    // 各类实体跑完各自的静态碰撞后,统一过一次动态碰撞层 ——
+    // 否则车穿车、人穿人、敌人站进人身体里。
+    resolve_dynamic_bodies(game);
     step_streamed_surface(game);
     update_camera(game, delta);
     // 注入的开火只持续一帧,到期后放开。
@@ -6214,6 +6240,138 @@ fn populate_combatants(game: &mut Game, phase: f32) {
     game.enemies = thugs;
     let peds: Vec<Pedestrian> = spawn_peds(here, PED_COUNT, phase);
     game.peds = peds;
+}
+
+/// 把场上所有动态实体过一遍**统一碰撞层**。
+///
+/// 之前每类实体各自跟静态世界碰撞,彼此之间**从不**相交:
+///
+/// - 玩家 → `Player::step` → `resolve_slide`;
+/// - 车辆 → `TrafficCar::drive` → `resolve_car`;
+/// - 行人 → `Pedestrian::step` → `resolve_with_radius`。
+///
+/// 三条路径互不知情,于是车会穿过另一辆车、行人会走进另一名行人、
+/// 敌人会站进人的身体里 —— 用户报的「所有实体都不能穿越和穿模」。
+///
+/// 现在它们先各自跑完自己的静态碰撞(那部分行为完全不变,探针
+/// `collision` / `car.drive` 依赖它),再由本函数统一做一次
+/// 两两分离 + 对静态收敛。
+///
+/// 槽位分配是**按索引**的,收集与回写严格对称:
+///
+/// | 槽位 | 实体 |
+/// |------|------|
+/// | 0    | 玩家(或他开的那辆车) |
+/// | 1..  | 车队(跳过玩家开的那辆) |
+/// | …    | 敌人 |
+/// | …    | 行人 |
+///
+/// 早先用「位置相等」来识别玩家开的那辆车 —— 两辆车停在同一坐标时
+/// 会双双被跳过,整个列表错位,把行人的位置写到敌人身上。这里改成
+/// 直接比较**索引**。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+fn resolve_dynamic_bodies(game: &mut Game) {
+    let driven: Option<usize> = game
+        .player
+        .get_vehicle()
+        .filter(|i: &usize| *i < game.traffic.get_cars_ref().len());
+    let mut bodies: Vec<DynamicBody> = Vec::new();
+    // 槽位 0 恒为玩家自己;在车里时那一格的碰撞体是车。
+    let player_at: Vec3 = game.player.get_position();
+    match driven {
+        Some(index) => {
+            if let Some(car) = game.traffic.get_cars_ref().get(index) {
+                let at: Vec3 = car.get_position();
+                bodies.push(DynamicBody::new(
+                    BodyKind::Car,
+                    [at[0], at[2]],
+                    CAR_RADIUS,
+                    CAR_MASS,
+                ));
+            }
+        }
+        None => {
+            bodies.push(DynamicBody::new(
+                BodyKind::Player,
+                [player_at[0], player_at[2]],
+                PLAYER_RADIUS,
+                PLAYER_MASS,
+            ));
+        }
+    }
+    for (index, car) in game.traffic.get_cars_ref().iter().enumerate() {
+        if driven == Some(index) {
+            continue;
+        }
+        let at: Vec3 = car.get_position();
+        bodies.push(DynamicBody::new(
+            BodyKind::Car,
+            [at[0], at[2]],
+            CAR_RADIUS,
+            CAR_MASS,
+        ));
+    }
+    for enemy in &game.enemies {
+        let at: Vec3 = enemy.get_position();
+        bodies.push(DynamicBody::new(
+            BodyKind::Enemy,
+            [at[0], at[2]],
+            ENEMY_RADIUS,
+            ENEMY_MASS,
+        ));
+    }
+    for ped in &game.peds {
+        let at: Vec3 = ped.get_position();
+        bodies.push(DynamicBody::new(
+            BodyKind::Pedestrian,
+            [at[0], at[2]],
+            PED_RADIUS,
+            PED_MASS,
+        ));
+    }
+    if bodies.len() < 2 {
+        return;
+    }
+    let resolved: Vec<Vec2> = game.world.resolve_all(&bodies);
+
+    // 回写:与收集严格对称地按槽位消费。槽位 0 已被上面处理,
+    // 所以 `cursor` 直接从 1 起(不回写的话从 0 起会错开一位)。
+    let mut cursor: usize = 1;
+    if let Some(index) = driven {
+        if let (Some(slot), Some(car)) = (resolved.first(), game.traffic.get_car_mut(index)) {
+            let at: Vec3 = car.get_position();
+            car.set_position([slot[0], at[1], slot[1]]);
+        }
+    } else if let Some(slot) = resolved.first() {
+        game.player.set_position([slot[0], player_at[1], slot[1]]);
+    }
+    for (index, car) in game.traffic.get_cars_mut().iter_mut().enumerate() {
+        if driven == Some(index) {
+            continue;
+        }
+        if let Some(slot) = resolved.get(cursor) {
+            let at: Vec3 = car.get_position();
+            car.set_position([slot[0], at[1], slot[1]]);
+        }
+        cursor += 1;
+    }
+    for enemy in game.enemies.iter_mut() {
+        if let Some(slot) = resolved.get(cursor) {
+            let at: Vec3 = enemy.get_position();
+            enemy.set_position([slot[0], at[1], slot[1]]);
+        }
+        cursor += 1;
+    }
+    for ped in game.peds.iter_mut() {
+        if let Some(slot) = resolved.get(cursor) {
+            let at: Vec3 = ped.get_position();
+            ped.set_position([slot[0], at[1], slot[1]]);
+        }
+        cursor += 1;
+    }
 }
 
 /// 把敌人与行人的姿态写回场景批次。
