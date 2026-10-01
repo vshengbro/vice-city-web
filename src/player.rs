@@ -411,6 +411,37 @@ impl Player {
         self.vertical_velocity = value;
     }
 
+    /// 起跳(键位写入入口):给一个向上的初速度,并立刻离开「站着」状态。
+    ///
+    /// **必须同时把 `grounded` 打成 false。** 之前这个方法不存在,
+    /// `vertical_velocity` 只由 `step_vertical` 在「离开支撑面」的
+    /// 自由落体分支里写 —— 也就是说玩家站着时往上写一个正速度,
+    /// 下一帧 `support - y <= STEP_UP_TOLERANCE` 依然成立,立刻被
+    /// `set_vertical_velocity(0.0)` 抹掉。这正是「按了 Space 原地
+    /// 弹一下就停」的那种假跳跃:速度被地板吃掉,人根本没离开地面。
+    ///
+    /// 初速度取 [`JUMP_VELOCITY`],顶高 1.245 m(见该常量的推导),
+    /// 滞空 0.67 s。滞空途中的重力与落地判定都由 `step_vertical` 走
+    /// **同一套**积分,这里不重复实现。
+    ///
+    /// # Arguments
+    ///
+    /// - `bool` - 上一帧是否踩在支撑面上;滞空时不得二次起跳。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - 本次是否真的起跳(滞空时为 `false`)。
+    pub fn set_jump_requested(&mut self, was_grounded: bool) -> bool {
+        if !was_grounded {
+            return false;
+        }
+        // 经已有的 `set_*` 写入口,而不是 `self.field` 直写(§17.3/§17.12:
+        // accessor 体内直写合法,业务方法里不合法)。
+        self.set_vertical_velocity(JUMP_VELOCITY);
+        self.set_grounded(false);
+        true
+    }
+
     /// 脚底是否正踩在某块楼板 / 地面上。
     ///
     /// # Returns
@@ -716,10 +747,10 @@ pub fn limb_matrix(origin: Vec3, yaw: f32, pivot: Vec3, swing: f32) -> Mat4 {
 mod tests {
     use crate::camera::Mat4;
     use crate::r#const::{
-        PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_UPPER_ARM_L, PART_UPPER_LEG_L,
-        T_DISTAL_INHERITS_PARENT_SWING, T_DISTAL_LIMB_HAS_PARENT, T_FACING_MATCHES_VELOCITY,
-        KEY_PART, T_LEGS_ANTIPHASE, T_LIMBS_RELAX_TO_ZERO, T_LIMB_STAYS_AT_ASSET_HEIGHT,
-        T_PARENT_IN_PLAN, T_SAME_SIDE_IN_PHASE,
+        KEY_PART, PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_UPPER_ARM_L,
+        PART_UPPER_LEG_L, T_DISTAL_INHERITS_PARENT_SWING, T_DISTAL_LIMB_HAS_PARENT,
+        T_FACING_MATCHES_VELOCITY, T_LEGS_ANTIPHASE, T_LIMB_STAYS_AT_ASSET_HEIGHT,
+        T_LIMBS_RELAX_TO_ZERO, T_PARENT_IN_PLAN, T_SAME_SIDE_IN_PHASE,
     };
     use crate::player::{
         GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, facing_yaw, limb_chain_matrix,
@@ -885,7 +916,10 @@ mod tests {
             "{}",
             fill(
                 T_DISTAL_INHERITS_PARENT_SWING,
-                &[("got", &format!("{direct:?}")), ("want", &format!("{hand:?}"))]
+                &[
+                    ("got", &format!("{direct:?}")),
+                    ("want", &format!("{hand:?}"))
+                ]
             )
         );
     }

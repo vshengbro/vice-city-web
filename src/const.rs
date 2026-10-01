@@ -44,6 +44,21 @@ pub const KEYT: &str = "KeyT";
 
 pub const KEYW: &str = "KeyW";
 
+/// 跳跃键(GTA V 的 Space)。
+pub const KEY_SPACE: &str = "Space";
+
+/// 投掷手雷键(GTA V 的 G)。
+pub const KEY_GRENADE: &str = "KeyG";
+
+/// 收起武器 / 切回徒手的键(GTA V 的 H)。
+pub const KEY_UNARMED: &str = "KeyH";
+
+/// 切换相机模式的键(GTA V 的 V)。
+pub const KEY_CAMERA: &str = "KeyV";
+
+/// 打开 / 关闭地图的键(GTA V 的 Tab)。
+pub const KEY_MAP: &str = "Tab";
+
 pub const NOON: &str = "NOON";
 
 pub const NIGHT: &str = "NIGHT";
@@ -378,8 +393,7 @@ pub const PEDESTRIAN_PERSONAL_SPACE: f32 = 0.18;
 
 /// 回归测试:界内玩家必须拿到满速(软边界不能误伤)。
 /// 流式世界没有边界:任何位置的速度上限都必须原样保留。
-pub const T_NO_SOFT_LIMIT: &str =
-    "流式世界不该限速:在 {at} 速度被削成 {got}";
+pub const T_NO_SOFT_LIMIT: &str = "流式世界不该限速:在 {at} 速度被削成 {got}";
 
 pub const T_SOFT_SPEED_INSIDE: &str = "界内玩家必须拿到满速,越界才减速";
 
@@ -409,6 +423,59 @@ pub const GRENADE_COOLDOWN: f32 = 1.2;
 pub const GRENADE_RANGE: f32 = 24.0;
 /// HUD 上显示的手雷名。
 pub const WEAPON_NAME_GRENADE: &str = "grenade";
+
+/// HUD 上显示的徒手名。
+pub const WEAPON_NAME_UNARMED: &str = "UNARMED";
+
+/// 徒手状态:按 H 收起武器的提示。
+pub const NOTICE_UNARMED: &str = "weapon holstered";
+
+/// 没有手雷可投的提示。
+pub const NOTICE_NO_GRENADE: &str = "no grenades";
+
+/// 投出手雷后的提示。
+pub const NOTICE_GRENADE_THROWN: &str = "grenade thrown";
+
+/// 投掷手雷的出手速度(米/秒,水平)。
+pub const GRENADE_THROW_SPEED: f32 = 16.0;
+
+/// 投掷手雷的出手仰角(弧度,向上为正)。
+pub const GRENADE_THROW_PITCH: f32 = 0.28;
+
+/// 投出的手雷在空中的存活时间(秒),到时结算爆炸。
+pub const GRENADE_FLIGHT_TIME: f32 = 1.1;
+
+/// 爆炸对敌人 / 玩家的作用半径(米)。
+pub const GRENADE_BLAST_RADIUS: f32 = 6.0;
+
+/// 地图面板(按 Tab)打开时显示的标题。
+pub const MAP_TITLE: &str = "VICE CITY · MAP";
+
+/// 地图面板打开时显示的底部提示。
+pub const MAP_HINT: &str = "TAB to close";
+
+/// 地图面板的显示样式(打开态)。
+pub const STYLE_MAP_PANEL: &str = "position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(78vw,720px);height:min(78vh,560px);background:rgba(6,12,26,.94);border:2px solid rgba(125,252,255,.55);border-radius:8px;box-shadow:0 0 40px rgba(0,0,0,.7);color:#eaf6ff;font-family:system-ui,sans-serif;padding:18px 22px;display:flex;flex-direction:column;gap:10px;pointer-events:none";
+
+/// 地图面板标题行。
+pub const STYLE_MAP_TITLE: &str =
+    "font-size:20px;letter-spacing:2px;color:#7dfcff;text-shadow:0 0 12px rgba(125,252,255,.45)";
+
+/// 地图面板底部的坐标 / 提示行。
+pub const STYLE_MAP_HINT: &str = "margin-top:auto;font-size:13px;color:#9fb4d8;letter-spacing:1px";
+
+/// 地图面板打开时游戏画面上的遮罩(压暗,让地图读得清)。
+pub const STYLE_MAP_DIM: &str =
+    "position:absolute;inset:0;background:rgba(2,5,14,.55);pointer-events:none";
+
+/// 相机在第一人称下的眼高(米):比跟随焦点略低一点,接近真实视角。
+pub const FIRST_PERSON_HEIGHT: f32 = 1.62;
+
+/// 相机在第一人称下的眼点到焦点的距离(米):0 表示焦点就是眼点。
+pub const FIRST_PERSON_DISTANCE: f32 = 0.0;
+
+/// 相机在第一人称下的俯角(弧度):正着看,略微低头。
+pub const FIRST_PERSON_PITCH: f32 = 0.0;
 
 pub const EXPECT_FALLBACK_BLOCK: &str = "fallback block must be valid";
 
@@ -987,6 +1054,15 @@ pub const ID_MINIMAP: &str = "vcw-minimap";
 pub const ID_HITMARKER: &str = "vcw-hitmarker";
 /// 屏幕中央准星。
 pub const ID_CROSSHAIR: &str = "vcw-crosshair";
+
+/// 地图面板的 id(Tab 打开)。
+pub const ID_MAP_PANEL: &str = "vcw-map";
+
+/// 地图面板底部坐标 / 提示行的 id。
+pub const ID_MAP_DETAIL: &str = "vcw-map-detail";
+
+/// 地图面板标题的 id。
+pub const ID_MAP_TITLE: &str = "vcw-map-title";
 
 /// 开火时的事件名。
 pub const EVENT_MOUSEDOWN: &str = "mousedown";
@@ -1636,6 +1712,61 @@ pub const GROUND_SNAP_SKIN: f32 = 0.06;
 /// 玩家每秒被拉回「站在当前楼板上」的最大高度(米/秒)——防穿地。
 pub const ANTI_TUNNEL_LIFT_SPEED: f32 = 6.0;
 
+/// 跳跃初速度(米/秒,向上为正)。
+///
+/// **不是拍脑袋定的,是按「能跳上 GTA V 量级的矮墙」反解的。**
+/// 平抛顶高 `h = v0² / (2·g)`,代入本项目的 `GRAVITY = 22.0`:
+///
+/// | `v0` (m/s) | 顶高 (m) | 滞空 (s) | 步行 4.6 m/s 前进 (m) |
+/// |---|---|---|---|
+/// | 4.5 | 0.46 | 0.41 | 1.9 |
+/// | 6.0 | 0.82 | 0.55 | 2.5 |
+/// | **7.4** | **1.245** | **0.673** | **3.1** |
+/// | 8.5 | 1.64 | 0.77 | 3.5 |
+///
+/// GTA V 街景里能被跳上去的台阶 / 矮墙在 1.0–1.2 m 量级(本项目
+/// 样板楼梯的单级踏高 `SHOWCASE_STAIR_RISE` 只有 0.305 m,一层隔墙
+/// 才 1 m 出头),`v0 = 6.0` 只到 0.82 m,够不上一整级台阶的两倍;
+/// `8.5` 又能翻越 `SHOWCASE_UPPER_TOP = 3.20 m` 那道门槛太多,手感飘。
+/// 取 **7.4** ⇒ 顶高 **1.245 m**,滞空 0.67 s:站着跳能上 1.0–1.2 m
+/// 的台阶,冲刺(8.4 m/s)起跳能横跨 5.6 m,和成熟第三人称射击一致。
+pub const JUMP_VELOCITY: f32 = 7.4;
+
+/// 回归测试:跳跃顶高必须够得上一格台阶的两倍。
+pub const T_JUMP_CLEARS_A_LEDGE: &str =
+    "跳跃顶高 {peak:.3} m 必须 >= {want:.2} m(1.0-1.2 m 量级的台阶 / 矮墙),实跳初速 {v0} m/s";
+
+/// 回归测试:跳跃必须先升后落,不能一按就往下掉。
+pub const T_JUMP_RISES_BEFORE_FALLING: &str = "跳跃必须先升后落,顶点 {peak:.3} m,滞空 {air:.3} s";
+
+/// 回归测试:落地后必须回到「站稳」状态。
+pub const T_JUMP_LANDS_STANDING: &str =
+    "落地后必须 grounded=true 且 vy=0,实际 grounded={grounded} vy={vy}";
+
+/// 回归测试:滞空途中不得二次起跳。
+pub const T_JUMP_ONLY_FROM_GROUND: &str = "滞空中(y={y:.3})不得再起跳,实际起跳后 vy={vy:.3}";
+
+/// 回归测试:积分器的稳态必须原样停在地面上。
+pub const T_VERTICAL_REST_ON_FLOOR: &str = "站在地板上时积分器必须保持原位,{y:.3}/{vy:.3}";
+
+/// 回归测试:徒手不能被当成一种「可拾取的地面模型」。
+pub const T_UNARMED_NOT_A_PICKUP: &str = "空串不是武器资产,徒手不能被 from_asset 反查出来";
+
+/// 回归测试:徒手永远不能开火。
+pub const T_UNARMED_CANNOT_FIRE: &str = "徒手不该能开火,实际 can_fire={ok}";
+
+/// 回归测试:徒手换不了弹。
+pub const T_UNARMED_NO_RELOAD: &str = "徒手不该能换弹,实际 reload={ok}";
+
+/// 回归测试:投掉一颗手雷后计数必须 -1,投完就不再给投。
+pub const T_GRENADE_COUNT_DOWN: &str = "投掷后手雷数必须 -1,实际 {before} -> {after}";
+
+/// 回归测试:手上没有手雷时不得凭空投出。
+pub const T_GRENADE_NONE_LEFT: &str = "手上没有手雷时 take_grenade 必须返回 false";
+
+/// 回归测试:徒手没有模型资产,手持批次必须落空。
+pub const T_UNARMED_HAS_NO_MESH: &str = "徒手不该持有手持模型,实际 asset={asset:?}";
+
 // ===========================================================================
 // 室内系统单元测试断言文案
 // ===========================================================================
@@ -1813,8 +1944,7 @@ pub const DIR_RIGHT: &str = "右";
 /// 高度(肩 y≈1.43)。顶点本来就在那个高度上,矩阵再平移一次就会把整节
 /// part 抬高一整个身高量级 —— 表现是「四肢飘在头顶上方、之间全是
 /// 空隙」。
-pub const T_LIMB_STAYS_AT_ASSET_HEIGHT: &str =
-    "{part} 被抬高了 {off:.3} m(实际 y {got:.2}..{got_hi:.2},资产给的是 {want:.2}..{want_hi:.2}): 关节枢轴不应再被当成平移量";
+pub const T_LIMB_STAYS_AT_ASSET_HEIGHT: &str = "{part} 被抬高了 {off:.3} m(实际 y {got:.2}..{got_hi:.2},资产给的是 {want:.2}..{want_hi:.2}): 关节枢轴不应再被当成平移量";
 
 /// 骨架回归测试:末端关节必须继承父关节的摆角(不能各转各的)。
 pub const T_DISTAL_INHERITS_PARENT_SWING: &str =
@@ -1832,8 +1962,7 @@ pub const T_WHEEL_ROLLS_FORWARD: &str =
     "车轮滚动方向反了:spin={spin} 时轮底沿车体后退了 {bottom:+.4} m,应当为负(车往 +X 前进)";
 
 /// 自转 90 度必须带动轮缘基向量(X / Y 之一)改变方向。
-pub const T_WHEEL_SPIN_MOVES_RIM: &str =
-    "自转 90 度必须改变轮缘基向量:rest={axis} turned={turned}";
+pub const T_WHEEL_SPIN_MOVES_RIM: &str = "自转 90 度必须改变轮缘基向量:rest={axis} turned={turned}";
 
 /// 绕轮轴(Z)自转时,轮轴基向量本身不得改变。
 pub const T_WHEEL_AXLE_STILL: &str = "绕 Z 自转不得转动 Z 轴本身,变化量 {delta}";

@@ -288,7 +288,7 @@ impl CollisionWorld {
     /// # Returns
     ///
     /// - `Vec2` - 沿墙滑过之后的位置。
-    fn slide_step(&self, before: Vec2, want: Vec2, pushed: Vec2, radius: f32) -> Vec2 {
+    fn slide_step(&self, before: Vec2, want: Vec2, pushed: Vec2, _radius: f32) -> Vec2 {
         let correction: Vec2 = [
             pushed[0] - (before[0] + want[0]),
             pushed[1] - (before[1] + want[1]),
@@ -336,7 +336,7 @@ impl CollisionWorld {
             // 进去,切向滑动被自己的接触测试冻住,于是又回到「有速度、
             // 无位移」。改用真距离后:贴着时距离恰为半径,减去一层皮后
             // 严格大于阈值,正常放行。
-            Shape::Aabb { center, half } => distance_to_shape(shape, point) < reach,
+            Shape::Aabb { center: _, half: _ } => distance_to_shape(shape, point) < reach,
             Shape::Circle {
                 center,
                 radius: other,
@@ -886,7 +886,7 @@ impl Default for CollisionWorld {
 /// 分离力的大小按质量比分配(见 [`CollisionWorld::resolve_dynamic`]),
 /// 所以「谁在撞谁」必须可判定 —— 同一类实体之间同样要分开,否则两个人
 /// 走在一起会互相穿过去。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BodyKind {
     /// 玩家角色。
     Player,

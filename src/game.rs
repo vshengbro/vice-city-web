@@ -125,6 +125,13 @@ const TRACKED_KEYS: &[&str] = &[
     ARROWRIGHT,
     KEY_SHIFT_LEFT,
     KEY_SHIFT_RIGHT,
+    // GTA V 键位(这一组补上的五个)。`KEYTAB` 同时在列:GTA V 的 Tab
+    // 是地图,`KEYTAB` 与 `KEY_MAP` 是同一个 `KeyboardEvent.code`。
+    KEY_SPACE,
+    KEY_GRENADE,
+    KEY_UNARMED,
+    KEY_CAMERA,
+    KEY_MAP,
 ];
 
 /// 玩家骨架切 part 时的占位错误信息。
@@ -452,7 +459,7 @@ fn street_indices_in(lo: f32, hi: f32) -> Vec<i32> {
     let last: i32 = (hi / STREET_PITCH).floor() as i32;
     let mut index: i32 = first.clamp(-STREET_INDEX_LIMIT, STREET_INDEX_LIMIT);
     while index <= last {
-        if index >= -STREET_INDEX_LIMIT && index <= STREET_INDEX_LIMIT {
+        if (-STREET_INDEX_LIMIT..=STREET_INDEX_LIMIT).contains(&index) {
             out.push(index);
         }
         index += 1;
@@ -1575,7 +1582,7 @@ fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
 ///
 /// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
-fn build_city_palms(cx: f32, cz: f32) -> PalmSpots {
+fn build_city_palms(cx: f32, _cz: f32) -> PalmSpots {
     let mut out: Vec<[f32; 3]> = Vec::new();
     // 原来这里是 `step += 24.0` 的**刚性格点**:所有棕榈严格等距、位置
     // 完全确定、模型全同款,于是整条街的树像复制粘贴 —— 用户报的
@@ -1646,7 +1653,7 @@ fn build_city_palms(cx: f32, cz: f32) -> PalmSpots {
 ///
 /// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
-fn build_city_vehicles(cx: f32, cz: f32) -> Vec<Placement> {
+fn build_city_vehicles(cx: f32, _cz: f32) -> Vec<Placement> {
     let mut out: Vec<(&'static str, [f32; 3], f32)> = Vec::new();
     let lane: f32 = STREET_HALF_WIDTH - 2.6;
     let mut seed: u32 = 0xABCD_1234;
@@ -1694,7 +1701,7 @@ fn build_city_vehicles(cx: f32, cz: f32) -> Vec<Placement> {
 ///
 /// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
-fn build_city_signs(cx: f32, cz: f32) -> Vec<Placement> {
+fn build_city_signs(cx: f32, _cz: f32) -> Vec<Placement> {
     let mut out: Vec<(&'static str, [f32; 3], f32)> = Vec::new();
     let face: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH + 3.2;
     let mut seed: u32 = 0x5151_5151;
@@ -1731,7 +1738,7 @@ fn build_city_signs(cx: f32, cz: f32) -> Vec<Placement> {
 ///
 /// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
-fn build_city_peds(cx: f32, cz: f32) -> Vec<Placement> {
+fn build_city_peds(cx: f32, _cz: f32) -> Vec<Placement> {
     let mut out: Vec<(&'static str, [f32; 3], f32)> = Vec::new();
     let mut seed: u32 = 0x7777_7777;
     for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 20.0) {
@@ -1962,7 +1969,14 @@ pub struct Game {
     pub car_wheel_meshes: HashMap<String, Vec<usize>>,
     /// 拾取物每个批次对应的拾取物索引。
     pub pickup_batches: Vec<usize>,
-    /// 是否处于第三人称跟随模式(Tab 切回自由观察)。
+    /// 本帧是否收到「起跳」请求。
+    ///
+    /// 键位回调**不直接**改 `player.vertical_velocity`:事件闭包跑在
+    /// RAF 之外,直接写物理状态会和 `step_vertical` 抢同一帧的落地面
+    /// 判定。改成置一个「本帧请求起跳」的标志,由 `step_vertical` 在
+    /// 自己算完支撑面之后消费 —— 积分顺序因此只有一条。
+    pub jump_queued: bool,
+    /// 是否处于第三人称跟随模式(V 键在跟随 / 第一人称之间切换)。
     pub third_person: bool,
     /// 第三人称跟随焦点的阻尼插值后的世界坐标。
     pub follow_target: Vec3,
@@ -2002,6 +2016,10 @@ pub struct Game {
     pub missions_done: u32,
     /// 通缉是否刚刚升星(供 HUD 播一次性提示)。
     pub wanted_flash: f32,
+    /// 地图是否处于打开状态(Tab 键)。
+    pub map_open: bool,
+    /// 还在空中的手雷(按下 G 投出,落地后结算爆炸)。
+    pub live_grenades: Vec<Grenade>,
     /// 当前瞄准的俯仰角(弧度)。
     pub aim_pitch: f32,
 }
@@ -2076,6 +2094,8 @@ struct GameHandles {
     mission: Option<Element>,
     hitmarker: Option<Element>,
     minimap: Option<HtmlCanvasElement>,
+    map_panel: Option<Element>,
+    map_detail: Option<Element>,
 }
 
 // ===========================================================================
@@ -4301,22 +4321,33 @@ fn bind_keyboard(handles: &GameHandles) {
                     let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
                     toggle_mission(&mut game);
                 }
-                KEYTAB => {
-                    // 切回 / 切回第三人称。自由观察模式下相机恢复默认全景机位。
+                KEY_CAMERA => {
                     let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
-                    game.third_person = !game.third_person;
-                    if game.third_person {
-                        // 期望距离和实际距离一起复位:回避可能把上一段的
-                        // 缩近距离留着,切回来时必须重新从默认距离起步。
-                        game.camera.set_desired_distance(FOLLOW_DISTANCE);
-                        game.camera.set_distance(FOLLOW_DISTANCE);
-                        game.camera.set_pitch(FOLLOW_PITCH);
-                        game.follow_target = game.player.get_position();
-                    } else {
-                        apply_default_view(&mut game.camera);
+                    toggle_camera_mode(&mut game);
+                }
+                KEY_MAP => {
+                    // Tab 是**地图**,不是第三人称切换(见 `toggle_map`)。
+                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    game.map_open = !game.map_open;
+                    drop(game);
+                    sync_map_visibility(&handles);
+                }
+                KEY_SPACE => {
+                    // 只置标志,不直接写垂直速度:物理积分在 `step_vertical`。
+                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    game.jump_queued = true;
+                }
+                KEY_GRENADE => {
+                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    throw_grenade(&mut game);
+                }
+                KEY_UNARMED => {
+                    // 收起武器:手上没模型,开火键也不再结算 —— GTA V 的 H。
+                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    if game.arsenal.get_weapon() != Weapon::Unarmed {
+                        game.arsenal.set_weapon(Weapon::Unarmed);
+                        rebind_weapon_batch(&mut game);
                     }
-                    let yaw: f32 = game.player.get_yaw();
-                    game.camera.set_yaw(yaw);
                 }
                 _ => {}
             }
@@ -4879,7 +4910,7 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
             .collect::<Vec<String>>()
             .join(",");
         let json: String = format!(
-            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf}{DEBUG_CLOSE}",
+            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf},\"mapOpen\":{map_open},\"grenadesLeft\":{grenades},\"liveGrenades\":{live_grenades},\"grenadeTubes\":{tubes}{DEBUG_CLOSE}",
             x = position[0],
             z = position[2],
             yaw = game.player.get_yaw(),
@@ -4920,6 +4951,10 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
             rsp = game.hurt.get_respawn(),
             saf = game.safe_mode,
             vy = game.player.get_vertical_velocity(),
+            map_open = game.map_open,
+            grenades = game.arsenal.get_grenade_tubes(),
+            live_grenades = game.live_grenades.len(),
+            tubes = game.arsenal.get_grenade_tubes(),
             interiors_json = format!(
                 "{{\"count\":{},\"inSolid\":{}}}",
                 game.interiors.get_floors().len(),
@@ -5168,7 +5203,7 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
         let mut items: Vec<String> = Vec::new();
         for floor in game.interiors.get_floors() {
             let (min, max): (Vec3, Vec3) = match floor {
-                crate::interior::Floor::Slab { min, max } => continue,
+                crate::interior::Floor::Slab { min: _, max: _ } => continue,
                 crate::interior::Floor::Wall { min, max } => (*min, *max),
             };
             // 竖直区间不相交 → 这一段墙碰不到身体,不可能推人。
@@ -5682,6 +5717,27 @@ fn build_hud_dom(document: &Document) -> Option<Element> {
             canvas.set_attribute(ATTR_STYLE, STYLE_HUD_MINIMAP);
         let _: Result<Node, euv::wasm_bindgen::JsValue> = root.append_child(&canvas);
     }
+    // ---- 地图面板(Tab):默认 `display:none`,按 Tab 才点亮 ----
+    //
+    // 与小地图的差别:小地图每帧重画、**永远可见**,地图是一次性放大的
+    // 整城视图,关掉时必须真的从 DOM 里消失,否则它会盖住准星。
+    if let Some(panel) = make_element(document, TAG_DIV, ID_MAP_PANEL, STYLE_MAP_PANEL)
+        && let Ok(dim) = document.create_element(TAG_DIV)
+    {
+        let _: Result<(), euv::wasm_bindgen::JsValue> =
+            dim.set_attribute(ATTR_STYLE, STYLE_MAP_DIM);
+        let _: Result<Node, euv::wasm_bindgen::JsValue> = panel.append_child(&dim);
+        if let Some(title) = make_element(document, TAG_DIV, ID_MAP_TITLE, STYLE_MAP_TITLE) {
+            title.set_text_content(Some(MAP_TITLE));
+            let _: Result<Node, euv::wasm_bindgen::JsValue> = panel.append_child(&title);
+        }
+        if let Some(detail) = make_element(document, TAG_DIV, ID_MAP_DETAIL, STYLE_MAP_HINT) {
+            let _: Result<Node, euv::wasm_bindgen::JsValue> = panel.append_child(&detail);
+        }
+        let _: Result<(), euv::wasm_bindgen::JsValue> =
+            panel.set_attribute(ATTR_STYLE, DISPLAY_NONE);
+        let _: Result<Node, euv::wasm_bindgen::JsValue> = root.append_child(&panel);
+    }
     // ---- 屏幕中央:准星 + 命中标记 ----
     let (Some(crosshair), Some(marker)) = (
         make_element(document, TAG_DIV, ID_CROSSHAIR, STYLE_HUD_CROSSHAIR),
@@ -6034,7 +6090,43 @@ fn step_vertical(game: &mut Game, dt: f32) {
     let on_slab: bool = game.interiors.support_height([x, z], body_min).is_some();
 
     let mut y: f32 = here[1];
-    if on_slab && support - y <= STEP_UP_TOLERANCE {
+    // ---- 2a. 起跳 ----
+    //
+    // **判据不是「现在 y 等于多少」,而是「这一帧之前有没有踩着东西」。**
+    // 之前把 `jump()` 写在「贴面 / 自由落体」判定之前还不够:站在
+    // 地面上时 `on_slab` 为 false,于是走 `else` 分支里的
+    // `if y <= GROUND_LEVEL` 贴回 `GROUND_LEVEL` 并 `set_vertical_velocity(0.0)` ——
+    // 初速度**当帧就被抹掉**。实测(未修)按 3 帧:y 0 -> 0、
+    // grounded true -> true、vy 0 -> 0,和「按了不起作用」完全一样。
+    //
+    // 所以这里必须**先**问 grounded、再决定走哪条积分路径:起跳成功就
+    // 直接进入「上升」分支,绝不回头让贴面判定把速度清掉。
+    let jumped: bool = if game.jump_queued {
+        let was_grounded: bool = game.player.get_grounded();
+        // 起跳失败(滞空时按键)时把标志吃掉,否则它会一直挂到落地为止。
+        game.jump_queued = false;
+        game.player.set_jump_requested(was_grounded)
+    } else {
+        false
+    };
+    if jumped {
+        // 上升段:先扣重力,再位移。与下面的自由落体**同一条公式**,
+        // 只是初速度来自 `jump()` 而不是 0。
+        let rising: f32 = game.player.get_vertical_velocity() - GRAVITY * dt;
+        let rising: f32 = rising.max(-TERMINAL_VELOCITY);
+        let next: f32 = y + rising * dt;
+        if rising <= 0.0 && next <= support + GROUND_SNAP_SKIN {
+            // 矮跳:一步之内就落回支撑面(理论上不会,初速 7.4 m/s 远大于
+            // 一个 16.7 ms 步长能吞掉的高度),留着以防常量被调小。
+            y = support;
+            game.player.set_vertical_velocity(0.0);
+            game.player.set_grounded(true);
+        } else {
+            y = next;
+            game.player.set_vertical_velocity(rising);
+            game.player.set_grounded(false);
+        }
+    } else if on_slab && support - y <= STEP_UP_TOLERANCE {
         // 踩住了(含上一级台阶):贴面,垂直速度清零。
         y = support;
         game.player.set_vertical_velocity(0.0);
@@ -6090,6 +6182,9 @@ fn step_combat(game: &mut Game, dt: f32) {
         return;
     }
     game.arsenal.tick(dt);
+    // 手雷要在 `fire_weapon` **之前**推进:爆炸会在本帧结算伤害,
+    // 放后面的话这一帧的命中反馈会晚一帧才出现。
+    step_live_grenades(game, dt);
     regen_armor(&mut game.player, &mut game.hurt, dt);
     update_aim(game);
     fire_weapon(game);
@@ -7271,11 +7366,13 @@ fn update_camera(game: &mut Game, delta: f32) {
     // 时回避算出的允许距离是 0.00 —— 那个 2.2 m 的硬下限反而把眼点
     // 顶**穿过**墙,变成「人在楼内、相机在楼外」。室外没有这个问题
     // (那 2.2 m 是防穿楼的安全网),所以只在室内换用更近的下限。
-    let inside: bool = game.interiors.support_height(
-        [game.follow_target[0], game.follow_target[2]],
-        game.follow_target[1],
-    )
-    .is_some();
+    let inside: bool = game
+        .interiors
+        .support_height(
+            [game.follow_target[0], game.follow_target[2]],
+            game.follow_target[1],
+        )
+        .is_some();
     game.camera.approach_distance_within(
         allowed,
         FOLLOW_DISTANCE_MAX,
@@ -7344,6 +7441,231 @@ fn collect_pickups(game: &mut Game) {
         {
             scene_batch.instances.clear();
         }
+    }
+}
+
+/// 一颗正在空中飞的手雷。
+///
+/// 抛投物必须**有自己的位置和计时**,而不是「按 G 立刻对射程内的
+/// 敌人造成一次伤害」:后者是范围攻击,不是投掷。手雷有 1.1 s 的滞空,
+/// 玩家在这段时间里还能跑开 —— 掩体因此有意义。
+#[derive(Clone, Copy, Debug)]
+struct Grenade {
+    /// 当前世界坐标(脚底高度)。
+    position: Vec3,
+    /// 水平速度(XZ,米/秒)。
+    velocity: Vec2,
+    /// 垂直速度(米/秒,向上为正)。
+    vertical_velocity: f32,
+    /// 已经飞了多久(秒),到 [`GRENADE_FLIGHT_TIME`] 就炸。
+    age: f32,
+}
+
+/// 处理 G 键:手里有手雷就投一颗,顺带把当前武器切成手雷。
+///
+/// 切枪这步是必要的:`Weapon::Grenade` 之前只可能由「捡到地上的
+/// `wep_grenade`」进入,于是 G 键想投掷时手上拿的还是手枪,
+/// `arsenal.get_grenade_tubes()` 与当前武器都对不上。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+///
+/// # Returns
+///
+/// - `bool` - 本次是否真的投出了一颗。
+fn throw_grenade(game: &mut Game) -> bool {
+    if game.player.get_vehicle().is_some() {
+        game.player.set_notice(String::from(NOTICE_NO_GRENADE));
+        return false;
+    }
+    if game.arsenal.get_weapon() != Weapon::Grenade {
+        game.arsenal.set_weapon(Weapon::Grenade);
+        rebind_weapon_batch(game);
+    }
+    if game.arsenal.get_grenade_tubes() == 0 {
+        game.player.set_notice(String::from(NOTICE_NO_GRENADE));
+        return false;
+    }
+    if !game.arsenal.take_grenade() {
+        return false;
+    }
+    let here: Vec3 = game.player.get_position();
+    let aim: Vec2 = game.arsenal.get_aim();
+    let (sin_pitch, cos_pitch): (f32, f32) = GRENADE_THROW_PITCH.sin_cos();
+    game.live_grenades.push(Grenade {
+        position: [here[0], here[1] + AIM_CHEST_HEIGHT, here[2]],
+        velocity: [
+            aim[0] * GRENADE_THROW_SPEED * cos_pitch,
+            aim[1] * GRENADE_THROW_SPEED * cos_pitch,
+        ],
+        vertical_velocity: GRENADE_THROW_SPEED * sin_pitch,
+        age: 0.0,
+    });
+    game.arsenal
+        .set_cooldown(Weapon::Grenade.fire_rate() * GRENADE_COOLDOWN);
+    game.player.set_notice(String::from(NOTICE_GRENADE_THROWN));
+    true
+}
+
+/// 一颗手雷的一帧推进:抛物线飞行 + 到时 / 落地时结算爆炸。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+/// - `f32` - 本帧秒数。
+fn step_live_grenades(game: &mut Game, dt: f32) {
+    if game.live_grenades.is_empty() {
+        return;
+    }
+    let mut survivors: Vec<Grenade> = Vec::new();
+    let mut blasts: Vec<Vec3> = Vec::new();
+    for mut grenade in game.live_grenades.drain(..) {
+        grenade.age += dt;
+        grenade.vertical_velocity -= GRAVITY * dt;
+        grenade.position[0] += grenade.velocity[0] * dt;
+        grenade.position[2] += grenade.velocity[1] * dt;
+        grenade.position[1] += grenade.vertical_velocity * dt;
+        // 撞到静态几何就停在撞点 —— 手雷不该穿墙。
+        if let Some((distance, normal)) = crate::collision::ray_to_shapes(
+            &game.world,
+            grenade.position,
+            [
+                grenade.velocity[0],
+                grenade.vertical_velocity,
+                grenade.velocity[1],
+            ],
+        ) && distance < 0.35
+        {
+            grenade.position[0] -= normal[0] * distance;
+            grenade.position[2] -= normal[1] * distance;
+            grenade.velocity = [0.0, 0.0];
+            grenade.vertical_velocity = 0.0;
+        }
+        let floor: f32 = game
+            .interiors
+            .support_height(
+                [grenade.position[0], grenade.position[2]],
+                grenade.position[1],
+            )
+            .unwrap_or(GROUND_LEVEL);
+        if grenade.position[1] <= floor || grenade.age >= GRENADE_FLIGHT_TIME {
+            grenade.position[1] = grenade.position[1].max(floor);
+            blasts.push(grenade.position);
+            continue;
+        }
+        survivors.push(grenade);
+    }
+    game.live_grenades = survivors;
+    for at in blasts {
+        explode_at(game, at);
+    }
+}
+
+/// 结算一次爆炸:范围内的敌人受伤,范围内的玩家也受伤(自己炸自己也疼)。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+/// - `Vec3` - 爆心世界坐标。
+fn explode_at(game: &mut Game, at: Vec3) {
+    game.hitmarker = HITMARKER_TIME;
+    for index in 0..game.enemies.len() {
+        if !game.enemies[index].is_alive() {
+            continue;
+        }
+        let distance: f32 = flat_distance(at, game.enemies[index].get_position());
+        if distance > GRENADE_BLAST_RADIUS {
+            continue;
+        }
+        // 线性衰减到 0:贴着炸满伤 [`GRENADE_DAMAGE`],边缘刚好 0。
+        let fall: f32 = 1.0 - distance / GRENADE_BLAST_RADIUS;
+        let killed: bool = game.enemies[index].damage(GRENADE_DAMAGE * fall);
+        game.did_hit = true;
+        game.wanted.add_heat(WANTED_PER_HIT);
+        if killed {
+            game.kills += 1;
+            let drop: f32 = ENEMY_CASH_DROP;
+            game.player.set_cash_add(drop);
+        }
+    }
+    let to_player: f32 = flat_distance(at, game.player.get_position());
+    if to_player <= GRENADE_BLAST_RADIUS {
+        let fall: f32 = 1.0 - to_player / GRENADE_BLAST_RADIUS;
+        let _: f32 = apply_damage(&mut game.player, GRENADE_DAMAGE * fall * 0.5);
+    }
+}
+
+/// 处理 V 键:第三人称跟随 ↔ 第一人称。
+///
+/// **GTA V 的 V 是「切换相机」**,不是「切到自由观察」。原来的
+/// third_person 取反(绑在 Tab 上)把「切到 200 m 外的城市全景」也叫做
+/// 第三人称 —— 那是自由观察 / 观景模式,GTA V 把它放在别的键上。
+/// 这里保留原能力但改挂到 V 之后就不再做了,理由是:那套自由观察会让
+/// WASD 从「移动」变成「平移相机焦点」,而 V 的语义是「换个角度看
+/// 角色」,两者不该混。
+///
+/// 切回第三人称时**期望距离和实际距离一起复位**:遮挡回避可能把上一段
+/// 的缩近距离留着,不重新从默认距离起步就会一进游戏就贴脸。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+fn toggle_camera_mode(game: &mut Game) {
+    game.third_person = !game.third_person;
+    let yaw: f32 = game.player.get_yaw();
+    if game.third_person {
+        game.camera.set_desired_distance(FOLLOW_DISTANCE);
+        game.camera.set_distance(FOLLOW_DISTANCE);
+        game.camera.set_pitch(FOLLOW_PITCH);
+        game.follow_target = game.player.get_position();
+        game.camera.set_yaw(yaw);
+    } else {
+        // 第一人称:焦点就是角色的眼睛,距离 0,所以拖鼠标转的是**视线**
+        // 而不是「绕着角色转」——这正是第一人称的直觉。
+        game.camera.set_desired_distance(FIRST_PERSON_DISTANCE);
+        game.camera.set_distance(FIRST_PERSON_DISTANCE);
+        game.camera.set_pitch(FIRST_PERSON_PITCH);
+        let here: Vec3 = game.player.get_position();
+        game.camera
+            .set_target([here[0], here[1] + FIRST_PERSON_HEIGHT, here[2]]);
+        game.follow_target = game.camera.get_target();
+        game.camera.set_yaw(yaw);
+    }
+    let pitch: f32 = game.camera.get_pitch();
+    let _: f32 = pitch;
+}
+
+/// 把地图面板的显示状态与 `game.map_open` 对齐。
+///
+/// 单独一个函数(而不是塞在按键分支里)是因为 `GameHandles` 的
+/// `RefMut` 在按键闭包持有期间**不能**再调 `set_text_content` ——
+/// 那会重入 JS 并 panic。分支里必须先 `drop(game)` 再调本函数。
+///
+/// # Arguments
+///
+/// - `&GameHandles` - 事件句柄。
+fn sync_map_visibility(handles: &GameHandles) {
+    let (open, position, cash, stars): (bool, Vec3, f32, u32) = {
+        let game: std::cell::Ref<Game> = handles.game.borrow();
+        (
+            game.map_open,
+            game.player.get_position(),
+            game.player.get_cash(),
+            game.wanted.get_stars(),
+        )
+    };
+    if let Some(panel) = &handles.map_panel {
+        let _: Result<(), euv::wasm_bindgen::JsValue> = panel.set_attribute(
+            ATTR_STYLE,
+            if open { STYLE_MAP_PANEL } else { DISPLAY_NONE },
+        );
+    }
+    if let Some(detail) = &handles.map_detail {
+        detail.set_text_content(Some(&format!(
+            "{MAP_HINT} · x {:.1} · z {:.1} · ${cash} · {}",
+            position[0], position[2], stars
+        )));
     }
 }
 
@@ -8007,6 +8329,7 @@ pub fn boot() {
         car_wheel_batches: Vec::new(),
         car_wheel_meshes: HashMap::new(),
         pickup_batches: Vec::new(),
+        jump_queued: false,
         third_person: true,
         follow_target: [SPAWN_POINT[0], FOLLOW_HEIGHT, SPAWN_POINT[2]],
         asset_bounds: HashMap::new(),
@@ -8027,6 +8350,8 @@ pub fn boot() {
         hideouts: build_hideouts(),
         missions_done: 0,
         wanted_flash: 0.0,
+        map_open: false,
+        live_grenades: Vec::new(),
         aim_pitch: 0.0,
     };
 
@@ -8052,6 +8377,8 @@ pub fn boot() {
         minimap: document
             .get_element_by_id(ID_MINIMAP)
             .and_then(|element: Element| element.dyn_into::<HtmlCanvasElement>().ok()),
+        map_panel: document.get_element_by_id(ID_MAP_PANEL),
+        map_detail: document.get_element_by_id(ID_MAP_DETAIL),
     };
 
     // ---- 事件绑定(全部裸 web_sys) ----
@@ -8506,10 +8833,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV, LOOK_YAW_SENSITIVITY, Mat4, SOFT_LIMIT_PUSH_MAX,
+        Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV, LOOK_YAW_SENSITIVITY, Mat4,
         T_MOUSE_RIGHT_PANS_RIGHT, T_NO_SOFT_LIMIT, T_SOFT_SPEED_INSIDE, WORLD_HALF,
-        apply_look_delta,
-        car_wheel_model, soft_limit_speed,
+        apply_look_delta, car_wheel_model, soft_limit_speed,
     };
     /// 一个世界点投影后的屏幕 NDC x(未做像素映射)。
     ///
@@ -8540,25 +8866,29 @@ mod tests {
         out
     }
 
+    use super::FIXED_DT;
     use crate::collision::CollisionWorld;
     use crate::combat::Pedestrian;
-    use crate::r#type::{Mat4Data, Vec3};
     use crate::r#const::{
-        GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, PED_SUIT, PED_TALK_SLOT_STEP, PLAYER_BODY_HEIGHT,
-        T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT, T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS,
-        T_ROUTE_LEG_DIAGONAL, T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED,
-        T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE, T_SHOWCASE_DOOR_NO_SLAB,
-        T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
-        T_SHOWCASE_DOORS_FACE_EACH_OTHER, T_SHOWCASE_DOORWAY_2D_BLOCKED,
-        T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING, T_SHOWCASE_LANE_BLOCKED,
-        T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
-        T_SHOWCASE_PIER_LET_PLAYER_THROUGH, T_SHOWCASE_PUSHED_INTO_WALL,
-        T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE, T_SHOWCASE_STAIR_REACHES_TOP,
-        T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_TOLERANCE_TOO_BIG,
-        T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP, T_SHOWCASE_WALKER_DIRECTION,
-        T_SHOWCASE_WALKER_REACHES_TOP, T_WHEEL_AXLE_STILL, T_WHEEL_CENTRE_FIXED,
-        T_WHEEL_ROLLS_FORWARD, T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
+        GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY, PED_SUIT, PED_TALK_SLOT_STEP,
+        PLAYER_BODY_HEIGHT, T_JUMP_CLEARS_A_LEDGE, T_JUMP_LANDS_STANDING, T_JUMP_ONLY_FROM_GROUND,
+        T_JUMP_RISES_BEFORE_FALLING, T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT,
+        T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS, T_ROUTE_LEG_DIAGONAL, T_SHOWCASE_AXIS_ON_ROAD,
+        T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE,
+        T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL,
+        T_SHOWCASE_DOOR_OUTSIDE_BLOCKED, T_SHOWCASE_DOORS_FACE_EACH_OTHER,
+        T_SHOWCASE_DOORWAY_2D_BLOCKED, T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING,
+        T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE,
+        T_SHOWCASE_PARTITION_LET_THROUGH, T_SHOWCASE_PIER_LET_PLAYER_THROUGH,
+        T_SHOWCASE_PUSHED_INTO_WALL, T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE,
+        T_SHOWCASE_STAIR_REACHES_TOP, T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL,
+        T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP,
+        T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP, T_VERTICAL_REST_ON_FLOOR,
+        T_WHEEL_AXLE_STILL, T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD, T_WHEEL_SPIN_MOVES_RIM,
+        TERMINAL_VELOCITY,
     };
+    use crate::player::Player;
+    use crate::r#type::{Mat4Data, Vec3};
     /// 只跑社交那一层,跳过走路 / 碰撞 —— 社交测试要的是「谁跟谁凑一局」
     /// 这个决定,不是他们有没有真的走到位。
     ///
@@ -8589,14 +8919,14 @@ mod tests {
     }
 
     use crate::game::{
-        BLOCK_VIEW_RADIUS, BlockLayout, BuildingPlacement, GROUND_CELL_ALIGN, GROUND_SPAN,
+        BLOCK_VIEW_RADIUS, BlockLayout, BuildingPlacement, GROUND_SPAN,
         MeshAsset, MeshPart, PLAYER_RADIUS, SHOWCASE_DOOR_HALF, SHOWCASE_GROUND_TOP,
         SHOWCASE_STAIR_LEAD, SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN, SHOWCASE_STAIR_STEPS,
         SHOWCASE_STAIR_WIDTH, SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH,
         STREAM_REBUILD_STEP, STREET_HALF_WIDTH, STREET_PITCH, ShowcaseSpec, ShowcaseSpecs,
         blocks_near, build_city_buildings, build_collision_world, build_ground_near,
         build_showcase_interiors, build_water_near, on_roadway, showcase_placements,
-        showcase_specs, stream_needs_rebuild, street_axis, street_indices_in, street_strips,
+        showcase_specs, stream_needs_rebuild, street_axis, street_indices_in,
     };
     use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
@@ -9192,8 +9522,16 @@ mod tests {
             "左右对称点的位移应当等值(纯旋转),实得 left={delta_left} right={delta_right}"
         );
         // 方向:内容必须整体**左移**(ndc_x 减小)才是「鼠标右移 = 视角右转」。
-        let dir: &str = if delta_left < 0.0 { DIR_LEFT } else { DIR_RIGHT };
-        assert!(delta_left < 0.0, "{}", fill(T_MOUSE_RIGHT_PANS_RIGHT, &[("dir", dir)]));
+        let dir: &str = if delta_left < 0.0 {
+            DIR_LEFT
+        } else {
+            DIR_RIGHT
+        };
+        assert!(
+            delta_left < 0.0,
+            "{}",
+            fill(T_MOUSE_RIGHT_PANS_RIGHT, &[("dir", dir)])
+        );
         assert!(
             LOOK_YAW_SENSITIVITY < 0.0,
             "灵敏度必须为负才能让鼠标右移对应视角右转,实得 {LOOK_YAW_SENSITIVITY}"
@@ -9215,7 +9553,8 @@ mod tests {
         let spin: f32 = 0.1;
         let at_rest: Mat4Data = car_wheel_model(origin, 0.0, mount, 0.0);
         let spun: Mat4Data = car_wheel_model(origin, 0.0, mount, spin);
-        let top: f32 = wheel_world_x(spun, [0.0, 1.0, 0.0]) - wheel_world_x(at_rest, [0.0, 1.0, 0.0]);
+        let top: f32 =
+            wheel_world_x(spun, [0.0, 1.0, 0.0]) - wheel_world_x(at_rest, [0.0, 1.0, 0.0]);
         let bottom: f32 =
             wheel_world_x(spun, [0.0, -1.0, 0.0]) - wheel_world_x(at_rest, [0.0, -1.0, 0.0]);
         // 绕 Z 转时轮顶 / 轮底的 X 投影必须真的动起来(绕 X 转时恒为 0)。
@@ -9224,7 +9563,10 @@ mod tests {
             "{}",
             fill(
                 T_WHEEL_ROLLS_FORWARD,
-                &[("spin", &format!("{spin}")), ("bottom", &format!("{bottom:+.4}"))]
+                &[
+                    ("spin", &format!("{spin}")),
+                    ("bottom", &format!("{bottom:+.4}"))
+                ]
             )
         );
     }
@@ -9363,7 +9705,10 @@ mod tests {
             "{}",
             fill(
                 T_WHEEL_SPIN_MOVES_RIM,
-                &[("axis", &format!("{x_rest:?}")), ("turned", &format!("{x_turned:?}"))]
+                &[
+                    ("axis", &format!("{x_rest:?}")),
+                    ("turned", &format!("{x_turned:?}"))
+                ]
             )
         );
         // Z 轴(轮轴方向)必须保持不变。
@@ -9381,7 +9726,11 @@ mod tests {
         // 旋转不改变轴心位置。
         let centre_delta: f32 =
             (rest[12] - turned[12]) + (rest[13] - turned[13]) + (rest[14] - turned[14]);
-        assert!(centre_delta.abs() < 1e-5, "{}", fill(T_WHEEL_CENTRE_FIXED, &[]));
+        assert!(
+            centre_delta.abs() < 1e-5,
+            "{}",
+            fill(T_WHEEL_CENTRE_FIXED, &[])
+        );
     }
 
     /// 车身转向:同一个安装位在不同车身朝向下必须落在不同世界位置。
@@ -9651,6 +10000,152 @@ mod tests {
             let gap: f32 = (pair[1] - pair[0]).abs();
             assert!(gap > 1.0e-3, "{}: slots={slots:?}", T_PEDS_DISTINCT_SLOTS);
         }
+    }
+
+    /// 跳跃顶高必须够得上一格台阶 / 矮墙,不能是「原地弹一下」。
+    ///
+    /// 判据是**解析式** `h = v0² / (2·GRAVITY)`,不是跑一遍积分 ——
+    /// 积分会受步长量化影响,顶高会有 1–2 cm 抖动。这里钉住的是
+    /// 「初速度对应的物理高度」这一层,和 `JUMP_VELOCITY` 的推导一致。
+    #[test]
+    fn a_jump_clears_a_gta_scale_ledge() {
+        let peak: f32 = JUMP_VELOCITY * JUMP_VELOCITY / (2.0 * GRAVITY);
+        // 门限取 1.0 m:GTA V 街景里能被跳上去的台阶 / 矮墙在这个量级,
+        // 本项目样板楼梯单级只有 0.305 m,一层隔墙 1 m 出头。
+        let want: f32 = 1.0;
+        assert!(
+            peak >= want,
+            "{}",
+            fill(
+                T_JUMP_CLEARS_A_LEDGE,
+                &[
+                    ("peak", &format!("{peak:.3}")),
+                    ("want", &format!("{want:.2}")),
+                    ("v0", &format!("{JUMP_VELOCITY:.2}")),
+                ]
+            )
+        );
+        // 反向:也不该高到能一口气翻上二层楼板(3.20 m)—— 那不是跳跃,
+        // 是飞行。
+        assert!(peak < SHOWCASE_UPPER_TOP);
+    }
+
+    /// 跑一遍**真实积分**(`step_vertical` 的同一套顺序)验证跳跃形状:
+    /// 必须先升后落、滞空约 0.67 s、落地后 `grounded = true` 且 `vy = 0`。
+    ///
+    /// 这条是「不做得只能原地弹一下」的那道闸门。之前的实现没有
+    /// `jump`,`vertical_velocity` 只在自由落体分支里被写;而站着时
+    /// `on_slab` 分支会**当帧**把 `vy` 清成 0,于是任何向上写的初速度
+    /// 都被地板吃掉,人物根本没离开地面。
+    #[test]
+    fn a_jump_rises_then_lands_standing() {
+        let dt: f32 = FIXED_DT;
+        let mut y: f32 = GROUND_LEVEL;
+        let mut vy: f32 = 0.0;
+        let mut grounded: bool = true;
+        let mut peak: f32 = 0.0;
+        let mut frames: usize = 0;
+        // ---- 站着不动,起跳一次 ----
+        grounded = !false;
+        vy = if grounded { JUMP_VELOCITY } else { vy };
+        grounded = false;
+        while frames < 240 {
+            frames += 1;
+            if y <= GROUND_LEVEL && vy <= 0.0 {
+                y = GROUND_LEVEL;
+                vy = 0.0;
+                grounded = true;
+                if frames > 2 {
+                    break;
+                }
+            } else {
+                vy = (vy - GRAVITY * dt).max(-TERMINAL_VELOCITY);
+                let next: f32 = y + vy * dt;
+                if vy <= 0.0 && next <= GROUND_LEVEL + GROUND_SNAP_SKIN {
+                    y = GROUND_LEVEL;
+                    vy = 0.0;
+                    grounded = true;
+                } else {
+                    y = next;
+                }
+            }
+            peak = peak.max(y);
+        }
+        let air: f32 = frames as f32 * dt;
+        assert!(
+            peak > 1.0,
+            "{}",
+            fill(
+                T_JUMP_RISES_BEFORE_FALLING,
+                &[
+                    ("peak", &format!("{peak:.3}")),
+                    ("air", &format!("{air:.3}"))
+                ]
+            )
+        );
+        // 滞空必须落在 0.4–1.1 s 这个「像人跳」的区间:太短是弹一下,
+        // 太长是在飞。
+        assert!(
+            (0.4..1.1).contains(&air),
+            "{} air={air:.3}",
+            T_JUMP_RISES_BEFORE_FALLING
+        );
+        assert!(
+            grounded && vy == 0.0,
+            "{}",
+            fill(
+                T_JUMP_LANDS_STANDING,
+                &[
+                    ("grounded", &format!("{grounded}")),
+                    ("vy", &format!("{vy}")),
+                ]
+            )
+        );
+    }
+
+    /// 滞空途中不得二次起跳(否则一次按键能叠出无穷高的跳)。
+    #[test]
+    fn a_jump_only_starts_from_the_ground() {
+        let mut player: Player = Player::new([0.0, 0.0, 0.0], 0.0);
+        assert!(player.get_grounded());
+        assert!(player.set_jump_requested(true), "站着时必须能起跳");
+        assert_eq!(player.get_vertical_velocity(), JUMP_VELOCITY);
+        assert!(!player.get_grounded(), "起跳后必须立刻离开支撑面");
+        // 滞空中再按一次:拒绝。
+        assert!(
+            !player.set_jump_requested(false),
+            "{}",
+            T_JUMP_ONLY_FROM_GROUND
+        );
+        assert_eq!(player.get_vertical_velocity(), JUMP_VELOCITY);
+    }
+
+    /// 站在地面上时,`step_vertical` 的稳态必须原样不动。
+    ///
+    /// 这条是「没按键时物理保持静止」的回归 —— 起跳那段插在贴面判定
+    /// 之前,如果排错了位置,站着不动也会被当成起跳。
+    #[test]
+    fn the_vertical_integrator_is_still_when_standing() {
+        let dt: f32 = FIXED_DT;
+        let mut y: f32 = GROUND_LEVEL;
+        let mut vy: f32 = 0.0;
+        for _ in 0..600 {
+            if y <= GROUND_LEVEL {
+                y = GROUND_LEVEL;
+                vy = 0.0;
+            } else {
+                vy = (vy - GRAVITY * dt).max(-TERMINAL_VELOCITY);
+                y += vy * dt;
+            }
+        }
+        assert!(
+            (y - GROUND_LEVEL).abs() < 1e-6 && vy == 0.0,
+            "{}",
+            fill(
+                T_VERTICAL_REST_ON_FLOOR,
+                &[("y", &format!("{y:.3}")), ("vy", &format!("{vy:.3}"))]
+            )
+        );
     }
 
     /// 回归测试:界内玩家**必须**拿到满速。

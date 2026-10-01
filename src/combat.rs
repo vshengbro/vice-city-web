@@ -43,6 +43,12 @@ pub enum Weapon {
     Bat,
     /// 手雷:抛投型,范围伤害。
     Grenade,
+    /// 徒手:没拿武器(GTA V 按 H 收起武器后的状态)。
+    ///
+    /// **不是新增玩法,是给「收起」一个可表示的状态。** 之前按 H 无处
+    /// 可去,原因是 `Weapon` 里根本没有「手上没东西」这一档,`weapon_mesh`
+    /// 只能指向某个真实模型。加了这个变体之后 H 才有地方落。
+    Unarmed,
 }
 
 /// 武器反查的结果类型,等价于 `Option<Weapon>`。
@@ -65,6 +71,10 @@ impl Weapon {
             Weapon::Smg => WEP_SMG,
             Weapon::Bat => WEP_BAT,
             Weapon::Grenade => WEP_GRENADE,
+            // 徒手没有模型资产。返回空串而不是编一个 id:`rebind_weapon_batch`
+            // 查不到就是 `usize::MAX`,手持批次自然被跳过(见
+            // `sync_combat_instances` 的 `batch != usize::MAX` 分支)。
+            Weapon::Unarmed => "",
         }
     }
 
@@ -89,6 +99,8 @@ impl Weapon {
             WEP_SMG => Some(Weapon::Smg),
             WEP_BAT => Some(Weapon::Bat),
             WEP_GRENADE => Some(Weapon::Grenade),
+            // 徒手不是地上的模型,不能被 `from_asset` 反查出来 ——
+            // 否则空串会反过来认成徒手。
             _ => None,
         }
     }
@@ -104,6 +116,7 @@ impl Weapon {
             Weapon::Smg => SMG_MAGAZINE,
             Weapon::Bat => 0,
             Weapon::Grenade => GRENADE_TUBES,
+            Weapon::Unarmed => 0,
         }
     }
 
@@ -118,6 +131,8 @@ impl Weapon {
             Weapon::Smg => SMG_DAMAGE,
             Weapon::Bat => BAT_DAMAGE,
             Weapon::Grenade => GRENADE_DAMAGE,
+            // 徒手打不出伤害:按 H 收起之后开火键不该结算任何东西。
+            Weapon::Unarmed => 0.0,
         }
     }
 
@@ -132,6 +147,7 @@ impl Weapon {
             Weapon::Smg => SMG_FIRE_RATE,
             Weapon::Bat => 1.0 / BAT_COOLDOWN,
             Weapon::Grenade => 1.0 / GRENADE_COOLDOWN,
+            Weapon::Unarmed => 0.0,
         }
     }
 
@@ -159,6 +175,7 @@ impl Weapon {
             Weapon::Smg => WEAPON_NAME_SMG,
             Weapon::Bat => WEAPON_NAME_BAT,
             Weapon::Grenade => WEAPON_NAME_GRENADE,
+            Weapon::Unarmed => WEAPON_NAME_UNARMED,
         }
     }
 }
@@ -239,6 +256,7 @@ impl Arsenal {
             Weapon::Smg => self.get_smg_ammo(),
             Weapon::Bat => 0,
             Weapon::Grenade => self.get_grenade_tubes(),
+            Weapon::Unarmed => 0,
         }
     }
 
@@ -251,8 +269,8 @@ impl Arsenal {
         match self.get_weapon() {
             Weapon::Pistol => self.get_pistol_reserve(),
             Weapon::Smg => self.get_smg_reserve(),
-            // 球棒和手雷都没有「备弹」概念:要补充得在地上再捡一颗。
-            Weapon::Bat | Weapon::Grenade => 0,
+            // 球棒 / 手雷 / 徒手都没有「备弹」概念:要补充得在地上再捡。
+            Weapon::Bat | Weapon::Grenade | Weapon::Unarmed => 0,
         }
     }
 
@@ -313,6 +331,8 @@ impl Arsenal {
         }
         match self.get_weapon() {
             Weapon::Bat | Weapon::Grenade => true,
+            // 徒手永远不会「能开火」——这是 `fire_weapon` 唯一的早退闸门。
+            Weapon::Unarmed => false,
             _ => self.get_magazine() > 0,
         }
     }
@@ -366,7 +386,8 @@ impl Arsenal {
     ///
     /// - `bool` - 换弹是否被启动(已经在换 / 满弹匣 / 球棒时为 `false`)。
     pub fn reload(&mut self) -> bool {
-        if self.get_weapon() == Weapon::Bat || self.get_reloading() > 0.0 {
+        if matches!(self.get_weapon(), Weapon::Bat | Weapon::Unarmed) || self.get_reloading() > 0.0
+        {
             return false;
         }
         if self.get_magazine() >= self.get_weapon().magazine() {
@@ -392,7 +413,7 @@ impl Arsenal {
                 self.set_smg_ammo((self.get_smg_ammo() + rounds).min(capacity));
                 self.set_smg_reserve(self.get_smg_reserve() - rounds);
             }
-            Weapon::Bat => {}
+            Weapon::Bat | Weapon::Unarmed => {}
             Weapon::Grenade => {
                 self.set_grenade_tubes((self.get_grenade_tubes() + rounds).min(capacity));
             }
@@ -413,7 +434,7 @@ impl Arsenal {
             Weapon::Smg => {
                 self.set_smg_reserve(self.get_smg_reserve() + rounds);
             }
-            Weapon::Bat | Weapon::Grenade => {}
+            Weapon::Bat | Weapon::Grenade | Weapon::Unarmed => {}
         }
     }
 
@@ -500,6 +521,24 @@ impl Arsenal {
     /// - `u32` - 新值。
     pub fn set_grenade_tubes(&mut self, value: u32) {
         self.grenade_tubes = value;
+    }
+
+    /// 投掉一颗手雷:数量 -1,手上没有就不给投。
+    ///
+    /// 计数和「有没有投出去」必须放在**一处**判:`throw_grenade` 先看
+    /// `get_grenade_tubes() == 0` 再调本函数,两次判之间没有别的写者,
+    /// 所以这里仍要自己再判一次 —— 它是这条路径上的最后一道闸门。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - 是否真的投出了一颗(没有则 `false`)。
+    pub fn take_grenade(&mut self) -> bool {
+        let now: u32 = self.get_grenade_tubes();
+        if now == 0 {
+            return false;
+        }
+        self.set_grenade_tubes(now - 1);
+        true
     }
 
     /// 捡起一颗手雷:数量 +1,不超过 `GRENADE_TUBES`。
@@ -2248,7 +2287,8 @@ mod tests {
     use crate::combat::{Arsenal, Weapon};
     use crate::r#const::{
         GRENADE_TUBES, PICKUP_AMMO_BOX, PICKUP_ARMOR_VEST, PICKUP_HEALTH_PACK, SMG_MAGAZINE,
-        WEP_BAT, WEP_GRENADE, WEP_PISTOL, WEP_SMG,
+        T_GRENADE_COUNT_DOWN, T_GRENADE_NONE_LEFT, T_UNARMED_CANNOT_FIRE, T_UNARMED_HAS_NO_MESH,
+        T_UNARMED_NO_RELOAD, T_UNARMED_NOT_A_PICKUP, WEP_BAT, WEP_GRENADE, WEP_PISTOL, WEP_SMG,
     };
 
     /// 回归测试(第 10 条):地上的每一种武器模型都必须能被认出来。
@@ -2278,6 +2318,77 @@ mod tests {
         for weapon in [Weapon::Pistol, Weapon::Smg, Weapon::Bat, Weapon::Grenade] {
             assert_eq!(Weapon::from_asset(weapon.asset()), Some(weapon));
         }
+    }
+
+    /// 徒手不是地上的模型:空串不能被 `from_asset` 反查成徒手。
+    ///
+    /// 之前 `Weapon` 里根本没有「手上没东西」这一档,按 H 无处可去。
+    /// 加了 `Unarmed` 之后,它的 `asset()` 返回空串 —— 如果 `from_asset`
+    /// 顺手把空串也认成徒手,任何一次资产查表落空(比如 `index_map`
+    /// 少一项)都会把人莫名其妙切成徒手。
+    #[test]
+    fn unarmed_is_not_a_pickup_asset() {
+        assert_eq!(
+            Weapon::from_asset(Weapon::Unarmed.asset()),
+            None,
+            "{}",
+            T_UNARMED_NOT_A_PICKUP
+        );
+        // 空串也不能反查成徒手:任何一次资产查表落空都会把人切成徒手。
+        assert_eq!(Weapon::from_asset(""), None, "{}", T_UNARMED_NOT_A_PICKUP);
+    }
+
+    /// 徒手没有模型资产:手持批次必须落空成 `usize::MAX`。
+    #[test]
+    fn unarmed_has_no_held_mesh() {
+        assert!(
+            Weapon::Unarmed.asset().is_empty(),
+            "{}",
+            T_UNARMED_HAS_NO_MESH
+        );
+    }
+
+    /// 徒手永远不能开火 —— 这是 `fire_weapon` 唯一的早退闸门。
+    ///
+    /// 少了这一条,按 H 收起武器之后点左键会走进 `fire_weapon` 的
+    /// hitscan 分支(手上没模型但照样结算),看起来就是「收枪了还在开枪」。
+    #[test]
+    fn unarmed_can_never_fire() {
+        let mut arsenal: Arsenal = Arsenal::new();
+        arsenal.set_weapon(Weapon::Unarmed);
+        arsenal.set_cooldown(0.0);
+        assert_eq!(arsenal.get_magazine(), 0);
+        assert!(!arsenal.can_fire(), "{}", T_UNARMED_CANNOT_FIRE);
+        assert!(!arsenal.fire(0));
+    }
+
+    /// 徒手换不了弹(没有弹匣可换)。
+    #[test]
+    fn unarmed_cannot_reload() {
+        let mut arsenal: Arsenal = Arsenal::new();
+        arsenal.set_weapon(Weapon::Unarmed);
+        assert!(!arsenal.reload(), "{}", T_UNARMED_NO_RELOAD);
+    }
+
+    /// 投掉一颗手雷:计数 -1,投完就不再给投。
+    ///
+    /// 这条是 G 键的**计数**判据:实测必须能看到 `grenadeTubes` 真的
+    /// 往下掉,否则「按 G」只是切了个武器名,玩家手上并没有少东西。
+    #[test]
+    fn throwing_a_grenade_takes_one_tube() {
+        let mut arsenal: Arsenal = Arsenal::new();
+        assert!(arsenal.add_grenade());
+        assert!(arsenal.add_grenade());
+        let before: u32 = arsenal.get_grenade_tubes();
+        assert!(arsenal.take_grenade());
+        let after: u32 = arsenal.get_grenade_tubes();
+        assert_eq!(after, before - 1, "{}", T_GRENADE_COUNT_DOWN);
+        // 投到最后一颗为止,之后必须投不出。
+        while arsenal.get_grenade_tubes() > 0 {
+            assert!(arsenal.take_grenade());
+        }
+        assert_eq!(arsenal.get_grenade_tubes(), 0);
+        assert!(!arsenal.take_grenade(), "{}", T_GRENADE_NONE_LEFT);
     }
 
     /// 捡手雷要真的 +1,并在 `GRENADE_TUBES` 处封顶。
