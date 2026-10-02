@@ -463,11 +463,6 @@ impl Camera {
         }
     }
 
-    /// 恢复出厂设置。
-    pub fn reset(&mut self) {
-        *self = Camera::new();
-    }
-
     /// 返回注视焦点的只读副本。
     ///
     /// 写入注视点。

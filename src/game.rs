@@ -111,10 +111,11 @@ const TRACKED_KEYS: &[&str] = &[
     KEYS,
     KEYA,
     KEYD,
-    KEYR,
     KEYT,
     KEYF,
     KEYTAB,
+    // 换弹就是 GTA V 的 R。曾经的 `KEYR` 常量已删 —— 它和 `KEY_RELOAD`
+    // 指向同一个 `KeyboardEvent.code`,两个常量只能留一个。
     KEY_RELOAD,
     DIGIT1,
     DIGIT2,
@@ -2133,26 +2134,6 @@ pub struct CarWheelBatch {
     pub mount: Vec3,
     /// 该轮子批次的场景索引。
     pub batch: usize,
-}
-
-/// 把相机摆到「街区网格全景」机位。
-///
-/// 城市扩到 300 m × 300 m 之后,默认机位必须**站得够高、拉得够远**,
-/// 才能一眼看到成片的街区网格而不是一条街。机位落在
-/// `(x≈0, y≈120, z≈210)`、俯角 ~0.55 rad:既越过绝大多数中层楼的
-/// 屋顶,又保留街道的透视纵深。
-///
-/// # Arguments
-///
-/// - `&mut Camera` - Camera 的可变引用。
-fn apply_default_view(camera: &mut Camera) {
-    camera.target = [0.0, 8.0, -30.0];
-    camera.distance = 250.0;
-    camera.desired_distance = 250.0;
-    camera.yaw = 0.0;
-    camera.pitch = 0.55;
-    camera.fov_y = std::f32::consts::FRAC_PI_4; // 45°:比 60° 收敛,避免近处楼被拉成大楔形
-    camera.far = 900.0;
 }
 
 /// 挂载到 canvas 上的事件驱动所需的共享引用。
@@ -4381,11 +4362,6 @@ fn bind_keyboard(handles: &GameHandles) {
                 return;
             }
             match code.as_str() {
-                KEYR => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
-                    game.camera.reset();
-                    apply_default_view(&mut game.camera);
-                }
                 KEYT => {
                     let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
                     game.input.phase = game.input.phase.next();
@@ -8388,7 +8364,8 @@ pub fn boot() {
     console_log(&format!("[vcw] renderer = {backend_note}"));
 
     // 默认是**第三人称跟随**:相机离角色 FOLLOW_DISTANCE 米、俯角 FOLLOW_PITCH。
-    // 城市全景机位(`apply_default_view`)只在按 Tab 切到自由观察时才用。
+    // 曾经还有一个「街区网格全景」机位(`apply_default_view`),由 R 键触发;
+    // R 在 GTA V 是换弹,那个机位也已经删掉了,没有别的键会切到它。
     let mut camera: Camera = Camera::new();
     camera.set_desired_distance(FOLLOW_DISTANCE);
     camera.set_distance(FOLLOW_DISTANCE);
@@ -8985,23 +8962,25 @@ mod tests {
     use crate::combat::Pedestrian;
     use crate::r#const::{
         AXIS_STRAFE, CAR_SEDAN, GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY, PED_SUIT,
-        PED_TALK_SLOT_STEP, PLAYER_BODY_HEIGHT, T_JUMP_CLEARS_A_LEDGE, T_JUMP_LANDS_STANDING,
-        T_JUMP_ONLY_FROM_GROUND, T_JUMP_RISES_BEFORE_FALLING, T_PEDS_DISTINCT_SLOTS,
-        T_PEDS_DOWNED_NO_CHAT, T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS, T_ROUTE_LEG_DIAGONAL,
-        T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DOOR_CENTER_BLOCKED,
-        T_SHOWCASE_DOOR_INSIDE, T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING,
-        T_SHOWCASE_DOOR_ON_OUTER_WALL, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
-        T_SHOWCASE_DOORS_FACE_EACH_OTHER, T_SHOWCASE_DOORWAY_2D_BLOCKED,
-        T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING, T_SHOWCASE_DESCENT_NO_CLIMB,
-        T_SHOWCASE_DESCENT_REACHES_GROUND, T_SHOWCASE_LANDING_COVERS_RUN,
-        T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE,
-        T_SHOWCASE_PARTITION_LET_THROUGH, T_SHOWCASE_PIER_LET_PLAYER_THROUGH,
-        T_SHOWCASE_PUSHED_INTO_WALL, T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE,
-        T_SHOWCASE_STAIR_REACHES_TOP, T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL,
-        T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP,
-        T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP, T_VERTICAL_REST_ON_FLOOR,
-        T_WHEEL_AXLE_STILL, T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD, T_WHEEL_SPIN_MOVES_RIM,
-        TERMINAL_VELOCITY,
+        PED_TALK_SLOT_STEP, PISTOL_MAGAZINE, PLAYER_BODY_HEIGHT, RELOAD_TIME,
+        SLOT_FORMER_RELOAD_KEY, SLOT_RELOAD_KEY, T_C_NO_LONGER_RELOADS, T_JUMP_CLEARS_A_LEDGE,
+        T_JUMP_LANDS_STANDING, T_JUMP_ONLY_FROM_GROUND, T_JUMP_RISES_BEFORE_FALLING,
+        T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT, T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS,
+        T_RELOAD_CONSUMES_RESERVE, T_RELOAD_KEY_IS_GTA_R, T_RELOAD_NOT_REPEATABLE,
+        T_RELOAD_R_REFILLS_MAGAZINE, T_RELOAD_R_STARTS_RELOAD, T_ROUTE_LEG_DIAGONAL,
+        T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DESCENT_NO_CLIMB,
+        T_SHOWCASE_DESCENT_REACHES_GROUND, T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE,
+        T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL,
+        T_SHOWCASE_DOOR_OUTSIDE_BLOCKED, T_SHOWCASE_DOORS_FACE_EACH_OTHER,
+        T_SHOWCASE_DOORWAY_2D_BLOCKED, T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING,
+        T_SHOWCASE_LANDING_COVERS_RUN, T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_OVERLAPS_ORDINARY,
+        T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
+        T_SHOWCASE_PIER_LET_PLAYER_THROUGH, T_SHOWCASE_PUSHED_INTO_WALL,
+        T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE, T_SHOWCASE_STAIR_REACHES_TOP,
+        T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_TOLERANCE_TOO_BIG,
+        T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP, T_SHOWCASE_WALKER_DIRECTION,
+        T_SHOWCASE_WALKER_REACHES_TOP, T_VERTICAL_REST_ON_FLOOR, T_WHEEL_AXLE_STILL,
+        T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD, T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
     };
     use crate::player::Player;
     use crate::r#type::{Mat4Data, Vec3};
@@ -10595,5 +10574,142 @@ mod tests {
         // 只有 D 时仍按老路径工作 —— 这条保证没把原有 A/D 修坏。
         let plain: super::InputState = input_holding(&[KEYD]);
         assert_eq!(plain.steer_axis(), 1.0);
+    }
+
+    // ---- 换弹键位:GTA V 的 R ------------------------------------------
+    //
+    // 判据全部落在 `Arsenal` 的**弹匣余量 / 换弹计时**上,而不是比对按键
+    // 码字符串 —— 字符串那条只能证明常量改对了,证明不了它真的接到了
+    // `reload()` 上。这里每条都从「非满匣」出发(实机 6 发),跑完
+    // `RELOAD_TIME` 再看弹匣有没有真的回升。
+    //
+    // **不用浮点等值判断弹匣**:弹匣是 `u32`,直接整数比较。
+
+    /// 造一把打到「非满匣」的手枪,给换弹测试当起点。
+    fn partially_spent_pistol() -> crate::combat::Arsenal {
+        let mut arsenal: crate::combat::Arsenal = crate::combat::Arsenal::new();
+        // 6 发 —— 和验收时 HUD 实测到的那个数一致。
+        arsenal.set_pistol_ammo(6);
+        arsenal
+    }
+
+    /// 换弹键就是 GTA V PC 的 R。
+    ///
+    /// 这条钉的是**常量本身**。它是那一行 `pub const KEY_RELOAD` 的
+    /// 回归锁:没有它,有人把换弹改回 C 键时下面那些行为测试可能照样
+    /// 绿(因为它们直接调 `reload()`),而实机按键又是坏的。
+    #[test]
+    fn reload_key_is_the_gta_r_key() {
+        assert_eq!(
+            super::KEY_RELOAD,
+            SLOT_RELOAD_KEY,
+            "{}",
+            fill(T_RELOAD_KEY_IS_GTA_R, &[("got", super::KEY_RELOAD)])
+        );
+    }
+
+    /// 按 R 换弹:计时推起来 → 跑完 → 弹匣真的回升。
+    #[test]
+    fn r_starts_a_reload_that_actually_refills_the_magazine() {
+        let mut arsenal: crate::combat::Arsenal = partially_spent_pistol();
+        let before: u32 = arsenal.get_magazine();
+        assert_eq!(before, 6);
+        // R 那一帧:`reload()` 成功并且把计时推满。
+        assert!(arsenal.reload());
+        let reloading: f32 = arsenal.get_reloading();
+        assert!(
+            reloading > RELOAD_TIME - 0.01,
+            "{}",
+            fill(
+                T_RELOAD_R_STARTS_RELOAD,
+                &[("got", &format!("{reloading:.3}"))]
+            )
+        );
+        // 换弹途中弹匣**不该**变 —— 弹药在计时归零那一刻才真的填进去。
+        assert_eq!(arsenal.get_magazine(), before);
+        // 跑完整个换弹时长(多跑一帧确保计时真的归零)。
+        arsenal.tick(RELOAD_TIME);
+        arsenal.tick(FIXED_DT);
+        let after: u32 = arsenal.get_magazine();
+        assert!(
+            after > before,
+            "{}",
+            fill(T_RELOAD_R_REFILLS_MAGAZINE, &[("got", &format!("{after}"))])
+        );
+        assert_eq!(after, PISTOL_MAGAZINE);
+        assert!(!arsenal.is_reloading());
+    }
+
+    /// 换弹从备弹里扣,不是凭空造子弹。
+    #[test]
+    fn reload_does_not_mint_rounds_out_of_nothing() {
+        let mut arsenal: crate::combat::Arsenal = partially_spent_pistol();
+        let reserve_before: u32 = arsenal.get_reserve();
+        let loaded: u32 = PISTOL_MAGAZINE - arsenal.get_magazine();
+        arsenal.reload();
+        arsenal.tick(RELOAD_TIME + FIXED_DT);
+        assert_eq!(arsenal.get_magazine(), PISTOL_MAGAZINE);
+        assert_eq!(
+            arsenal.get_reserve(),
+            reserve_before - loaded,
+            "{}",
+            fill(
+                T_RELOAD_CONSUMES_RESERVE,
+                &[("got", &format!("{}", arsenal.get_reserve()))]
+            )
+        );
+    }
+
+    /// C 键不再换弹 —— 它既不在 `TRACKED_KEYS` 里,也不该触发 `reload()`。
+    ///
+    /// 这一条按任务要求钉死「C 不再是换弹键」。GTA V 里 C 是进车 /
+    /// 蹲伏,本项目两个都没有,所以 C 是**完全未绑定**的键。
+    #[test]
+    fn c_no_longer_reloads() {
+        // C 甚至不在按键白名单里 —— 事件层就直接放行了。
+        assert!(
+            !super::TRACKED_KEYS.contains(&SLOT_FORMER_RELOAD_KEY),
+            "{}",
+            fill(
+                T_C_NO_LONGER_RELOADS,
+                &[("got", "C is still a tracked key")]
+            )
+        );
+        // 即便绕过事件层直接调换弹入口,C 也不会出现在任何 match 分支里:
+        // 白名单里只有 `KEY_RELOAD`(= "KeyR")这一个换弹 code。
+        let reload_codes: Vec<&str> = super::TRACKED_KEYS
+            .iter()
+            .copied()
+            .filter(|code: &&str| *code == super::KEY_RELOAD)
+            .collect();
+        assert_eq!(reload_codes.len(), 1);
+        assert!(!reload_codes.contains(&SLOT_FORMER_RELOAD_KEY));
+    }
+
+    /// 连按 R 不会叠加出多次换弹:换弹中再按 R 必须被拒。
+    ///
+    /// 键盘的 `keydown` 在按住不放时会自动重复触发(浏览器的 OS 级
+    /// repeat)。`bind_keyboard` 靠 `is_press`(「上一次是不是已经按着」)
+    /// 挡掉了自动重复,但玩家**主动**连按两下仍然会进两次
+    /// `keydown`。`Arsenal::reload` 自己用 `reloading > 0` 兜底,所以
+    /// 第二次必须被拒。
+    #[test]
+    fn pressing_r_again_mid_reload_does_not_stack() {
+        let mut arsenal: crate::combat::Arsenal = partially_spent_pistol();
+        assert!(arsenal.reload());
+        let first: f32 = arsenal.get_reloading();
+        // 再按一次 R。
+        assert!(!arsenal.reload());
+        assert!(
+            (arsenal.get_reloading() - first).abs() < 0.001,
+            "{}",
+            fill(
+                T_RELOAD_NOT_REPEATABLE,
+                &[("got", &format!("{:.3}", arsenal.get_reloading()))]
+            )
+        );
+        // 换完之后弹匣**只补一次**,不会补出 18 发。
+        arsenal.tick(RELOAD_TIME + FIXED_DT);
+        assert_eq!(arsenal.get_magazine(), PISTOL_MAGAZINE);
     }
 }

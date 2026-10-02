@@ -36,8 +36,6 @@ pub const KEYA: &str = "KeyA";
 
 pub const KEYD: &str = "KeyD";
 
-pub const KEYR: &str = "KeyR";
-
 pub const KEYS: &str = "KeyS";
 
 pub const KEYT: &str = "KeyT";
@@ -504,7 +502,7 @@ pub const READY_BUILT_IN_FALLBACK_SCENE: &str = "ready (built-in fallback scene)
 
 pub const FALLING_BACK_TO_BUILT_IN_SCENE: &str = "falling back to built-in scene…";
 
-pub const DRAG_ORBIT_WHEEL_PINCH_ZOOM_WASD_PAN_R_RESET: &str = "WASD walk · SHIFT run · DRAG orbit camera · WHEEL zoom · F enter/exit vehicle · TAB free-look · T time of day · R reset";
+pub const DRAG_ORBIT_WHEEL_PINCH_ZOOM_WASD_PAN_R_RESET: &str = "WASD walk · SHIFT run · DRAG orbit camera · WHEEL zoom · F enter/exit vehicle · TAB map · T time of day · R reload";
 
 pub const NO_RENDERING_BACKEND_AVAILABLE_WEBGL2_AND_CA: &str =
     "No rendering backend available (WebGL2 and Canvas2D both failed).";
@@ -1093,8 +1091,12 @@ pub const EVENT_MOUSEMOVE: &str = "mousemove";
 /// 防止右键菜单吃掉右键。
 pub const EVENT_CONTEXTMENU: &str = "contextmenu";
 
-/// 换弹键。
-pub const KEY_RELOAD: &str = "KeyC";
+/// 换弹键(GTA V PC 的 R)。
+///
+/// **曾经是 `KeyC`。** GTA V PC 上换弹只有 R;C 键在 GTA V 里是「进入
+/// 车辆」,本项目没有蹲伏也不需要「按 C 上车」,所以把换弹完全交给 R,
+/// 不留 C 别名 —— 留着就等于又造一个和 GTA V 语义相反的自加键。
+pub const KEY_RELOAD: &str = "KeyR";
 /// 切回手枪。
 pub const DIGIT1: &str = "Digit1";
 /// 切冲锋枪。
@@ -1970,6 +1972,36 @@ pub const DIR_LEFT: &str = "左";
 
 /// 上面那条模板里要填的「移向右边」分支。
 pub const DIR_RIGHT: &str = "右";
+
+// ---- 换弹键位(GTA V 的 R)的回归测试 ------------------------------------
+//
+// 这一组盯的是「R 换弹 / C 不换弹」这条接线。原来的 bug 是反过来:
+// `KEY_RELOAD` 写着 `KeyC`,而 R 被 `camera.reset()` 占着,所以玩家按 R
+// 什么都不发生。判据落在**弹匣余量与换弹计时**上,不比对按键码字符串。
+
+/// 回归测试:`KEY_RELOAD` 必须就是 GTA V PC 的 R。
+pub const T_RELOAD_KEY_IS_GTA_R: &str = "换弹键必须是 GTA V 的 R,实得 {got}";
+
+/// 回归测试:按 R 必须真的把换弹计时推起来。
+pub const T_RELOAD_R_STARTS_RELOAD: &str = "按 R 必须开始换弹,reloading 实得 {got}";
+
+/// 回归测试:换弹完成后弹匣必须真的补满(不是只把计时清零)。
+pub const T_RELOAD_R_REFILLS_MAGAZINE: &str = "R 换弹后弹匣必须回升,实得 {got}";
+
+/// 回归测试:换弹要从备弹里扣,不能凭空造子弹。
+pub const T_RELOAD_CONSUMES_RESERVE: &str = "换弹必须从备弹里扣,备弹实得 {got}";
+
+/// 回归测试:C 键不得再触发换弹(对齐 GTA V:C 在 GTA V 是进车 / 蹲伏)。
+pub const T_C_NO_LONGER_RELOADS: &str = "C 键不再换弹,reloading 实得 {got}";
+
+/// 回归测试:连按 R 不能叠加出多次换弹。
+pub const T_RELOAD_NOT_REPEATABLE: &str = "换弹途中再按 R 不得叠加,reloading 实得 {got}";
+
+/// 上面「换弹键」模板要填的按键码槽位。
+pub const SLOT_RELOAD_KEY: &str = "KeyR";
+
+/// 上面「C 键不换弹」模板要填的按键码槽位。
+pub const SLOT_FORMER_RELOAD_KEY: &str = "KeyC";
 
 // ---- 方向键驾驶转向的回归测试 ---------------------------------------
 //
