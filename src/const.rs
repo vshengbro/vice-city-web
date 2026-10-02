@@ -1971,6 +1971,36 @@ pub const DIR_LEFT: &str = "左";
 /// 上面那条模板里要填的「移向右边」分支。
 pub const DIR_RIGHT: &str = "右";
 
+// ---- 方向键驾驶转向的回归测试 ---------------------------------------
+//
+// 这一组对应 `game.rs` 里「方向键只在驾驶状态下接管 steer」那条接线。
+// 判据全部是**实际喂进 `TrafficCar::drive` 的 steer 数值**,不看中间
+// 状态:符号错了、数值为 0、或者方向键漏进了步行移动轴,这三条都会炸。
+
+/// 回归测试:驾驶时左右方向键必须真的产生非零转向(而不是被 A/D 吃掉)。
+pub const T_ARROW_STEERS_WHILE_DRIVING: &str =
+    "驾驶时方向键必须产生非零转向,{key} 实得 steer={got}";
+
+/// 回归测试:左右方向键的转向符号必须相反,且左负右正。
+pub const T_ARROW_STEER_SIGNS_OPPOSED: &str =
+    "左右方向键的转向必须符号相反,左(ArrowLeft) 实得 {left},右(ArrowRight) 实得 {right}";
+
+/// 回归测试:方向键不得接管步行移动 —— GTA V 的移动只用 WASD。
+pub const T_ARROW_DOES_NOT_MOVE_ON_FOOT: &str =
+    "步行时方向键不得进入移动轴,{key} 竟让 {axis} 变成了 {got}";
+
+/// 回归测试:步行时玩家必须一步不动(位置逐轴比较)。
+pub const T_FOOT_POSITION_UNCHANGED: &str =
+    "步行时按方向键位置必须完全不变,实得位移 dx={dx},dz={dz}";
+
+/// 回归测试:A/D 与方向键同时按下时,舵角必须是**满舵**(±1),不能是
+/// 相加后的 0(那样玩家会觉得方向盘突然失灵)。
+pub const T_AD_AND_ARROW_DO_NOT_CANCEL: &str =
+    "A/D 与方向键同按时不能互相抵消,实得 steer={got},应保持满舵 ±1";
+
+/// 上面那些模板里要填的「A 轴(左右)」分支名。
+pub const AXIS_STRAFE: &str = "A 轴(左右)";
+
 /// 骨架回归测试:每节 limb 的顶点必须停在资产给定的**绝对高度**上。
 ///
 /// 关节枢轴(`joint_pivot`)是从顶点包围盒推出来的,已经含有角色的绝对

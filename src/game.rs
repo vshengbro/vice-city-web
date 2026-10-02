@@ -1801,6 +1801,13 @@ pub(crate) struct InputState {
     aim_point: [f64; 2],
     /// 画布的 CSS 像素尺寸,用于把鼠标坐标换算成 NDC。
     viewport: [f64; 2],
+    /// 驾驶时**当前接管方向盘**的按键(`"KeyA"` / `"ArrowLeft"` …),
+    /// 空串表示没人按。
+    ///
+    /// 这不是为了「记住谁按着」,而是为了 A/D 与方向键**同时按住**时裁决
+    /// 谁说话 —— 见 [`InputState::steer_axis`]。`keys` 本身是「谁按着」,
+    /// 单独一个布尔值回答不了「两个方向同时按」这种问题。
+    steer_key: String,
 }
 
 impl Default for InputState {
@@ -1818,6 +1825,7 @@ impl Default for InputState {
             fire_released: false,
             aim_point: [0.0, 0.0],
             viewport: [1280.0, 720.0],
+            steer_key: String::new(),
         }
     }
 }
@@ -1834,6 +1842,70 @@ impl InputState {
     /// - `bool` - 判定结果。
     fn held(&self, code: &str) -> bool {
         self.get_keys().get(code).copied().unwrap_or(false)
+    }
+
+    /// 当前拥有方向盘的按键(空串 = 没人按)。
+    ///
+    /// # Returns
+    ///
+    /// - `&str` - `KeyboardEvent.code`,借用本结构内部的 `steer_key`。
+    fn get_steer_key(&self) -> &str {
+        &self.steer_key
+    }
+
+    /// 写回「当前谁拥有方向盘」。传空串即交还控制权。
+    ///
+    /// # Arguments
+    ///
+    /// - `String` - 新的拥有者按键。
+    fn set_steer_key(&mut self, value: String) {
+        self.steer_key = value;
+    }
+
+    /// 驾驶时的舵角输入(−1..1,**左负右正**,与 `drive` 的约定一致)。
+    ///
+    /// 两组键都能转方向盘:A/D 与 ←/→。方向键**只**在这里被读,
+    /// 而这个函数**只有驾驶时**才被 `simulate` 调用,所以步行时方向键
+    /// 既不会开车,也不会进移动轴 —— GTA V 的移动只认 WASD。
+    ///
+    /// 符号直接由「拥有方向盘的那个键」决定,而不是把两组的键塞进
+    /// 一个 `axis` 调用 —— 后者会把 `ArrowRight` 当成 `KeyA` 的反向键,
+    /// 算出 `0 - 1 = -1`,右箭头反而左转。
+    ///
+    /// **为什么是「后按的赢」而不是相加:**A/D 与方向键各自都是满舵 ±1,
+    /// 相加在两组反向时正好得 0 —— 玩家明明压着两个相反方向,车却
+    /// 笔直走,体感就是「方向盘突然失灵」。成熟开车游戏(Forza、GTA V
+    /// 的辅助转向)统一用后按优先:每次按下一个转向键就把控制权交给它,
+    /// 直到它松开为止。`steer_key` 记的就是这个「当前谁拥有方向盘」。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 舵角:左转 −1.0,右转 +1.0,无人按键 `0.0`。
+    pub fn steer_axis(&self) -> f32 {
+        // 拥有者一旦松手,控制权作废,回到「谁在按就听谁」。
+        let owner: &str = self.get_steer_key();
+        if !owner.is_empty() && self.held(owner) {
+            return steer_sign(owner);
+        }
+        // 没人拥有方向盘:按「右优先,其次左」兜底,同样是满舵二选一。
+        if self.held(KEYD) || self.held(ARROWRIGHT) {
+            return 1.0;
+        }
+        if self.held(KEYA) || self.held(ARROWLEFT) {
+            return -1.0;
+        }
+        0.0
+    }
+
+    /// 记下「这个键此刻接管了方向盘」。keyup 时对应清除。
+    ///
+    /// # Arguments
+    ///
+    /// - `&str` - 被按下的 `KeyboardEvent.code`。
+    pub fn claim_steer(&mut self, code: &str) {
+        if is_steer_key(code) {
+            self.set_steer_key(String::from(code));
+        }
     }
 
     /// 当前按下的按键集合的只读视图。
@@ -4296,8 +4368,15 @@ fn bind_keyboard(handles: &GameHandles) {
                 let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
                 let was: bool = game.input.held(&code);
                 game.input.keys.insert(code.clone(), true);
+                // 转向键互相抢占时「后按的赢」,所以必须记下这一下是谁按的。
+                game.input.claim_steer(&code);
                 !was
             };
+            // 方向键在浏览器里默认会滚动页面。方向键现在真能开车了,
+            // 让它顺带把页面滚走是明显的破绽,所以在这里吃掉默认行为。
+            if code.starts_with("Arrow") {
+                event.prevent_default();
+            }
             if !is_press {
                 return;
             }
@@ -4384,7 +4463,11 @@ fn bind_keyboard(handles: &GameHandles) {
             };
             let code: String = keyboard.code();
             let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
-            game.input.keys.insert(code, false);
+            game.input.keys.insert(code.clone(), false);
+            // 拥有方向盘的那个键松开了,控制权作废,回到「谁在按就听谁」。
+            if game.input.steer_key == code {
+                game.input.steer_key = String::new();
+            }
         }));
         attach(window, EVENT_KEYUP, closure);
     }
@@ -5860,9 +5943,14 @@ fn simulate(game: &mut Game, delta: f32) {
     // 验收通道的「朝世界方向走」优先于键盘:它绕过相机朝向,让脚本不用
     // 先转相机就能沿直线推进。零向量表示不干预。
     let world_walk: Vec2 = game.walk_request;
-    // 驾驶时 A/D 当方向盘:横向输入就是舵角,不再被
+    // 驾驶时 A/D 与左右方向键**共同**当方向盘:横向输入就是舵角,不再被
     // `set_position([lane_x, ...])` 吃掉。
-    let steer_input: f32 = strafe_input;
+    //
+    // 符号沿用 A/D 的老约定(`正 = 右转`,见 `TrafficCar::drive`),方向键
+    // 直接接同一个 `steer_axis`,因此左 = 负、右 = 正。**只有驾驶时**才
+    // 调它:步行分支的 `intent` 只由 WASD 组成,所以方向键既不会开车,
+    // 也不会变成第四个移动键 —— GTA V 的移动只认 WASD。
+    let steer_input: f32 = game.input.steer_axis();
     let running: bool = game.input.held(KEY_SHIFT_LEFT) || game.input.held(KEY_SHIFT_RIGHT);
     let dt: f32 = delta.min(FIXED_DT * 4.0);
 
@@ -7300,6 +7388,43 @@ fn axis(input: &InputState, positive: &str, negative: &str) -> f32 {
     let forward: f32 = if input.held(positive) { 1.0 } else { 0.0 };
     let backward: f32 = if input.held(negative) { 1.0 } else { 0.0 };
     forward - backward
+}
+
+/// 某个键是不是「能当方向盘」的键(A/D 与 ←/→ 共四个)。
+///
+/// # Arguments
+///
+/// - `&str` - `KeyboardEvent.code`。
+///
+/// # Returns
+///
+/// - `bool` - 是方向盘键时为真。
+fn is_steer_key(code: &str) -> bool {
+    let steer: bool = code == KEYA
+        || code == KEYD
+        || code == ARROWLEFT
+        || code == ARROWRIGHT;
+    steer
+}
+
+/// 一个方向盘键对应的舵角:左 −1.0,右 +1.0。
+///
+/// 符号与 `TrafficCar::drive` 的「正 = 右转」一一对应,左负右正。
+///
+/// # Arguments
+///
+/// - `&str` - `KeyboardEvent.code`,调用方保证已用 [`is_steer_key`] 过滤。
+///
+/// # Returns
+///
+/// - `f32` - 舵角。
+fn steer_sign(code: &str) -> f32 {
+    let right: bool = code == KEYD || code == ARROWRIGHT;
+    if right {
+        1.0
+    } else {
+        -1.0
+    }
 }
 
 /// 把跟随焦点推向玩家,并在第三人称模式下重摆相机。
@@ -8820,9 +8945,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV, LOOK_YAW_SENSITIVITY, Mat4, RUN_OVER_WALK_MIN,
-        T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK, T_RUN_SPEED_PICK, T_WALK_SPEED_PICK,
-        apply_look_delta, car_wheel_model,
+        ARROWLEFT, ARROWRIGHT, ARROWUP, ARROWDOWN, Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV, KEYA,
+        KEYD, KEYS, KEYW, LOOK_YAW_SENSITIVITY, Mat4, RUN_OVER_WALK_MIN, T_AD_AND_ARROW_DO_NOT_CANCEL,
+        T_ARROW_DOES_NOT_MOVE_ON_FOOT, T_ARROW_STEER_SIGNS_OPPOSED, T_ARROW_STEERS_WHILE_DRIVING,
+        T_FOOT_POSITION_UNCHANGED, T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK,
+        T_RUN_SPEED_PICK, T_WALK_SPEED_PICK, apply_look_delta, car_wheel_model,
     };
     /// 一个世界点投影后的屏幕 NDC x(未做像素映射)。
     ///
@@ -8857,16 +8984,16 @@ mod tests {
     use crate::collision::CollisionWorld;
     use crate::combat::Pedestrian;
     use crate::r#const::{
-        GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY, PED_SUIT, PED_TALK_SLOT_STEP,
-        PLAYER_BODY_HEIGHT, T_JUMP_CLEARS_A_LEDGE, T_JUMP_LANDS_STANDING, T_JUMP_ONLY_FROM_GROUND,
-        T_JUMP_RISES_BEFORE_FALLING, T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT,
-        T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS, T_ROUTE_LEG_DIAGONAL, T_SHOWCASE_AXIS_ON_ROAD,
-        T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE,
-        T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL,
-        T_SHOWCASE_DOOR_OUTSIDE_BLOCKED, T_SHOWCASE_DOORS_FACE_EACH_OTHER,
-        T_SHOWCASE_DOORWAY_2D_BLOCKED, T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING,
-        T_SHOWCASE_DESCENT_NO_CLIMB, T_SHOWCASE_DESCENT_REACHES_GROUND,
-        T_SHOWCASE_LANDING_COVERS_RUN,
+        AXIS_STRAFE, CAR_SEDAN, GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY, PED_SUIT,
+        PED_TALK_SLOT_STEP, PLAYER_BODY_HEIGHT, T_JUMP_CLEARS_A_LEDGE, T_JUMP_LANDS_STANDING,
+        T_JUMP_ONLY_FROM_GROUND, T_JUMP_RISES_BEFORE_FALLING, T_PEDS_DISTINCT_SLOTS,
+        T_PEDS_DOWNED_NO_CHAT, T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS, T_ROUTE_LEG_DIAGONAL,
+        T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DOOR_CENTER_BLOCKED,
+        T_SHOWCASE_DOOR_INSIDE, T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING,
+        T_SHOWCASE_DOOR_ON_OUTER_WALL, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
+        T_SHOWCASE_DOORS_FACE_EACH_OTHER, T_SHOWCASE_DOORWAY_2D_BLOCKED,
+        T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING, T_SHOWCASE_DESCENT_NO_CLIMB,
+        T_SHOWCASE_DESCENT_REACHES_GROUND, T_SHOWCASE_LANDING_COVERS_RUN,
         T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE,
         T_SHOWCASE_PARTITION_LET_THROUGH, T_SHOWCASE_PIER_LET_PLAYER_THROUGH,
         T_SHOWCASE_PUSHED_INTO_WALL, T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE,
@@ -10295,5 +10422,178 @@ mod tests {
                 ]
             )
         );
+    }
+
+    // ---- 方向键驾驶转向 ------------------------------------------------
+    //
+    // 这一组盯的是 `simulate` 里那一行 `game.input.steer_axis()`。它绕开的
+    // 坑是:方向键早就在 `TRACKED_KEYS` 里(`git grep -c ArrowUp` 只数到
+    // const.rs 那个字符串字面量,看不到标识符),于是**看上去**接好了,
+    // 实际 `steer_input` 一直等于 `strafe_input`,只有 A/D 进得来。
+    //
+    // 判据都落在**真正喂进 `TrafficCar::drive` 的数值**上,而不是中间
+    // 变量:光断言 `steer_axis()` 非零,一辆完全不改 yaw 的车也能通过。
+
+    /// 造一个只按住 `codes` 的 `InputState`。
+    fn input_holding(codes: &[&str]) -> super::InputState {
+        let mut input: super::InputState = super::InputState::default();
+        for code in codes {
+            input.keys.insert(String::from(*code), true);
+        }
+        input
+    }
+
+    /// 空世界里的车,给足初速好越过 `STEER_MIN_SPEED` 的转向死区。
+    fn steer_test_car() -> crate::traffic::TrafficCar {
+        crate::traffic::TrafficCar::new(CAR_SEDAN, 0.0, 0.0, 8.0, 1.0)
+    }
+
+    /// 方向键在**驾驶**时必须真的把车转出角度,符号相反。
+    ///
+    /// 走的是完整的 `drive()` 而不只是 `steer_axis()`:这正是漏接线时
+    /// 会漏掉的那一段。`+steer` 按 `drive` 的文档约定是右转,所以
+    /// ArrowRight 的 yaw 必须**大于** ArrowLeft 的。
+    #[test]
+    fn arrow_keys_steer_the_car_while_driving() {
+        let world: CollisionWorld = CollisionWorld::new();
+        let delta: f32 = 1.0 / 60.0;
+        let mut deltas: Vec<(String, f32)> = Vec::new();
+        for code in [ARROWLEFT, ARROWRIGHT] {
+            let input: super::InputState = input_holding(&[code]);
+            let steer: f32 = input.steer_axis();
+            assert!(
+                steer.abs() > 0.0,
+                "{}",
+                fill(
+                    T_ARROW_STEERS_WHILE_DRIVING,
+                    &[
+                        ("key", &format!("{code}")),
+                        ("got", &format!("{steer:.4}")),
+                    ]
+                )
+            );
+            let mut car: crate::traffic::TrafficCar = steer_test_car();
+            let yaw0: f32 = car.get_yaw();
+            for _ in 0..120 {
+                car.drive(0.6, steer, delta, &world);
+            }
+            let turned: f32 = car.get_yaw() - yaw0;
+            assert!(
+                turned.abs() > 0.3,
+                "{}",
+                fill(
+                    T_ARROW_STEERS_WHILE_DRIVING,
+                    &[
+                        ("key", &format!("{code}")),
+                        ("got", &format!("{turned:.4} rad"))
+                    ]
+                )
+            );
+            deltas.push((String::from(code), turned));
+        }
+        let (left, right): (&(String, f32), &(String, f32)) = (&deltas[0], &deltas[1]);
+        assert!(
+            left.1 < 0.0 && right.1 > 0.0,
+            "{}",
+            fill(
+                T_ARROW_STEER_SIGNS_OPPOSED,
+                &[
+                    ("left", &format!("{:.4}", left.1)),
+                    ("right", &format!("{:.4}", right.1)),
+                ]
+            )
+        );
+        // 方向键的转向必须与 A/D **完全对称**:和为零即两组键的增益
+        // 一致,方向键没有被悄悄乘上一个小系数。
+        assert!(
+            (left.1 + right.1).abs() < 1e-3,
+            "左右转向幅度不对称,左 {:.4} 右 {:.4},差 {:.6}",
+            left.1,
+            right.1,
+            (left.1 + right.1).abs()
+        );
+    }
+
+    /// 方向键在**步行**时不得进入移动轴:位置必须逐轴纹丝不动。
+    ///
+    /// GTA V 的移动只认 WASD;把方向键接成移动键会让玩家的手在方向键
+    /// 上无意识地「滑动」。这里模拟 `simulate` 的步行分支——`intent`
+    /// 只由 `axis(D, A)` 与 `axis(W, S)` 组成,方向键根本不在里面。
+    #[test]
+    fn arrow_keys_do_not_move_the_player_on_foot() {
+        for code in [ARROWLEFT, ARROWRIGHT, ARROWUP, ARROWDOWN] {
+            let input: super::InputState = input_holding(&[code]);
+            // 步行分支的移动轴只认 WASD:这里复刻 `simulate` 的两行。
+            let strafe: f32 = super::axis(&input, KEYD, KEYA);
+            let forward: f32 = super::axis(&input, KEYW, KEYS);
+            assert!(
+                strafe == 0.0 && forward == 0.0,
+                "{}",
+                fill(
+                    T_ARROW_DOES_NOT_MOVE_ON_FOOT,
+                    &[
+                        ("key", &format!("{code}")),
+                        ("axis", &format!("{AXIS_STRAFE}")),
+                        ("got", &format!("{strafe}")),
+                    ]
+                )
+            );
+        }
+        // 端到端:只有方向键按住时,`Player::step` 走满 2 秒,位置不变。
+        let input: super::InputState = input_holding(&[ARROWRIGHT]);
+        let world: CollisionWorld = CollisionWorld::new();
+        let mut player: Player = Player::new([4.0, GROUND_LEVEL, -7.0], 0.0);
+        let start: Vec3 = player.get_position();
+        for _ in 0..120 {
+            let intent: Vec2 = [
+                super::axis(&input, KEYD, KEYA),
+                super::axis(&input, KEYW, KEYS),
+            ];
+            player.step(intent, [0.0, -1.0], 1.0 / 60.0, WALK_SPEED, &world);
+        }
+        let end: Vec3 = player.get_position();
+        assert!(
+            (end[0] - start[0]).abs() < 1e-6 && (end[2] - start[2]).abs() < 1e-6,
+            "{}",
+            fill(
+                T_FOOT_POSITION_UNCHANGED,
+                &[
+                    ("dx", &format!("{:.6}", end[0] - start[0])),
+                    ("dz", &format!("{:.6}", end[2] - start[2])),
+                ]
+            )
+        );
+    }
+
+    /// A/D 与方向键**同按**时舵角必须是满舵,不能互相抵消成 0。
+    ///
+    /// 策略是「后按的赢」(`steer_key`),这条把两种输入源混用的三种
+    /// 情况都钉住:A 与 ← 一致(都左)、D 与 → 一致(都右)、
+    /// 交叉的 A 与 → 则由**后按**的键决定。
+    #[test]
+    fn ad_and_arrow_keys_do_not_cancel_each_other() {
+        // 同向:A + ArrowLeft → 满左舵;后按的箭头接管,值不变。
+        let mut input: super::InputState = input_holding(&[KEYA]);
+        input.claim_steer(ARROWLEFT);
+        assert_eq!(input.steer_axis(), -1.0);
+        // 交叉:先按 A,再按 ArrowRight → 后按的右赢,满右舵而不是 0。
+        let mut crossed: super::InputState = input_holding(&[KEYA]);
+        crossed.claim_steer(ARROWRIGHT);
+        let steer: f32 = crossed.steer_axis();
+        assert!(
+            steer.abs() == 1.0,
+            "{}",
+            fill(
+                T_AD_AND_ARROW_DO_NOT_CANCEL,
+                &[("got", &format!("{steer:.4}"))]
+            )
+        );
+        // 拥有者松手后控制权交还:此时 A 仍按着,应回到左舵。
+        crossed.keys.insert(String::from(ARROWRIGHT), false);
+        crossed.steer_key = String::new();
+        assert_eq!(crossed.steer_axis(), -1.0);
+        // 只有 D 时仍按老路径工作 —— 这条保证没把原有 A/D 修坏。
+        let plain: super::InputState = input_holding(&[KEYD]);
+        assert_eq!(plain.steer_axis(), 1.0);
     }
 }
