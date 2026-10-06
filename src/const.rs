@@ -1931,6 +1931,48 @@ pub const T_SHOWCASE_LANE_BLOCKED: &str = "的过道被堵住了 lane={lane:?} t
 /// 单元测试断言文案:占地不得压上车行道。
 pub const T_SHOWCASE_AXIS_ON_ROAD: &str = "的轴 {axis} 压到了车行道:x={} 街={line} 半径={reach}";
 
+#[cfg(test)]
+/// 单元测试断言文案:一帧的位移必须被**扫掠**,不能只看帧末落点。
+///
+/// 冲刺一帧推进 1.1269 m,前墙门垛只有 `SHOWCASE_WALL_THICKNESS` 0.20 m
+/// 厚、隔墙 0.15 m 厚:帧末人已经在墙另一侧,`separate_interior` 的推离向量
+/// 为 0,「墙没推我」分支把整帧原样放行 —— 整堵墙被一步跨过去。断言逐帧
+/// 记下第一处越界的帧号与落点,便于回溯是哪一帧穿过去的。
+pub const T_SHOWCASE_SPRINT_TUNNELS_WALL: &str =
+    "冲刺穿墙:楼 {index} 第 {frame} 帧一步 {stride:.3} m 越过 {face:.3},落点 {at:?} 已在墙内";
+
+#[cfg(test)]
+/// 单元测试断言文案:冲刺终点不得停在墙的 AABB 内部。
+///
+/// 逐帧判据(`推进量 <= 接触线`)只覆盖「越过接触面」,终点这条独立地
+/// 覆盖「人整个站进了墙里」—— 两种形态的失效路径不同,各钉一条。
+pub const T_SHOWCASE_SPRINT_PENETRATES_WALL: &str =
+    "冲刺终点仍在墙内:楼 {index} 接触线 {got:.3},终点 {end:?}";
+
+#[cfg(test)]
+/// 单元测试断言文案:步行沿墙滑动仍然必须保留切向分量。
+///
+/// 与冲刺那条互为对照:同一个 `resolve_interior_slide`,步行必须照旧
+/// 滑得动,子步细分只应影响「一帧位移长于墙厚」的场景。
+pub const T_SHOWCASE_WALK_LOSES_SLIDE: &str =
+    "步行沿墙滑动丢了切向位移:楼 {index} 只沿墙挪了 {from:.3} m,终点 x={to:.3}";
+
+#[cfg(test)]
+/// 单元测试断言文案:子步细分在 60 fps 下必须是 no-op。
+///
+/// 60 fps 步行一帧走 0.077 m,远小于最小子步,`substeps == 1`,细分退化回
+/// 修复前的单次 `resolve_interior_slide`。把最小子步调到 60 fps 步长以下
+/// 就会破坏这个前提,这条立刻红。
+pub const T_SHOWCASE_SUBSTEP_NOT_NO_OP: &str =
+    "60 fps 下一帧被切成了 {split} 个子步(整帧 {split_at:?},单步应是 {whole_at:?})";
+
+#[cfg(test)]
+/// 单元测试断言文案:冲刺路线上必须真的有一堵墙挡路。
+///
+/// 拿不到墙就不能判「没穿墙」—— 那是一条**空洞的通过**:路线摆错了,
+/// 测试照样绿。没有墙是夹具的问题,不是应用的结论,所以直接失败。
+pub const T_SHOWCASE_NO_WALL_AHEAD: &str = "冲刺路线上找不到挡路的墙,测试路线摆错了";
+
 /// 单元测试断言文案:占地不得与普通楼重叠。
 pub const T_SHOWCASE_OVERLAPS_ORDINARY: &str = "与普通楼 ({:.1},{:.1}) 的保守包围盒重叠";
 

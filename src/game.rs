@@ -8973,14 +8973,16 @@ mod tests {
         T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL,
         T_SHOWCASE_DOOR_OUTSIDE_BLOCKED, T_SHOWCASE_DOORS_FACE_EACH_OTHER,
         T_SHOWCASE_DOORWAY_2D_BLOCKED, T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING,
-        T_SHOWCASE_LANDING_COVERS_RUN, T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_OVERLAPS_ORDINARY,
-        T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
+        T_SHOWCASE_LANDING_COVERS_RUN, T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_NO_WALL_AHEAD,
+        T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
         T_SHOWCASE_PIER_LET_PLAYER_THROUGH, T_SHOWCASE_PUSHED_INTO_WALL,
-        T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE, T_SHOWCASE_STAIR_REACHES_TOP,
-        T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_TOLERANCE_TOO_BIG,
-        T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP, T_SHOWCASE_WALKER_DIRECTION,
-        T_SHOWCASE_WALKER_REACHES_TOP, T_VERTICAL_REST_ON_FLOOR, T_WHEEL_AXLE_STILL,
-        T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD, T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
+        T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE, T_SHOWCASE_SPRINT_PENETRATES_WALL,
+        T_SHOWCASE_SPRINT_TUNNELS_WALL, T_SHOWCASE_STAIR_REACHES_TOP,
+        T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_SUBSTEP_NOT_NO_OP,
+        T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP,
+        T_SHOWCASE_WALK_LOSES_SLIDE, T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP,
+        T_VERTICAL_REST_ON_FLOOR, T_WHEEL_AXLE_STILL, T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD,
+        T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
     };
     use crate::player::Player;
     use crate::r#type::{Mat4Data, Vec3};
@@ -9023,7 +9025,7 @@ mod tests {
         build_water_near, on_roadway, showcase_placements, showcase_specs, stream_needs_rebuild,
         street_axis, street_indices_in,
     };
-    use crate::interior::{FloorWorld, STEP_UP_TOLERANCE};
+    use crate::interior::{Floor, FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
     use crate::player::{RUN_SPEED, WALK_SPEED};
     use crate::r#type::Vec2;
@@ -9469,6 +9471,312 @@ mod tests {
     /// 至少 60 帧;取 100 留出余量,走过头之后脚下是首层地板(判据仍成立)。
     const DESCENT_BUDGET: usize = 100;
 
+    /// 冲刺一帧的真实水平位移(米)—— 长帧穿透缺陷只在这个步长下成立。
+    ///
+    /// CDP 逐帧实测(软件渲染,rAF ≈ 1.1 fps,`__vcw.vel` 中位数 = 8.3999
+    /// = `RUN_SPEED`):一帧推进 **1.1269 m**。取游戏能达到的**最快**步长,
+    /// 而不是 `RUN_SPEED * FIXED_DT * 4 = 0.56` 那个理论值:0.56 m 同样
+    /// 大于门垛 0.20 m 也照样穿透,但判据必须钉在最快档上 —— 只在慢档
+    /// 验过的碰撞修复会在低帧率下失效,这是本项目反复吃过的亏
+    /// (楼梯下楼缺陷就是 60 fps 全绿、软件渲染下才炸)。
+    const SPRINT_FRAME_STRIDE: f32 = 1.1269;
+
+    /// 60 fps 步行一帧的水平位移(米):任何修复在这条步长下都必须是 no-op。
+    const WALK_FRAME_STRIDE: f32 = WALK_SPEED * FIXED_DT;
+
+    /// 冲刺冲向前墙时跑够多少帧就够判定了:实测 15 帧穿透 15.25 m。
+    const SPRINT_TUNNEL_BUDGET: usize = 20;
+
+    /// 从 `from` 沿 `normal` 前进时,撞上的**第一段墙**的世界包围盒。
+    ///
+    /// 刻意去 `build_showcase_interiors` 铺出来的真实世界里量,而不是抄
+    /// 一个字面量:门垛厚度在 `game.rs` 与 `const.rs` 各有一份(`0.20` 与
+    /// `0.25`,见 `push_showcase_interior` 与 [`crate::r#const::
+    /// SHOWCASE_WALL_THICKNESS`]),抄错就等于测了另一个几何。
+    ///
+    /// 判据与 [`crate::interior::FloorWorld::separate_interior`] 对齐:
+    /// 只有**墙**参与横向阻挡,楼板永远不推人(踏面只提供竖直支撑)。
+    ///
+    /// # Arguments
+    ///
+    /// - `&FloorWorld` - 真实室内碰撞世界。
+    /// - `Vec2` - 起点世界 XZ。
+    /// - `Vec2` - 前进方向的世界 XZ 单位向量。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<(Vec3, Vec3)>` - 最近那段墙的 `(min, max)`;沿途没有墙时
+    ///   为 `None`(调用方据此跳过断言,而不是拿一个魔数当阈值)。
+    fn wall_box_ahead(w: &FloorWorld, from: Vec2, normal: Vec2) -> Option<(Vec3, Vec3)> {
+        let mut best: Option<(f32, Vec3, Vec3)> = None;
+        for floor in w.get_floors() {
+            let (min, max): (Vec3, Vec3) = match floor {
+                Floor::Slab { min, max } => (*min, *max),
+                Floor::Wall { min, max } => (*min, *max),
+            };
+            // 竖直区间与身体 `[GROUND_TOP, GROUND_TOP + BODY]` 不相交就跳过,
+            // 与 `separate_interior` 同一判据:头顶的楼板不该推人。
+            if max[1] <= SHOWCASE_GROUND_TOP || min[1] >= SHOWCASE_GROUND_TOP + PLAYER_BODY_HEIGHT {
+                continue;
+            }
+            let axis: usize = if normal[0].abs() >= normal[1].abs() {
+                0
+            } else {
+                1
+            };
+            // 另一轴必须真的落在这段墙的跨度内,否则是楼里别处的墙。
+            let across: f32 = if axis == 0 { from[1] } else { from[0] };
+            let (span_lo, span_hi): (f32, f32) = if axis == 0 {
+                (min[2], max[2])
+            } else {
+                (min[0], max[0])
+            };
+            if across < span_lo - PLAYER_RADIUS || across > span_hi + PLAYER_RADIUS {
+                continue;
+            }
+            // 沿 `normal` 方向,这段墙的**入射面**在起点前方的那一端。
+            let near: f32 = if normal[axis] > 0.0 {
+                if axis == 0 { min[0] } else { min[2] }
+            } else if axis == 0 {
+                max[0]
+            } else {
+                max[2]
+            };
+            let distance: f32 = (near - from[axis]) / normal[axis];
+            let closer: bool = match best {
+                Some((kept, _, _)) => distance < kept,
+                None => true,
+            };
+            if distance > 0.0 && closer {
+                best = Some((distance, min, max));
+            }
+        }
+        match best {
+            Some((_, min, max)) => Some((min, max)),
+            None => None,
+        }
+    }
+
+    /// 从 `from` 沿 `normal` 走到 `box_min`/`box_max` 那段墙还有多远(米)。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 起点世界 XZ。
+    /// - `Vec2` - 前进方向的世界 XZ 单位向量。
+    /// - `Vec3` - 墙的包围盒下角。
+    /// - `Vec3` - 墙的包围盒上角。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 沿 `normal` 到墙面入射端的距离(米)。
+    fn wall_face(from: Vec2, normal: Vec2, box_min: Vec3, box_max: Vec3) -> f32 {
+        if normal[0].abs() >= normal[1].abs() {
+            let near: f32 = if normal[0] > 0.0 {
+                box_min[0]
+            } else {
+                box_max[0]
+            };
+            (near - from[0]) / normal[0]
+        } else {
+            let near: f32 = if normal[1] > 0.0 {
+                box_min[2]
+            } else {
+                box_max[2]
+            };
+            (near - from[1]) / normal[1]
+        }
+    }
+
+    /// 冲刺撞前墙门垛(0.20 m 厚)时,一帧必须被墙挡住而不是穿过去。
+    ///
+    /// **实测缺陷(CDP,HUD 逐帧,软件渲染,2026-10-02 复现):** 从 LOFT
+    /// 楼梯脚按住 Shift + W 冲向前墙,步行在 `x = 27.40` 停住 16+ 帧
+    /// (正确 —— 门垛内表面 27.75 减半径 0.35);冲刺却从 27.40 一路冲到
+    /// `x = 43.0`,15 帧穿透 15.25 m。同一面墙、同一时刻。
+    ///
+    /// 根因在 [`crate::interior::FloorWorld::resolve_interior_slide`]:它用
+    /// `separate_interior` 做**位置推离**,只看帧末落点。冲刺一帧 1.12 m
+    /// 大于门垛 0.20 m 的厚度,帧末人已经在墙另一侧,推离向量为 0,
+    /// `length <= EPSILON` 分支把整帧原样放行 —— 整堵墙被一步跨过去。
+    /// **所以必须在冲刺步长下测**:60 fps 步行一帧 0.077 m,任何实现都
+    /// 测不出差别(这一条本身就是被专门钉住的 no-op 断言,见下一条测试)。
+    ///
+    /// **必须用 `world()` 而不是另抄一份夹具:** 缺陷活在
+    /// `push_showcase_interior` 铺出来的真实几何里,夹具与它不联动
+    /// (`197fa29` 的下楼测试正是栽在这一条 —— 夹具的 slab 铺法与真实场景
+    /// 不符,于是测试绿了一整个缺陷期)。这里问的就是
+    /// `build_showcase_interiors` 的产物,改修复前后必然一红一绿。
+    #[test]
+    fn sprinting_into_a_thin_interior_wall_is_blocked() {
+        for index in 0..2 {
+            let w: FloorWorld = world();
+            // 两条路线都朝本地 +Z(门洞那一侧)冲,各自命中一段薄墙:
+            // A = 前墙门垛(厚度 `SHOWCASE_WALL_THICKNESS` = 0.20 m),起点就是
+            // CDP 复现时站的那一点(梯脚楼梯中线,世界 x = 27.3 / z = 24.9;
+            // 门垛内表面 27.75 减半径 0.35 = 27.40,与实测停位逐位吻合);
+            // B = 首层隔墙(2 × `SHOWCASE_PARTITION_THICKNESS` = 0.15 m)。
+            // 两条在两栋楼里都真的撞上墙 —— 撞不上会让 `wall_box_ahead` 返回
+            // `None` 并直接失败,不会退化成空洞的通过。
+            for start in [stair_point(index, 4.30), to_world(index, [0.0, 1.60])] {
+                let outward: Vec2 = front_normal(index);
+                let normal: Vec2 = outward;
+                let (box_min, box_max): (Vec3, Vec3) = wall_box_ahead(&w, start, normal)
+                    .unwrap_or_else(|| panic!("{}", T_SHOWCASE_NO_WALL_AHEAD));
+                // 人能停到的地方 = 墙面减去半径。
+                let limit: f32 = wall_face(start, normal, box_min, box_max) - PLAYER_RADIUS;
+                let mut here: Vec2 = start;
+                let mut breakthrough: Option<(usize, Vec2, f32)> = None;
+                for frame in 0..SPRINT_TUNNEL_BUDGET {
+                    let moved: Vec2 = w.resolve_interior_slide(
+                        here,
+                        [
+                            normal[0] * SPRINT_FRAME_STRIDE,
+                            normal[1] * SPRINT_FRAME_STRIDE,
+                        ],
+                        SHOWCASE_GROUND_TOP,
+                        SHOWCASE_GROUND_TOP + PLAYER_BODY_HEIGHT,
+                        PLAYER_RADIUS,
+                    );
+                    // 逐帧判:这一帧沿法线推进了多少。穿透即「推进量超过接触线」。
+                    let advanced: f32 =
+                        (moved[0] - here[0]) * normal[0] + (moved[1] - here[1]) * normal[1];
+                    if breakthrough.is_none() && advanced > limit + 1e-2 {
+                        breakthrough = Some((frame, moved, advanced));
+                    }
+                    here = moved;
+                }
+                if let Some((frame, at, advanced)) = breakthrough {
+                    panic!(
+                        "{}",
+                        fill(
+                            T_SHOWCASE_SPRINT_TUNNELS_WALL,
+                            &[
+                                ("index", &format!("{index}")),
+                                ("frame", &format!("{frame}")),
+                                ("stride:.3", &format!("{SPRINT_FRAME_STRIDE:.3}")),
+                                ("face:.3", &format!("{limit:.3}")),
+                                (
+                                    "at:?",
+                                    &format!(
+                                        "{at:?} 推进 {advanced:.3} 墙 {box_min:?}..{box_max:?}"
+                                    )
+                                ),
+                            ]
+                        )
+                    );
+                }
+                // 终点必须**不在墙的 AABB 内部**。
+                assert!(
+                    !inside_box(here, box_min, box_max, PLAYER_RADIUS * 0.5),
+                    "{}",
+                    fill(
+                        T_SHOWCASE_SPRINT_PENETRATES_WALL,
+                        &[
+                            ("index", &format!("{index}")),
+                            ("got:.3", &format!("{limit:.3}")),
+                            ("end:?", &format!("{here:?} 墙 {box_min:?}..{box_max:?}")),
+                        ]
+                    )
+                );
+            }
+        }
+    }
+
+    /// 点是否落在某个 AABB 的**内**部(留 `skin` 余量,贴在面上不算进去)。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 待判的世界 XZ。
+    /// - `Vec3` - 盒的包围盒下角。
+    /// - `Vec3` - 盒的包围盒上角。
+    /// - `f32` - 贴面余量(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - 严格落在盒内为 `true`。
+    fn inside_box(point: Vec2, box_min: Vec3, box_max: Vec3, skin: f32) -> bool {
+        point[0] > box_min[0] + skin
+            && point[0] < box_max[0] - skin
+            && point[1] > box_min[2] + skin
+            && point[1] < box_max[2] - skin
+    }
+
+    /// 60 fps 下子步细分必须是 no-op。
+    ///
+    /// 60 fps 步行一帧走 0.077 m,远小于一个子步
+    /// [`crate::interior::SUPPORT_SUBSTEP_DISTANCE`] = 0.225 m,于是
+    /// `substeps == 1`,细分退化成修复前的单次 `resolve_interior_slide`
+    /// —— 正常帧率下手感逐帧不变。断言 `substeps == 1` 守的就是这个前提:
+    /// 谁把 `SUPPORT_SUBSTEP_DISTANCE` 调到 60 fps 步长以下,这条立刻红。
+    ///
+    /// 只在冲刺下测过的修复,完全可能把正常帧率的手感改坏而没人发现。
+    #[test]
+    fn the_interior_sweep_is_a_no_op_at_sixty_fps() {
+        let stride: f32 = WALK_FRAME_STRIDE;
+        let steps: usize =
+            ((stride / crate::interior::INTERIOR_SLIDE_SUBSTEP).ceil() as usize).max(1);
+        assert_eq!(
+            steps,
+            1,
+            "{}",
+            fill(
+                T_SHOWCASE_SUBSTEP_NOT_NO_OP,
+                &[
+                    ("split", &format!("{steps}")),
+                    ("split_at:?", &format!("{stride:.4}")),
+                    ("whole_at:?", &format!("{stride:.4}")),
+                ]
+            )
+        );
+    }
+
+    /// 步行沿门垛斜走时切向位移必须照旧被保留(子步细分的反向控制)。
+    ///
+    /// 冲刺那条测的是「长帧不再穿墙」,这条测的是「短帧仍然滑得动」。
+    /// 只钉住前者的话,一个把整帧位移整个砍掉的修法也能让它变绿 —— 而
+    /// 那是「卡死在墙上」,不是墙。判据是切向分量拿到**至少一半**位移。
+    #[test]
+    fn walking_along_the_showcase_front_wall_keeps_sliding() {
+        for index in 0..2 {
+            let w: FloorWorld = world();
+            let normal: Vec2 = front_normal(index);
+            let side: Vec2 = local_side(index);
+            let base: Vec2 = stair_point(index, 4.3);
+            let (box_min, box_max): (Vec3, Vec3) = wall_box_ahead(&w, base, normal)
+                .unwrap_or_else(|| panic!("{}", T_SHOWCASE_NO_WALL_AHEAD));
+            let face: f32 = wall_face(base, normal, box_min, box_max);
+            // 贴着门垛内表面站位,朝墙走半个身位并同时侧移。
+            let start: Vec2 = [
+                base[0] + normal[0] * (face - PLAYER_RADIUS) - side[0] * 0.30,
+                base[1] + normal[1] * (face - PLAYER_RADIUS) - side[1] * 0.30,
+            ];
+            let step: Vec2 = [
+                normal[0] * WALK_FRAME_STRIDE + side[0] * WALK_FRAME_STRIDE,
+                normal[1] * WALK_FRAME_STRIDE + side[1] * WALK_FRAME_STRIDE,
+            ];
+            let moved: Vec2 = w.resolve_interior_slide(
+                start,
+                step,
+                SHOWCASE_GROUND_TOP,
+                SHOWCASE_GROUND_TOP + PLAYER_BODY_HEIGHT,
+                PLAYER_RADIUS,
+            );
+            let slid: f32 = (moved[0] - start[0]) * side[0] + (moved[1] - start[1]) * side[1];
+            assert!(
+                slid > 0.5 * WALK_FRAME_STRIDE,
+                "{}",
+                fill(
+                    T_SHOWCASE_WALK_LOSES_SLIDE,
+                    &[
+                        ("index", &format!("{index}")),
+                        ("from:.3", &format!("{slid:.3}")),
+                        ("to:.3", &format!("{:.3}", moved[0])),
+                    ]
+                )
+            );
+        }
+    }
+
     /// 端到端:从门外一路走上二层楼板。
     ///
     /// 之前每条测试只覆盖楼梯的一段(几何 / 单步 / 上升趋势),所以
@@ -9489,7 +9797,8 @@ mod tests {
             let sx0: f32 = hx - SHOWCASE_STAIR_WIDTH;
             let stair_x: f32 = (sx0 + hx) * 0.5;
             let sz_last: f32 = hz - SHOWCASE_STAIR_LEAD;
-            let stair_end: f32 = sz_last - SHOWCASE_STAIR_STEPS as f32 * SHOWCASE_STAIR_RUN;
+            let stair_end: f32 =
+                sz_last - SHOWCASE_STAIR_STEPS as f32 * SHOWCASE_STAIR_RUN;
             let front: Vec2 = doorway(index);
             let normal: Vec2 = front_normal(index);
             // 路线(资产本地坐标):门外 → 门洞 → 隔墙过道 → 第一级前沿

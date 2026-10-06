@@ -40,6 +40,22 @@ const INTERIOR_SLIDE_EPSILON: f32 = 1e-3;
 /// `blocks_sight` 里判定「视线与某轴平行」的位移阈值(米)。
 const INTERIOR_SIGHT_EPSILON: f32 = 1e-6;
 
+/// 水平滑动把一帧切分成多小的子步(米)。
+///
+/// **必须小于最薄的那堵墙。** [`FloorWorld::resolve_interior_slide`] 靠
+/// 子步把长帧切开:每一小步各自做一次完整 `move_and_slide`,只要一小步
+/// 走不完一整堵墙,法向钳制就总能生效。最薄的是首层隔墙
+/// (2 × `SHOWCASE_PARTITION_THICKNESS` = 0.15 m)。
+///
+/// **取 0.10 m**:约为最薄墙的 2/3,留出浮点余量;同时远小于冲刺一帧
+/// 1.1269 m(拆成 12 小步)与步行一帧 0.31 m(拆成 4 小步)。
+///
+/// **60 fps 下不参与。** 步行一帧 `WALK_SPEED / 60 = 0.077 m` 已经
+/// 小于它,`substeps == 1`,整帧仍走一次 —— 正常帧率的手感逐帧不变。
+/// 取值一旦掉到 0.077 以下,那条 no-op 前提就没了,单测
+/// `the_interior_sweep_is_a_no_op_at_sixty_fps` 会立刻红。
+pub const INTERIOR_SLIDE_SUBSTEP: f32 = 0.10;
+
 /// 室内垂直碰撞体:一块楼板或一段隔墙。
 #[derive(Clone, Copy, Debug)]
 pub enum Floor {
@@ -403,6 +419,28 @@ impl FloorWorld {
     /// **只保留切向**再走一遍。玩家于是顺着墙滑过去,而不是被钉在
     /// 接触点上。
     ///
+    /// **但单步做这件事会穿墙,所以整帧必须先切子步。** 上面那套
+    /// 分离是**位置推离**:它只看「现在在哪儿」,于是只要一帧的位移
+    /// 超过墙的厚度,帧末人就落在墙的另一侧、且离墙面比半径还远 ——
+    /// 推离向量恰好为 0,`length <= INTERIOR_SLIDE_EPSILON` 分支把
+    /// **整帧**原样放行,墙被一步跨过去。
+    ///
+    /// 实测(CDP,HUD 逐帧,软件渲染 rAF ≈ 1.1 fps,`__vcw.vel` 中位数
+    /// 8.3999 = `RUN_SPEED`):冲刺一帧推进 **1.1269 m**,而首层隔墙只有
+    /// 0.15 m 厚、前墙门垛 0.20 m 厚。从 LOFT 梯脚(世界 27.3, 24.9)冲
+    /// 向前墙,步行正确地停在 `x = 27.40`(门垛内表面 27.75 减半径
+    /// 0.35),冲刺却在 15 帧里推进 15.25 m。同一面墙、同一时刻 ——
+    /// 差别只有一帧多长。
+    ///
+    /// 所以这里把整帧切成一串 [`INTERIOR_SLIDE_SUBSTEP`] 的小步(和
+    /// [`Self::support_along_frame` 对踏面做的事同形),**每小步各做一次
+    /// 完整的 `move_and_slide`**。小步长度压到比最薄的墙还短,每一小步的
+    /// 落点就不可能跳过整堵墙,法向钳制于是总能生效。
+    ///
+    /// **60 fps 下必须是 no-op**:步行一帧 `4.6 / 60 = 0.077 m`,远小于
+    /// 一个小步,`substeps == 1`,整帧仍走一次 —— 正常帧率的手感逐帧
+    /// 不变。这条由单测 `the_interior_sweep_is_a_no_op_at_sixty_fps` 守着。
+    ///
     /// # Arguments
     ///
     /// - `Vec2` - 待分离的世界 XZ 坐标。
@@ -415,6 +453,44 @@ impl FloorWorld {
     ///
     /// - `Vec2` - 分离(并保留切向位移)之后的世界 XZ 坐标。
     pub fn resolve_interior_slide(
+        &self,
+        point: Vec2,
+        delta: Vec2,
+        body_min_y: f32,
+        body_max_y: f32,
+        radius: f32,
+    ) -> Vec2 {
+        let span: f32 = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        let substeps: usize = ((span / INTERIOR_SLIDE_SUBSTEP).ceil() as usize).max(1);
+        if substeps <= 1 {
+            return self.slide_one_step(point, delta, body_min_y, body_max_y, radius);
+        }
+        // 每小步走**等分**的一段(`delta / substeps`),不是从头累积的
+        // `delta * t`:后者会让第 k 步再走一遍前 k-1 步的路,整帧位移被
+        // 放大成 `delta * (1 + 2 + ... + n) / n`。
+        let step: Vec2 = [delta[0] / substeps as f32, delta[1] / substeps as f32];
+        let mut cursor: Vec2 = point;
+        for _ in 0..substeps {
+            cursor = self.slide_one_step(cursor, step, body_min_y, body_max_y, radius);
+        }
+        cursor
+    }
+
+    /// [`Self::resolve_interior_slide`] 切完子步之后,真正做**一步**
+    /// `move_and_slide` 的那部分(单步版即修复前的实现)。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 待分离的世界 XZ 坐标。
+    /// - `Vec2` - 本步想要的水平位移(米)。
+    /// - `f32` - 身体底面高度(脚底,米)。
+    /// - `f32` - 身体顶面高度(头顶,米)。
+    /// - `f32` - 身体等效圆柱半径(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 这一步走完(并保留切向位移)之后的世界 XZ 坐标。
+    fn slide_one_step(
         &self,
         point: Vec2,
         delta: Vec2,
