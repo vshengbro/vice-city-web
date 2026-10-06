@@ -398,6 +398,61 @@ pub const T_WALK_SPEED_PICK: &str = "走路必须选中 WALK_SPEED,实得 {got},
 pub const T_RUN_SPEED_PICK: &str = "按住 Shift 必须选中 RUN_SPEED,实得 {got},应为 {want}";
 
 pub const T_RUN_FASTER_THAN_WALK: &str = "冲刺必须明显快于走路:实测比值 {ratio},下限 {min}";
+#[cfg(test)]
+
+/// 断言文案里的「走路」档位名。
+pub const MODE_WALK: &str = "walk";
+#[cfg(test)]
+
+/// 断言文案里的「冲刺」档位名。
+pub const MODE_SPRINT: &str = "sprint";
+#[cfg(test)]
+
+/// 断言文案里 `{mode}` 的占位符。
+pub const KEY_MODE: &str = "mode";
+#[cfg(test)]
+
+/// 断言文案里 `{diagonal}` 的占位符。
+pub const KEY_DIAGONAL: &str = "diagonal";
+#[cfg(test)]
+
+/// 断言文案里 `{straight}` 的占位符。
+pub const KEY_STRAIGHT: &str = "straight";
+#[cfg(test)]
+
+/// 回归测试:斜向移动不得比直线快(`|W+D| == |W|`,`Shift+W+D` 同理)。
+///
+/// 目标参照物是 GTA V —— 那边按 W+D 不会比单按 W 快。两轴各受 `speed`
+/// 上限约束并不等于合速度受约束:两轴分别顶到 `speed` 时合速度是
+/// `speed * sqrt(2)`(实测步行 6.5052 = 4.6√2,冲刺 11.8787 = 8.4√2)。
+/// 区间容差而非浮点等值。
+pub const T_DIAGONAL_MATCHES_STRAIGHT: &str =
+    "斜向移动不得比直线快:{mode} 实得 |{diagonal}| = {got:.4},|{straight}| = {want:.4}(比值 {ratio:.4})";
+#[cfg(test)]
+
+/// 回归测试:直线档位必须仍然是满速。
+///
+/// 与斜向那条互为对照:只钉「斜向不更快」的话,把速度**整体**砍到
+/// `speed / √2` 的修法也能让上一条变绿,而那是把走路和冲刺都拖慢了。
+pub const T_STRAIGHT_KEEPS_FULL_SPEED: &str =
+    "{mode} 直线必须保持满速:实得 {got:.4},应为 {want:.4}";
+#[cfg(test)]
+
+/// 回归测试:半个身位的输入必须仍然是半速。
+///
+/// 归一化最常见的实现错误是**无脑除以模长**:`(0.5, 0.5)` 模长 0.707,
+/// 除完变成 `(0.707, 0.707)`,半速输入被放大成满速。正确写法是只把
+/// **超过 1** 的模长钳下来。
+pub const T_HALF_INPUT_STAYS_HALF_SPEED: &str =
+    "{mode} 半速输入不得被归一化成满速:实得 {got:.4},应为 {want:.4}(比值 {ratio:.4})";
+#[cfg(test)]
+
+/// 斜向合速度与直线合速度的容差(比值无量纲)。
+///
+/// 归一化把 `(1, 1)` 缩到 `(0.7071, 0.7071)`,浮点余量约 1e-6;
+/// 取 1e-3 留足空间,又远小于 sqrt(2) = 1.4142 —— 修复前的实测值
+/// 一抓一个准,不会被这个容差放过。
+pub const DIAGONAL_SPEED_TOLERANCE: f32 = 1e-3;
 
 /// 走 / 跑速度上限之比的下限。
 ///

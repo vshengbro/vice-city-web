@@ -489,6 +489,29 @@ impl Player {
         }
     }
 
+    /// 把两轴按键输入的模长钳到不超过 1(斜向不快于直线的关键)。
+    ///
+    /// **钳长度,不是无脑除以模长。** 无脑归一化(`intent / |intent|`)会把
+    /// 半个身位的输入 `(0.5, 0.5)`(模长 0.707)放大成满速 —— 手柄半推和
+    /// 键盘全按之间就失去了区别,微调会变成冲刺。正确做法是**只把超过 1 的
+    /// 模长压下来**,模长不足 1 的原样保留,于是半速输入仍然是半速。
+    ///
+    /// 效果:W 给出 `1`,W+D 给出 `1 / √2 = 0.7071`,于是合速度恒为
+    /// `speed`(`speed * |intent|` ≤ `speed * 1`)。单轴输入时模长本来就是
+    /// 1,`scale` 恒为 1,直线档位**逐位不变**。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 原始的两轴输入(各分量 −1..1)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 缩放系数,模长超过 1 时为 `1 / |intent|`,否则为 1。
+    fn diagonal_scale(intent: Vec2) -> f32 {
+        let length: f32 = (intent[0] * intent[0] + intent[1] * intent[1]).sqrt();
+        if length > 1.0 { 1.0 / length } else { 1.0 }
+    }
+
     /// 推进一个固定步长:移动、碰撞分离、转身、步态相位。
     ///
     /// # Arguments
@@ -506,10 +529,25 @@ impl Player {
         speed: f32,
         world: &CollisionWorld,
     ) {
-        // 目标速度 = 前向分量 + 侧向分量,两者各自受 `speed` 上限约束,
-        // 所以斜向移动不会比直线快(和真实操作手感一致)。
-        let forward: f32 = intent[1];
-        let strafe: f32 = intent[0];
+        // 目标速度 = 前向分量 + 侧向分量,两者**合起来**受 `speed` 上限约束,
+        // 所以斜向移动不比直线快(和 GTA V 的手感一致:那边按 W+D 也不会比
+        // 单按 W 快)。
+        //
+        // **「各自受上限」并不够。** 这里原来直接把
+        // `direction * forward + perp * strafe` 乘 `speed`,于是两轴分别顶到
+        // `speed` 时合速度是 `speed * √(forward² + strafe²)` —— W+D 时
+        // `√2 = 1.4142`。实测步行 6.5052(`4.6 * √2`,直线是 4.5998)、冲刺
+        // 11.8787(`8.4 * √2`,直线是 8.3997),斜向比直线快 41.4%。紧挨着这
+        // 段的旧注释写的却是「斜向移动不会比直线快」—— 注释描述的是**意图**,
+        // 代码做的是另一回事,两者对不上,于是这个偏差一直没人发现。
+        //
+        // **归一化的是 `intent`(按键轴),不是世界方向。** `direction` 本身
+        // 已经是单位向量(相机的水平朝向),旋过去不改变模长,所以「`intent`
+        // 归一 + `speed` 乘在旋后的方向上」与「合速度钳到 `speed`」完全等价,
+        // 取前者更省一次钳制。
+        let scale: f32 = Self::diagonal_scale(intent);
+        let forward: f32 = intent[1] * scale;
+        let strafe: f32 = intent[0] * scale;
         let target: Vec2 = [
             (direction[0] * forward + -direction[1] * strafe) * speed,
             (direction[1] * forward + direction[0] * strafe) * speed,
@@ -746,15 +784,18 @@ pub fn limb_matrix(origin: Vec3, yaw: f32, pivot: Vec3, swing: f32) -> Mat4 {
 #[cfg(test)]
 mod tests {
     use crate::camera::Mat4;
+    use crate::collision::CollisionWorld;
     use crate::r#const::{
-        KEY_PART, PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_UPPER_ARM_L,
-        PART_UPPER_LEG_L, T_DISTAL_INHERITS_PARENT_SWING, T_DISTAL_LIMB_HAS_PARENT,
-        T_FACING_MATCHES_VELOCITY, T_LEGS_ANTIPHASE, T_LIMB_STAYS_AT_ASSET_HEIGHT,
-        T_LIMBS_RELAX_TO_ZERO, T_PARENT_IN_PLAN, T_SAME_SIDE_IN_PHASE,
+        DIAGONAL_SPEED_TOLERANCE, KEY_DIAGONAL, KEY_MODE, KEY_PART, KEY_STRAIGHT, MODE_SPRINT,
+        MODE_WALK, PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_UPPER_ARM_L,
+        PART_UPPER_LEG_L, T_DIAGONAL_MATCHES_STRAIGHT, T_DISTAL_INHERITS_PARENT_SWING,
+        T_DISTAL_LIMB_HAS_PARENT, T_FACING_MATCHES_VELOCITY, T_HALF_INPUT_STAYS_HALF_SPEED,
+        T_LEGS_ANTIPHASE, T_LIMB_STAYS_AT_ASSET_HEIGHT, T_LIMBS_RELAX_TO_ZERO, T_PARENT_IN_PLAN,
+        T_SAME_SIDE_IN_PHASE, T_STRAIGHT_KEEPS_FULL_SPEED,
     };
     use crate::player::{
-        GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, facing_yaw, limb_chain_matrix,
-        limb_parent, limb_swing,
+        GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, RUN_SPEED, WALK_SPEED, Player,
+        facing_yaw, limb_chain_matrix, limb_parent, limb_swing,
     };
     use crate::r#type::{Mat4Data, Vec2, Vec3};
 
@@ -995,5 +1036,127 @@ mod tests {
             })
             .count();
         assert_eq!(chained, 8, "{T_DISTAL_LIMB_HAS_PARENT}");
+    }
+
+    /// 让一个 `Player` 在空地上按某组键走够时间,返回稳定后的速度模长。
+    ///
+    /// 走的是真实的 [`Player::step`] —— `CollisionWorld::new()` 是空世界,
+    /// 所以 `|v|` 就是目标速度,碰撞分支不参与。**跑够 300 帧**是必须的:
+    /// `SPEED_RAMP` 的指数逼近需要时间,少跑几帧读到的是半路上的值,
+    /// 那样任何实现都测不出斜向差别。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - `intent`(侧向, 前向)。
+    /// - `f32` - 速度上限(米/秒)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 稳定后的速度模长(米/秒)。
+    fn settle_speed(intent: Vec2, speed: f32) -> f32 {
+        let world: CollisionWorld = CollisionWorld::new();
+        let mut player: Player = Player::new([0.0, 0.0, 0.0], 0.0);
+        let dt: f32 = 1.0 / 60.0;
+        for _ in 0..300 {
+            player.step(intent, [1.0, 0.0], dt, speed, &world);
+        }
+        let v: Vec2 = player.get_velocity();
+        (v[0] * v[0] + v[1] * v[1]).sqrt()
+    }
+
+    /// 斜向移动不得比直线快 —— 参照物是 GTA V(那边按 W+D 不会更快)。
+    ///
+    /// 回归测试(修复前实测失败):`Player::step` 把 `direction * forward +
+    /// perp * strafe` 直接乘 `speed`,两轴各顶到 `speed` 时合速度是
+    /// `speed * sqrt(2)`。实测步行 `W+D` = 6.5052(`4.6 * √2`),`Shift+W+D`
+    /// = 11.8787(`8.4 * √2`),与直线 W 的 4.5998 / 8.3997 相比分别快
+    /// 41.4% —— 而紧挨着这段代码的注释写的是「斜向移动不会比直线快」。
+    ///
+    /// **判据用比值 + 区间容差,不用浮点等值。** 归一化后 `(1, 1)` 缩到
+    /// `(0.7071, 0.7071)`,余量约 1e-6;容差取
+    /// [`DIAGONAL_SPEED_TOLERANCE`] = 1e-3,又远低于修复前的 1.4142。
+    #[test]
+    fn diagonal_movement_is_not_faster_than_straight() {
+        for (mode, speed) in [(MODE_WALK, WALK_SPEED), (MODE_SPRINT, RUN_SPEED)] {
+            let straight: f32 = settle_speed([0.0, 1.0], speed);
+            for diagonal in [[1.0f32, 1.0f32], [-1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]] {
+                let got: f32 = settle_speed(diagonal, speed);
+                let ratio: f32 = got / straight;
+                assert!(
+                    (ratio - 1.0).abs() <= DIAGONAL_SPEED_TOLERANCE,
+                    "{}",
+                    fill(
+                        T_DIAGONAL_MATCHES_STRAIGHT,
+                        &[
+                            (KEY_MODE, mode),
+                            (
+                                "diagonal",
+                                &format!(
+                                    "W{:+}",
+                                    if diagonal[0] > 0.0 { "D" } else { "A" }
+                                )
+                            ),
+                            ("got:.4", &format!("{got:.4}")),
+                            (KEY_STRAIGHT, "W"),
+                            ("want:.4", &format!("{straight:.4}")),
+                            ("ratio:.4", &format!("{ratio:.4}")),
+                        ]
+                    )
+                );
+            }
+        }
+    }
+
+    /// 归一化只该压斜向,不该动直线 —— `W` 仍然必须是满速。
+    ///
+    /// 上一条只钉住「斜向不更快」,一个把速度**整体**砍到 `speed / √2` 的
+    /// 修法也能让它变绿,而那是把走路和冲刺都拖慢了。所以这里独立地钉住
+    /// 直线档位:`|W|` 落在 `speed` 的容差内,`Shift+W` 同理。
+    #[test]
+    fn straight_movement_keeps_the_full_speed() {
+        for (mode, speed) in [(MODE_WALK, WALK_SPEED), (MODE_SPRINT, RUN_SPEED)] {
+            let straight: f32 = settle_speed([0.0, 1.0], speed);
+            let error: f32 = (straight - speed).abs() / speed;
+            assert!(
+                error <= DIAGONAL_SPEED_TOLERANCE,
+                "{}",
+                fill(
+                    T_STRAIGHT_KEEPS_FULL_SPEED,
+                    &[
+                        (KEY_MODE, mode),
+                        ("got:.4", &format!("{straight:.4}")),
+                        ("want:.4", &format!("{speed:.4}")),
+                    ]
+                )
+            );
+        }
+    }
+
+    /// 半个身位(模拟摇杆推一半)必须仍然是半速,而不是被归一化成满速。
+    ///
+    /// 归一化最常见的实现错误就是**无脑除以模长**:`(0.5, 0.5)` 的模长是
+    /// 0.707,除完变成 `(0.707, 0.707)`,半速输入被放大成满速。正确写法是
+    /// **只把超过 1 的模长钳下来**。这条守着那个区别 —— `Player::step` 的
+    /// `intent` 由 `axis()` 产生,每分量在 −1..1,0.5 正是真实会出现的值。
+    #[test]
+    fn a_half_strength_input_stays_at_half_speed() {
+        for (mode, speed) in [(MODE_WALK, WALK_SPEED), (MODE_SPRINT, RUN_SPEED)] {
+            let half: f32 = settle_speed([0.0, 0.5], speed);
+            let full: f32 = settle_speed([0.0, 1.0], speed);
+            let ratio: f32 = half / full;
+            assert!(
+                (ratio - 0.5).abs() <= DIAGONAL_SPEED_TOLERANCE,
+                "{}",
+                fill(
+                    T_HALF_INPUT_STAYS_HALF_SPEED,
+                    &[
+                        (KEY_MODE, mode),
+                        ("got:.4", &format!("{half:.4}")),
+                        ("want:.4", &format!("{:.4}", full * 0.5)),
+                        ("ratio:.4", &format!("{ratio:.4}")),
+                    ]
+                )
+            );
+        }
     }
 }
