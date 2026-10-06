@@ -259,6 +259,18 @@ const PALM_PITCH_MAX: f32 = 33.0;
 const PALM_PITCH_JITTER: f32 = 7.0;
 /// 垂直于街方向的随机抖动幅度(米):有的贴路沿、有的靠外侧。
 const PALM_SIDE_JITTER: f32 = 1.6;
+/// 沿街方向那一维要避开的**路口**半宽(米),等于路面半宽。
+///
+/// 横向那一维天生安全:`STREET_HALF_WIDTH + SIDEWALK_WIDTH * 0.55` 再加
+/// `±PALM_SIDE_JITTER / 2` 落在 `[8.18, 9.78]`,永远在人行道
+/// `[7.0, 10.6]` 里。**出问题的是沿街那一维** —— 它是自由走的
+/// `step + along_jitter`,每 `STREET_PITCH` 米就会撞上一次垂直街道的
+/// 轴线,于是每隔 60 m 就有一棵树种在**十字路口的沥青上**。
+///
+/// 用户报的是「道路上不能有树木」,那是硬约束,不是观感问题:实测
+/// 生成中心 (0, 0) 附近 830 棵里有 138 棵(16.6%)踩在路上,最近的一棵
+/// 离路中线只有 **0.03 m**,正对着车道中心。路口这一段直接不种树。
+const PALM_JUNCTION_GUARD: f32 = STREET_HALF_WIDTH;
 /// 抽中「高个」的概率(0..1):少量高树成簇,避免整片同高。
 const PALM_TALL_FRACTION: f32 = 0.22;
 /// 普通棕榈的最小缩放。
@@ -1617,11 +1629,22 @@ fn build_city_palms(cx: f32, _cz: f32) -> PalmSpots {
                 PALM_SCALE_MIN + hash_unit(seed, 4) * (PALM_SCALE_MAX - PALM_SCALE_MIN)
             };
             let offset: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH * 0.55 + side_jitter;
-            out.push([line + offset, step + along_jitter, scale]);
-            out.push([step + along_jitter, line - offset, scale]);
-            // 间距随机化,而不是固定 24 m。
+            // 间距先生成,位置后判 —— 抽签顺序不变,下面内院循环拿到的是
+            // 同一串随机数,所以这一改动不挪动任何一棵内院棕榈。
             let pitch: f32 =
                 PALM_PITCH_MIN + hash_unit(seed, 5) * (PALM_PITCH_MAX - PALM_PITCH_MIN);
+            // 沿街坐标离**最近的十字街道轴线**不足一个路面半宽,就是站在
+            // 路口的沥青上,这一对跳过。横向那一维本来就在
+            // `[8.18, 9.78]` 的人行道里,不需要再判。
+            let along: f32 = step + along_jitter;
+            let cross_axis: f32 = street_axis((along / STREET_PITCH).round() as i32);
+            if (along - cross_axis).abs() < PALM_JUNCTION_GUARD {
+                step += pitch;
+                continue;
+            }
+            out.push([line + offset, along, scale]);
+            out.push([along, line - offset, scale]);
+            // 间距随机化,而不是固定 24 m。
             step += pitch;
         }
     }
@@ -8992,7 +9015,8 @@ mod tests {
         T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT, T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS,
         T_RELOAD_CONSUMES_RESERVE, T_RELOAD_KEY_IS_GTA_R, T_RELOAD_NOT_REPEATABLE,
         T_RELOAD_R_REFILLS_MAGAZINE, T_RELOAD_R_STARTS_RELOAD, T_ROUTE_LEG_DIAGONAL,
-        T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DESCENT_NO_CLIMB,
+        T_PALM_ON_ROADWAY, T_PALM_ROW_IS_UNIFORM, T_SHOWCASE_AXIS_ON_ROAD,
+        T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DESCENT_NO_CLIMB,
         T_SHOWCASE_DESCENT_REACHES_GROUND, T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE,
         T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL,
         T_SHOWCASE_DOOR_OUTSIDE_BLOCKED, T_SHOWCASE_DOORS_FACE_EACH_OTHER,
@@ -9045,6 +9069,7 @@ mod tests {
         SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN, SHOWCASE_STAIR_STEPS, SHOWCASE_STAIR_WIDTH,
         SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH, STREAM_REBUILD_STEP,
         STREET_HALF_WIDTH, STREET_PITCH, ShowcaseSpec, ShowcaseSpecs, blocks_near,
+        build_city_palms,
         build_city_buildings, build_collision_world, build_ground_near, build_showcase_interiors,
         build_water_near, on_roadway, showcase_placements, showcase_specs, stream_needs_rebuild,
         street_axis, street_indices_in,
@@ -10421,6 +10446,68 @@ mod tests {
                 T_SHOWCASE_FOOTPRINT_CLEAR
             );
         }
+    }
+
+    #[test]
+    fn no_palm_stands_on_the_roadway() {
+        // `street_strips` 只保证棕榈相对**它自己那条街**的横向偏移,而
+        // 沿街那一维是自由走的 `step + along_jitter` —— 每隔
+        // `STREET_PITCH` 米就会撞上一次垂直街道的轴线,于是每隔 60 m 就
+        // 有一棵树落进十字路口的沥青上。这里按用户的要求逐棵判:到**最近
+        // 街道轴线**的横向距离必须 >= 路面半宽。
+        //
+        // 三个生成中心一起判,免得这条断言只在出生点附近成立:世界是
+        // 无限的,`street_axis` 的取整在负坐标与大坐标上同样要对。
+        for center in [0.0f32, 30.0, 1234.5] {
+            for spot in build_city_palms(center, center).iter() {
+                let (x, z): (f32, f32) = (spot[0], spot[1]);
+                let nearest_x: f32 = street_axis((x / STREET_PITCH).round() as i32);
+                let nearest_z: f32 = street_axis((z / STREET_PITCH).round() as i32);
+                let gap: f32 = (x - nearest_x).abs().min((z - nearest_z).abs());
+                assert!(
+                    gap >= STREET_HALF_WIDTH,
+                    "{}",
+                    fill(
+                        T_PALM_ON_ROADWAY,
+                        &[
+                            ("x", &format!("{x}")),
+                            ("z", &format!("{z}")),
+                            ("line", &format!("{gap}")),
+                            ("need", &format!("{STREET_HALF_WIDTH}")),
+                        ],
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn palm_lateral_offsets_stay_scattered_inside_the_sidewalk() {
+        // 修「路口不种树」不能顺手把横向抖动清零 —— 那会退回上一轮修好的
+        // 「复制粘贴的一直线」。安全带是 `[STREET_HALF_WIDTH,
+        // STREET_HALF_WIDTH + SIDEWALK_WIDTH]`,3.6 m 宽,里面的取值必须
+        // 足够多,才读得出「有的贴路沿、有的靠外侧」。
+        let mut distinct: Vec<u32> = Vec::new();
+        for spot in build_city_palms(0.0, 0.0).iter() {
+            let lateral: f32 = (spot[0] - street_axis((spot[0] / STREET_PITCH).round() as i32)).abs();
+            // 量化到 1 cm,滤掉浮点噪声后再数「不同取值」。
+            let bucket: u32 = (lateral * 100.0).round() as u32;
+            if !distinct.contains(&bucket) {
+                distinct.push(bucket);
+            }
+        }
+        let band: f32 = SIDEWALK_WIDTH;
+        assert!(
+            distinct.len() >= 40,
+            "{}",
+            fill(
+                T_PALM_ROW_IS_UNIFORM,
+                &[
+                    ("distinct", &format!("{}", distinct.len())),
+                    ("band", &format!("{band}")),
+                ],
+            )
+        );
     }
 
     #[test]
