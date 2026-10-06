@@ -3174,9 +3174,11 @@ fn stream_needs_rebuild(player: Vec2, center: Vec2) -> bool {
 ///
 /// # Returns
 ///
-/// - `Vec<usize>` - **被改写过的 `Scene::meshes` 下标**。调用方必须把
-///   这些网格重新传到 GPU(`WebGlRenderer::replace_mesh`),否则画面上
+/// - `(Vec<usize>, usize)` - 第一项是**被改写过的 `Scene::meshes` 下标**,
+///   调用方必须把它们重新传到 GPU(`WebGlRenderer::replace_mesh`),否则画面上
 ///   仍是旧地面 —— CPU 侧换了数据而 GPU 缓冲没换,且**没有任何报错**。
+///   第二项是**重建之后新的静态段长度**,静态段长度会随生成中心变化,
+///   调用方必须写回 `Game::static_batch_count`。
 pub fn rebuild_streamed_surface(
     scene: &mut Scene,
     ground_batch: usize,
@@ -3185,8 +3187,8 @@ pub fn rebuild_streamed_surface(
     cz: f32,
     index_map: &HashMap<String, usize>,
     static_batch_count: usize,
-) -> Vec<usize> {
-    rebuild_static_batches(scene, index_map, static_batch_count, cx, cz);
+) -> (Vec<usize>, usize) {
+    let new_static_count: usize = rebuild_static_batches(scene, index_map, static_batch_count, cx, cz);
     let mut rewritten: Vec<usize> = Vec::new();
     let surfaces: [(usize, MeshAsset); 2] = [
         (ground_batch, build_ground_near(cx, cz)),
@@ -3219,7 +3221,7 @@ pub fn rebuild_streamed_surface(
         *slot = build_gpu_mesh(&mesh, &emissive);
         rewritten.push(mesh_index);
     }
-    rewritten
+    (rewritten, new_static_count)
 }
 
 /// 把流式重建改写过的网格重新上传到 GPU。
@@ -3266,10 +3268,28 @@ fn reupload_streamed_meshes(renderer: &mut Renderer, scene: &Scene, rewritten: &
 
 /// 整段换掉静态批次(建筑 / 树 / 道具 / 招牌 / 行人 / 摆件车)。
 ///
-/// 静态批次是尾插的:它们一定排在玩家骨架 / 车队 / 拾取物之前,于是
-/// 「截断到 `static_batch_count` 再重新铺一遍」能精确换掉静态段而不动
-/// 动态段。不这么做的后果是玩家走到 600 m 外看到的还是出生点那批楼 ——
-/// 地面是新的,楼是旧的,等于没做流式。
+/// **动态段(玩家骨架 / 车队 / 拾取物)必须原样搬到静态段后面。**
+///
+/// 静态批次是尾插的,所以「截断到 `static_batch_count`」确实能精确换掉静态段
+/// —— 但它同时**把尾插在后面的动态段一起截掉了**,而后面没有任何代码重建
+/// 那些批次。后果是玩家走出 60 m(`STREAM_REBUILD_STEP`)之后:
+///
+/// - `scene.batches` 重新只长出静态段,实测从 100 掉到 37;
+/// - `player_batches` / `car_batches` / `car_wheel_batches` / `pickup_batches`
+///   里存的全是**过期的下标**(`scene.batches.get_mut(limb.batch)` 拿到
+///   `None`,实例列表再也填不回去);
+/// - 角色、车身、手持武器、拾取物就彻底不画了。
+///
+/// 这正是用户报的「角色加速移动一短距离之后角色不展示」—— 实测传送
+/// 61 m(刚过 60 m 阈值)之后:批次表 100 → 37,骨架实例 13 → 0,角色
+/// 包围盒里的像素占比 26.4% → **0.0%**,画面里连一个人都没有。
+///
+/// 静态段自己的长度也不是常量:它等于「新中心周围实际用到的不同 mesh 数」,
+/// 而那个数会随中心变化(实测 12 与 11 都出现过)。所以不能靠「假设静态段
+/// 长度不变」来救 —— 必须把动态段**真的搬回去**,下标才能重新对上。
+///
+/// 之前那句注释「静态段是尾插的,截断能精确换掉静态段而不动动态段」正是在
+/// 这里想当然:尾插只保证**顺序**,不保证 `truncate` 会替你留���动态段。
 ///
 /// # Arguments
 ///
@@ -3278,17 +3298,25 @@ fn reupload_streamed_meshes(renderer: &mut Renderer, scene: &Scene, rewritten: &
 /// - `usize` - 静态批次当前占用的长度。
 /// - `f32` - 新的生成中心 X(米)。
 /// - `f32` - 新的生成中心 Z(米)。
+///
+/// # Returns
+///
+/// - `usize` - 重建之后新的静态段长度。静态段长度会随生成中心变化,
+///   调用方必须写回 `Game::static_batch_count`,否则下一次重建会按旧长度切,
+///   把动态段的头几个批次误当成静态段丢掉。
 fn rebuild_static_batches(
     scene: &mut Scene,
     index_map: &HashMap<String, usize>,
     static_batch_count: usize,
     cx: f32,
     cz: f32,
-) {
+) -> usize {
     if static_batch_count == 0 || static_batch_count > scene.batches.len() {
-        return;
+        return static_batch_count;
     }
-    scene.batches.truncate(static_batch_count);
+    // 先把动态段**摘下来**(而不是让 `truncate` 连它一起丢掉),静态段重铺
+    // 完再接回去 —— 顺序不变,`mesh_index` 也不变,下标自然重新对上。
+    let dynamic: Vec<SceneBatch> = scene.batches.split_off(static_batch_count);
     for building in build_city_buildings(cx, cz) {
         let Some(&mesh_index) = index_map.get(building.asset) else {
             continue;
@@ -3339,6 +3367,20 @@ fn rebuild_static_batches(
         let batch: usize = find_or_create_batch(scene, mesh_index);
         scene.push_instance(batch, Instance::new(position, yaw, 1.0, [1.0, 1.0, 1.0]));
     }
+    // 静态段铺完了,把动态段原样接回它后面 —— 这一步是整个修复的落点。
+    // `find_or_create_batch` 只按 `mesh_index` 找,静态段重铺可能会把某个
+    // mesh 的批次下标挪动,所以这里不能靠「按 mesh_index 重新 find」,必须
+    // 保持**动态段内部原有的相对顺序**:玩家骨架 / 车身 / 车轮 / 拾取物在
+    // `player_batches` 等表里记的是下标,顺序一变那些下标就全废了。
+    //
+    // 顺带记下**新的**静态段长度:它等于新中心周围实际用到的不同 mesh 数,
+    // 会随中心变化(实测 12 与 11 都出现过)。调用方必须把它写回
+    // `Game::static_batch_count`,否则下一次重建会按旧长度切,把静态段切短
+    // 一截、把动态段的头几个批次误当成静态段丢掉 —— 那等于把同一个 bug 换
+    // 个偏移再犯一次。
+    let new_static_count: usize = scene.batches.len();
+    scene.batches.extend(dynamic);
+    new_static_count
 }
 
 /// 找到某个 mesh 已有的批次,没有就新建 —— 这就是 instancing 分组的关键。
@@ -4913,11 +4955,12 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
                 .map(|ped: &Pedestrian| {
                     let at: Vec3 = ped.get_position();
                     format!(
-                        "{{\"x\":{:.2},\"z\":{:.2},\"down\":{},\"gait\":{:.2}}}",
+                        "{{\"x\":{:.2},\"z\":{:.2},\"down\":{},\"gait\":{:.2},\"gaitPhase\":{:.4}}}",
                         at[0],
                         at[2],
                         ped.is_down(),
-                        ped.get_gait_amount()
+                        ped.get_gait_amount(),
+                        ped.get_gait_phase()
                     )
                 })
                 .collect();
@@ -6079,7 +6122,7 @@ fn step_streamed_surface(game: &mut Game) {
     let next_z: f32 = street_axis((player[1] / STREET_PITCH).round() as i32);
     let index_map: HashMap<String, usize> = game.asset_index.clone();
     let static_count: usize = game.static_batch_count;
-    let rewritten: Vec<usize> = rebuild_streamed_surface(
+    let (rewritten, new_static_count): (Vec<usize>, usize) = rebuild_streamed_surface(
         &mut game.scene,
         game.ground_batch,
         game.water_batch,
@@ -6088,6 +6131,9 @@ fn step_streamed_surface(game: &mut Game) {
         &index_map,
         static_count,
     );
+    // 静态段长度随生成中心变化,不写回的话下一次重建会按旧长度切,把动态段
+    // 的头几个批次误当成静态段丢掉 —— 同一个 bug 换个偏移再犯一次。
+    game.static_batch_count = new_static_count;
     // 地面 / 水面的顶点数据换了,GPU 缓冲必须跟着换 —— 否则玩家走出街区
     // 边界后看到的还是出生点那块地,而 CPU 侧探针报告的却是新数据。
     if let Some(renderer) = game.renderer.as_mut() {
@@ -8974,6 +9020,7 @@ mod tests {
         T_ARROW_DOES_NOT_MOVE_ON_FOOT, T_ARROW_STEER_SIGNS_OPPOSED, T_ARROW_STEERS_WHILE_DRIVING,
         T_FOOT_POSITION_UNCHANGED, T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK,
         T_RUN_SPEED_PICK, T_WALK_SPEED_PICK, apply_look_delta, car_wheel_model,
+        Instance, MeshAssetGpu, Scene, SceneBatch, rebuild_static_batches,
     };
     /// 一个世界点投影后的屏幕 NDC x(未做像素映射)。
     ///
@@ -9026,6 +9073,7 @@ mod tests {
         T_SHOWCASE_PIER_LET_PLAYER_THROUGH, T_SHOWCASE_PUSHED_INTO_WALL,
         T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE, T_SHOWCASE_SPRINT_PENETRATES_WALL,
         T_SHOWCASE_SPRINT_TUNNELS_WALL, T_SHOWCASE_STAIR_REACHES_TOP,
+        T_STATIC_LEN_ASSUMED_CONSTANT,
         T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_SUBSTEP_NOT_NO_OP,
         T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP,
         T_SHOWCASE_WALK_LOSES_SLIDE, T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP,
@@ -9069,8 +9117,8 @@ mod tests {
         SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN, SHOWCASE_STAIR_STEPS, SHOWCASE_STAIR_WIDTH,
         SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH, STREAM_REBUILD_STEP,
         STREET_HALF_WIDTH, STREET_PITCH, ShowcaseSpec, ShowcaseSpecs, blocks_near,
-        build_city_palms,
-        build_city_buildings, build_collision_world, build_ground_near, build_showcase_interiors,
+        build_city_buildings, build_city_palms, build_city_peds, build_city_props,
+        build_city_signs, build_collision_world, build_ground_near, build_showcase_interiors,
         build_water_near, on_roadway, showcase_placements, showcase_specs, stream_needs_rebuild,
         street_axis, street_indices_in,
     };
@@ -10446,6 +10494,138 @@ mod tests {
                 T_SHOWCASE_FOOTPRINT_CLEAR
             );
         }
+    }
+
+    /// 一个零三角形的网格 —— 批次结构测试只需要 `mesh_index` 的身份,
+    /// 不需要真的几何。
+    fn empty_gpu_mesh() -> MeshAssetGpu {
+        MeshAssetGpu {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            faces: Vec::new(),
+            triangle_count: 0,
+        }
+    }
+
+    #[test]
+    fn streamed_rebuild_keeps_the_dynamic_batches() {
+        // `rebuild_static_batches` 换静态段时,必须把尾插在后面的动态段
+        // (玩家骨架 / 车身 / 车轮 / 拾取物)**原样接回去**。之前它直接
+        // `truncate(static_batch_count)`,把动态段一起截掉,而且没有重建 ——
+        // 玩家走出 60 m(`STREAM_REBUILD_STEP`)之后,`player_batches` 等表里
+        // 存的下标全部越界,`scene.batches.get_mut(limb.batch)` 拿到 `None`,
+        // 角色 / 车身就再也不画了。
+        //
+        // 实测(浏览器 + CDP):传送 61 m 触发一次重建之后,批次表 100 → 37,
+        // 骨架实例 13 → 0,角色包围盒内的像素占比 26.4% → 0.0%。
+        //
+        // 这里按真实结构搭一个场景:静态段 2 个批次,动态段 3 个,记录动态段
+        // 的 `mesh_index` 顺序;重建之后要求 (a) 动态批次一个不少、
+        // (b) `mesh_index` 顺序不变、(c) 每个动态批次都还能按**旧下标**取到。
+        let mut scene: Scene = Scene {
+            meshes: Vec::new(),
+            batches: Vec::new(),
+            total_triangles: 0,
+        };
+        let mut index_map: HashMap<String, usize> = HashMap::new();
+        // 静态段用的两个 mesh。
+        let ground: usize = scene.push_mesh(empty_gpu_mesh());
+        let building: usize = scene.push_mesh(empty_gpu_mesh());
+        index_map.insert("ground".to_string(), ground);
+        index_map.insert("bldg_a".to_string(), building);
+        let static_count: usize = 2;
+        scene.push_batch(ground, true);
+        scene.push_batch(building, true);
+        // 动态段:玩家骨架 13 节、车身、车轮。
+        let dynamic_meshes: Vec<usize> = (0..15)
+            .map(|i: usize| {
+                let mesh: usize = scene.push_mesh(empty_gpu_mesh());
+                let batch: usize = scene.push_batch(mesh, false);
+                scene.push_instance(batch, Instance::new([0.0, 0.0, 0.0], 0.0, 1.0, [1.0; 3]));
+                assert_eq!(batch, static_count + i, "动态段必须尾插在静态段之后");
+                index_map.insert(format!("dyn{i}"), mesh);
+                batch
+            })
+            .collect();
+        let before: usize = scene.batches.len();
+        assert_eq!(before, static_count + 15);
+
+        let new_static_count: usize =
+            rebuild_static_batches(&mut scene, &index_map, static_count, 60.0, 60.0);
+
+        // (a) 一个批次都没丢。
+        assert_eq!(
+            scene.batches.len(),
+            before,
+            "重建之后批次表长度必须不变:动态段被截掉了"
+        );
+        // (c) 动态段仍在原来的下标上,`player_batches` 之类表里存的
+        // 下标依然有效。
+        for (offset, batch) in dynamic_meshes.iter().enumerate() {
+            let got: &SceneBatch = &scene.batches[*batch];
+            assert_eq!(
+                got.mesh_index,
+                *index_map.get(&format!("dyn{offset}")).unwrap(),
+                "动态批次 {batch} 的 mesh 换了 —— 下标语义被破坏"
+            );
+        }
+        // (b) 动态段的相对顺序不变。
+        let order: Vec<usize> = dynamic_meshes
+            .iter()
+            .map(|b: &usize| scene.batches[*b].mesh_index)
+            .collect();
+        let expected: Vec<usize> = (0..15)
+            .map(|i: usize| *index_map.get(&format!("dyn{i}")).unwrap())
+            .collect();
+        assert_eq!(order, expected, "动态段内部顺序变了");
+        // 静态段长度变化必须被如实报回去(调用方要写回 `static_batch_count`)。
+        assert_eq!(
+            new_static_count, scene.batches.len() - 15,
+            "报回去的新静态段长度必须等于实际重铺出来的静态段长度"
+        );
+    }
+
+    #[test]
+    fn streamed_rebuild_reports_a_varying_static_length() {
+        // 静态段长度 = 新中心周围真正用到的不同 mesh 数,不是常量。如果修复
+        // 依赖「静态段长度不变」,那下一次重建就会按旧长度切,等于把同一个
+        // bug 换个偏移再犯。这里钉住「长度真的会变」这个前提,让上面那条
+        // 断言的写回逻辑始终是必要的。
+        let lengths: Vec<usize> = [(0.0f32, 0.0f32), (0.0, 60.0), (0.0, 120.0), (30.0, 0.0)]
+            .iter()
+            .map(|center: &(f32, f32)| {
+                let mut used: Vec<&str> = Vec::new();
+                for building in build_city_buildings(center.0, center.1) {
+                    if !used.contains(&building.asset) {
+                        used.push(building.asset);
+                    }
+                }
+                for prop in build_city_props(center.0, center.1) {
+                    if !used.contains(&prop.asset) {
+                        used.push(prop.asset);
+                    }
+                }
+                for (asset, _, _) in build_city_signs(center.0, center.1).iter() {
+                    if !used.contains(asset) {
+                        used.push(asset);
+                    }
+                }
+                for (asset, _, _) in build_city_peds(center.0, center.1).iter() {
+                    if !used.contains(asset) {
+                        used.push(asset);
+                    }
+                }
+                used.len()
+            })
+            .collect();
+        assert!(
+            lengths.iter().min() != lengths.iter().max(),
+            "{}",
+            fill(
+                T_STATIC_LEN_ASSUMED_CONSTANT,
+                &[("lengths", &format!("{lengths:?}"))]
+            )
+        );
     }
 
     #[test]

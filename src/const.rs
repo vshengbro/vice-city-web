@@ -2002,6 +2002,14 @@ pub const T_PALM_ON_ROADWAY: &str =
 pub const T_PALM_ROW_IS_UNIFORM: &str =
     "棕榈横向偏移只有 {distinct} 种取值(安全带宽 {band} m),退回了复制粘贴的一直线";
 
+/// 单元测试断言文案:静态段长度被当成常量了。
+///
+/// 静态段长度 = 新生成中心周围真正用到的不同 mesh 数,实测会变(12 与 11
+/// 都出现过)。谁要是顺着「截断到旧的 `static_batch_count` 就行」把动态段
+/// 一起截掉,这条断言会先响:先说清楚长度本来就不是常量。
+pub const T_STATIC_LEN_ASSUMED_CONSTANT: &str =
+    "四个生成中心的静态段长度居然一样:{lengths} —— 「静态段长度恒定」的前提不成立,重建必须把动态段搬回去再把新长度写回";
+
 #[cfg(test)]
 /// 单元测试断言文案:一帧的位移必须被**扫掠**,不能只看帧末落点。
 ///
