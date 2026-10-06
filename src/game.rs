@@ -9706,6 +9706,76 @@ mod tests {
         }
     }
 
+    /// 一整帧的「静态层 + 室内层」串联:冲刺撞薄墙必须在墙前停住。
+    ///
+    /// **为什么上一条单测不够。** `sprinting_into_a_thin_interior_wall_is_blocked`
+    /// 直接把玩家放在一个**合法**起点上调用 `resolve_interior_slide`,于是
+    /// 它只钉住了「子步细分能挡住一帧的长位移」。但真实的一帧还有静态层
+    /// (`CollisionWorld`)在**前面**跑过一遍,而它看不见室内墙 —— 它会把人
+    /// 推进墙里再推进墙那边。
+    ///
+    /// **这条钉住的是调用点的起点,不是函数。** 拿子步的起点从「静态层留下
+    /// 的落点」换成「这一帧的真起点」,函数本身一行没改,上一条照样绿,
+    /// 而真实应用里缺陷原样复现(CDP 实测:15 帧推进 15.25 m 到 x = 41.5)。
+    /// 差别在**参数**上,所以只能在串联了两层的这一层测出来。
+    ///
+    /// 静态层用**空世界**代替 `build_collision_world` 的产物:它按定义看不
+    /// 见室内墙(见 `step_vertical` 的注释),所以对「这堵墙有没有被静态层
+    /// 挡住」而言,空世界与真实城市是同一个答案 —— 都不挡。用空世界是为了
+    /// 让这条测试只依赖 `build_showcase_interiors` 的真实室内几何,不去重
+    /// 抄 1800+ 个 shape 的城市碰撞体。
+    #[test]
+    fn sprinting_through_a_full_frame_into_a_thin_wall_is_blocked() {
+        for index in 0..2 {
+            let w: FloorWorld = world();
+            let static_world: CollisionWorld = CollisionWorld::new();
+            let normal: Vec2 = front_normal(index);
+            let origin: Vec2 = stair_point(index, 4.30);
+            let (bmin, bmax): (Vec3, Vec3) = wall_box_ahead(&w, origin, normal)
+                .unwrap_or_else(|| panic!("{}", T_SHOWCASE_NO_WALL_AHEAD));
+            let reach: f32 = wall_face(origin, normal, bmin, bmax);
+            let mut here: Vec2 = origin;
+            for frame in 0..SPRINT_TUNNEL_BUDGET {
+                // ---- 静态层:看不见室内墙,于是照常推进(可能跨过整堵墙)。
+                let previous: Vec2 = here;
+                let after_static: Vec2 = static_world.resolve_slide(
+                    here,
+                    [
+                        normal[0] * SPRINT_FRAME_STRIDE,
+                        normal[1] * SPRINT_FRAME_STRIDE,
+                    ],
+                    PLAYER_RADIUS,
+                );
+                // ---- 室内层:起点是**帧真起点**,位移仍是静态层算出的整帧量。
+                //     (这正是 `step_vertical` 的调用方式。)
+                let travel: Vec2 = [after_static[0] - previous[0], after_static[1] - previous[1]];
+                here = w.resolve_interior_slide(
+                    previous,
+                    travel,
+                    SHOWCASE_GROUND_TOP,
+                    SHOWCASE_GROUND_TOP + PLAYER_BODY_HEIGHT,
+                    PLAYER_RADIUS,
+                );
+                let advanced: f32 =
+                    (here[0] - previous[0]) * normal[0] + (here[1] - previous[1]) * normal[1];
+                assert!(
+                    advanced <= reach - PLAYER_RADIUS + 1e-2,
+                    "{}",
+                    fill(
+                        T_SHOWCASE_SPRINT_TUNNELS_WALL,
+                        &[
+                            ("index", &format!("{index}")),
+                            ("frame", &format!("{frame}")),
+                            ("stride:.3", &format!("{SPRINT_FRAME_STRIDE:.3}")),
+                            ("face:.3", &format!("{:.3}", reach - PLAYER_RADIUS)),
+                            ("at:?", &format!("{here:?} 静态层落点 {after_static:?}")),
+                        ]
+                    )
+                );
+            }
+        }
+    }
+
     /// 点是否落在某个 AABB 的**内**部(留 `skin` 余量,贴在面上不算进去)。
     ///
     /// # Arguments
