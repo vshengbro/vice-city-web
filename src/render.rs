@@ -16,8 +16,8 @@ use euv::{
 
 use crate::{
     camera::{Mat4, is_back_facing},
-    r#const::*,
     mesh::{GpuMesh, f32_slice_to_bytes},
+    r#const::*,
     r#type::{Mat4Data, Rgb8, Vec3},
 };
 
@@ -110,6 +110,78 @@ fn instance_distance(instance: &Instance, eye: Vec3) -> f32 {
     let dy: f32 = m[13] - eye[1];
     let dz: f32 = m[14] - eye[2];
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// 阴影 pass 的保守剔除半径(米):一个实例只要中心落在
+/// `SHADOW_HALF_EXTENT` 的包围盒内、或者到视锥轴的距离小于这个半径,
+/// 就一定有一部分落在阴影 frustum 里。
+///
+/// 取 [`SHADOW_CULL_MARGIN`] 而不是 0:实例的平移列是**模型原点**,
+/// 而一辆车 / 一栋楼的模型原点通常在几何体中间偏下,几何体本身可以
+/// 伸出好几米。留 20 m 余量意味着「被剔除的实例一定离视锥 20 m 以外」,
+/// 地面上不会出现影子凭空消失的暗斑。
+///
+/// # Returns
+///
+/// - `f32` - 剔除余量(米),取 [`SHADOW_CULL_MARGIN`]。
+pub fn shadow_frustum_cull_radius() -> f32 {
+    SHADOW_CULL_MARGIN
+}
+
+/// 判断实例是否**可能**落进阴影 frustum。
+///
+/// 阴影 frustum 是**正交**盒:以 `focus` 为中心、XZ 方向半宽
+/// [`SHADOW_HALF_EXTENT`],沿光线方向从 `SHADOW_NEAR` 到 `SHADOW_FAR`。
+///
+/// 这里刻意**不**用「到 focus 的水平距离」那种球形判据:黄昏光
+/// (`light_dir = [0.86, 0.24, -0.44]`)相当斜,高楼顶的影子会被拉出
+/// 几十米远,一个只比视锥中心远一点、高却很高的楼,影子其实落在
+/// frustum 边缘之外 —— 球形判据会把它留下(无害),但反过来若用
+/// 纯水平判据且余量给小了,就会把「影子伸进 frustum」的实例误剔掉,
+/// 地面上凭空少一块影子。
+///
+/// 所以这里按**光空间**投影来判:把实例中心沿光线方向投影到 shadow
+/// frustum 的中心平面上,得到它在 XZ 上真正落点,再和半宽比。
+/// 落点 = `center + light_dir_horizontal * ((focus.y - center.y) / light_dir.y)`。
+/// 竖直光线(`|light_dir.y| < 1e-3`)时退化成「只看水平距离」,不会除零。
+///
+/// # Arguments
+///
+/// - `&Instance` - Instance 的只读引用。
+/// - `Vec3` - 阴影 frustum 的中心(世界坐标)。
+/// - `Vec3` - 指向光源的单位方向向量。
+///
+/// # Returns
+///
+/// - `bool` - 实例可能影响阴影贴图时为 `true`。
+pub fn instance_affects_shadow(instance: &Instance, focus: Vec3, light_dir: Vec3) -> bool {
+    let m: &Mat4Data = instance.get_model_ref();
+    let center: Vec3 = [m[12], m[13], m[14]];
+    // 判据要同时看**原点**和**原点往下挪一截**这两个落点。
+    //
+    // 只看原点会误剔:斜光下(`dusk` 光 y 分量仅 0.24)一栋 40 m 高的楼,
+    // 原点在 y = 40 时影子落点距 focus 119 m(在视锥外),而它的**底部**
+    // (y = 20)落点只有 61 m,仍在半宽 + 余量之内 —— 只测原点就会把
+    // 「影子还伸进视锥」的高楼整栋剔掉,地面上凭空少一块长影子。
+    //
+    // 往下挪 [`SHADOW_CULL_MARGIN`] 是最保守的写法:它覆盖「模型原点
+    // 不在几何体底部」的一切情况,代价只是视锥附近多留一圈实例。
+    let reach: f32 = SHADOW_HALF_EXTENT + shadow_frustum_cull_radius();
+    // 贴地光:光线没有竖直分量,影子不随高度平移,只看水平距离。
+    if light_dir[1].abs() <= SHADOW_GROUNDED_EPS {
+        let dx: f32 = center[0] - focus[0];
+        let dz: f32 = center[2] - focus[2];
+        return dx * dx + dz * dz <= reach * reach;
+    }
+    for probe in [center[1], center[1] - SHADOW_CULL_MARGIN] {
+        let along: f32 = (focus[1] - probe) / light_dir[1];
+        let dx: f32 = center[0] + light_dir[0] * along - focus[0];
+        let dz: f32 = center[2] + light_dir[2] * along - focus[2];
+        if dx * dx + dz * dz <= reach * reach {
+            return true;
+        }
+    }
+    false
 }
 
 /// 一个三角面在 CPU 侧的表示,软件渲染与 WebGL 共用。
@@ -4325,9 +4397,27 @@ impl WebGlRenderer {
                 if !batch.opaque || batch.instances.is_empty() || hidden.contains(&index) {
                     continue;
                 }
+                // 阴影 pass 只画 frustum 内的实例:整座城市每帧都往
+                // 2048² 的阴影贴图上提交顶点,而阴影 frustum 只覆盖
+                // 玩家周围 `SHADOW_HALF_EXTENT` 米 —— 视锥外那些实例
+                // 画上去的深度**永远不会被采样到**,是纯粹的浪费。
+                //
+                // 逐实例剔除而不是整批跳过的原因:一排行道树 / 一排路灯
+                // 往往跨在视锥边界上,整批丢会把还在范围内的影子也弄没。
+                let visible: Vec<Instance> = batch
+                    .instances
+                    .iter()
+                    .copied()
+                    .filter(|inst: &Instance| {
+                        instance_affects_shadow(inst, shadow_focus, lighting.light_dir)
+                    })
+                    .collect();
+                if visible.is_empty() {
+                    continue;
+                }
                 // 阴影 pass 不做近处剔除:被剔掉的实例如果还留着影子,
                 // 地面上会出现一块「无中生有」的暗斑。
-                self.draw_batch(batch.mesh_index, &batch.instances);
+                self.draw_batch(batch.mesh_index, &visible);
             }
         }
 
@@ -5049,5 +5139,149 @@ impl Renderer {
             Renderer::WebGl(_) => WEBGL2,
             Renderer::Software(_) => CANVAS2D,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::r#const::{
+        SHADOW_CULL_MARGIN, SHADOW_GROUNDED_EPS, SHADOW_HALF_EXTENT,
+        T_SHADOW_CULLS_OUTSIDE, T_SHADOW_GROUNDED_SAFE, T_SHADOW_KEEPS_CENTRE,
+        T_SHADOW_KEEPS_MARGIN, T_SHADOW_TALL_KEPT,
+    };
+    use crate::render::{Instance, instance_affects_shadow, normalize3};
+    use crate::r#type::Vec3;
+
+    /// 把断言文案里的 `{名字}` 占位符替换成实际数值。
+    fn fill(template: &str, args: &[(&str, &str)]) -> String {
+        let mut out: String = template.to_string();
+        let mut index: usize = 0;
+        while index < args.len() {
+            out = out.replace(&format!("{{{}}}", args[index].0), args[index].1);
+            index += 1;
+        }
+        out
+    }
+
+    /// 在给定位置造一个单位缩放的实例。
+    fn at(position: Vec3) -> Instance {
+        Instance::new(position, 0.0, 1.0, [1.0, 1.0, 1.0])
+    }
+
+    /// 游戏正午的真实光照方向(`render.rs` 里 `NOON` 那一档)。
+    fn noon_light() -> Vec3 {
+        normalize3([0.35, 0.86, 0.36])
+    }
+
+    /// 判据的有效半径:半宽 + 余量。
+    fn reach() -> f32 {
+        SHADOW_HALF_EXTENT + SHADOW_CULL_MARGIN
+    }
+
+    /// frustum 正中心的实例必须保留 —— 否则玩家脚下会没有影子。
+    #[test]
+    fn shadow_cull_keeps_frustum_centre() {
+        let focus: Vec3 = [12.0, 0.0, -34.0];
+        let kept: bool = instance_affects_shadow(&at(focus), focus, noon_light());
+        assert!(
+            kept,
+            "{}",
+            fill(
+                T_SHADOW_KEEPS_CENTRE,
+                &[("dist", "0.00"), ("reach", &format!("{:.2}", reach()))]
+            )
+        );
+    }
+
+    /// 远在 frustum 之外的实例必须被剔除 —— 这正是优化要的收益。
+    #[test]
+    fn shadow_cull_drops_far_instances() {
+        let focus: Vec3 = [0.0, 0.0, 0.0];
+        // 2 倍有效半径之外,肯定不可能有任何影子落进视锥。
+        let far: Vec3 = [reach() * 2.0, 0.0, 0.0];
+        let kept: bool = instance_affects_shadow(&at(far), focus, noon_light());
+        assert!(
+            !kept,
+            "{}",
+            fill(
+                T_SHADOW_CULLS_OUTSIDE,
+                &[
+                    ("dist", &format!("{:.2}", reach() * 2.0)),
+                    ("reach", &format!("{:.2}", reach()))
+                ]
+            )
+        );
+    }
+
+    /// 余量之内(视锥之外一点点)必须仍然保留:余量就是防「影子凭空消失」。
+    #[test]
+    fn shadow_cull_keeps_inside_margin() {
+        let focus: Vec3 = [0.0, 0.0, 0.0];
+        // 落在半宽与「半宽 + 余量」之间。
+        let edge: Vec3 = [SHADOW_HALF_EXTENT + SHADOW_CULL_MARGIN * 0.5, 0.0, 0.0];
+        let kept: bool = instance_affects_shadow(&at(edge), focus, noon_light());
+        assert!(
+            kept,
+            "{}",
+            fill(
+                T_SHADOW_KEEPS_MARGIN,
+                &[
+                    ("dist", &format!("{:.2}", SHADOW_HALF_EXTENT + SHADOW_CULL_MARGIN * 0.5)),
+                    ("reach", &format!("{:.2}", reach()))
+                ]
+            )
+        );
+    }
+
+    /// 贴地光(`light_dir.y` ≈ 0)不得除零,也不得把视锥内的实例剔掉。
+    #[test]
+    fn shadow_cull_survives_grounded_light() {
+        let focus: Vec3 = [0.0, 0.0, 0.0];
+        let flat: Vec3 = normalize3([1.0, 0.0, 0.0]);
+        let kept: bool = instance_affects_shadow(&at([1.0, 0.0, 0.0]), focus, flat);
+        assert!(
+            kept && flat[1].abs() <= SHADOW_GROUNDED_EPS,
+            "{}",
+            fill(
+                T_SHADOW_GROUNDED_SAFE,
+                &[
+                    ("ly", &format!("{:.6}", flat[1].abs())),
+                    ("dist", "1.00"),
+                    ("reach", &format!("{:.2}", reach()))
+                ]
+            )
+        );
+    }
+
+    /// 斜光下的高楼:影子被拉得很远,但只要落点还在视锥内就必须画。
+    ///
+    /// 这是光空间投影存在的理由 —— 只比「到 focus 的水平距离」的话,
+    /// 这栋楼会被误剔,地面上凭空少一块长影子。
+    #[test]
+    fn shadow_cull_keeps_tall_building_under_oblique_light() {
+        let focus: Vec3 = [0.0, 0.0, 0.0];
+        // 游戏里真实存在的黄昏光方向(`DUSK` 那一档)。
+        let dusk: Vec3 = normalize3([0.86, 0.24, -0.44]);
+        let height: f32 = 40.0;
+        // 楼刚好立在 frustum 边缘外一点,但斜光会把影子拉回视锥内。
+        let building: Vec3 = [SHADOW_HALF_EXTENT + 4.0, height, 0.0];
+        let kept: bool = instance_affects_shadow(&at(building), focus, dusk);
+        // 落点 = center + light_dir_xz * ((focus.y - center.y) / light_dir.y)
+        let along: f32 = (focus[1] - building[1]) / dusk[1];
+        let dist: f32 = ((building[0] + dusk[0] * along - focus[0]).powi(2)
+            + (building[2] + dusk[2] * along - focus[2]).powi(2))
+        .sqrt();
+        assert!(
+            kept,
+            "{}",
+            fill(
+                T_SHADOW_TALL_KEPT,
+                &[
+                    ("height", &format!("{height:.0}")),
+                    ("dist", &format!("{dist:.2}")),
+                    ("reach", &format!("{:.2}", reach()))
+                ]
+            )
+        );
     }
 }

@@ -2270,6 +2270,42 @@ pub const T_INTERIOR_STAIRWELL_IS_OPEN: &str =
 
 /// 验收通道:传送 / 走位 / 加速 / 探针请求挂在这个 window 属性上。
 pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";
+/// 阴影 pass 视锥剔除的保守余量(米)。
+///
+/// 实例的平移列是**模型原点**,几何体可以往外伸出好几米(一辆车 4 m 长、
+/// 一栋楼几十米高)。剔除时留这个余量,保证「被剔掉的实例一定离视锥
+/// 20 m 以外」—— 地面上不会出现影子凭空消失的暗斑。
+///
+/// 代价:frustum 附近会多画一圈实例。换来的是 frustum 内**一个顶点都不少**。
+pub(crate) const SHADOW_CULL_MARGIN: f32 = 20.0;
+
+/// `light_dir.y` 的下限阈值:低于它就认为光线太平(垂直于地面),
+/// 此时不能拿 `focus.y - center.y` 去除(除零 / 放大到天上)。
+///
+/// 正午光 `[0.35, 0.86, 0.36]` 的 y 分量是 0.86,离阈值很远;
+/// 这个阈值只为「万一将来出现贴地光」兜底。
+pub(crate) const SHADOW_GROUNDED_EPS: f32 = 1.0e-3;
+
+/// 单元测试断言文案:frustum 中心的实例必须保留。
+pub(crate) const T_SHADOW_KEEPS_CENTRE: &str =
+    "阴影 frustum 中心的实例被剔掉了(距 {dist:.2} m ≤ 半宽 + 余量 = {reach:.2})";
+
+/// 单元测试断言文案:frustum 之外的实例必须剔除。
+pub(crate) const T_SHADOW_CULLS_OUTSIDE: &str =
+    "阴影 frustum 外的实例(距 {dist:.2} m)没被剔除,应当 > 半宽 + 余量 = {reach:.2}";
+
+/// 单元测试断言文案:余量内的实例必须保留(余量存在的意义就在这里)。
+pub(crate) const T_SHADOW_KEEPS_MARGIN: &str =
+    "余量内的实例被剔掉了(距 {dist:.2} m,半宽 + 余量 = {reach:.2})";
+
+/// 单元测试断言文案:贴地光下判据不得除零,也不得把视锥内的实例剔掉。
+pub(crate) const T_SHADOW_GROUNDED_SAFE: &str =
+    "贴地光(|light_dir.y| = {ly:.6})下阴影判据失稳:距 {dist:.2} m,半宽 + 余量 = {reach:.2}";
+
+/// 单元测试断言文案:高楼在斜光下仍然必须参与阴影渲染。
+pub(crate) const T_SHADOW_TALL_KEPT: &str =
+    "斜光下 {height:.0} m 高的楼被剔掉了(落点距 {dist:.2} m,半宽 + 余量 = {reach:.2})";
+
 /// 单元测试断言文案:车少了(批次没建出来)。
 pub(crate) const T_CAR_BODY_BATCH_MISSING: &str =
     "只建出 {cars} 个车身批次,车没建全 —— 车身批次必须每辆车一个,不能按 mesh_index 共用";
