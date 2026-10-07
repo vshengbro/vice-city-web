@@ -27,6 +27,13 @@ pub const TURN_RATE: f32 = 11.0;
 pub const GAIT_RATE_PER_METER: f32 = 2.6;
 /// 肢体摆动幅度上限(弧度)。
 pub const LIMB_SWING: f32 = 0.62;
+/// 脚相对小腿的**自转**摆角上限(弧度)。
+///
+/// 取 0 而不是非零:脚是被小腿**带着走**的,踝关节自身在这套骨架里
+/// 不额外发力。留成可调常量是为了把「不摆」这件事显式写进骨架表,而不是
+/// 靠「表里没登记」来隐式实现 —— 后者正是本缺陷的成因(见 [`LIMB_PLAN`]
+/// 里鞋那一段的注释)。要加踝部旋转时改这一个数即可。
+pub const FOOT_SWING: f32 = 0.0;
 /// 停止后相位回零的速率(1/秒)。
 pub const GAIT_RELAX_RATE: f32 = 6.5;
 /// 起步 / 停步时速度的指数趋近速率(1/秒)。
@@ -75,6 +82,19 @@ pub const LIMB_PLAN: &[(&str, &str, f32, f32)] = &[
         GAIT_PHASE_R,
         LIMB_SWING * 0.9,
     ),
+    // 鞋挂在**小腿**上,不是躯干上。
+    //
+    // 漏掉这两项时 `limb_swing` 对鞋返回 `0.0`,于是鞋的矩阵退化成纯位姿
+    // (只有 `T(origin)·Ry(yaw)`),整条腿绕髋转起来时脚留在原地 —— 表现
+    // 就是「鞋子不跟随腿部」。实测(HEAD `25f4a53`):走路时 `shoe_L` 的平移列
+    // 恒等于 `origin`,而 `lower_leg_L` 在 ±0.39 m 之间摆动。
+    //
+    // 摆角取 `0`:脚本身相对小腿**不摆**,它是被小腿带着走的。GTA V 里
+    // 落脚那一瞬有轻微的踝部旋转,那属于摆动相位而不是幅度问题,靠
+    // `SWING` 之外的相位项表达;在这里给一个与小腿同相位的常量会把脚
+    // 变成第二条腿。
+    (PART_SHOE_L, PART_LOWER_LEG_L, GAIT_PHASE_L, FOOT_SWING),
+    (PART_SHOE_R, PART_LOWER_LEG_R, GAIT_PHASE_R, FOOT_SWING),
 ];
 
 /// 查某个 part 的父 part 名。
@@ -786,17 +806,18 @@ mod tests {
     use crate::camera::Mat4;
     use crate::collision::CollisionWorld;
     use crate::r#const::{
-        DIAGONAL_SPEED_TOLERANCE, KEY_DIAGONAL, KEY_MODE, KEY_PART, KEY_STRAIGHT,
-        MODE_SPRINT, MODE_WALK, PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_UPPER_ARM_L,
+        DIAGONAL_SPEED_TOLERANCE, KEY_DIAGONAL, KEY_MODE, KEY_PART, KEY_STRAIGHT, MODE_SPRINT,
+        MODE_WALK, PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_SHOE_R, PART_UPPER_ARM_L,
         PART_UPPER_LEG_L, PED_BOB_HEIGHT, T_DIAGONAL_MATCHES_STRAIGHT,
         T_DISTAL_INHERITS_PARENT_SWING, T_DISTAL_LIMB_HAS_PARENT, T_FACING_MATCHES_VELOCITY,
         T_HALF_INPUT_STAYS_HALF_SPEED, T_LEGS_ANTIPHASE, T_LIMB_STAYS_AT_ASSET_HEIGHT,
         T_LIMBS_RELAX_TO_ZERO, T_PARENT_IN_PLAN, T_PED_BOB_DOUBLE_FREQUENCY,
-        T_PED_BOB_OUT_OF_PHASE, T_SAME_SIDE_IN_PHASE, T_STRAIGHT_KEEPS_FULL_SPEED,
+        T_PED_BOB_OUT_OF_PHASE, T_SAME_SIDE_IN_PHASE, T_SHOE_FOLLOWS_SHIN,
+        T_STRAIGHT_KEEPS_FULL_SPEED,
     };
     use crate::player::{
-        GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, RUN_SPEED, WALK_SPEED, Player,
-        facing_yaw, limb_chain_matrix, limb_parent, limb_swing,
+        GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, Player, RUN_SPEED, WALK_SPEED,
+        facing_yaw, joint_pivot, limb_chain_matrix, limb_parent, limb_swing,
     };
     use crate::r#type::{Mat4Data, Vec2, Vec3};
 
@@ -1121,6 +1142,179 @@ mod tests {
         }
     }
 
+    /// 鞋必须挂在**小腿**上,并且真的跟着腿走。
+    ///
+    /// 这是「鞋子不跟随腿部」的回归测试。缺陷成因是 `LIMB_PLAN` 只登记了
+    /// 8 节肢体(上臂 / 小臂 ×2、大腿 / 小腿 ×2),`shoe_L` / `shoe_R` 根本
+    /// 不在表里 —— `limb_swing` 对它们返回 `0.0`,矩阵退化成纯位姿,
+    /// 于是腿绕髋转起来时脚留在原地。
+    ///
+    /// 断言分两层,少任何一层都会漏掉一种坏法:
+    ///
+    /// 1. **骨架表**:鞋有父 part,且父 part 是**小腿**(不是躯干、不是大腿)。
+    ///    父节点指错的话鞋会跟着躯干走,同样表现为「脚跟不上腿」。
+    /// 2. **变换结果**:把整条腿的链矩阵跑一遍,取鞋盒里一个离踝关节最远
+    ///    的角点(脚尖),断言它**离开**了静止姿态的位置。只断言 `swing`
+    ///    的符号是不够的 —— 摆角为 0 但链串对了的情形同样会让脚跟随,
+    ///    所以这里判的是世界坐标,不是角度。
+    ///
+    /// 静止姿态用摆角全 0 复现(和渲染端 `gait_amount == 0` 一致)。
+    #[test]
+    fn shoes_follow_the_shin_through_the_limb_chain() {
+        // --- 1. 骨架表层 ---
+        assert_eq!(
+            limb_parent(PART_SHOE_L),
+            PART_LOWER_LEG_L,
+            "{T_SHOE_FOLLOWS_SHIN}: 左鞋必须挂在左小腿上,实得父 {}",
+            limb_parent(PART_SHOE_L)
+        );
+        assert_eq!(
+            limb_parent(PART_SHOE_R),
+            crate::r#const::PART_LOWER_LEG_R,
+            "{T_SHOE_FOLLOWS_SHIN}: 右鞋必须挂在右小腿上,实得父 {}",
+            limb_parent(PART_SHOE_R)
+        );
+
+        // --- 2. 变换层:脚尖必须随小腿摆动 ---
+        // 枢轴不写死:和渲染端一样从**资产包围盒**推出(`joint_pivot`),
+        // 所以换模型时这条断言跟着变,不会钉死一份过期魔法坐标。
+        // 实测包围盒(`www/assets/ped_suit.json` 的 positions):
+        //   lower_leg_L  x 0.0304..0.1916, y 0.0976..0.4856, z -0.0806..0.0806
+        //   shoe_L       x 0.0630..0.1650, y 0.0000..0.1120, z  0.1260..0.3780
+        let shin_bounds: (Vec3, Vec3) = ([0.0304, 0.0976, -0.0806], [0.1916, 0.4856, 0.0806]);
+        let shoe_bounds: (Vec3, Vec3) = ([0.0630, 0.0000, 0.1260], [0.1650, 0.1120, 0.3780]);
+        // 渲染端(`game.rs:7962-7967`):父 part 有值时 `root_pivot` 取**父**
+        // 的枢轴,`pivot` 取自己的;`root_swing` 是**父**的摆角。这里逐字
+        // 复刻鞋的那一次调用。
+        let root_pivot: Vec3 = joint_pivot(PART_LOWER_LEG_L, shin_bounds);
+        let own_pivot: Vec3 = joint_pivot(PART_SHOE_L, shoe_bounds);
+        let toe: Vec3 = [0.063, 0.0, 0.378];
+
+        let shin_swing: f32 = limb_swing(PART_LOWER_LEG_L, 0.9, 1.0);
+        let shoe_swing: f32 = limb_swing(PART_SHOE_L, 0.9, 1.0);
+        assert!(
+            shin_swing.abs() > 1.0e-3,
+            "{T_SHOE_FOLLOWS_SHIN}: 选的相位上小腿必须在摆(膝 {shin_swing}),否则这条断言是空的"
+        );
+
+        // 摆角为 0 = 站立姿态(与渲染端 `gait_amount == 0` 一致)。
+        let rest: Mat4 = limb_chain_matrix([0.0, 0.0, 0.0], 0.0, root_pivot, own_pivot, 0.0, 0.0);
+        let posed: Mat4 = limb_chain_matrix(
+            [0.0, 0.0, 0.0],
+            0.0,
+            root_pivot,
+            own_pivot,
+            shin_swing,
+            shoe_swing,
+        );
+
+        let rest_toe: Vec3 = apply(&rest, toe);
+        let posed_toe: Vec3 = apply(&posed, toe);
+        let moved: f32 = ((posed_toe[0] - rest_toe[0]).powi(2)
+            + (posed_toe[1] - rest_toe[1]).powi(2)
+            + (posed_toe[2] - rest_toe[2]).powi(2))
+        .sqrt();
+        assert!(
+            moved > 0.02,
+            "{}{}",
+            fill(
+                T_SHOE_FOLLOWS_SHIN,
+                &[
+                    (KEY_PART, PART_SHOE_L),
+                    ("moved", &format!("{moved:.4}")),
+                    ("hip", &format!("{shin_swing:.3}")),
+                    ("knee", &format!("{shoe_swing:.3}")),
+                ]
+            ),
+            " —— 脚尖必须离开静止位置(它挂在小腿上)"
+        );
+
+        // **独立第二条路径**:手算 `T(knee)·Rx(knee_a)·T(-knee)` 作用在脚尖上
+        // 的结果,必须与 `limb_chain_matrix` 逐分量相等。
+        //
+        // 只有「动了」不够:一个把鞋挂到**躯干**上的实现同样会让脚尖移动。
+        // 手算值把枢轴写死在测试里,所以父节点挂错时两条路径必然分叉。
+        // `FOOT_SWING = 0` ⇒ 鞋自身不转,于是整条链退化成绕膝的一次旋转。
+        let offset: Vec3 = [
+            toe[0] - root_pivot[0],
+            toe[1] - root_pivot[1],
+            toe[2] - root_pivot[2],
+        ];
+        let (sine, cosine): (f32, f32) = shin_swing.sin_cos();
+        // `Mat4::rotation_x` 列主序 ⇒ `y' = y·cos - z·sin`、`z' = y·sin + z·cos`
+        let hand: Vec3 = [
+            root_pivot[0] + offset[0],
+            root_pivot[1] + offset[1] * cosine - offset[2] * sine,
+            root_pivot[2] + offset[1] * sine + offset[2] * cosine,
+        ];
+        assert!(
+            (posed_toe[0] - hand[0]).abs() < 1.0e-4
+                && (posed_toe[1] - hand[1]).abs() < 1.0e-4
+                && (posed_toe[2] - hand[2]).abs() < 1.0e-4,
+            "{T_SHOE_FOLLOWS_SHIN}: 脚尖必须绕**膝**摆(父 = 小腿),实得 {posed_toe:?} 应为 {hand:?}"
+        );
+
+        // 左右两条腿的鞋必须反相 —— 脚同相就是「两条腿一起蹦」。
+        //
+        // 判**相位偏移**而不是判摆角乘积:`FOOT_SWING = 0` 时两个摆角都
+        // 恒为 0,乘积永远是 0,拿它当断言等于断言 `0 < 0`(恒假)。
+        // 左右反相是骨架表的**相位列**属性,与幅度无关。
+        //
+        // 每只鞋的相位必须**等于它那条腿**的相位 —— 挂错腿时两者会分叉。
+        for (shoe, leg) in [
+            (PART_SHOE_L, PART_UPPER_LEG_L),
+            (PART_SHOE_R, crate::r#const::PART_UPPER_LEG_R),
+        ] {
+            let mut shoe_phase: Option<f32> = None;
+            let mut leg_phase: Option<f32> = None;
+            for (part, parent, phase, _) in LIMB_PLAN {
+                if *part == shoe {
+                    shoe_phase = Some(*phase);
+                    assert_eq!(
+                        *parent,
+                        if shoe == PART_SHOE_L {
+                            PART_LOWER_LEG_L
+                        } else {
+                            crate::r#const::PART_LOWER_LEG_R
+                        },
+                        "{T_SHOE_FOLLOWS_SHIN}: {shoe} 必须挂在对应的小腿上"
+                    );
+                }
+                if *part == leg {
+                    leg_phase = Some(*phase);
+                }
+            }
+            assert!(
+                shoe_phase.is_some(),
+                "{T_SHOE_FOLLOWS_SHIN}: {shoe} 没有登记进 LIMB_PLAN(它将永远不随腿动)"
+            );
+            assert_eq!(
+                shoe_phase, leg_phase,
+                "{T_SHOE_FOLLOWS_SHIN}: {shoe} 的相位必须与 {leg} 一致,否则脚会跟错腿"
+            );
+        }
+
+        // 左右相位差必须正好是 π。上面那轮循环已经取到了左右鞋的相位,
+        // 这里直接比较二者的差,不再重新查表。
+        let left_phase: f32 = LIMB_PLAN
+            .iter()
+            .find_map(|(part, _, phase, _): &(&str, &str, f32, f32)| {
+                (*part == PART_SHOE_L).then_some(*phase)
+            })
+            .unwrap_or(0.0);
+        let right_phase: f32 = LIMB_PLAN
+            .iter()
+            .find_map(|(part, _, phase, _): &(&str, &str, f32, f32)| {
+                (*part == PART_SHOE_R).then_some(*phase)
+            })
+            .unwrap_or(0.0);
+        let gap: f32 = (right_phase - left_phase).abs();
+        assert!(
+            (gap - GAIT_PHASE_R).abs() < 1.0e-4,
+            "{T_SHOE_FOLLOWS_SHIN}: 左右脚相位差必须等于 π(反相),实得 {gap}"
+        );
+    }
+
     /// 小腿 / 小臂必须挂在父 part 上 —— 没有父关节的串联,腿会断成两截。
     #[test]
     fn distal_limbs_declare_their_parent_joint() {
@@ -1203,10 +1397,7 @@ mod tests {
                             (KEY_MODE, mode),
                             (
                                 "diagonal",
-                                &format!(
-                                    "W{:+}",
-                                    if diagonal[0] > 0.0 { "D" } else { "A" }
-                                )
+                                &format!("W{:+}", if diagonal[0] > 0.0 { "D" } else { "A" })
                             ),
                             ("got:.4", &format!("{got:.4}")),
                             (KEY_STRAIGHT, "W"),

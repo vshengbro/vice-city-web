@@ -2277,6 +2277,10 @@ pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";
 /// 20 m 以外」—— 地面上不会出现影子凭空消失的暗斑。
 ///
 /// 代价:frustum 附近会多画一圈实例。换来的是 frustum 内**一个顶点都不少**。
+/// 鞋必须挂在小腿上,并跟着腿的链一起摆(用户报的「鞋子不跟随腿部」)。
+pub(crate) const T_SHOE_FOLLOWS_SHIN: &str =
+    "{part} 必须挂在小腿上并随腿摆动:脚尖实测只移动了 {moved} m(髋 {hip} / 膝 {knee} 弧度)";
+
 pub(crate) const SHADOW_CULL_MARGIN: f32 = 20.0;
 
 /// `light_dir.y` 的下限阈值:低于它就认为光线太平(垂直于地面),
