@@ -429,8 +429,17 @@ impl TrafficCar {
         // 死区按**速度的绝对值**判:倒车时 `speed` 是负的,但倒车一样要能
         // 打方向(倒库全靠它)。写 `speed > STEER_MIN_SPEED` 会让整段倒车
         // 永远转不动 —— 速度为负时那个判断恒假。
+        //
+        // 负号是转向符号的**根因修复**。本文件的 yaw 约定来自第 6 步的
+        // `fwd = [cos yaw, −sin yaw]`,于是
+        // `d(fwd)/d(yaw) = [−sin yaw, −cos yaw]` —— 那是车头的**左**方向。
+        // 也就是说 yaw 增大 = 车向左转,而 `steer` 的契约是「正 = 右转」
+        // (`steer_sign` 对 KEYD / ARROWRIGHT 返回 +1)。两边基准不同,所以
+        // `yaw_rate` 必须带一个负号才对齐;少了它,按 D 会把车往左拐 ——
+        // 这正是「方向键反向」的全部来源。符号不是从直觉定的,是从这个
+        // `fwd` 表达式推出来的。
         let yaw_rate: f32 = if speed.abs() > STEER_MIN_SPEED {
-            steer * STEER_RATE * grip_scale
+            -steer * STEER_RATE * grip_scale
         } else {
             0.0
         };

@@ -2134,9 +2134,13 @@ pub const SLOT_FORMER_RELOAD_KEY: &str = "KeyC";
 pub const T_ARROW_STEERS_WHILE_DRIVING: &str =
     "驾驶时方向键必须产生非零转向,{key} 实得 steer={got}";
 
-/// 回归测试:左右方向键的转向符号必须相反,且左负右正。
+/// 回归测试:左右方向键必须把车**真的**转向相反的两侧。
+///
+/// 判据是几何量(车头朝向的变化朝世界的哪一边),不是 `Δyaw` 的符号 ——
+/// `Δyaw` 的正负取决于 yaw 的定义基准,拿它当判据等于把「yaw 增大 =
+/// 左转」这个约定硬编码进测试,而那个约定正是本缺陷藏身的地方。
 pub const T_ARROW_STEER_SIGNS_OPPOSED: &str =
-    "左右方向键的转向必须符号相反,左(ArrowLeft) 实得 {left},右(ArrowRight) 实得 {right}";
+    "左右方向键必须把车转向相反两侧,左(ArrowLeft) 朝{left_side},右(ArrowRight) 朝{right_side}";
 
 /// 回归测试:方向键不得接管步行移动 —— GTA V 的移动只用 WASD。
 pub const T_ARROW_DOES_NOT_MOVE_ON_FOOT: &str =

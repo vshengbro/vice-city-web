@@ -11097,16 +11097,27 @@ mod tests {
         crate::traffic::TrafficCar::new(CAR_SEDAN, 0.0, 0.0, 8.0, 1.0)
     }
 
-    /// 方向键在**驾驶**时必须真的把车转出角度,符号相反。
+    /// 方向键在**驾驶**时必须真的把车转向相反的两侧。
     ///
     /// 走的是完整的 `drive()` 而不只是 `steer_axis()`:这正是漏接线时
-    /// 会漏掉的那一段。`+steer` 按 `drive` 的文档约定是右转,所以
-    /// ArrowRight 的 yaw 必须**大于** ArrowLeft 的。
+    /// 会漏掉的那一段。
+    ///
+    /// 判据用**几何**而不是 `Δyaw` 的符号:本文件的 yaw 约定是
+    /// `fwd = [cos yaw, −sin yaw]`,于是 `yaw` 增大 = 车向左转,而键位
+    /// 契约是「ArrowRight = 右转」。断言 `Δyaw > 0` 等于断言「yaw 增大 =
+    /// 右转」,那是一条假约定,照它写测试会让「方向键反向」这个缺陷永远
+    /// 绿着通过(原来的断言就是这样)。这里改为:车头朝向的变化在**世界
+    /// 右手系**下朝哪一侧,ArrowRight 必须朝右。
     #[test]
     fn arrow_keys_steer_the_car_while_driving() {
         let world: CollisionWorld = CollisionWorld::new();
         let delta: f32 = 1.0 / 60.0;
-        let mut deltas: Vec<(String, f32)> = Vec::new();
+        // 世界「右」的基准:由玩家自己的前向定义钉死,不引入新约定。
+        // `simulate` 里步行用的前向就是 `[cos yaw, −sin yaw]`,它的右手侧
+        // 是 `[sin yaw, cos yaw]`(`camera.rs` 与 `game.rs` 用的是同一套)。
+        let world_right: fn(f32) -> [f32; 2] = |yaw: f32| [yaw.sin(), yaw.cos()];
+
+        let mut rows: Vec<(String, f32)> = Vec::new();
         for code in [ARROWLEFT, ARROWRIGHT] {
             let input: super::InputState = input_holding(&[code]);
             let steer: f32 = input.steer_axis();
@@ -11138,17 +11149,28 @@ mod tests {
                     ]
                 )
             );
-            deltas.push((String::from(code), turned));
+            // 车头朝向的变化量,投影到起始朝向的世界右手侧。
+            let f0: [f32; 2] = [yaw0.cos(), -yaw0.sin()];
+            let f1: [f32; 2] = [car.get_yaw().cos(), -car.get_yaw().sin()];
+            let r: [f32; 2] = world_right(yaw0);
+            let lateral: f32 = (f1[0] - f0[0]) * r[0] + (f1[1] - f0[1]) * r[1];
+            rows.push((String::from(code), lateral));
         }
-        let (left, right): (&(String, f32), &(String, f32)) = (&deltas[0], &deltas[1]);
+        let (left, right): (&(String, f32), &(String, f32)) = (&rows[0], &rows[1]);
         assert!(
             left.1 < 0.0 && right.1 > 0.0,
             "{}",
             fill(
                 T_ARROW_STEER_SIGNS_OPPOSED,
                 &[
-                    ("left", &format!("{:.4}", left.1)),
-                    ("right", &format!("{:.4}", right.1)),
+                    (
+                        "left_side",
+                        &String::from(if left.1 < 0.0 { "左" } else { "右" })
+                    ),
+                    (
+                        "right_side",
+                        &String::from(if right.1 > 0.0 { "右" } else { "左" })
+                    ),
                 ]
             )
         );
