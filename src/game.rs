@@ -3188,7 +3188,8 @@ pub fn rebuild_streamed_surface(
     index_map: &HashMap<String, usize>,
     static_batch_count: usize,
 ) -> (Vec<usize>, usize) {
-    let new_static_count: usize = rebuild_static_batches(scene, index_map, static_batch_count, cx, cz);
+    let new_static_count: usize =
+        rebuild_static_batches(scene, index_map, static_batch_count, cx, cz);
     let mut rewritten: Vec<usize> = Vec::new();
     let surfaces: [(usize, MeshAsset); 2] = [
         (ground_batch, build_ground_near(cx, cz)),
@@ -4954,13 +4955,20 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
                 .iter()
                 .map(|ped: &Pedestrian| {
                     let at: Vec3 = ped.get_position();
+                    // `bob` 是**实际写进渲染矩阵的那个 Y 偏移**,和渲染
+                    // 走同一个函数 [`ped_bob`]。验收脚本要靠它判「身体
+                    // 起伏的波峰有没有和落脚对齐」:脚点屏幕 Y 会混进透视,
+                    // 读矩阵里的 Y 才是唯一不受相机影响的读数。
+                    let bob: f32 = ped_bob(ped);
                     format!(
-                        "{{\"x\":{:.2},\"z\":{:.2},\"down\":{},\"gait\":{:.2},\"gaitPhase\":{:.4}}}",
+                        "{{\"x\":{:.2},\"z\":{:.2},\"down\":{},\"gait\":{:.2},\
+                         \"gaitPhase\":{:.4},\"bob\":{:.5}}}",
                         at[0],
                         at[2],
                         ped.is_down(),
                         ped.get_gait_amount(),
-                        ped.get_gait_phase()
+                        ped.get_gait_phase(),
+                        bob
                     )
                 })
                 .collect();
@@ -7324,6 +7332,39 @@ fn join_talk(peds: &mut [Pedestrian], index: usize, slot: usize, center: Vec2, t
     ]);
 }
 
+/// 行人身体在起伏上的 Y 偏移。
+///
+/// # Arguments
+///
+/// - `&Pedestrian` - 行人。
+///
+/// # Returns
+///
+/// - `f32` - 世界 Y 偏移(米)。站定时是 0。
+///
+/// 渲染与调试读数**共用这一个函数**:验收脚本判「起伏的波峰有没有和落脚
+/// 对齐」读的就是它,两边不可能算出不一样的数。
+///
+/// 起伏必须**与落脚同相**。肢体摆动是 `sin(phase)`,脚在
+/// `phase = 0 / pi` 时腿摆角为 0 —— 那正是腿伸直、脚踏实地的瞬间
+/// (见 `player::limb_swing` 与 `GAIT_PHASE_L/R`)。原来的
+/// `sin(phase * 2.0)` 把波峰落在 `phase = pi/4 / 5pi/4`,也就是
+/// **脚还悬在半空摆动的中段** —— 身体在脚没落地时反而最高,脚一落地
+/// 身体正好过零。每一个波峰都错开四分之一个步周期,叠起来就是弹簧,
+/// 这就是用户报的「NPC 蹦蹦跳跳」。
+///
+/// `* 2.0` 的**频率**是对的,别删:落脚每 `pi` 相位一次,而重心每一步
+/// 起伏一次,所以起伏确实是步态相位的两倍频。错的是相位 —— 要的是
+/// **每一步落地都抬到最高**,波峰必须落在 `0` 与 `pi`,也就是
+/// `cos(phase * 2.0)` 而不是 `sin(phase * 2.0)`。
+///
+/// # Panics
+///
+/// 不会 panic。
+fn ped_bob(ped: &Pedestrian) -> f32 {
+    (ped.get_gait_phase() * 2.0).cos() * PED_BOB_HEIGHT * ped.get_gait_amount()
+}
+
 /// 把敌人与行人的姿态写回场景批次。
 ///
 /// **距离剔除**:超过 `ENEMY_RENDER_RANGE` 的敌人实例直接不写 —— 批次
@@ -7405,8 +7446,9 @@ fn sync_combat_instances(game: &mut Game) {
             continue;
         }
         // 行人不做逐部件骨架(那要 13 个批次 × 18 个行人),整具一个矩阵:
-        // 走路时靠 Y 轴的轻微上下起伏表达「在走」。
-        let bob: f32 = (ped.get_gait_phase() * 2.0).sin() * PED_BOB_HEIGHT * ped.get_gait_amount();
+        // 走路时靠 Y 轴的轻微上下起伏表达「在走」。相位为什么必须这样选,
+        // 见 [`ped_bob`]。
+        let bob: f32 = ped_bob(ped);
         let lift: Vec3 = [at[0], at[1] + bob, at[2]];
         let model: Mat4 = body_matrix(lift, ped.get_yaw(), 1.0);
         let tint: Vec3 = if ped.is_down() {
@@ -7469,10 +7511,7 @@ fn axis(input: &InputState, positive: &str, negative: &str) -> f32 {
 ///
 /// - `bool` - 是方向盘键时为真。
 fn is_steer_key(code: &str) -> bool {
-    let steer: bool = code == KEYA
-        || code == KEYD
-        || code == ARROWLEFT
-        || code == ARROWRIGHT;
+    let steer: bool = code == KEYA || code == KEYD || code == ARROWLEFT || code == ARROWRIGHT;
     steer
 }
 
@@ -7489,11 +7528,7 @@ fn is_steer_key(code: &str) -> bool {
 /// - `f32` - 舵角。
 fn steer_sign(code: &str) -> f32 {
     let right: bool = code == KEYD || code == ARROWRIGHT;
-    if right {
-        1.0
-    } else {
-        -1.0
-    }
+    if right { 1.0 } else { -1.0 }
 }
 
 /// 把跟随焦点推向玩家,并在第三人称模式下重摆相机。
@@ -7951,7 +7986,22 @@ fn spawn_player_traffic_pickups(
         let Some(mesh_index) = index_map.get(asset) else {
             continue;
         };
-        let batch: usize = find_or_create_batch(&mut game.scene, *mesh_index);
+        // 车身**必须每辆车一个批次**,不能像静态道具那样按 `mesh_index` 共用。
+        //
+        // `find_or_create_batch` 找的是「已有的、mesh 相同的批次」,而
+        // `TRAFFIC_LANES` 里 10 辆车只有 5 种车型 —— 于是同车型的车拿到
+        // **同一个批次下标**。接着 `sync_dynamic_instances` 对每辆车做
+        // `instances.clear()` 再 push:第 2 辆同车型的车会把第 1 辆刚写进去的
+        // 车身矩阵清掉。一帧跑完,每种车型只剩**最后一辆**的车身,另外 6 辆
+        // 的车身是空的 —— 实测 10 辆车只有 4 个车身批次有实例。
+        //
+        // 车轮没有这个问题:它们走 `push_batch_with_cull`,每辆车 4 个独立批次。
+        // 于是画面正好是用户报的「汽车建模只有轮子,车身消失」—— 40 个轮子全在,
+        // 车身只剩零星几辆。
+        //
+        // 姿态独立(每辆车一个 model matrix)是批次的职责,静态道具之所以能共用
+        // 批次,是因为它们的矩阵是构造时就固定好的、之后没人重写。
+        let batch: usize = game.scene.push_batch_with_cull(*mesh_index, true, false);
         game.car_batches.push(batch);
         // 车轮:每辆车四个轮子各一个批次。
         //
@@ -9015,12 +9065,13 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ARROWLEFT, ARROWRIGHT, ARROWUP, ARROWDOWN, Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV, KEYA,
-        KEYD, KEYS, KEYW, LOOK_YAW_SENSITIVITY, Mat4, RUN_OVER_WALK_MIN, T_AD_AND_ARROW_DO_NOT_CANCEL,
+        ARROWDOWN, ARROWLEFT, ARROWRIGHT, ARROWUP, Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV,
+        Instance, KEYA, KEYD, KEYS, KEYW, LOOK_YAW_SENSITIVITY, Mat4, MeshAssetGpu,
+        RUN_OVER_WALK_MIN, Scene, SceneBatch, T_AD_AND_ARROW_DO_NOT_CANCEL,
         T_ARROW_DOES_NOT_MOVE_ON_FOOT, T_ARROW_STEER_SIGNS_OPPOSED, T_ARROW_STEERS_WHILE_DRIVING,
         T_FOOT_POSITION_UNCHANGED, T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK,
-        T_RUN_SPEED_PICK, T_WALK_SPEED_PICK, apply_look_delta, car_wheel_model,
-        Instance, MeshAssetGpu, Scene, SceneBatch, rebuild_static_batches,
+        T_RUN_SPEED_PICK, T_WALK_SPEED_PICK, TRAFFIC_LANES, apply_look_delta, car_wheel_model,
+        rebuild_static_batches,
     };
     /// 一个世界点投影后的屏幕 NDC x(未做像素映射)。
     ///
@@ -9055,30 +9106,30 @@ mod tests {
     use crate::collision::CollisionWorld;
     use crate::combat::Pedestrian;
     use crate::r#const::{
-        AXIS_STRAFE, CAR_SEDAN, GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY, PED_SUIT,
-        PED_TALK_SLOT_STEP, PISTOL_MAGAZINE, PLAYER_BODY_HEIGHT, RELOAD_TIME,
-        SLOT_FORMER_RELOAD_KEY, SLOT_RELOAD_KEY, T_C_NO_LONGER_RELOADS, T_JUMP_CLEARS_A_LEDGE,
+        AXIS_STRAFE, CAR_SEDAN, GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY, KEY_BATCH,
+        PED_SUIT, PED_TALK_SLOT_STEP, PISTOL_MAGAZINE, PLAYER_BODY_HEIGHT, RELOAD_TIME,
+        SLOT_FORMER_RELOAD_KEY, SLOT_RELOAD_KEY, T_C_NO_LONGER_RELOADS, T_CAR_BODY_BATCH_MISSING,
+        T_CAR_BODY_BATCH_NOT_TAIL, T_CAR_BODY_BATCH_SHARED, T_JUMP_CLEARS_A_LEDGE,
         T_JUMP_LANDS_STANDING, T_JUMP_ONLY_FROM_GROUND, T_JUMP_RISES_BEFORE_FALLING,
-        T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT, T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS,
-        T_RELOAD_CONSUMES_RESERVE, T_RELOAD_KEY_IS_GTA_R, T_RELOAD_NOT_REPEATABLE,
-        T_RELOAD_R_REFILLS_MAGAZINE, T_RELOAD_R_STARTS_RELOAD, T_ROUTE_LEG_DIAGONAL,
-        T_PALM_ON_ROADWAY, T_PALM_ROW_IS_UNIFORM, T_SHOWCASE_AXIS_ON_ROAD,
-        T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DESCENT_NO_CLIMB,
-        T_SHOWCASE_DESCENT_REACHES_GROUND, T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE,
-        T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL,
-        T_SHOWCASE_DOOR_OUTSIDE_BLOCKED, T_SHOWCASE_DOORS_FACE_EACH_OTHER,
-        T_SHOWCASE_DOORWAY_2D_BLOCKED, T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING,
-        T_SHOWCASE_LANDING_COVERS_RUN, T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_NO_WALL_AHEAD,
-        T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
+        T_PALM_ON_ROADWAY, T_PALM_ROW_IS_UNIFORM, T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT,
+        T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS, T_RELOAD_CONSUMES_RESERVE, T_RELOAD_KEY_IS_GTA_R,
+        T_RELOAD_NOT_REPEATABLE, T_RELOAD_R_REFILLS_MAGAZINE, T_RELOAD_R_STARTS_RELOAD,
+        T_ROUTE_LEG_DIAGONAL, T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED,
+        T_SHOWCASE_DESCENT_NO_CLIMB, T_SHOWCASE_DESCENT_REACHES_GROUND,
+        T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE, T_SHOWCASE_DOOR_NO_SLAB,
+        T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
+        T_SHOWCASE_DOORS_FACE_EACH_OTHER, T_SHOWCASE_DOORWAY_2D_BLOCKED,
+        T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING, T_SHOWCASE_LANDING_COVERS_RUN,
+        T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_NO_WALL_AHEAD, T_SHOWCASE_OVERLAPS_ORDINARY,
+        T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
         T_SHOWCASE_PIER_LET_PLAYER_THROUGH, T_SHOWCASE_PUSHED_INTO_WALL,
         T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE, T_SHOWCASE_SPRINT_PENETRATES_WALL,
         T_SHOWCASE_SPRINT_TUNNELS_WALL, T_SHOWCASE_STAIR_REACHES_TOP,
-        T_STATIC_LEN_ASSUMED_CONSTANT,
         T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_SUBSTEP_NOT_NO_OP,
         T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP,
         T_SHOWCASE_WALK_LOSES_SLIDE, T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP,
-        T_VERTICAL_REST_ON_FLOOR, T_WHEEL_AXLE_STILL, T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD,
-        T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
+        T_STATIC_LEN_ASSUMED_CONSTANT, T_VERTICAL_REST_ON_FLOOR, T_WHEEL_AXLE_STILL,
+        T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD, T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
     };
     use crate::player::Player;
     use crate::r#type::{Mat4Data, Vec3};
@@ -9498,16 +9549,15 @@ mod tests {
             let (hx, hz): (f32, f32) = (spec.span[0] * 0.5, spec.span[1] * 0.5);
             let sx0: f32 = hx - SHOWCASE_STAIR_WIDTH;
             let sz_last: f32 = hz - SHOWCASE_STAIR_LEAD;
-            let stair_end: f32 =
-                sz_last - SHOWCASE_STAIR_STEPS as f32 * SHOWCASE_STAIR_RUN;
+            let stair_end: f32 = sz_last - SHOWCASE_STAIR_STEPS as f32 * SHOWCASE_STAIR_RUN;
             let stair_x: f32 = (sx0 + hx) * 0.5;
 
             // ---- 判据 1:梯段每一级头顶都是空的。
             for step in 0..SHOWCASE_STAIR_STEPS {
                 let z1: f32 = sz_last - step as f32 * SHOWCASE_STAIR_RUN;
-                let tread: f32 =
-                    SHOWCASE_GROUND_TOP + (step as f32 + 1.0) * SHOWCASE_STAIR_RISE;
-                let at: Vec2 = super::showcase_to_world(index, [stair_x, z1 - 0.5 * SHOWCASE_STAIR_RUN]);
+                let tread: f32 = SHOWCASE_GROUND_TOP + (step as f32 + 1.0) * SHOWCASE_STAIR_RISE;
+                let at: Vec2 =
+                    super::showcase_to_world(index, [stair_x, z1 - 0.5 * SHOWCASE_STAIR_RUN]);
                 let got: Option<f32> = w.support_height(at, tread);
                 assert!(
                     got.is_some_and(|height: f32| (height - tread).abs() < 1e-3),
@@ -9964,8 +10014,7 @@ mod tests {
             let sx0: f32 = hx - SHOWCASE_STAIR_WIDTH;
             let stair_x: f32 = (sx0 + hx) * 0.5;
             let sz_last: f32 = hz - SHOWCASE_STAIR_LEAD;
-            let stair_end: f32 =
-                sz_last - SHOWCASE_STAIR_STEPS as f32 * SHOWCASE_STAIR_RUN;
+            let stair_end: f32 = sz_last - SHOWCASE_STAIR_STEPS as f32 * SHOWCASE_STAIR_RUN;
             let front: Vec2 = doorway(index);
             let normal: Vec2 = front_normal(index);
             // 路线(资产本地坐标):门外 → 门洞 → 隔墙过道 → 第一级前沿
@@ -10508,6 +10557,88 @@ mod tests {
     }
 
     #[test]
+    fn every_car_gets_its_own_body_batch() {
+        // 车身批次必须**每辆车一个**,不能按 `mesh_index` 共用。
+        //
+        // `TRAFFIC_LANES` 里 10 辆车只有 5 种车型。之前车身走
+        // `find_or_create_batch`(找「mesh 相同的已有批次」),同车型的车因此拿到
+        // **同一个**批次下标;`sync_dynamic_instances` 对每辆车
+        // `instances.clear()` 再 push,第 2 辆同车型的车把第 1 辆刚写进去的
+        // 车身矩阵清掉 —— 一帧跑完每种车型只剩最后一辆的车身,实测 10 辆车只有
+        // 4 个车身批次有实例。车轮走 `push_batch_with_cull`,每辆 4 个独立批次,
+        // 40 个轮子全都在,所以画面正好是用户报的「只有轮子,车身消失」。
+        //
+        // 这里按真实蓝图复刻建批次那一段,要求下标两两不同。
+        let mut scene: Scene = Scene {
+            meshes: Vec::new(),
+            batches: Vec::new(),
+            total_triangles: 0,
+        };
+        let mut index_map: HashMap<String, usize> = HashMap::new();
+        // 每个车型一份 mesh(模拟「同一车型的车共用一份几何」)。
+        for (asset, _, _, _) in TRAFFIC_LANES.iter() {
+            if !index_map.contains_key(*asset) {
+                index_map.insert((*asset).to_string(), scene.push_mesh(empty_gpu_mesh()));
+            }
+        }
+        let static_count: usize = scene.batches.len();
+        // 一段静态批次在车前面 —— 与真实建场景顺序一致,顺便证明动态段仍尾插。
+        let extra_mesh: usize = scene.push_mesh(empty_gpu_mesh());
+        scene.push_batch(extra_mesh, true);
+
+        let car_batches: Vec<usize> = TRAFFIC_LANES
+            .iter()
+            .map(|(asset, _, _, _): &(&str, f32, f32, f32)| {
+                let mesh_index: usize = *index_map.get(*asset).unwrap();
+                scene.push_batch_with_cull(mesh_index, true, false)
+            })
+            .collect();
+
+        assert_eq!(
+            car_batches.len(),
+            TRAFFIC_LANES.len(),
+            "{}",
+            fill(
+                T_CAR_BODY_BATCH_MISSING,
+                &[("cars", &TRAFFIC_LANES.len().to_string())]
+            )
+        );
+        for i in 0..car_batches.len() {
+            for j in (i + 1)..car_batches.len() {
+                assert_ne!(
+                    car_batches[i],
+                    car_batches[j],
+                    "{}",
+                    fill(
+                        T_CAR_BODY_BATCH_SHARED,
+                        &[
+                            ("i", &i.to_string()),
+                            ("j", &j.to_string()),
+                            (KEY_BATCH, &car_batches[i].to_string()),
+                            ("asset_i", TRAFFIC_LANES[i].0),
+                            ("asset_j", TRAFFIC_LANES[j].0),
+                        ]
+                    )
+                );
+            }
+        }
+        // 车身批次必须排在静态段之后(动态段尾插的前提)。
+        for batch in car_batches.iter() {
+            assert!(
+                *batch > static_count,
+                "{}",
+                fill(
+                    T_CAR_BODY_BATCH_NOT_TAIL,
+                    &[
+                        (KEY_BATCH, &batch.to_string()),
+                        ("static", &static_count.to_string())
+                    ]
+                )
+            );
+        }
+    }
+
+    #[test]
     fn streamed_rebuild_keeps_the_dynamic_batches() {
         // `rebuild_static_batches` 换静态段时,必须把尾插在后面的动态段
         // (玩家骨架 / 车身 / 车轮 / 拾取物)**原样接回去**。之前它直接
@@ -10580,7 +10711,8 @@ mod tests {
         assert_eq!(order, expected, "动态段内部顺序变了");
         // 静态段长度变化必须被如实报回去(调用方要写回 `static_batch_count`)。
         assert_eq!(
-            new_static_count, scene.batches.len() - 15,
+            new_static_count,
+            scene.batches.len() - 15,
             "报回去的新静态段长度必须等于实际重铺出来的静态段长度"
         );
     }
@@ -10669,7 +10801,8 @@ mod tests {
         // 足够多,才读得出「有的贴路沿、有的靠外侧」。
         let mut distinct: Vec<u32> = Vec::new();
         for spot in build_city_palms(0.0, 0.0).iter() {
-            let lateral: f32 = (spot[0] - street_axis((spot[0] / STREET_PITCH).round() as i32)).abs();
+            let lateral: f32 =
+                (spot[0] - street_axis((spot[0] / STREET_PITCH).round() as i32)).abs();
             // 量化到 1 cm,滤掉浮点噪声后再数「不同取值」。
             let bucket: u32 = (lateral * 100.0).round() as u32;
             if !distinct.contains(&bucket) {
@@ -11126,10 +11259,7 @@ mod tests {
                 "{}",
                 fill(
                     T_ARROW_STEERS_WHILE_DRIVING,
-                    &[
-                        ("key", &format!("{code}")),
-                        ("got", &format!("{steer:.4}")),
-                    ]
+                    &[("key", &format!("{code}")), ("got", &format!("{steer:.4}")),]
                 )
             );
             let mut car: crate::traffic::TrafficCar = steer_test_car();

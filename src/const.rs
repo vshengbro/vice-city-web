@@ -2270,3 +2270,46 @@ pub const T_INTERIOR_STAIRWELL_IS_OPEN: &str =
 
 /// 验收通道:传送 / 走位 / 加速 / 探针请求挂在这个 window 属性上。
 pub const K_TELEPORT_WINDOW: &str = "__vcw_teleport";
+/// 单元测试断言文案:车少了(批次没建出来)。
+pub(crate) const T_CAR_BODY_BATCH_MISSING: &str =
+    "只建出 {cars} 个车身批次,车没建全 —— 车身批次必须每辆车一个,不能按 mesh_index 共用";
+
+/// 单元测试断言文案:两辆车共用了同一个车身批次。
+///
+/// 共用批次 = `sync_dynamic_instances` 里后一辆车 `instances.clear()` 把前一辆
+/// 刚写进去的车身矩阵清掉,画面上那辆车只剩轮子。修好的写法是每辆车
+/// `push_batch_with_cull` 一个。
+pub(crate) const T_CAR_BODY_BATCH_SHARED: &str = "第 {i} 辆({asset_i})和第 {j} 辆({asset_j})共用车身批次 {batch} —— 后一辆车会把前一辆的车身矩阵 clear 掉,那辆车只剩轮子";
+
+/// 单元测试断言文案:车身批次不在动态段(尾插)里。
+///
+/// 动态段必须排在静态段之后,`rebuild_static_batches` 才切得对(见
+/// [`T_STATIC_LEN_ASSUMED_CONSTANT`])。车身批次插到静态段前面,流式重建会把
+/// 它当成静态段丢掉,走过 60 m 之后所有车身消失。
+pub(crate) const T_CAR_BODY_BATCH_NOT_TAIL: &str = "车身批次 {batch} 排在静态段({static})之前 —— 动态段必须尾插,否则流式重建会把它连同静态段一起截掉";
+
+/// 单元测试断言文案的字段名:批次号。
+///
+/// `fill()` 的字段名同样走 §1.3c,调用点不许写字面量。
+pub(crate) const KEY_BATCH: &str = "batch";
+
+/// 单元测试断言文案:行人的起伏与落脚没有同相。
+///
+/// 脚落地的瞬间是腿摆角为 0 的时刻(`phase = 0 / pi`,见
+/// [`crate::player::limb_swing`]),也就是**身体该处于最高点**的那一刻。
+/// 原来的 `sin(phase * 2.0)` 把波峰推到 `phase = pi/4` —— 脚还悬在
+/// 摆动中段 —— 身体反而最高;脚一落地身体正好过零。每个高峰都错开
+/// 四分之一个步周期,叠起来就是弹簧式弹跳,也就是用户报的「NPC 蹦蹦跳跳」。
+///
+/// 注意别把 `* 2.0` 一起删掉:落脚每 `pi` 相位一次,重心每步起伏一次,
+/// 所以起伏确实是两倍频;要改的只是相位(用 `cos` 而不是 `sin`)。
+pub(crate) const T_PED_BOB_OUT_OF_PHASE: &str =
+    "行人起伏与落脚错开:{deg:.1}° 处 bob = {bob:.5} m,但脚正落在这个相位上,身体应该到顶(cos(2·phi) = {cos:.5})";
+
+/// 单元测试断言文案:行人起伏的波峰个数不对。
+///
+/// 起伏必须是**每步一次一个高峰**,所以一个完整步周期里恰好 2 个
+/// (左右脚各一次)。`cos(phi)` 只有 1 个,`sin(2·phi)` 虽有 2 个但位置
+/// 错开四分之一个周期 —— 两条都要挡住。
+pub(crate) const T_PED_BOB_DOUBLE_FREQUENCY: &str =
+    "行人起伏一个步周期里出现了 {peaks} 个波峰(应当恰好 2 个,左右脚各一次)—— 起伏必须与落脚同相、每步一次";

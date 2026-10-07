@@ -786,12 +786,13 @@ mod tests {
     use crate::camera::Mat4;
     use crate::collision::CollisionWorld;
     use crate::r#const::{
-        DIAGONAL_SPEED_TOLERANCE, KEY_DIAGONAL, KEY_MODE, KEY_PART, KEY_STRAIGHT, MODE_SPRINT,
-        MODE_WALK, PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_UPPER_ARM_L,
-        PART_UPPER_LEG_L, T_DIAGONAL_MATCHES_STRAIGHT, T_DISTAL_INHERITS_PARENT_SWING,
-        T_DISTAL_LIMB_HAS_PARENT, T_FACING_MATCHES_VELOCITY, T_HALF_INPUT_STAYS_HALF_SPEED,
-        T_LEGS_ANTIPHASE, T_LIMB_STAYS_AT_ASSET_HEIGHT, T_LIMBS_RELAX_TO_ZERO, T_PARENT_IN_PLAN,
-        T_SAME_SIDE_IN_PHASE, T_STRAIGHT_KEEPS_FULL_SPEED,
+        DIAGONAL_SPEED_TOLERANCE, KEY_DIAGONAL, KEY_MODE, KEY_PART, KEY_STRAIGHT,
+        MODE_SPRINT, MODE_WALK, PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_UPPER_ARM_L,
+        PART_UPPER_LEG_L, PED_BOB_HEIGHT, T_DIAGONAL_MATCHES_STRAIGHT,
+        T_DISTAL_INHERITS_PARENT_SWING, T_DISTAL_LIMB_HAS_PARENT, T_FACING_MATCHES_VELOCITY,
+        T_HALF_INPUT_STAYS_HALF_SPEED, T_LEGS_ANTIPHASE, T_LIMB_STAYS_AT_ASSET_HEIGHT,
+        T_LIMBS_RELAX_TO_ZERO, T_PARENT_IN_PLAN, T_PED_BOB_DOUBLE_FREQUENCY,
+        T_PED_BOB_OUT_OF_PHASE, T_SAME_SIDE_IN_PHASE, T_STRAIGHT_KEEPS_FULL_SPEED,
     };
     use crate::player::{
         GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, RUN_SPEED, WALK_SPEED, Player,
@@ -984,6 +985,117 @@ mod tests {
             (phase_gap - std::f32::consts::PI).abs() < 1.0e-6,
             "{T_LEGS_ANTIPHASE}: 左右相位必须差 π,实得 {phase_gap}"
         );
+    }
+
+    /// 行人起伏必须与落脚**同相**:每一步落地身体都抬到最高点。
+    ///
+    /// 落脚时刻 = 腿摆角为 0 = `phase ∈ {0, π}`(左右脚交替,每步一次)。
+    /// 身体在那两个时刻都应该最高,所以起伏的峰值必须**两个**都落在那里。
+    /// 原来的 `sin(phase * 2.0)` 把波峰推到 `pi/4` 与 `5pi/4` —— 脚还
+    /// 悬在摆动中段 —— 身体反而最高;脚一落地身体过零。每个高峰都错开
+    /// 四分之一个步周期,叠起来就是弹簧式弹跳(用户报的「NPC 蹦蹦跳跳」)。
+    #[test]
+    fn ped_bob_peaks_when_the_foot_plants() {
+        let footfalls: [f32; 2] = [GAIT_PHASE_L, GAIT_PHASE_R];
+        for phase in footfalls {
+            // 此刻(脚正落地)身体必须是最高点。
+            let at_plant: f32 = (phase * 2.0).cos() * PED_BOB_HEIGHT;
+            assert!(
+                (at_plant - PED_BOB_HEIGHT).abs() < 1.0e-5,
+                "{}",
+                fill(
+                    T_PED_BOB_OUT_OF_PHASE,
+                    &[
+                        ("deg:.1", &format!("{:.1}", phase.to_degrees())),
+                        ("bob:.5", &format!("{at_plant:.5}")),
+                        ("cos:.5", &format!("{:.5}", (phase * 2.0).cos())),
+                    ]
+                )
+            );
+            // 摆动中段(脚悬空)身体必须压到最低 —— 不能反过来。
+            let mid: f32 = phase + GAIT_PHASE_R / 2.0;
+            let at_mid: f32 = (mid * 2.0).cos() * PED_BOB_HEIGHT;
+            assert!(
+                (at_mid + PED_BOB_HEIGHT).abs() < 1.0e-5,
+                "{}",
+                fill(
+                    T_PED_BOB_OUT_OF_PHASE,
+                    &[
+                        ("deg:.1", &format!("{:.1}", mid.to_degrees())),
+                        ("bob:.5", &format!("{at_mid:.5}")),
+                        ("cos:.5", &format!("{:.5}", (mid * 2.0).cos())),
+                    ]
+                )
+            );
+        }
+    }
+
+    /// 起伏必须是**每步一次**两个高峰,且两个高峰等高。
+    ///
+    /// 扫一个完整步周期数局部极大值:落脚在 `0` 与 `pi`,所以恰好 2 个。
+    /// 这条同时挡住 `cos(phi)`(只有 1 个峰)和 `sin(2·phi)`(2 个峰但
+    /// 位置错开四分之一个周期)两种退化。
+    #[test]
+    fn ped_bob_has_one_peak_per_footfall() {
+        // 只扫 `[0, TAU)` —— 闭区间会把末端 `TAU` 也算成一个峰,而那个
+        // 峰其实就是 `t = 0` 的周期性重复,数出来就多一个。
+        //
+        // 数波峰用**斜率过零**(由正转负)而不是「值超过阈值」:阈值法在
+        // 峰顶附近有一整片样本都达标,会数出十几个「峰」。过零法每个
+        // 真峰只触发一次。
+        let steps: usize = 1440;
+        let mut peaks: Vec<f32> = Vec::new();
+        let bob_at: fn(f32) -> f32 = |t: f32| (t * 2.0).cos() * PED_BOB_HEIGHT;
+        let mut rising: bool = true;
+        let indices: Vec<usize> = (0..steps).collect();
+        for i in indices {
+            let t: f32 = i as f32 / steps as f32 * 2.0 * GAIT_PHASE_R;
+            let slope: f32 = bob_at(t + 0.001) - bob_at(t);
+            if rising && slope < 0.0 {
+                peaks.push(t);
+                rising = false;
+            } else if !rising && slope > 0.0 {
+                rising = true;
+            }
+        }
+        assert_eq!(
+            peaks.len(),
+            2,
+            "{}",
+            fill(
+                T_PED_BOB_DOUBLE_FREQUENCY,
+                &[("peaks", &format!("{}", peaks.len()))]
+            )
+        );
+        // 两个峰必须落在两次落脚相位上(0 与 π),且到顶。
+        for (index, peak) in peaks.iter().enumerate() {
+            let want: f32 = index as f32 * GAIT_PHASE_R;
+            let gap: f32 = (peak - want).abs();
+            assert!(
+                gap < 0.01,
+                "{}",
+                fill(
+                    T_PED_BOB_OUT_OF_PHASE,
+                    &[
+                        ("deg:.1", &format!("{:.1}", peak.to_degrees())),
+                        ("bob:.5", &format!("{:.5}", bob_at(*peak))),
+                        ("cos:.5", &format!("{:.5}", (peak * 2.0).cos())),
+                    ]
+                )
+            );
+            assert!(
+                (bob_at(*peak) - PED_BOB_HEIGHT).abs() < 1.0e-3,
+                "{}",
+                fill(
+                    T_PED_BOB_OUT_OF_PHASE,
+                    &[
+                        ("deg:.1", &format!("{:.1}", peak.to_degrees())),
+                        ("bob:.5", &format!("{:.5}", bob_at(*peak))),
+                        ("cos:.5", &format!("{:.5}", (peak * 2.0).cos())),
+                    ]
+                )
+            );
+        }
     }
 
     /// 同一侧的大腿 / 小腿必须同相位(否则就是抽搐而不是摆腿)。
