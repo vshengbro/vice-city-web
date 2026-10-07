@@ -29,6 +29,16 @@ pub const SPEED_MAX: f32 = 15.0;
 pub const DRIVE_ACCEL: f32 = 11.0;
 /// 玩家驾驶时的刹车减速度(米/秒²)。
 pub const DRIVE_BRAKE: f32 = 18.0;
+/// 倒车时的加速度(米/秒²),正值,用来把速度推向 `−REVERSE_SPEED_MAX`。
+///
+/// 倒车比前进慢:真车倒库的速度本来就低,而且低了才容易把方向打准。
+/// 这条是 [`REVERSE_SPEED_MAX`] 的唯一加速度来源,不是给倒车用的减速度。
+pub(crate) const REVERSE_ACCEL: f32 = 6.0;
+/// 倒车速度上限(米/秒)—— 绝对值。
+///
+/// 真车倒库基本不超过前进速度的三分之一,GTA V 里倒车也只有慢慢蹭的
+/// 速度。取前进上限(`SPEED_MAX`)的 0.4 倍。
+pub(crate) const REVERSE_SPEED_MAX: f32 = SPEED_MAX * 0.4;
 // ---- 玩家驾驶的车辆模型:转向 + 漂移 ------------------------------
 //
 // 之前玩家驾驶只有油门:朝向是常量 `direction`��±1.0),位置被
@@ -68,7 +78,7 @@ pub const DRIFT_SLIP_RATIO: f32 = 0.22;
 /// 数值由 `car_sedan.json` 的 `tyres` 顶点按 x/z 象限聚类后取质心量得
 /// (左 x=-1.33 / 右 x=+1.32,前后各 z=±0.77,轮心 y=0.34);y 也正好
 /// 等于 [`WHEEL_RADIUS`],与轮子 y∈[0, 0.68] 的实际跨度自洽。
-pub const WHEEL_MOUNTS: [[f32; 3]; 4] = [
+pub(crate) const WHEEL_MOUNTS: [[f32; 3]; 4] = [
     [-1.32, 0.34, 0.77],
     [1.32, 0.34, 0.77],
     [-1.32, 0.34, -0.77],
@@ -85,7 +95,7 @@ pub const WHEEL_RADIUS: f32 = 0.34;
 pub const STEER_MIN_SPEED: f32 = 1.2;
 
 /// 玩家走到拾取物多少米内就算拾到。
-pub const PICKUP_RADIUS: f32 = 2.2;
+pub(crate) const PICKUP_RADIUS: f32 = 2.2;
 /// 玩家走到车边多少米内可以按 F 上车。
 /// 车队巡航速度(米/秒)——城市道路 8–15 m/s,取区间中段。
 pub const CRUISE_SPEED: f32 = 11.5;
@@ -363,6 +373,10 @@ impl TrafficCar {
 
     /// 玩家驾驶输入:油门 / 转向 / 刹车,并把车挡在碰撞世界之外。
     ///
+    /// 速度**可以是负的**:负 = 倒车。车在 GTA V 里本来就有倒库这一档,
+    /// 所以 `S` 的语义分两段:前进中按 `S` 是刹车(把正速度减到 0),
+    /// 到 0 之后继续按就转成倒车(速度变负,车尾朝前走)。
+    ///
     /// 这里**不再把车钉死在车道 X 上**(那是 AI 巡航的约束,玩家驾驶时
     /// 反而让人开不了车)。取而代之的是真实车身朝向 + 侧向速度,见本文件
     /// 顶部的车辆模型常量组。
@@ -374,26 +388,48 @@ impl TrafficCar {
     /// - `f32` - 固定步长(秒)。
     /// - `&CollisionWorld` - 静态碰撞世界。
     pub fn drive(&mut self, throttle: f32, steer: f32, dt: f32, world: &CollisionWorld) {
-        // ---- 1. 纵向:油门 / 刹车 --------------------------------
+        // ---- 1. 纵向:油门 / 刹车 / 倒车 -----------------------------
+        //
+        // 速度是**带符号**的:正 = 前进,负 = 倒车。上下限分别是
+        // `-REVERSE_SPEED_MAX` 与 `SPEED_MAX * 1.6`,所以 S 在前进中是
+        // 刹车(速度掉到 0 就停住),按住不放继续变成倒车。这两段之间
+        // 没有额外状态,判据只是「当前速度的符号」,所以前进 / 刹车 /
+        // 倒车不会互相漏进对方 —— 这是原来 `clamp(0.0, ..)` 做不到的,
+        // 那个下限把倒车整段从物理上删掉了。
         let speed: f32 = self.get_speed();
         let next: f32 = if throttle > 0.0 {
             speed + DRIVE_ACCEL * throttle * dt
         } else if throttle < 0.0 {
-            speed + DRIVE_BRAKE * throttle * dt
+            if speed > 0.0 {
+                // 前进中踩「刹车」:减速度按 DRIVE_BRAKE,越过 0 就停下。
+                (speed + DRIVE_BRAKE * throttle * dt).max(0.0)
+            } else {
+                // 静止或已在倒车:同一个键变成倒车油门。
+                (speed + REVERSE_ACCEL * throttle * dt).max(-REVERSE_SPEED_MAX)
+            }
         } else {
             speed
         };
-        self.set_speed(next.clamp(0.0, SPEED_MAX * 1.6));
+        self.set_speed(next.clamp(-REVERSE_SPEED_MAX, SPEED_MAX * 1.6));
 
         // ---- 2. 转向:车身角速度 = 舵角 × 纵向速度 / 轴距 -----------
         //
         // bicycle model 的核心:偏航角速度与**速度成正比**。所以低速几乎
         // 转不动(方向盘打满也只是慢慢挪),高速才敢打舵 —— 这就是为什么
         // 真车倒库要来回打好几把。
+        //
+        // `yaw_rate` 带一个负号,因为本文件的 yaw 约定是
+        // `fwd = [cos yaw, −sin yaw]`,于是 `d(fwd)/d(yaw)` = `[−sin, −cos]`
+        // —— 那是车头的**左**方���。也就是说 yaw 增大 = 车向左转,而 `steer`
+        // 的契约是「正 = 右转」。不取负号时按 D 会把车往左拐,这正是方向键
+        // 反向的根因;符号基准不是猜的,是从上面这个 `fwd` 定义推出来的。
         let steer: f32 = steer.clamp(-1.0, 1.0);
         let speed: f32 = self.get_speed();
         let grip_scale: f32 = 1.0 / (1.0 + speed.abs() * STEER_SPEED_FALLOFF);
-        let yaw_rate: f32 = if speed > STEER_MIN_SPEED {
+        // 死区按**速度的绝对值**判:倒车时 `speed` 是负的,但倒车一样要能
+        // 打方向(倒库全靠它)。写 `speed > STEER_MIN_SPEED` 会让整段倒车
+        // 永远转不动 —— 速度为负时那个判断恒假。
+        let yaw_rate: f32 = if speed.abs() > STEER_MIN_SPEED {
             steer * STEER_RATE * grip_scale
         } else {
             0.0
@@ -420,13 +456,20 @@ impl TrafficCar {
         let lateral: f32 = lateral * decay;
 
         // ---- 5. 漂移代价:侧滑越狠,纵向掉速越快 --------------------
-        let slip: f32 = lateral.abs() / speed.max(1.0);
+        //
+        // 滑移比的分母用 `speed.max(1.0)`,倒车时 `speed` 为负会让分母
+        // 退化成 1.0,滑移比被放大好几倍 —— 于是倒车一打方向就凭空掉速。
+        // 正确的比值两边都取绝对值,「相对纵向速度」的物理含义不变。
+        let slip: f32 = lateral.abs() / speed.abs().max(1.0);
         let drag: f32 = if slip > DRIFT_SLIP_RATIO {
             DRIFT_SPEED_DRAG * (slip - DRIFT_SLIP_RATIO) * dt
         } else {
             0.0
         };
-        self.set_speed((speed - drag).max(0.0));
+        // 掉速不能把速度推过 0:穿过 0 就等于「滑着滑着自动挂上了倒挡」。
+        // 倒车时同理不能推过倒车下限。
+        let floor: f32 = -REVERSE_SPEED_MAX;
+        self.set_speed((speed - drag).max(floor));
         self.set_lateral(lateral);
 
         // ---- 6. 积分位置:沿「纵向 + 侧向」两个分量一起走 ---------
@@ -758,7 +801,8 @@ pub fn apply_pickup(player: &mut Player, pickup: &mut Pickup) {
 mod tests {
     use crate::r#const::*;
     use crate::traffic::{
-        DRIFT_SLIP_RATIO, LATERAL_GRIP, STEER_MIN_SPEED, STEER_RATE, TrafficCar, WHEEL_RADIUS,
+        DRIFT_SLIP_RATIO, LATERAL_GRIP, REVERSE_SPEED_MAX, STEER_MIN_SPEED, STEER_RATE, TrafficCar,
+        WHEEL_RADIUS,
     };
     use crate::r#type::Vec3;
 
@@ -902,5 +946,154 @@ mod tests {
     fn grip_constant_is_a_valid_decay() {
         assert!(LATERAL_GRIP > 0.0 && LATERAL_GRIP.is_finite());
         assert!(STEER_RATE > 0.0 && STEER_RATE.is_finite());
+    }
+
+    // ---- 倒车:速度必须能变负 --------------------------------------
+
+    /// 静止时按住 S 必须真的倒出去(速度变负),而不是停在 0。
+    ///
+    /// 这条钉的是原来那个 `clamp(0.0, ..)`:下限 0 把倒车整段从物理上
+    /// 删掉了,车「只能减速到 0」,所以这个断言在修复前必然失败。
+    #[test]
+    fn standstill_reverses_instead_of_staying_at_zero() {
+        let mut c: TrafficCar = TrafficCar::new(CAR_SEDAN, 0.0, 0.0, 0.0, 1.0);
+        let world: crate::collision::CollisionWorld = empty_world();
+        let start: Vec3 = c.get_position();
+        for _ in 0..60 {
+            c.drive(-1.0, 0.0, 1.0 / 60.0, &world);
+        }
+        assert!(
+            c.get_speed() < 0.0,
+            "静止按 S 一秒必须倒出去(速度为负),实际 {}",
+            c.get_speed()
+        );
+        assert!(
+            c.get_speed() >= -REVERSE_SPEED_MAX - 1e-4,
+            "倒车速度不能超过倒车上限 {},实际 {}",
+            REVERSE_SPEED_MAX,
+            c.get_speed()
+        );
+        let end: Vec3 = c.get_position();
+        let moved: f32 = ((end[0] - start[0]).powi(2) + (end[2] - start[2]).powi(2)).sqrt();
+        assert!(moved > 0.5, "倒车必须真的把车往后挪,实际只挪了 {} m", moved);
+        // 倒车的位移必须与车头**相反**:点积为负。
+        let yaw: f32 = c.get_yaw();
+        let forward: [f32; 2] = [yaw.cos(), -yaw.sin()];
+        let delta: [f32; 2] = [end[0] - start[0], end[2] - start[2]];
+        let along: f32 = forward[0] * delta[0] + forward[1] * delta[1];
+        assert!(
+            along < 0.0,
+            "倒车位移必须朝车尾方向(与车头点积为负),实际点积 {}",
+            along
+        );
+    }
+
+    /// 前进中按 S:先刹车到 0,继续按住才变负 —— 两段必须都在。
+    ///
+    /// GTA V 里 S 在前进中是刹车而不是倒车,所以「一路踩到底」的速度
+    /// 曲线必须先单调降到 0,再单调变负。只断终点会漏掉「直接从正跳到负」
+    /// 这种把刹车和倒车混成一段的错误实现。
+    #[test]
+    fn reverse_after_braking_passes_through_exactly_zero() {
+        let mut c: TrafficCar = car();
+        let world: crate::collision::CollisionWorld = empty_world();
+        for _ in 0..60 {
+            c.drive(1.0, 0.0, 1.0 / 60.0, &world);
+        }
+        let rolling: f32 = c.get_speed();
+        assert!(rolling > 0.0, "起步必须是正速度,实际 {}", rolling);
+
+        let mut trace: Vec<f32> = Vec::new();
+        let mut zero_frame: Option<usize> = None;
+        for i in 0..240 {
+            c.drive(-1.0, 0.0, 1.0 / 60.0, &world);
+            trace.push(c.get_speed());
+            if zero_frame.is_none() && c.get_speed() <= 0.0 {
+                zero_frame = Some(i);
+            }
+        }
+        let at_zero: Option<usize> = zero_frame;
+        assert!(
+            at_zero.is_some(),
+            "前进中按住 S 必须先减到 0(刹车),现在没有出现过非正速度"
+        );
+        let z: usize = at_zero.unwrap_or(0);
+        // 刹车段:速度必须单调不增地走到 0。
+        for i in 1..=z {
+            assert!(
+                trace[i] <= trace[i - 1] + 1e-6,
+                "刹车段速度必须单调不增,帧 {} 从 {} 涨到 {}",
+                i,
+                trace[i - 1],
+                trace[i]
+            );
+        }
+        // 倒车段:0 之后必须真的变负。
+        assert!(
+            trace[trace.len() - 1] < 0.0,
+            "按住 S 到底必须倒出去,最终速度 {}",
+            trace[trace.len() - 1]
+        );
+        assert!(
+            trace[z] >= -1e-6 && trace[z] <= 0.0,
+            "越过零点的那一帧必须贴着 0,实际 {}",
+            trace[z]
+        );
+    }
+
+    /// 倒车也必须能打方向,而且摆动方向与前进时**相反**。
+    ///
+    /// 这是自行车模型倒推的自然结果:车身反转时速度向量的相对朝向也反转。
+    /// 判据用「横向位移相对车头右方」的方向,不假设任何 yaw 符号约定。
+    #[test]
+    fn reverse_steering_keeps_working_and_is_distinguishable() {
+        let world: crate::collision::CollisionWorld = empty_world();
+
+        // 同一辆车、同一个舵角,分别在前进与倒车状态各转一次,比较 yaw 变化。
+        let mut ahead: TrafficCar = car();
+        for _ in 0..60 {
+            ahead.drive(1.0, 0.0, 1.0 / 60.0, &world);
+        }
+        let yaw0: f32 = ahead.get_yaw();
+        let speed_fwd: f32 = ahead.get_speed();
+        for _ in 0..120 {
+            ahead.drive(0.0, 1.0, 1.0 / 60.0, &world);
+        }
+        let turn_fwd: f32 = ahead.get_yaw() - yaw0;
+
+        let mut back: TrafficCar = TrafficCar::new(CAR_SEDAN, 0.0, 0.0, 0.0, 1.0);
+        for _ in 0..60 {
+            back.drive(-1.0, 0.0, 1.0 / 60.0, &world);
+        }
+        let byaw0: f32 = back.get_yaw();
+        let speed_rev: f32 = back.get_speed();
+        for _ in 0..120 {
+            back.drive(0.0, 1.0, 1.0 / 60.0, &world);
+        }
+        let turn_rev: f32 = back.get_yaw() - byaw0;
+
+        assert!(
+            speed_rev < 0.0,
+            "这一段必须在倒车状态,实际速度 {}",
+            speed_rev
+        );
+        assert!(
+            turn_rev.abs() > 0.1,
+            "倒车时必须能打方向,实际只转了 {}",
+            turn_rev.abs()
+        );
+        // yaw 转速的**大小**只跟 |速度| 有关,所以两段应当同量级。
+        // 这一条是反向的「倒车没接上转向」的保护:如果死区还写
+        // `speed > STEER_MIN_SPEED`,倒车段恒为 0,这里立刻失败。
+        let ratio: f32 = turn_rev.abs() / turn_fwd.abs();
+        assert!(
+            ratio > 0.5 && ratio < 2.0,
+            "倒车与前进的转向幅度应当同量级(比值 {}),前进 {} 倒车 {} 车速 {} / {}",
+            ratio,
+            turn_fwd,
+            turn_rev,
+            speed_fwd,
+            speed_rev
+        );
     }
 }
