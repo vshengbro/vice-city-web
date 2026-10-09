@@ -44,9 +44,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "euv"
-version = "0.28.6"
+version = "0.28.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8e8d48fbcd0a3872724b10404b189ee8ca8e19842375b835fb7a2f325a17112"
+checksum = "47f9934aeba66c987d2f2f4bdd0851f228808cbace11ab902356ce589949b8fa"
 dependencies = [
  "alloc-no-stdlib",
  "console_error_panic_hook",
@@ -61,9 +61,9 @@ dependencies = [
 
 [[package]]
 name = "euv-core"
-version = "0.28.6"
+version = "0.28.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad17a5895e407363f70e3c9001c18b2d83560e1518a2b1bc53ea26814489ddaf"
+checksum = "d068897e438d8dc69c65dc56fd628f0185fba392dfca1f0b7c4b77646535e698"
 dependencies = [
  "bin-encode-decode",
  "js-sys",
@@ -75,9 +75,9 @@ dependencies = [
 
 [[package]]
 name = "euv-engine"
-version = "0.28.6"
+version = "0.28.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5d75756606435b34f4879544b76865a5e6b62821aa6e1181e6bd1f31146a571"
+checksum = "7c52a868a0a9bdd8494db1d897a77944cccfa83aa04be1c98ab19198f40427a5"
 dependencies = [
  "euv",
  "js-sys",
@@ -89,9 +89,9 @@ dependencies = [
 
 [[package]]
 name = "euv-macros"
-version = "0.28.6"
+version = "0.28.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d1caa62ada61e112e9d8c0115ff295cd3e15fc5f2b3657926fccee7bf6cc8e5"
+checksum = "4278bb3d768715ad25433cd8fee528ac0493e337438f56e629e71da490e01f53"
 dependencies = [
  "lombok-macros",
  "proc-macro2",
