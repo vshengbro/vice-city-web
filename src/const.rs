@@ -982,7 +982,7 @@ pub(crate) const U_VIEW: &str = "u_view";
 pub(crate) const U_FAR_PLANE: &str = "u_far_plane";
 
 /// bloom 模糊方向 uniform 名。
-pub(crate) const U_BLOOM_DIR: &str = "u_bloom_dir";
+pub(crate) const U_BLOOM_DIR: &str = "u_direction";
 
 /// 胶片颗粒的时间种子 uniform 名。
 pub(crate) const U_TIME: &str = "u_time";
@@ -1050,7 +1050,7 @@ pub(crate) const U_SSR_STRENGTH: &str = "u_ssr_strength";
 pub(crate) const U_BLOOM_STRENGTH: &str = "u_bloom_strength";
 
 /// bloom 亮度阈值 uniform 名。
-pub(crate) const U_BLOOM_THRESHOLD: &str = "u_bloom_threshold";
+pub(crate) const U_BLOOM_THRESHOLD: &str = "u_threshold";
 
 /// 色调分级的 lift(黑场染色)uniform 名。
 pub(crate) const U_GRADE_LIFT: &str = "u_grade_lift";

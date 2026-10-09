@@ -5195,6 +5195,12 @@ mod tests {
         T_SHADOW_TALL_KEPT,
     };
     use crate::render::{DayPhase, Instance, instance_affects_shadow, normalize3};
+    use crate::render::{
+        BLOOM_BLUR_FRAGMENT_SHADER, BLOOM_EXTRACT_FRAGMENT_SHADER, COMPOSITE_FRAGMENT_SHADER,
+        FRAGMENT_SHADER, GBUFFER_FRAGMENT_SHADER, GLOW_FRAGMENT_SHADER, SHADOW_FRAGMENT_SHADER,
+        SHADOW_VERTEX_SHADER, SSAO_FRAGMENT_SHADER, SSR_FRAGMENT_SHADER, VERTEX_SHADER,
+    };
+    use crate::r#const::{U_BLOOM_DIR, U_BLOOM_THRESHOLD};
     use crate::r#type::Vec3;
 
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值。
@@ -5373,5 +5379,67 @@ mod tests {
                 ]
             )
         );
+    }
+
+    /// 每个被 `get_uniform_location` 查过的 uniform 名都必须在某段 GLSL 里
+    /// **真的声明过**。
+    ///
+    /// ⚠️ 这是两条**已经真实发生过**的静默 bug 的回归闸。查一个不存在的
+    /// 名字不会报错:`get_uniform_location` 只是返回 `None`,而
+    /// `uniform1f(None, …)` 是彻底的空操作 —— 没有警告、没有异常、画面
+    /// 照常出图,只是那个 uniform 永远保持 GLSL 的默认值(0)。
+    ///
+    /// - `U_BLOOM_THRESHOLD` 曾经写成 `"u_bloom_threshold"`,而亮度提取
+    ///   着色器里声明的是 `u_threshold`。阈值恒为 0.0,于是提取 pass
+    ///   **把整幅画面原样透传**成「bloom 图」,合成时再乘 `0.85 * 1.85`。
+    ///   实测夜景整幅被抬亮(均值 0.201 → 0.498,越过阈值的像素
+    ///   0.20% → 30.2%),整座城市看上去像开了高光过曝 —— 而这正是
+    ///   「WebGPU 的 bloom 弱 82 倍」这个结论的来源:WebGL2 的 0.296
+    ///   根本不是 bloom,是这个 bug 抬起来的。
+    /// - `U_BLOOM_DIR` 同样写成 `"u_bloom_dir"`,而模糊着色器声明的是
+    ///   `u_direction`。方向恒为 `(0,0)`,可分离高斯退化成同点加权重采样,
+    ///   完全没有模糊。
+    ///
+    /// 两条都不会让 `cargo test` 变红、不产生一条编译警告,只能靠这条测试。
+    #[test]
+    fn every_looked_up_uniform_is_declared_in_glsl() {
+        // 所有 GLSL 源码常量(带 `#version 300 es` 的那些 raw string)。
+        const SOURCES: [&str; 11] = [
+            VERTEX_SHADER,
+            FRAGMENT_SHADER,
+            GLOW_FRAGMENT_SHADER,
+            SHADOW_VERTEX_SHADER,
+            SHADOW_FRAGMENT_SHADER,
+            GBUFFER_FRAGMENT_SHADER,
+            SSAO_FRAGMENT_SHADER,
+            SSR_FRAGMENT_SHADER,
+            BLOOM_EXTRACT_FRAGMENT_SHADER,
+            BLOOM_BLUR_FRAGMENT_SHADER,
+            COMPOSITE_FRAGMENT_SHADER,
+        ];
+        let mut declared: Vec<&str> = Vec::new();
+        for source in SOURCES {
+            for part in source.split("uniform ") {
+                // `uniform vec2 u_direction;` → 末个标识符就是名字。
+                let Some(head) = part.split(';').next() else {
+                    continue;
+                };
+                if let Some(name) = head.split_whitespace().last() {
+                    declared.push(name);
+                }
+            }
+        }
+        // 被 Rust 侧实际查过的 uniform 名 → 必须逐个在上面出现过。
+        const LOOKED_UP: [(&str, &str); 2] = [
+            ("U_BLOOM_THRESHOLD", U_BLOOM_THRESHOLD),
+            ("U_BLOOM_DIR", U_BLOOM_DIR),
+        ];
+        for (constant, name) in LOOKED_UP {
+            assert!(
+                declared.contains(&name),
+                "get_uniform_location({constant} = \"{name}\") 在任何 GLSL 里都查不到 —— \
+                 它会返回 None,而 uniform1f(None, …) 是静默空操作,该 uniform 永远取默认值。"
+            );
+        }
     }
 }
