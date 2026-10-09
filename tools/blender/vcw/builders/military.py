@@ -623,8 +623,91 @@ def _destroyer():
 
 
 # ============================================================================
-# 3. SAILING YACHT  -- 11.0 m long, 3.40 m wide, 13.2 m mast head
+# 3. SAILING YACHT  -- 11.0 m long, 3.40 m wide, ~12.0 m mast head
 # ============================================================================
+
+SAIL_THICK = 0.035       # cloth thickness, m
+# Belly depth as a fraction of the sail's CHORD (its long dimension).  A
+# real sail's draft is roughly 8-14% of chord; 0.22 produced a 2.45 m bulge on
+# an 11 m mainsail, which turned the rig into a balloon rather than a sail.
+SAIL_CAMBER = 0.10
+
+
+def _sail_profile(pts):
+    """Offset one side of a sail outline into a thin CLOSED loop.
+
+    A sail used to be a single triangle at x = 0 with a second coincident copy
+    wound the other way, which made the sail vanish completely when viewed
+    edge-on -- measured x-extent was exactly 0.0000 m, so at any camera angle
+    near the boat's centreline the yacht lost the one feature that identifies
+    it.  Two coincident planes are still zero-thickness planes; being wound
+    oppositely only decides which of the two you happen to see.
+
+    Each outline point becomes a pair straddling x = 0, so the sail has real
+    cloth thickness and closes into a proper solid: ``core.loft`` then sweeps
+    it as a closed shell whose outwardness is proven by signed volume, and the
+    ``outward=("dir", ...)`` declaration these parts used to require is no
+    longer needed at all.
+
+    ``core.loft`` derives the side-wall winding from the ring traversal, and a
+    cap flip only reverses the two end fans -- it cannot repair the walls.
+    Measured across all four cap combinations the signed volume was negative
+    in every case (-2.82, -3.82, -4.82, -3.82), so the ring itself has to be
+    walked the other way.  Hence ``reversed(pts)`` below: it makes the prism
+    outward-wound, after which ``cap_start_flip=True`` closes it.
+    """
+    half = SAIL_THICK * 0.5
+    loop = [(p[0] + half, p[1], p[2]) for p in reversed(pts)]
+    loop += [(p[0] - half, p[1], p[2]) for p in reversed(pts)]
+    return loop
+
+
+def _sail_foil(a, loop, color, reverse=False):
+    """Emit one cambered sail as a single watertight part.
+
+    ``loop`` is a closed ring walking the outline twice: once offset to +X and
+    once back at -X.  ``core.loft`` connects corresponding points between the
+    two rings, so the result is a thin prism whose cross-section is the sail
+    shape -- the rim becomes the perimeter faces and the caps become the two
+    broad faces.
+
+    Belly pushes each side AWAY from the centreline, never toward it.  The
+    first version subtracted the belly instead, which on a 0.035 m sail with a
+    chord-derived belly of up to 2.45 m drove the two rings straight through
+    each other: the shell self-intersected and the exporter rejected it.  The
+    belly is also keyed to the Y chord, not the sail's height -- keying it off
+    Z is what produced that 2.45 m balloon.
+
+    ``reverse`` exists because the sign of a thin prism's signed volume is
+    decided by the traversal of its cross-section, and that traversal depends
+    on which way the caller happened to list the outline.  A sail triangle
+    listed luff-first comes out correct on its own; the small batten quads are
+    listed the other way round, and no cap flip can rescue them (measured
+    -0.0015 unflipped and -0.0004 flipped -- both inverted), so they pass
+    ``reverse=True`` instead of being kept out of the loft.
+    """
+    part = _part(a, "sail", base_color=color, roughness=0.85)
+    n = len(loop) // 2
+    sides = (loop[:n], loop[n:])
+    order = list(range(n))
+    if reverse:
+        order.reverse()
+    chord = max((p[1] for p in sides[0]), default=1.0) - \
+        min((p[1] for p in sides[0]), default=1.0)
+    rings = []
+    for side in sides:
+        cambered = []
+        span = max(float(n - 1), 1.0)
+        for k, idx in enumerate(order):
+            x, y, z = side[idx]
+            t = k / span
+            sign = 1.0 if x >= 0.0 else -1.0
+            cambered.append((x + sign * SAIL_CAMBER * chord * t, y, z))
+        rings.append(cambered)
+    C.loft(part.mesh, rings, color, cap_start=True, cap_end=True,
+           cap_start_flip=True, cap_end_flip=False)
+    return part
+
 
 # Hull stations, stern (+Y) to bow (-Y), as (y, half_beam, z_bottom, z_deck,
 # radius).  The keel is at Z = 0 and the deck edge at 1.25 m, so the visible
@@ -726,69 +809,59 @@ def _yacht():
                color=MAST, axis="X")
 
     # ---- mast + boom -----------------------------------------------------
+    # Mast proportions matter here: the hull is 11.0 m long, and a masthead at
+    # 13.25 m made the rig TALLER THAN THE BOAT IS LONG, which reads as a
+    # misplaced radio mast rather than a sailing yacht.  A production cruising
+    # yacht runs a mast of roughly 1.3-1.5 x the hull length measured to the
+    # sheer, so ~12.0 m masthead is still generous but no longer absurd; the
+    # sail head follows it down to match.
     rig = a.part("rig", base_color=MAST, roughness=0.40, metallic=0.35)
-    C.cylinder(rig.mesh, 0.095, 11.6, seg=8, center=(0.0, 0.60, 7.10),
+    C.cylinder(rig.mesh, 0.095, 10.35, seg=8, center=(0.0, 0.60, 6.475),
                color=MAST, axis="Z")                   # mast
     C.cylinder(rig.mesh, 0.075, 3.40, seg=6, center=(0.0, -1.10, 2.30),
                color=MAST, axis="Y")                   # boom
-    C.cylinder(rig.mesh, 0.035, 1.30, seg=4, center=(0.0, 0.20, 12.60),
+    C.cylinder(rig.mesh, 0.035, 1.30, seg=4, center=(0.0, 0.20, 11.83),
                color=MAST, axis="Z")                   # masthead
 
-    # ---- THE SAIL: the only open surfaces in this module -----------------
+    # ---- THE SAIL: cambered closed solids, not open decals -----------------
     #
-    # WHY OUTWARD MUST BE DECLARED AT ALL.  A sail is a bare triangle: it
-    # encloses no volume, so the signed-volume check the exporter runs on
-    # every solid has nothing to measure and the part would ship as an
-    # unverified "open-shell".  ``outward=("dir", ...)`` states which way
-    # "out of the asset" is instead, and the exporter then asserts that EVERY
-    # face agrees with it.
+    # These used to be two coincident single-sided triangles -- `sail_port` and
+    # `sail_stbd`, identical geometry with opposite winding, each carrying an
+    # ``outward=("dir", ...)`` declaration to satisfy the exporter's signed-
+    # volume check on a surface that encloses no volume.  That arrangement
+    # looks correct on paper and is invisible in practice: BOTH skins are
+    # exactly zero-thickness, so the pair still vanishes when the camera looks
+    # along the sail's plane.  Measured x-extent was 0.0000 m.
     #
-    # WHY +X, NOT -Y.  A rig runs fore-and-aft: the luff is the mast, the
-    # foot is the boom, both lie along Y, and the sail's triangular plane
-    # spans Y and Z.  Its normal is therefore ATHWARTSHIPS, along X.  The
-    # forward axis -Y lies IN the sail's own plane, so declaring it would
-    # give dot(n, d) == 0 on every face and the exporter's strict ``> 0``
-    # test would reject the whole part.
-    #
-    # WHY TWO PARTS.  A single one-sided triangle is only ever visible from
-    # one side, and the runtime back-face culls, so a yacht would lose its
-    # sail -- the single most identifying feature it has -- the moment the
-    # camera crossed the centreline.  Two parts, the SAME geometry with
-    # opposite winding and opposite declared directions, is the standard
-    # two-sided decal: each part is independently outward-checked, and the
-    # sail is solid from every angle.
-    # The two skins are created ONCE here, not inside the helper: the
-    # exporter rejects duplicate part names within an asset, and a.part()
-    # always creates a new one rather than looking one up.  ``_part`` is the
-    # get-or-create accessor for exactly this reason.
-    port = _part(a, "sail_port", base_color=SAIL, roughness=0.85)
-    stbd = _part(a, "sail_stbd", base_color=SAIL, roughness=0.85)
-    port.outward = ("dir", (1.0, 0.0, 0.0))
-    stbd.outward = ("dir", (-1.0, 0.0, 0.0))
-
-    def _sail_face(verts, color):
-        """Emit one sail face into both the +X and the -X skin."""
-        # cross((0,dy,0), (0,dy,dz)) is +X for any dy, dz > 0, so this order
-        # is the +X-facing one and the reversal is the -X-facing one
-        port.mesh.tri(verts[0], verts[1], verts[2], color)
-        stbd.mesh.tri(verts[2], verts[1], verts[0], color)
+    # They are now real cloth: `_sail_profile` offsets each outline into a thin
+    # closed loop straddling the centreline and `_sail_foil` lofts it as a
+    # watertight, cambered solid.  No `outward` declaration is needed because
+    # the part now has a real interior for the exporter to measure, and the
+    # belly means each sail carries two values under the single directional
+    # light instead of one.
 
     # mainsail: luff up the mast (y=+0.45), foot along the boom (y=-2.70),
-    # head at the masthead -- a right triangle, the whole readable silhouette
-    _sail_face([(0.0, -2.70, 2.40), (0.0, 0.45, 2.40), (0.0, 0.45, 12.40)],
-               SAIL)
-    # a jib forward of the mast, the same open surface wound to the same
-    # side: it is what makes the rig read as a RIG and not as one lone triangle
-    _sail_face([(0.0, -4.20, 1.90), (0.0, -0.30, 1.90), (0.0, -0.30, 9.40)],
-               SAIL_DK)
-    # batten lines: the horizontal seams that stop a flat triangle from
-    # reading as a single dead value
+    # head at the masthead -- the whole readable silhouette
+    _sail_foil(a, _sail_profile([(0.0, -2.70, 2.40), (0.0, 0.45, 2.40),
+                                 (0.0, 0.45, 11.15)]), SAIL)
+    # a jib forward of the mast: it is what makes the rig read as a RIG and
+    # not as one lone triangle
+    _sail_foil(a, _sail_profile([(0.0, -4.20, 1.90), (0.0, -0.30, 1.90),
+                                 (0.0, -0.30, 8.40)]), SAIL_DK)
+    # batten lines: the horizontal seams that stop a flat sail from reading as a
+    # single dead value.  The four corners are given in the SAME rotational
+    # sense as the sail outlines above (foot-leading then up-and-aft); the
+    # first attempt listed them luff-first, which traversed the cross-section
+    # the opposite way and inverted all three shells -- the exporter reported
+    # "3 of 5 closed shells have negative signed volume", which is exactly
+    # these three.
     for i in range(3):
-        zb = 4.4 + i * 2.4
+        zb = 4.4 + i * 2.0
         ya = -2.70 + 0.42 * i
-        _sail_face([(0.0, ya, zb), (0.0, ya + 0.10, zb),
-                    (0.0, ya + 0.10, zb + 0.10), (0.0, ya, zb + 0.10)],
-                   C.shade(SAIL, 0.90))
+        _sail_foil(a, _sail_profile([(0.0, ya, zb), (0.0, ya, zb + 0.10),
+                                     (0.0, ya + 0.10, zb + 0.10),
+                                     (0.0, ya + 0.10, zb)]),
+                   C.shade(SAIL, 0.90), reverse=True)
     return a
 
 

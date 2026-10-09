@@ -1170,16 +1170,26 @@ def _manhole_cover():
     C.cylinder(field.mesh, 0.33, 0.028, 20, center=(0, 0, 0.014),
                color=C.shade(IRON, 1.18))
 
-    ribs = a.part("cover_ribs", base_color=C.shade(IRON, 1.32), metallic=0.45,
+    # The 8 ribs used to be built in the SAME colour as the field they sit on,
+    # which made this the only fully achromatic prop in the set -- every base
+    # colour satisfied r == g == b, so the cover had no hue at all and read as
+    # a grey disc.  They are their own part now, shaded a stop darker, so the
+    # rib shadows separate from the plate instead of being invisible on it.
+    ribs = a.part("cover_ribs", base_color=C.shade(IRON, 0.72), metallic=0.45,
                   roughness=0.55)
     for k in range(8):
         ang = k * math.pi / 4.0
         _rbox(ribs.mesh, (0.22, 0.035, 0.030), rot=(0, 0, math.degrees(ang)),
               center=(0.20 * math.cos(ang), 0.20 * math.sin(ang), 0.015),
-              color=C.shade(IRON, 1.32))
+              color=C.shade(IRON, 0.72))
     C.cylinder(ribs.mesh, 0.255, 0.016, 20, center=(0, 0, 0.016),
-               color=C.shade(IRON, 1.06))                   # inner ring
+               color=C.shade(IRON, 0.86))                   # inner ring
 
+    # Hub with a REAL recessed pull slot.  It was a solid chamfered key block,
+    # so the one feature a player would reach for was a raised blank square --
+    # the opposite of a lifting hole.  The slot is a dark inset bar sunk into
+    # the key, flanked by the two remaining cheeks, which is what makes the
+    # cover look like it can be lifted rather than being a welded disc.
     hub = a.part("cover_hub", base_color=IRON, metallic=0.45, roughness=0.7)
     # A chamfered key block instead of a 10-gon hub: fewer triangles (28 vs 40)
     # and a lit arris all round, on the one piece the player looks straight at.
@@ -1187,6 +1197,13 @@ def _manhole_cover():
                 color=IRON)
     _chamfer_at(hub.mesh, (0.07, 0.07, 0.020), center=(0, 0, 0.028), bevel=0.007,
                 color=C.shade(IRON, 1.45))                  # lifting key
+    # The slot itself: a shallow sunk bar in near-black, reading as a void
+    # because it is both darker than every neighbouring face AND set below the
+    # key's top plane.
+    slot = a.part("cover_pull_slot", base_color=C.shade(IRON, 0.34),
+                  metallic=0.30, roughness=0.85)
+    _chamfer_at(slot.mesh, (0.115, 0.030, 0.012), center=(0, 0, 0.0355),
+                bevel=0.004, color=C.shade(IRON, 0.34))
     return a
 
 

@@ -4,7 +4,7 @@
   "up_axis": "Y",
   "unit": "meter",
   "asset_count": 99,
-  "tri_count": 132207,
+  "tri_count": 132297,
   "categories": [
     "animal",
     "beach",
@@ -445,8 +445,8 @@
       "id": "yacht_sailboat",
       "category": "vehicle",
       "file": "yacht_sailboat.json",
-      "tri_count": 806,
-      "part_count": 7,
+      "tri_count": 868,
+      "part_count": 6,
       "bounds": {
         "min": [
           -1.74,
@@ -455,7 +455,7 @@
         ],
         "max": [
           1.74,
-          13.25,
+          12.48,
           5.5
         ]
       }
@@ -825,8 +825,8 @@
       "id": "prop_manhole_cover",
       "category": "prop",
       "file": "prop_manhole_cover.json",
-      "tri_count": 408,
-      "part_count": 4,
+      "tri_count": 436,
+      "part_count": 5,
       "bounds": {
         "min": [
           -0.38,
@@ -835,7 +835,7 @@
         ],
         "max": [
           0.38,
-          0.038,
+          0.0415,
           0.38
         ]
       }
