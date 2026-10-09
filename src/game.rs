@@ -8373,6 +8373,9 @@ fn step_and_render(
                 width,
                 height,
                 near_cull_radius: near_cull,
+                // 阴影 frustum 跟**玩家**而不是相机眼点 —— 与下面
+                // WebGL2 那个调用传的 `game.player.get_position()` 同源。
+                shadow_focus: game.player.get_position(),
             }),
             Renderer::WebGl(webgl) => webgl.render(
                 &game.scene,

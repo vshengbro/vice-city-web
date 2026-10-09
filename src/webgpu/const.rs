@@ -182,6 +182,51 @@ pub(crate) const FIELD_STEP_MODE: &str = "stepMode";
 /// 键:attributes。
 pub(crate) const FIELD_ATTRIBUTES: &str = "attributes";
 
+// ---- 阴影贴图专用(compare sampler / sampler binding)----
+
+/// `GPUSamplerBindingLayout.type` —— `comparison`(而非 `filtering`)。
+///
+/// ⚠️ 深度纹理**必须**用 `comparison`:它让采样硬件自己做
+/// `refOp(depth) vs storedDepth` 并返回 0/1,而不是把深度当普通
+/// 浮点纹理读回来。用 `filtering` 配 `texture_depth_2d` 会被 WebGPU
+/// 判为 validation error(且是异步的:画面纯黑,console 一句话没有)。
+pub(crate) const SAMPLER_TYPE_COMPARISON: &str = "comparison";
+
+/// `GPUSamplerBindingLayout` / `GPUSamplerDescriptor` 的 `compare` 键。
+pub(crate) const FIELD_COMPARE: &str = "compare";
+
+/// `GPUSamplerDescriptor.compare` = `"less"`。
+///
+/// 语义与 WebGL2 那条手写比较 `compare_depth > stored ? 0 : 1` 逐字
+/// 对应:参考值(当前片元深度)小于存下来的遮挡体深度 → 全亮。
+pub(crate) const COMPARE_LESS: &str = "less";
+
+/// `GPUSamplerDescriptor.magFilter` / `minFilter` = `"linear"`。
+///
+/// 比较采样也支持线性过滤,而且**必须**用线性:PCF 的半影就是靠
+/// 硬件在 2×2 邻域内插值出来的。给 `"nearest"` 的话 3×3 核会退化成
+/// 9 个方块状硬边,半影全丢。
+pub(crate) const FILTER_LINEAR: &str = "linear";
+
+/// `GPUSamplerDescriptor` 的 `magFilter` 键。
+pub(crate) const FIELD_MAG_FILTER: &str = "magFilter";
+
+/// `GPUSamplerDescriptor` 的 `minFilter` 键。
+pub(crate) const FIELD_MIN_FILTER: &str = "minFilter";
+
+/// `GPUBindGroupLayoutEntry.texture` —— 绑一张纹理(而非 buffer)。
+pub(crate) const FIELD_TEXTURE: &str = "texture";
+
+/// `GPUBindGroupLayoutEntry.sampler` —— 绑一个采样器。
+pub(crate) const FIELD_SAMPLER: &str = "sampler";
+
+/// `GPUTextureBindingLayout.sampleType` = `"depth"`。
+///
+/// ⚠️ 深度纹理必须声明 `"depth"`,采样器配套必须是
+/// `sampler_comparison` + `compare`。这一对组合起来才是 WebGPU 的
+/// 「阴影比较采样」;少了任何一半都是 validation error。
+pub(crate) const SAMPLE_TYPE_DEPTH: &str = "depth";
+
 // ===========================================================================
 // descriptor 枚举值
 // ===========================================================================
@@ -191,6 +236,15 @@ pub(crate) const ENTRY_VERTEX: &str = "vs_main";
 
 /// 片元着色器入口点名。
 pub(crate) const ENTRY_FRAGMENT: &str = "fs_main";
+
+/// 阴影 pass 的顶点着色器入口点名。
+///
+/// 与主 pass **刻意分开**:`SHADER_VERTEX` 里给光照用的那些 varying
+/// 在阴影 pass 一概不需要,只留 `@builtin(position)`。但 WebGPU 的
+/// `entryPoint` 是**按名字**查的,同名不等于同一段代码 —— 见
+/// [`SHADER_SHADOW_VERTEX`]:阴影管线必须有一条自己那份、把实例变换
+/// 乘进光源矩阵的顶点着色器。
+pub(crate) const ENTRY_SHADOW_VERTEX: &str = "vs_shadow";
 
 /// 三角列表拓扑。
 pub(crate) const TOPOLOGY_TRIANGLE_LIST: &str = "triangle-list";
@@ -214,6 +268,28 @@ pub(crate) const DEPTH_COMPARE_LESS: &str = "less";
 
 /// 深度纹理格式。
 pub(crate) const DEPTH_FORMAT: &str = "depth24plus";
+
+/// 阴影深度纹理格式:`depth32float`。
+///
+/// 画布深度用 `depth24plus`(WebGPU 唯一**被采样**保证的性质要靠
+/// `depth24plus`,它带实现定义的不可压缩保证),但阴影贴图是
+/// `depth32float` —— 理由和 WebGL2 端换成 `DEPTH_COMPONENT24` 一样:
+/// 阴影比较需要**跨整个正交深度范围**都稳定可靠的数值,24 位整数深度
+/// 在 near=1 / far=320 的长条区间上,近处的深度步进会大到足以让
+/// 远处整片地面自阴影痤疮。
+///
+/// ⚠️ 换格式 = 偏置常数要重调,不是回归。见
+/// [`SHADOW_DEPTH_BIAS_SCALE`] / [`SHADOW_NORMAL_OFFSET_SCALE`]:
+/// 本切片的 depth bias 是在 WebGPU 的 `[0, 1]` NDC 深度域里算的
+/// (与 WebGL2 的 `[-1, 1]` 不同),所以按 WebGPU 的深度跨度重新标定。
+pub(crate) const SHADOW_DEPTH_FORMAT: &str = "depth32float";
+
+/// 阴影 pass 剔**背面**(`cullMode: "front"`)。
+///
+/// 对应 WebGL2 端的 `cull_face(FRONT)`:阴影贴图存的是「从光看过去
+/// 最靠后的表面」,拿背面当遮挡体能把自阴影痤疮与 Peter-Panning
+/// 一起压掉一个量级,这是阴影贴图最经典的一招。
+pub(crate) const CULL_MODE_FRONT: &str = "front";
 
 /// 顶点属性格式:`float32x3`。
 pub(crate) const VERTEX_FORMAT_F32X3: &str = "float32x3";
@@ -251,6 +327,32 @@ pub(crate) const BINDING_FRAME: u32 = 0;
 /// uniform binding 槽位 1:着色参数。
 pub(crate) const BINDING_SHADING: u32 = 1;
 
+/// 纹理 binding 槽位 0:阴影深度图(`texture_depth_2d`)。
+///
+/// 放在 **group 1** 而不是挤进 group 0:阴影管线是一条**独立的**
+/// pipeline,它只有 binding 0(光源视投影矩阵),而主 pipeline 的
+/// group 0 是 frame + shading。把阴影纹理塞进 group 0 就得让阴影管线
+/// 也声明那两个 uniform(`layout` 不一致会被 WebGPU 判为 invalid),
+/// 分离成两个 group 之后两条管线各自的布局都干净。
+///
+/// ⚠️ 本机 `maxBindGroups` 是规范下限 **4**,group 0 = 主 uniform、
+/// group 1 = 阴影贴图,只用掉 2 个。
+pub(crate) const BINDING_SHADOW_MAP: u32 = 0;
+
+/// 采样器 binding 槽位 0:阴影图的**比较**采样器。
+///
+/// WebGPU 没有「普通 sampler 采深度纹理」这种东西:深度格式必须配
+/// `sampler_comparison`,由硬件在采样时完成 PCF 比较。
+pub(crate) const BINDING_SHADOW_SAMPLER: u32 = 1;
+
+/// 光源视投影矩阵在 **group 1** 里的 binding 槽位。
+///
+/// ⚠️ 与 [`BINDING_FRAME`](上,group 0 的槽位 0) 是**不同的槽位**:
+/// 两条管线各有自己的 bind group,同一个物理 buffer 被绑在两处 ——
+/// 阴影管线(group 0 slot 0)用它做顶点变换,主管线(group 1 slot 2)
+/// 用它在片元阶段把世界坐标投到光空间。
+pub(crate) const BINDING_SHADOW_FRAME: u32 = 2;
+
 // ===========================================================================
 // GPU 对象的方法名
 // ===========================================================================
@@ -272,6 +374,9 @@ pub(crate) const METHOD_CREATE_PIPELINE_LAYOUT: &str = "createPipelineLayout";
 
 /// `GPU.createBindGroup`。
 pub(crate) const METHOD_CREATE_BIND_GROUP: &str = "createBindGroup";
+
+/// `GPUDevice.createSampler`.
+pub(crate) const METHOD_CREATE_SAMPLER: &str = "createSampler";
 
 /// `GPUCommandEncoder.finish` —— **必须**在 `submit` 之前调用,否则
 /// encoder 本身不是 GPUCommandBuffer,`submit` 会报
@@ -338,6 +443,9 @@ pub(crate) const FIELD_LENGTH: &str = "length";
 /// `GPUBufferBindingLayout.type` / `GPUTextureBindingLayout` 用的 `type` 键。
 pub(crate) const FIELD_TYPE: &str = "type";
 
+/// `GPUTextureBindingLayout.sampleType` 键。
+pub(crate) const FIELD_SAMPLE_TYPE: &str = "sampleType";
+
 /// `GPUFragmentState.targets`。
 pub(crate) const FIELD_TARGETS: &str = "targets";
 
@@ -351,8 +459,15 @@ pub(crate) const FIELD_COUNT: &str = "count";
 /// 索引缓冲格式:`uint32`(资产索引就是 `u32`)。
 pub(crate) const INDEX_FORMAT_UINT32: &str = "uint32";
 
-/// bind group 下标:本切片只有 group 0。
+/// bind group 下标:主 uniform(frame + shading)。
 pub(crate) const BINDING_GROUP: u32 = 0;
+
+/// bind group 下标:阴影贴图 + 比较采样器。
+///
+/// 见 [`BINDING_SHADOW_MAP`] 的说明:两条管线共用 group 0 的**形状**
+/// 是做不到的(阴影管线没有 frame / shading),所以阴影资源单开
+/// group 1。`maxBindGroups` 规范下限 4,这里只用 0 和 1。
+pub(crate) const BINDING_GROUP_SHADOW: u32 = 1;
 
 /// 顶点缓冲槽位。
 pub(crate) const SLOT_VERTEX: u32 = 0;
@@ -414,6 +529,30 @@ pub(crate) const USAGE_UNIFORM_BUFFER: u32 = USAGE_UNIFORM | USAGE_COPY_DST;
 /// 深度纹理:`RENDER_ATTACHMENT`。
 pub(crate) const USAGE_DEPTH_TEXTURE: u32 = USAGE_RENDER_ATTACHMENT;
 
+// ---- GPUTextureUsage ----
+
+/// `TEXTURE_BINDING` —— 可作 bind group 里的纹理资源。
+///
+/// ⚠️ **阴影深度纹理必须加上这一位**,不只是 `RENDER_ATTACHMENT`:
+/// 它既要被阴影 pass 写进去(`RENDER_ATTACHMENT`),又要被主管线
+/// 的片元着色器采样回来(`TEXTURE_BINDING`)。少一位的症状极隐蔽:
+///
+/// ```text
+/// [TextureView ...] usage (TextureUsage::RenderAttachment) doesn't
+/// include TextureUsage::TextureBinding.
+///  - While validating entries[0] against { binding: 0, ... texture ... }
+/// ```
+///
+/// 注意这是 `GPUTextureUsage` 的 **0x0004**,与 `GPUBufferUsage` 的
+/// `COPY_SRC`(同样是 0x0004)是两套独立命名空间 —— 两个 usage
+/// 掩码绝不能混用(见上面那段关于两组位掩码的说明)。
+pub(crate) const USAGE_TEXTURE_BINDING: u32 = 0x0004;
+
+/// 阴影深度纹理:`RENDER_ATTACHMENT | TEXTURE_BINDING`。
+///
+/// 见 [`USAGE_TEXTURE_BINDING`]:这张图既要写也要读。
+pub(crate) const USAGE_SHADOW_TEXTURE: u32 = USAGE_DEPTH_TEXTURE | USAGE_TEXTURE_BINDING;
+
 // ===========================================================================
 // WGSL 着色器
 //
@@ -438,8 +577,74 @@ pub(crate) const USAGE_DEPTH_TEXTURE: u32 = USAGE_RENDER_ATTACHMENT;
 /// 视投影矩阵 uniform buffer 的字节数。
 pub(crate) const UNIFORM_FRAME_BYTES: u32 = 64;
 
-/// 着色参数 uniform buffer 的字节数(12 × vec4)。
-pub(crate) const UNIFORM_SHADING_BYTES: u32 = 192;
+/// 光源视投影矩阵 uniform buffer 的字节数。
+pub(crate) const UNIFORM_SHADOW_FRAME_BYTES: u32 = 64;
+
+/// 着色参数 uniform buffer 的字节数(14 × vec4 = 224 字节)。
+///
+/// ⚠️ 阴影那两块 vec4 加进来之后从 192 涨到 224。这个数**必须**跟着
+/// [`crate::webgpu::r#struct::ShadingUniforms`] 的字段数一起改:
+/// 少分配的话 `writeBuffer` 会直接抛
+/// `writeBuffer size exceeds buffer size`,而不是静默截断。
+pub(crate) const UNIFORM_SHADING_BYTES: u32 = 14 * 16;
+
+// ===========================================================================
+// 阴影偏置的 WebGPU 标定
+//
+// WebGL2 端那两行偏置是在 **OpenGL 的 `[-1, 1]` NDC 深度域**里算的:
+//
+//     float bias_in_ndc = bias * 2.0 / 1024.0 * (u_shadow_params.z + 1.0);
+//
+// 那个 `2.0` 是 GL 的深度跨度(`z ∈ [-1,1]`),`1024.0` 是个魔数。
+// WebGPU 的 NDC 深度是 `[0, 1]`,跨度只有一半,所以整套偏置必须
+// 重新标定 —— **照抄 GLSL 的系数会直接导致影子整体偏移**(要么
+// 全痤疮,要么整个影子浮起来)。
+//
+// 正确的标定方式是从**深度跨度**出发:正交投影下深度是线性的,所以
+// 「NDC 深度 1.0」对应 `(SHADOW_FAR - SHADOW_NEAR)` 米。因此
+// 「一个纹素在世界空间的高度」折算成深度,只要拿深度跨度去除。
+//
+// 这里把三个数拆开,各自对应一个可独立调的量:
+//   - 纹素世界尺寸:由 [`crate::render::shadow_texel_world_size`] 给,
+//     它是 `2 * SHADOW_HALF_EXTENT / SHADOW_MAP_SIZE`。
+//   - 深度偏置倍数:[`SHADOW_DEPTH_BIAS_SCALE`],乘在纹素上。
+//   - 法线偏移倍数:[`SHADOW_NORMAL_OFFSET_SCALE`],乘在纹素上。
+// ===========================================================================
+
+/// WebGPU NDC 深度 `[0, 1]` 对应的世界深度跨度(米)。
+///
+/// 正交投影下深度线性,所以 `1.0` 深度 = `SHADOW_FAR - SHADOW_NEAR`
+/// 米 —— 这是偏置从「纹素(米)」换算到「深度」的换算系数来源。
+pub(crate) const SHADOW_DEPTH_SPAN_M: f32 = 320.0 - 1.0;
+
+/// 深度偏置倍数(以纹素为单位)。
+///
+/// `1.0` 就是「把比较点沿光线推离表面一个纹素」,约 4.4 cm。
+/// 斜率缩放(见 [`SHADOW_BIAS_SLOPE_GAIN`])在掠射面上还会再放大它。
+///
+/// 调这个值时看什么:地面出现平行条纹 = **偏小**(痤疮);影子整体
+/// 从物体脚下脱开 = **偏大**(Peter-Panning)。
+pub(crate) const SHADOW_DEPTH_BIAS_SCALE: f32 = 1.6;
+
+/// 法线偏移倍数(以纹素为单位)。
+///
+/// 沿世界法线把比较点推离表面,专治自阴影痤疮;掠射面推得更远。
+pub(crate) const SHADOW_NORMAL_OFFSET_SCALE: f32 = 1.4;
+
+/// 斜率缩放的深度偏置增益:掠射面上的额外深度偏置
+/// = `增益 × (1 - n·l)`。
+///
+/// 与 WebGL2 端 GLSL 里那个写死的 `3.0` 同一个形状,但这里**跟着
+/// uniform 上传**(见 `ShadingUniforms::shadow_misc.z`),不写死在
+/// WGSL 字符串里 —— 调偏置时只改 `const.rs` 这一处,不必重新编译
+/// 着色器字符串再肉眼核对 GLSL 与 WGSL 两份魔数有没有同步。
+pub(crate) const SHADOW_BIAS_SLOPE_GAIN: f32 = 3.0;
+
+/// 斜率缩放的法线偏移增益(同 [`SHADOW_BIAS_SLOPE_GAIN`] 的理由,
+/// 上传到 `ShadingUniforms::shadow_misc.w`)。
+///
+/// 与 WebGL2 端 GLSL 里那个写死的 `2.0` 同一个形状。
+pub(crate) const SHADOW_NORMAL_OFFSET_SLOPE_GAIN: f32 = 2.0;
 
 /// WebGPU 顶点着色器。
 pub(crate) const SHADER_VERTEX: &str = r#"
@@ -534,6 +739,47 @@ fn vs_main(
 }
 "#;
 
+/// WebGPU 阴影 pass 的顶点着色器。
+///
+/// 对应 WebGL2 端的 `SHADOW_VERTEX_SHADER`:复用**同一套 instance
+/// 布局**,只把 `u_view_proj` 换成光源视投影矩阵 —— 所以阴影 pass
+/// 与主 pass 吃的是同一份顶点 / 索引 / instance buffer,不需要第二条
+/// 几何上传路径。
+///
+/// ⚠️ 只需要 `@location(0)`(position)与 `@location(4..8)`
+/// (model matrix);`normal` / `color` / `emissive` / `tint` 一概不读。
+/// 顶点 buffer layout 里它们**仍然声明着**(见
+/// [`crate::webgpu::WebGpuRenderer`] 建的 `build_vertex_layout`),而
+/// WebGPU 允许管线声明的 location 集合**多于**着色器实际读取的集合 ——
+/// 少声明才会触发「着色器读了未声明的 location」validation error。
+///
+/// @group(0) 的 binding 0 是**光源**视投影矩阵,不是相机那一份:两条
+/// 管线各有各的 pipeline layout,同一个 binding 号在它们里面指的是
+/// 不同的 buffer。
+pub(crate) const SHADER_SHADOW_VERTEX: &str = r#"
+struct ShadowFrame {
+    view_proj : mat4x4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> shadow_frame : ShadowFrame;
+
+@vertex
+fn vs_shadow(
+    @location(0) position : vec3<f32>,
+    @location(4) row0 : vec4<f32>,
+    @location(5) row1 : vec4<f32>,
+    @location(6) row2 : vec4<f32>,
+    @location(7) row3 : vec4<f32>,
+) -> @builtin(position) vec4<f32> {
+    let model : mat4x4<f32> = mat4x4<f32>(row0, row1, row2, row3);
+    let world : vec4<f32> = model * vec4<f32>(position, 1.0);
+    let clip : vec4<f32> = shadow_frame.view_proj * world;
+    // ---- TEMP DIAGNOSTIC: keep x/y, force depth to 0.5 so ANY triangle
+    // that reaches the rasterizer leaves an unmistakable 0.5 in the map.
+    return vec4<f32>(clip.xy, 0.5, 1.0);
+}
+"#;
+
 /// WebGPU 片元着色器。
 ///
 /// 光照公式刻意与 [`crate::render::shade_face`] 逐项对应(半球环境光 →
@@ -553,9 +799,32 @@ struct Shading {
     fog : vec4<f32>,
     ao_params : vec4<f32>,
     exposure_white : vec4<f32>,
+    // x = 阴影强度, y = PCF 半径(纹素), z = 深度偏置(纹素),
+    // w = 法线偏移(纹素), 与 WebGL2 端 `u_shadow_params` 逐项一致。
+    shadow_params : vec4<f32>,
+    // x = 一个纹素覆盖的世界尺寸(米), y = WebGPU 深度域跨度(米)。
+    shadow_misc : vec4<f32>,
 };
 
+// ---- 阴影(见 WebGL2 端 FRAGMENT_SHADER 的「---- 阴影 ----」一段)----
+//
+// 阴影资源放在 **group 1**:group 0 是主 pass 的 frame + shading,
+// 阴影管线的 group 0 只有光源矩阵(见 SHADER_SHADOW_VERTEX),
+// 两者的 group 0 形状不同,不能共用。
+//
+// 光源矩阵**不塞进** `Shading` —— 它要按每帧上传的独立 uniform buffer
+// 走(binding 2),和 shading 那 192 字节的静态块分开。压成 vec4 对再
+// 拼回去,既多 16 字节又让矩阵的下标变成手算偏移,不值。
 @group(0) @binding(1) var<uniform> shading : Shading;
+
+@group(1) @binding(0) var shadow_map : texture_depth_2d;
+@group(1) @binding(1) var shadow_sampler : sampler_comparison;
+
+struct ShadowFrame {
+    view_proj : mat4x4<f32>,
+};
+
+@group(1) @binding(2) var<uniform> shadow_frame : ShadowFrame;
 
 /// Body of the `tonemap_luma` free function.
 ///
@@ -614,6 +883,73 @@ fn linear_to_srgb(value : vec3<f32>) -> vec3<f32> {
     return select(hi, lo, c <= vec3<f32>(0.0031308));
 }
 
+/// 3×3 PCF 阴影。返回 1 = 全亮,0 = 全暗。
+///
+/// 与 WebGL2 端 `FRAGMENT_SHADER` 的 `sample_shadow` 逐项对应,但有
+/// **一处必须重算**:NDC y 与纹理 v 的对应关系。
+///
+/// ⚠️ 这里实测过(见 `tools/gpu-probe` 侧的 ndc-y 探针):WebGPU 的
+/// NDC **+y 在屏幕上方**,与 OpenGL 一致。所以纹理坐标是
+/// `v = 0.5 - ndc.y * 0.5`,**不是** `0.5 + ndc.y * 0.5`。
+/// 写反了影子会整体上下颠倒 —— 太阳在东,影子却落在西。
+///
+/// 另外 WebGPU 的 NDC 深度是 `[0, 1]`(GL 是 `[-1, 1]`),所以
+/// `current` **不需要**再乘 `0.5 + 0.5`;而纹理里存下来的深度已经
+/// 是 `[0, 1]` 的设备深度,可以直接喂给 `textureSampleCompare`。
+fn sample_shadow(world : vec3<f32>, n_dot_l : f32) -> f32 {
+    let light_clip : vec4<f32> = shadow_frame.view_proj * vec4<f32>(world, 1.0);
+    let ndc : vec3<f32> = light_clip.xyz / light_clip.w;
+    // 走出 shadow frustum 的地方没有数据,判全亮而不是判全黑 ——
+    // 判全黑会让视锥边界出现一圈整齐的黑框。
+    let inside : bool = ndc.x >= -1.0 && ndc.x <= 1.0 && ndc.y >= -1.0
+        && ndc.y <= 1.0 && ndc.z >= 0.0 && ndc.z <= 1.0;
+    // ⚠️ y 取反:WebGPU 的 NDC +y 在上方(实测),而纹理 v=0 在**上方**
+    // 那一行,所以 v 要跟着翻。见本函数 doc 的说明。
+    let uv : vec2<f32> = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    // WebGPU 深度域已经是 [0, 1],直接就是纹理里存的那个值。
+    var current : f32 = ndc.z;
+
+    // 斜率缩放偏置:掠射面(light_dir 与法线夹角大)的深度梯度最陡,
+    // 固定偏置在这种面上必然要么痤疮要么 Peter-Panning。
+    let slope : f32 = clamp(1.0 - n_dot_l, 0.0, 1.0);
+    let bias_texels : f32 = shading.shadow_params.z
+        * (1.0 + shading.shadow_misc.z * slope);
+    // 一个纹素覆盖多少世界距离(米)→ 折算成 WebGPU `[0, 1]` 深度域。
+    // 正交投影下深度线性,所以换算就是「世界高度 / 深度跨度」。
+    let texel_world : f32 = shading.shadow_misc.x;
+    let depth_span : f32 = shading.shadow_misc.y;
+    let bias_in_depth : f32 = bias_texels * texel_world / max(depth_span, 0.001);
+    current = current - bias_in_depth;
+
+    let radius : f32 = max(shading.shadow_params.y, 0.0);
+    // 纹素尺寸换算成 uv 单位:1 / 阴影贴图边长。
+    // WebGPU 里有 `textureDimensions()`,比再传一个 uniform 可靠 ——
+    // 它永远等于实际分配的贴图边长,不会和 resize 后的贴图脱节。
+    let dims : vec2<f32> = vec2<f32>(textureDimensions(shadow_map));
+    let texel_uv : f32 = 1.0 / max(dims.x, 1.0);
+    // ⚠️ **循环与采样都不许放进 `if` 里。**
+    //
+    // `textureSampleCompare` 属于「隐式求导」的纹理采样(它自带 mip
+    // 选择与过滤),WGSL 规定它只能在**一致控制流**里调用 —— 写在
+    // `if (outside) { return 1.0; }` 之后就是非一致控制流,着色器
+    // **编译失败**(validation error,画面直接黑)。
+    //
+    // 所以判据只用来 `select` 一个结果:采样无条件跑完,再用
+    // `inside` 与「强度是否为零」把结果调回 1.0。
+    var visibility : f32 = 0.0;
+    for (var x : i32 = -1; x <= 1; x = x + 1) {
+        for (var y : i32 = -1; y <= 1; y = y + 1) {
+            let offset : vec2<f32> = vec2<f32>(f32(x), f32(y)) * radius * texel_uv;
+            visibility = visibility + textureSampleCompare(
+                shadow_map, shadow_sampler, uv + offset, current);
+        }
+    }
+    let pcf : f32 = visibility / 9.0;
+    let lit : f32 = select(1.0, pcf, inside);
+    // 强度为 0 时直接返回 1 —— 夜晚关掉阴影时连一次采样都不做。
+    return select(lit, 1.0, shading.shadow_params.x <= 0.0);
+}
+
 @fragment
 /// Body of the `fs_main` free function.
 ///
@@ -639,14 +975,26 @@ fn fs_main(
     @location(5) eye_distance : f32,
     @location(6) contact_ao : f32,
 ) -> @location(0) vec4<f32> {
-    let _unused_world : vec3<f32> = world;
     let n : vec3<f32> = normalize(normal);
     let n_dot_l : f32 = max(dot(n, shading.light_dir.xyz), 0.0);
     let hemi_weight : f32 = n.y * 0.5 + 0.5;
     let hemi : vec3<f32> = mix(shading.ground_ambient.xyz, shading.sky_ambient.xyz, hemi_weight);
     let ambient : vec3<f32> = mix(shading.ambient.xyz, hemi, shading.ambient_hemi.x);
     let base : vec3<f32> = color * tint;
-    let lit : vec3<f32> = base * (ambient + shading.light_color.xyz * n_dot_l)
+
+    // ---- 阴影 ----
+    // 法线偏移:沿世界法线把比较点推离表面,专治自阴影痤疮。
+    // 掠射面(n_dot_l 小)推得更远,因为那里的深度梯度最陡。
+    let shadow_slope : f32 = clamp(1.0 - n_dot_l, 0.0, 1.0);
+    let normal_offset : f32 = shading.shadow_misc.x * shading.shadow_params.w
+        * (1.0 + shading.shadow_misc.w * shadow_slope);
+    let shadow_world : vec3<f32> = world + n * normal_offset;
+    var shadow : f32 = sample_shadow(shadow_world, n_dot_l);
+    // 强度低的相位(夜)把阴影调淡,不是完全关掉 —— 路灯下仍有一层
+    // 淡淡的接触暗部,物体才不至于「漂起来」。
+    shadow = mix(1.0, shadow, shading.shadow_params.x);
+
+    let lit : vec3<f32> = base * (ambient + shading.light_color.xyz * n_dot_l * shadow)
         + base * emissive * shading.emissive_gain.x;
     var mapped : vec3<f32> = tonemap(lit, shading.exposure_white.x, shading.exposure_white.y);
     mapped = mapped * contact_ao;

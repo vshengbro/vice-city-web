@@ -66,6 +66,13 @@ pub struct RenderParams<'a> {
     pub height: u32,
     /// 近处剔除半径。
     pub near_cull_radius: f32,
+    /// 阴影 frustum 的中心(世界坐标)。
+    ///
+    /// ⚠️ 与 WebGL2 端**同一个参数、同一份语义**:跟的是**相机焦点**
+    /// 而不是眼点(见 [`crate::render::shadow_view_projection`] 的说明
+    /// —— 跟着眼点会让远处物体的影子落进 frustum 之外,边缘出现一条
+    /// 整齐的「影子截止线」)。
+    pub shadow_focus: Vec3,
 }
 
 /// 着色参数 uniform 的字节布局(12 × vec4 = 192 字节)。
@@ -99,7 +106,30 @@ pub struct ShadingUniforms {
     pub ao_params: [f32; 4],
     /// `x` = `exposure`,`y` = `tone_map_white`,其余为 pad。
     pub exposure_white: [f32; 4],
+    /// `x` = `shadow_strength`,`y` = PCF 半径(纹素),
+    /// `z` = 深度偏置(纹素),`w` = 法线偏移(纹素)。
+    ///
+    /// 与 WebGL2 端的 `u_shadow_params` **逐项同序**,便于一眼比对。
+    pub shadow_params: [f32; 4],
+    /// `x` = 一个纹素覆盖的世界尺寸(米),`y` = WebGPU 深度域跨度(米),
+    /// `z` = 深度偏置的斜率增益,`w` = 法线偏移的斜率增益。
+    ///
+    /// 后者是偏置从「纹素(米)」换算到「`[0, 1]` 深度」的分母 ——
+    /// WebGL2 那边的 `2.0 / 1024.0` 魔数在 WebGPU 里不成立,详见
+    /// [`crate::webgpu::r#const::SHADOW_DEPTH_SPAN_M`]。
+    ///
+    /// 两个斜率增益走 uniform 而不是写死在 WGSL 里,是为了调偏置时
+    /// 只改 [`crate::webgpu::r#const`] 一处,不必同时维护 GLSL 与
+    /// WGSL 两份魔数。
+    pub shadow_misc: [f32; 4],
 }
+
+/// 着色参数 uniform 的字节数(14 × vec4 = 224 字节)。
+///
+/// ⚠️ 必须与 [`ShadingUniforms`] 的字段数**逐项一致**:少写一个
+/// `vec4` 不会编译报错,只会在 GPU 上读到**后面那个块的数据**当成本
+/// 字段 —— 阴影参数会静默变成色调映射的曝光值,画面偏亮且无影。
+pub(crate) const SHADING_VEC4_COUNT: usize = 14;
 
 /// 视投影矩阵的字节序(列主序,直接 `writeBuffer`)。
 ///
@@ -208,8 +238,7 @@ mod r#tests {
             assert_eq!(out[at(0, column)], source[at(0, column)], "row 0 moved");
             assert_eq!(out[at(1, column)], source[at(1, column)], "row 1 moved");
             // 第 2 行:必须是 0.5·z + 0.5·w。
-            let expected: f32 =
-                0.5 * source[at(2, column)] + 0.5 * source[at(3, column)];
+            let expected: f32 = 0.5 * source[at(2, column)] + 0.5 * source[at(3, column)];
             assert_eq!(out[at(2, column)], expected, "row 2 not remapped");
             // 第 3 行:只有 z 行参与搬运,w 行自己保持不变。
             assert_eq!(out[at(3, column)], source[at(3, column)], "row 3 moved");
@@ -238,6 +267,107 @@ mod r#tests {
         assert_eq!(out[at(2, 1)], 0.0, "clip.y gained a z term");
         // 第 2 行第 2 项:0.5·(-1) + 0.5·(-1) = -1。
         assert_eq!(out[at(2, 2)], -1.0, "z row not remapped");
+    }
+
+    /// 游戏里真实存在的黄昏光方向(`render.rs` 里 `DUSK` 那一档)。
+    ///
+    /// 复用来它是因为两个后端必须对**同一束斜光**给出同一个剔除决定 ——
+    /// 否则 WebGPU 上会少掉一栋楼的影子,而 WebGL2 上是好的。
+    fn dusk_light() -> Vec3 {
+        crate::render::normalize3([0.86, 0.24, -0.44])
+    }
+
+    /// 判据的有效半径:半宽 + 余量(`render.rs` 的 `SHADOW_HALF_EXTENT`
+    /// 与 `SHADOW_CULL_MARGIN`)。
+    fn reach() -> f32 {
+        crate::r#const::SHADOW_HALF_EXTENT + crate::r#const::SHADOW_CULL_MARGIN
+    }
+
+    /// ⚠️ **只测原点的判据会误剔高楼** —— 这条钉住那个坑。
+    ///
+    /// [`crate::render::instance_affects_shadow`] 的注释里写了原因:
+    /// 判据要同时看**原点**和**原点往下挪一截**两个落点。斜光下
+    /// (`dusk` 的 y 分量仅 0.24)一栋 40 m 高的楼,原点在 y = 40 时
+    /// 影子落点距 focus 119 m(在视锥外),而它的**底部**(y = 20)
+    /// 落点只有 61 m,仍在「半宽 + 余量」之内 —— 只测原点就会把
+    /// 「影子还伸进视锥」的高楼整栋剔掉,地面上凭空少一块长影子。
+    ///
+    /// 这里的实例用 `[x, 40, 0]` 与 `[x, 20, 0]` 两支:
+    /// 前者是只看原点会做出错误决定的那个,后者是唯一救回它的那支。
+    #[test]
+    fn shadow_cull_keeps_a_tower_whose_base_reaches_the_frustum() {
+        let focus: Vec3 = [0.0, 0.0, 0.0];
+        let light: Vec3 = dusk_light();
+        let top: crate::render::Instance =
+            crate::render::Instance::new([30.0, 40.0, 0.0], 0.0, 1.0, [1.0; 3]);
+        let base: crate::render::Instance =
+            crate::render::Instance::new([30.0, 20.0, 0.0], 0.0, 1.0, [1.0; 3]);
+
+        // 两个落点:沿光线投影到 focus 所在的水平面上。
+        //
+        // 闭包**不能**写成 `fn(f32) -> f32` 指针类型(§5.1 要求显式标注,
+        // 而 `fn` 指针不能捕获环境),所以把 focus / light 改成参数。
+        let landing: fn(Vec3, Vec3, f32) -> f32 = |focus: Vec3, light: Vec3, height: f32| -> f32 {
+            let along: f32 = (focus[1] - height) / light[1];
+            let dx: f32 = 30.0 + light[0] * along - focus[0];
+            let dz: f32 = 0.0 + light[2] * along - focus[2];
+            (dx * dx + dz * dz).sqrt()
+        };
+        let top_landing: f32 = landing(focus, light, top.get_model_ref()[13]);
+        let base_landing: f32 = landing(focus, light, base.get_model_ref()[13]);
+
+        // 这个用例的前提:楼顶落在视锥外,而楼底落在视锥内。
+        // 两支断言都失败的话说明常量被改了,用例本身失去意义。
+        assert!(
+            top_landing > reach(),
+            "前提不成立:楼顶落点 {top_landing:.2} m 已在视锥内(半宽 + 余量 = {:.2}),\
+             测不出「只看原点」那个坑",
+            reach()
+        );
+        assert!(
+            base_landing <= reach(),
+            "前提不成立:楼底落点 {base_landing:.2} m 也在视锥外(半宽 + 余量 = {:.2}),\
+             这栋楼根本不该被考虑",
+            reach()
+        );
+
+        // 真正要钉的那一条:**只测原点**的写法会把这栋楼剔掉。
+        assert!(
+            !origin_only_would_keep(&top, focus, light),
+            "只看原点的判据本该把这栋楼剔掉(它就是那个 bug 的形状),\
+             落点 {top_landing:.2} m > 半宽 + 余量 = {:.2}",
+            reach()
+        );
+        // 而带上下两支探针的真判据**必须**留下它。
+        assert!(
+            crate::render::instance_affects_shadow(&top, focus, light),
+            "斜光下 {top_landing:.2} m 的高楼被剔掉了,但它的楼底落点只有 \
+             {base_landing:.2} m ≤ 半宽 + 余量 = {:.2} —— 地面上会凭空少一块影子",
+            reach()
+        );
+        // 楼底那一支单独看当然也在视锥内。
+        assert!(
+            crate::render::instance_affects_shadow(&base, focus, light),
+            "楼底落点 {base_landing:.2} m 明明在视锥内(半宽 + 余量 = {:.2}),却被剔掉了",
+            reach()
+        );
+    }
+
+    /// 「只看原点」那个**已知错误**的判据,仅供上面的测试做对照。
+    ///
+    /// 它刻意**不是** [`crate::render::instance_affects_shadow`] ——
+    /// 那正是本测试要证明「不再只看原点」的理由。写成独立函数而不是
+    /// 在测试里内联,是为了让对照判据一眼可读。
+    fn origin_only_would_keep(
+        instance: &crate::render::Instance,
+        focus: Vec3,
+        light: Vec3,
+    ) -> bool {
+        let m: &crate::r#type::Mat4Data = instance.get_model_ref();
+        let along: f32 = (focus[1] - m[13]) / light[1];
+        let dx: f32 = m[12] + light[0] * along - focus[0];
+        let dz: f32 = m[14] + light[2] * along - focus[2];
+        dx * dx + dz * dz <= reach() * reach()
     }
 }
 
@@ -270,6 +400,35 @@ pub struct WebGpuRenderer {
     pub(crate) shading_buffer: JsValue,
     /// 与上面两个 buffer 对应的 bind group。
     pub(crate) bind_group: JsValue,
+    /// 阴影 pass 的 pipeline(纯深度、无颜色输出)。
+    pub(crate) shadow_pipeline: JsValue,
+    /// 阴影 pass 的 pipeline layout(只有 group 0 的光源矩阵)。
+    pub(crate) shadow_pipeline_layout: JsValue,
+    /// 阴影 pass 的 bind group layout。
+    pub(crate) shadow_group_layout: JsValue,
+    /// 阴影 pass 的 bind group(group 0 = 光源矩阵)。
+    pub(crate) shadow_bind_group: JsValue,
+    /// 光源视投影矩阵 uniform buffer(主 pass 与阴影 pass 各绑一份
+    /// 同一个 buffer 到不同的 binding 上)。
+    pub(crate) shadow_frame_buffer: JsValue,
+    /// 阴影深度纹理(`depth32float`,边长 [`crate::r#const::SHADOW_MAP_SIZE`] 的正方形)。
+    pub(crate) shadow_texture: JsValue,
+    /// 阴影 pass 专用的 instance buffer。
+    ///
+    /// ⚠️ **不能与主管线共用**:`queue.writeBuffer` 在队列时间线上先于
+    /// 整条 command buffer 执行,同帧两次上传会互相覆盖。详见
+    /// [`WebGpuRenderer::draw_shadow_pass`] 里的说明。
+    pub(crate) shadow_instance_buffer: JsValue,
+    /// 阴影 instance buffer 的容量(实例数)。
+    pub(crate) shadow_instance_capacity: usize,
+    /// 主 pass 用的 group 1:阴影图 + 比较采样器 + 光源矩阵。
+    pub(crate) shadow_sample_bind_group: JsValue,
+    /// group 1 的 `GPUBindGroupLayout`。
+    ///
+    /// 单独存一份是因为它被**两个阶段**按顺序用到:主 pipeline 的
+    /// layout 里要列它(`build_pipeline_inner`),而 bind group 要拿它
+    /// 当描述符的 `layout`(`create_shadow_sample_bind_group`)。
+    pub(crate) shadow_sample_group_layout: JsValue,
     /// 顶点 / 索引缓冲,下标与 `Scene::meshes` 一一对应。
     pub(crate) meshes: Vec<GpuMesh>,
     /// 所有批次共享的 instance buffer。

@@ -11,14 +11,20 @@ pub use super::{
 };
 
 pub use r#const::*;
-pub use r#fn::{distance_to, flatten_shading};
 pub use r#fn::*;
+pub use r#fn::{distance_to, flatten_shading};
 pub use r#struct::*;
 
 pub(crate) use crate::{
     camera::Mat4,
+    r#const::{
+        BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FLOOR, REPLACE_MESH_OUT_OF_RANGE, SHADOW_MAP_SIZE,
+        SHADOW_PCF_RADIUS,
+    },
     mesh::{f32_slice_to_bytes, u32_slice_to_bytes},
-    r#const::{BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FLOOR, REPLACE_MESH_OUT_OF_RANGE},
+    render::{
+        FLOATS_PER_INSTANCE, INSTANCE_STRIDE_BYTES, STRIDE_FLOATS, SceneLighting,
+        instance_affects_shadow, shadow_view_projection,
+    },
     r#type::Vec3,
-    render::{FLOATS_PER_INSTANCE, INSTANCE_STRIDE_BYTES, STRIDE_FLOATS, SceneLighting},
 };

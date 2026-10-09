@@ -56,9 +56,8 @@ pub async fn acquire(canvas: &HtmlCanvasElement) -> Result<GpuContext, GpuUnavai
         &JsValue::from_str(ALPHA_MODE_OPAQUE),
     )
     .map_err(|_: JsValue| GpuUnavailable::new(GPU_ERR_CONFIGURE_FAILED))?;
-    let configure: euv::js_sys::Function =
-        method(&context, "configure")
-            .map_err(|_: String| GpuUnavailable::new(GPU_ERR_CONFIGURE_FAILED))?;
+    let configure: euv::js_sys::Function = method(&context, "configure")
+        .map_err(|_: String| GpuUnavailable::new(GPU_ERR_CONFIGURE_FAILED))?;
     configure
         .call1(&context, config.as_ref())
         .map_err(|_: JsValue| GpuUnavailable::new(GPU_ERR_CONFIGURE_FAILED))?;
@@ -91,13 +90,13 @@ pub async fn acquire(canvas: &HtmlCanvasElement) -> Result<GpuContext, GpuUnavai
 ///
 /// - `Result<Option<JsValue>, GpuUnavailable>` - 适配器句柄。
 async fn await_adapter(gpu: &JsValue) -> Result<Option<JsValue>, GpuUnavailable> {
-    let request: euv::js_sys::Function =
-        method(gpu, "requestAdapter").map_err(|_: String| GpuUnavailable::new(GPU_ERR_NO_ADAPTER))?;
+    let request: euv::js_sys::Function = method(gpu, "requestAdapter")
+        .map_err(|_: String| GpuUnavailable::new(GPU_ERR_NO_ADAPTER))?;
     let called: JsValue = request
         .call0(gpu)
         .map_err(|_: JsValue| GpuUnavailable::new(GPU_ERR_NO_ADAPTER))?;
-    let promise: Promise = as_promise(&called)
-        .map_err(|_: String| GpuUnavailable::new(GPU_ERR_NO_ADAPTER))?;
+    let promise: Promise =
+        as_promise(&called).map_err(|_: String| GpuUnavailable::new(GPU_ERR_NO_ADAPTER))?;
     let resolved: JsValue = JsFuture::from(promise)
         .await
         .map_err(|_: JsValue| GpuUnavailable::new(GPU_ERR_NO_ADAPTER))?;
@@ -306,6 +305,11 @@ pub fn frame_bytes(view_proj: &Mat4) -> [f32; 16] {
 
 /// 把 [`SceneLighting`] 摊进 WGSL 期望的 vec4 布局。
 ///
+/// 阴影那几项来自 WebGL2 端的 `u_shadow_params` / `u_shadow_texel`
+/// 两个 uniform,这里合成两个 vec4 上传,顺序与 GLSL 完全一致 ——
+/// **不要**调换,换了偏置与法线偏移会互换,症状是「影子整体浮起来」
+/// 或「满屏痤疮」。
+///
 /// # Arguments
 ///
 /// - `&SceneLighting` - 当前相位的光照参数。
@@ -326,13 +330,23 @@ pub fn shading_from_lighting(lighting: &SceneLighting, eye: Vec3) -> ShadingUnif
         emissive_gain: [lighting.emissive_gain, 0.0, 0.0, 0.0],
         eye: pad3(eye),
         fog: [lighting.fog_start, lighting.fog_end, 0.0, 0.0],
-        ao_params: [
-            BAKED_CONTACT_AO_HEIGHT,
-            CONTACT_SHADOW_FLOOR,
-            0.0,
-            0.0,
-        ],
+        ao_params: [BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FLOOR, 0.0, 0.0],
         exposure_white: [lighting.exposure, lighting.tone_map_white, 0.0, 0.0],
+        // 纹素尺寸与偏置倍数都从 `render.rs` 的那三个函数取,不在这里
+        // 另立一套常量 —— 两个后端必须是同一个数,否则同一个场景两边
+        // 影子形状不同。
+        shadow_params: [
+            lighting.shadow_strength,
+            SHADOW_PCF_RADIUS,
+            SHADOW_DEPTH_BIAS_SCALE,
+            SHADOW_NORMAL_OFFSET_SCALE,
+        ],
+        shadow_misc: [
+            crate::render::shadow_texel_world_size(),
+            SHADOW_DEPTH_SPAN_M,
+            SHADOW_BIAS_SLOPE_GAIN,
+            SHADOW_NORMAL_OFFSET_SLOPE_GAIN,
+        ],
     }
 }
 
@@ -462,14 +476,15 @@ pub fn gpu_object(navigator: &Navigator) -> Result<JsValue, GpuUnavailable> {
 /// - `Result<JsValue, GpuUnavailable>` - `GPUCanvasContext`。
 pub fn canvas_context(canvas: &HtmlCanvasElement) -> Result<JsValue, GpuUnavailable> {
     let result: Result<Option<Object>, JsValue> = canvas.get_context(CONTEXT_WEBGPU);
-    let value: Option<Object> = result.map_err(|_: JsValue| GpuUnavailable::new(GPU_ERR_NO_CONTEXT))?;
+    let value: Option<Object> =
+        result.map_err(|_: JsValue| GpuUnavailable::new(GPU_ERR_NO_CONTEXT))?;
     match value {
         Some(context) => Ok(context.into()),
         None => Err(GpuUnavailable::new(GPU_ERR_NO_CONTEXT)),
     }
 }
 
-/// 展平着色参数 uniform 成 48 个 f32。
+/// 展平着色参数 uniform 成 56 个 f32。
 ///
 /// # Arguments
 ///
@@ -477,9 +492,9 @@ pub fn canvas_context(canvas: &HtmlCanvasElement) -> Result<JsValue, GpuUnavaila
 ///
 /// # Returns
 ///
-/// - `[f32; 48]` - 可直接上传的字节序。
-pub fn flatten_shading(shading: ShadingUniforms) -> [f32; 48] {
-    let blocks: [[f32; 4]; 12] = [
+/// - `[f32; 56]` - 可直接上传的字节序。
+pub fn flatten_shading(shading: ShadingUniforms) -> [f32; 56] {
+    let blocks: [[f32; 4]; SHADING_VEC4_COUNT] = [
         shading.light_dir,
         shading.light_color,
         shading.ambient,
@@ -492,8 +507,10 @@ pub fn flatten_shading(shading: ShadingUniforms) -> [f32; 48] {
         shading.fog,
         shading.ao_params,
         shading.exposure_white,
+        shading.shadow_params,
+        shading.shadow_misc,
     ];
-    let mut out: [f32; 48] = [0.0; 48];
+    let mut out: [f32; 56] = [0.0; 56];
     for (index, block) in blocks.iter().enumerate() {
         let base: usize = index * 4;
         out[base] = block[0];
@@ -621,7 +638,10 @@ pub fn push_into(array: &JsValue, index: usize, value: &JsValue) -> Result<(), S
         .map_err(|_| String::from("array.length unreadable"))?;
     let pushed: usize = length.as_f64().unwrap_or(-1.0) as usize;
     if pushed != index + 1 {
-        return Err(format!("array.push order wrong: expected len {}, got {pushed}", index + 1));
+        return Err(format!(
+            "array.push order wrong: expected len {}, got {pushed}",
+            index + 1
+        ));
     }
     Ok(())
 }
@@ -743,9 +763,7 @@ pub fn write_buffer(
     writer
         .call3(&queue, buffer, &JsValue::from_f64(offset), view.as_ref())
         .map(|_: JsValue| ())
-        .map_err(|error: JsValue| {
-            format!("writeBuffer threw: {}", describe(&error))
-        })
+        .map_err(|error: JsValue| format!("writeBuffer threw: {}", describe(&error)))
 }
 
 /// `texture.createView()`。
@@ -777,9 +795,7 @@ pub fn set_bind_group(pass: &JsValue, index: u32, group: &JsValue) -> Result<(),
     function
         .call2(pass, &JsValue::from_f64(index as f64), group)
         .map(|_: JsValue| ())
-        .map_err(|error: JsValue| {
-            format!("setBindGroup threw: {}", describe(&error))
-        })
+        .map_err(|error: JsValue| format!("setBindGroup threw: {}", describe(&error)))
 }
 
 /// `pass.setVertexBuffer(slot, buffer)`。
@@ -798,12 +814,7 @@ pub fn set_vertex_buffer(pass: &JsValue, slot: u32, buffer: &JsValue) -> Result<
     function
         .call2(pass, &JsValue::from_f64(slot as f64), buffer)
         .map(|_: JsValue| ())
-        .map_err(|error: JsValue| {
-            format!(
-                "setVertexBuffer threw: {}",
-                describe(&error)
-            )
-        })
+        .map_err(|error: JsValue| format!("setVertexBuffer threw: {}", describe(&error)))
 }
 
 /// `pass.setIndexBuffer(buffer, "uint32")`。
@@ -821,12 +832,7 @@ pub fn set_index_buffer(pass: &JsValue, buffer: &JsValue) -> Result<(), String> 
     function
         .call2(pass, buffer, &JsValue::from_str(INDEX_FORMAT_UINT32))
         .map(|_: JsValue| ())
-        .map_err(|error: JsValue| {
-            format!(
-                "setIndexBuffer threw: {}",
-                describe(&error)
-            )
-        })
+        .map_err(|error: JsValue| format!("setIndexBuffer threw: {}", describe(&error)))
 }
 
 /// `pass.drawIndexed(...)`。
@@ -857,14 +863,16 @@ pub fn draw_indexed(
     // 位置)。最后一个参数 `firstInstance` 用 `Reflect::apply` 传。
     let arguments: euv::js_sys::Array = euv::js_sys::Array::new();
     for value in [
-        index_count, instances, first_index, base_vertex, first_instance,
+        index_count,
+        instances,
+        first_index,
+        base_vertex,
+        first_instance,
     ] {
         arguments.push(&JsValue::from_f64(f64::from(value)));
     }
     function
         .apply(pass, &arguments)
         .map(|_: JsValue| ())
-        .map_err(|error: JsValue| {
-            format!("drawIndexed threw: {}", describe(&error))
-        })
+        .map_err(|error: JsValue| format!("drawIndexed threw: {}", describe(&error)))
 }

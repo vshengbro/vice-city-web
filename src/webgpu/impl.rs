@@ -50,12 +50,23 @@ impl WebGpuRenderer {
             frame_buffer: JsValue::NULL,
             shading_buffer: JsValue::NULL,
             bind_group: JsValue::NULL,
+            shadow_pipeline: JsValue::NULL,
+            shadow_pipeline_layout: JsValue::NULL,
+            shadow_group_layout: JsValue::NULL,
+            shadow_bind_group: JsValue::NULL,
+            shadow_frame_buffer: JsValue::NULL,
+            shadow_texture: JsValue::NULL,
+            shadow_instance_buffer: JsValue::NULL,
+            shadow_instance_capacity: 0,
+            shadow_sample_bind_group: JsValue::NULL,
+            shadow_sample_group_layout: JsValue::NULL,
             meshes: Vec::new(),
             instance_buffer: JsValue::NULL,
             instance_capacity: 0,
             gpu_mesh_count: 0,
         };
         renderer.create_pipeline()?;
+        renderer.create_shadow_pipeline()?;
         renderer.create_uniform_buffers()?;
         renderer.reserve_instances(INSTANCE_PREALLOC)?;
         Ok(renderer)
@@ -88,9 +99,17 @@ impl WebGpuRenderer {
     /// - `Result<(), String>` - 失败时的错误文本。
     fn build_pipeline_inner(&mut self) -> Result<(), String> {
         let device: JsValue = self.get_device().clone();
+        // ⚠️ **顺序**:group 1 的 layout 必须**先**建出来 ——
+        // 主 pipeline 的 `pipeline layout` 里要列它(见
+        // [`WebGpuRenderer::build_pipeline_layout`]),而 bind group 又要
+        // 等阴影纹理与光源矩阵 buffer 建好才能建。三者的依赖是:
+        //   group1 layout → 主 pipeline layout → 主 pipeline
+        //   阴影纹理 / 光源矩阵 buffer → group1 bind group
+        let shadow_group_layout: JsValue = self.build_shadow_sample_group_layout()?;
         // pipeline layout 必须**留到 bind group 创建时再用**,所以这里
         // 存进字段,而不是建完就丢 —— 否则 bind group 无从创建。
-        let (layout, group_layout): (JsValue, JsValue) = self.build_pipeline_layout(&device)?;
+        let (layout, group_layout): (JsValue, JsValue) =
+            self.build_pipeline_layout(&device, &shadow_group_layout)?;
         let buffers: JsValue = self.build_vertex_layout()?;
 
         let vertex_module: JsValue = create_shader_module(&device, SHADER_VERTEX)?;
@@ -133,7 +152,11 @@ impl WebGpuRenderer {
             FIELD_TOPOLOGY,
             &JsValue::from_str(TOPOLOGY_TRIANGLE_LIST),
         )?;
-        set(&primitive, FIELD_CULL_MODE, &JsValue::from_str(CULL_MODE_BACK))?;
+        set(
+            &primitive,
+            FIELD_CULL_MODE,
+            &JsValue::from_str(CULL_MODE_BACK),
+        )?;
         // WebGPU 的正面默认就是逆时针,这里显式写出来,免得「为什么
         // WebGL2 剔背面这里也剔背面却朝向相反」成为下一个 debug 谜题。
         // ⚠️ **必须是 `ccw`,而且必须与 [`frame_bytes`] 的 Y 取反配套。**
@@ -182,26 +205,32 @@ impl WebGpuRenderer {
         self.set_pipeline(pipeline);
         self.set_pipeline_layout(layout);
         self.set_group_layout(group_layout);
+        // group 1 的 layout 留着给 bind group 那一步用(它现在还不能建:
+        // 阴影纹理与光源矩阵 buffer 都还没分配)。
+        self.set_shadow_sample_group_layout(shadow_group_layout);
         Ok(())
     }
 
-    /// 建 pipeline layout:group 0 上两个 uniform binding。
+    /// 建 pipeline layout:group 0 上两个 uniform binding,group 1 上阴影资源。
     ///
     /// # Arguments
     ///
     /// - `&JsValue` - `GPUDevice`。
+    /// - `&JsValue` - group 1 的 `GPUBindGroupLayout`(阴影图 + 采样器 +
+    ///   光源矩阵)。
     ///
     /// # Returns
     ///
     /// - `Result<(JsValue, JsValue), String>` - `(GPUPipelineLayout, GPUBindGroupLayout)`。
     ///
-    /// 两者都要留着:pipeline 用 `GPUPipelineLayout`,而
-    /// `createBindGroup` 要的是里面的 `GPUBindGroupLayout`。拿前者去
+    /// 后者(group **0** 那个)要留着:pipeline 用 `GPUPipelineLayout`,
+    /// 而 `createBindGroup` 要的是里面的 `GPUBindGroupLayout`。拿前者去
     /// 建 bind group 会报
     /// `Failed to convert value to 'GPUBindGroupLayout'`。
     fn build_pipeline_layout(
         &self,
         device: &JsValue,
+        shadow_group_layout: &JsValue,
     ) -> Result<(JsValue, JsValue), String> {
         let entries: JsValue = make_array();
         let visibility: f64 = f64::from(visibility_vertex_fragment());
@@ -215,7 +244,11 @@ impl WebGpuRenderer {
             //   'GPUBindGroupLayoutEntry': The provided value is not of
             //   type 'GPUBufferBindingLayout'.
             let buffer_layout: Object = new_object();
-            set(&buffer_layout, FIELD_TYPE, &JsValue::from_str(BUFFER_TYPE_UNIFORM))?;
+            set(
+                &buffer_layout,
+                FIELD_TYPE,
+                &JsValue::from_str(BUFFER_TYPE_UNIFORM),
+            )?;
             set(&entry, FIELD_BUFFER, buffer_layout.as_ref())?;
             push_into(&entries, index, entry.as_ref())?;
         }
@@ -230,11 +263,331 @@ impl WebGpuRenderer {
             call1(device, METHOD_CREATE_BIND_GROUP_LAYOUT, descriptor.as_ref())?;
         let layouts: JsValue = make_array();
         push_into(&layouts, 0usize, group_layout.as_ref())?;
+        // ⚠️ group 1 必须**列在这里**:WGSL 在 `@group(1)` 声明了阴影图 /
+        // 采样器 / 光源矩阵,`bindGroupLayouts` 里没有这一项的话
+        // `createRenderPipeline` 直接被判 invalid ——
+        // `The entry-point uses bindings in group 1 but [PipelineLayout]
+        // doesn't have a BindGroupLayout for this index`。
+        push_into(&layouts, 1usize, shadow_group_layout)?;
         let descriptor: Object = new_object();
         set(&descriptor, FIELD_BIND_GROUP_LAYOUTS, &layouts)?;
         let pipeline_layout: JsValue =
             call1(device, METHOD_CREATE_PIPELINE_LAYOUT, descriptor.as_ref())?;
         Ok((pipeline_layout, group_layout))
+    }
+
+    /// 建阴影 pass 的管线(纯深度、无颜色输出)。
+    ///
+    /// 与 [`WebGpuRenderer::create_pipeline`] 一样整段包在 validation
+    /// error scope 里:WGSL 里 `textureSampleCompare` 的控制流约束、
+    /// bind group layout 与 bind group 不匹配,全是**异步**报的 ——
+    /// 不开 error scope 的话症状只有一个:画面纯黑,console 一句话没有。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 管线创建失败时的可读原因。
+    pub fn create_shadow_pipeline(&mut self) -> Result<(), String> {
+        let device: JsValue = self.get_device().clone();
+        push_error_scope(&device, VALIDATION_SCOPE);
+        let built: Result<(), String> = self.build_shadow_pipeline_inner();
+        pop_error_scope(&device, VALIDATION_SCOPE);
+        built
+    }
+
+    /// 真正建阴影管线的那几步(外层负责 error scope)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时的错误文本。
+    fn build_shadow_pipeline_inner(&mut self) -> Result<(), String> {
+        let device: JsValue = self.get_device().clone();
+        let (layout, group_layout): (JsValue, JsValue) = self.build_shadow_pipeline_layout()?;
+        // ⚠️ **顶点 buffer layout 与主 pass 完全相同**:阴影 pass 吃的是
+        // 同一份几何缓冲,不需要第二套上传路径,所以这里直接复用。
+        let buffers: JsValue = self.build_vertex_layout()?;
+        let module: JsValue = create_shader_module(&device, SHADER_SHADOW_VERTEX)?;
+
+        let vertex_stage: Object = new_object();
+        set(&vertex_stage, FIELD_MODULE, &module)?;
+        set(
+            &vertex_stage,
+            FIELD_ENTRY_POINT,
+            &JsValue::from_str(ENTRY_SHADOW_VERTEX),
+        )?;
+        set(&vertex_stage, FIELD_BUFFERS, &buffers)?;
+
+        let primitive: Object = new_object();
+        set(
+            &primitive,
+            FIELD_TOPOLOGY,
+            &JsValue::from_str(TOPOLOGY_TRIANGLE_LIST),
+        )?;
+        // ⚠️ 剔**背面**:阴影贴图存的是「从光看过去最靠后的表面」,
+        // 与 WebGL2 端 `cull_face(FRONT)` 逐字对应。拿背面当遮挡体能
+        // 把自阴影痤疮与 Peter-Panning 一起压掉一个量级。
+        set(
+            &primitive,
+            FIELD_CULL_MODE,
+            &JsValue::from_str(CULL_MODE_FRONT),
+        )?;
+        set(
+            &primitive,
+            FIELD_FRONT_FACE,
+            &JsValue::from_str(FRONT_FACE_CCW),
+        )?;
+
+        let depth_stencil: Object = new_object();
+        set(
+            &depth_stencil,
+            FIELD_FORMAT,
+            &JsValue::from_str(SHADOW_DEPTH_FORMAT),
+        )?;
+        set(&depth_stencil, FIELD_DEPTH_WRITE_ENABLED, &JsValue::TRUE)?;
+        set(
+            &depth_stencil,
+            FIELD_DEPTH_COMPARE,
+            &JsValue::from_str(DEPTH_COMPARE_LESS),
+        )?;
+
+        let descriptor: Object = new_object();
+        set(&descriptor, FIELD_LAYOUT, &layout)?;
+        set(&descriptor, FIELD_VERTEX, &vertex_stage)?;
+        set(&descriptor, FIELD_PRIMITIVE, &primitive)?;
+        set(&descriptor, FIELD_DEPTH_STENCIL, &depth_stencil)?;
+        let multisample: Object = new_object();
+        set(&multisample, FIELD_COUNT, &JsValue::from_f64(1.0))?;
+        set(&descriptor, FIELD_MULTISAMPLE, multisample.as_ref())?;
+        // ⚠️ **没有 `fragment`**。纯深度 pass 在 WebGPU 里就是
+        // 「`vertex` + `depthStencil`,不带 fragment stage」——
+        // 带一个什么都不写的 fragment 反而会被判成「fragment 没有
+        // target」。这与 WebGL2 那份 `SHADOW_FRAGMENT_SHADER`
+        // (`out_color = vec4(1.0)`)的差别就在这里:GL 的 FBO 即使只
+        // 挂深度附件也仍然需要一个会写颜色的片元着色器,WebGPU 不需要。
+
+        let pipeline: JsValue = call1(&device, METHOD_CREATE_RENDER_PIPELINE, descriptor.as_ref())?;
+        self.set_shadow_pipeline(pipeline);
+        self.set_shadow_pipeline_layout(layout);
+        self.set_shadow_group_layout(group_layout);
+        Ok(())
+    }
+
+    /// 阴影管线的 layout:group 0 只有光源矩阵一个 uniform。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(JsValue, JsValue), String>` - `(GPUPipelineLayout, GPUBindGroupLayout)`。
+    fn build_shadow_pipeline_layout(&self) -> Result<(JsValue, JsValue), String> {
+        let device: JsValue = self.get_device().clone();
+        let entries: JsValue = make_array();
+        let entry: Object = new_object();
+        set(
+            &entry,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_FRAME as f64),
+        )?;
+        set(
+            &entry,
+            FIELD_VISIBILITY,
+            &JsValue::from_f64(f64::from(VISIBILITY_VERTEX)),
+        )?;
+        let buffer_layout: Object = new_object();
+        set(
+            &buffer_layout,
+            FIELD_TYPE,
+            &JsValue::from_str(BUFFER_TYPE_UNIFORM),
+        )?;
+        set(&entry, FIELD_BUFFER, buffer_layout.as_ref())?;
+        push_into(&entries, 0usize, entry.as_ref())?;
+        let descriptor: Object = new_object();
+        set(&descriptor, FIELD_ENTRIES, &entries)?;
+        let group_layout: JsValue = call1(
+            &device,
+            METHOD_CREATE_BIND_GROUP_LAYOUT,
+            descriptor.as_ref(),
+        )?;
+        let layouts: JsValue = make_array();
+        push_into(&layouts, 0usize, group_layout.as_ref())?;
+        let descriptor: Object = new_object();
+        set(&descriptor, FIELD_BIND_GROUP_LAYOUTS, &layouts)?;
+        let pipeline_layout: JsValue =
+            call1(&device, METHOD_CREATE_PIPELINE_LAYOUT, descriptor.as_ref())?;
+        Ok((pipeline_layout, group_layout))
+    }
+
+    /// 主 pass 的 **group 1**:阴影深度图 + 比较采样器 + 光源矩阵。
+    ///
+    /// 单独一个 group 而不是并进 group 0:阴影管线没有 frame / shading,
+    /// 两条管线的 group 0 形状**必须**不同(WebGPU 按 index 逐条对齐
+    /// `bindGroupLayouts`,形状不一致会直接判 pipeline invalid)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<JsValue, String>` - `(GPUBindGroupLayout)`,创建失败时的错误文本。
+    fn build_shadow_sample_group_layout(&self) -> Result<JsValue, String> {
+        let device: JsValue = self.get_device().clone();
+        let entries: JsValue = make_array();
+        // binding 0:阴影深度纹理。`sampleType: "depth"` 是硬性要求。
+        let texture_entry: Object = new_object();
+        set(
+            &texture_entry,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_SHADOW_MAP as f64),
+        )?;
+        set(
+            &texture_entry,
+            FIELD_VISIBILITY,
+            &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+        )?;
+        let texture_layout: Object = new_object();
+        set(
+            &texture_layout,
+            FIELD_SAMPLE_TYPE,
+            &JsValue::from_str(SAMPLE_TYPE_DEPTH),
+        )?;
+        set(&texture_entry, FIELD_TEXTURE, texture_layout.as_ref())?;
+        push_into(&entries, 0usize, texture_entry.as_ref())?;
+        // binding 1:比较采样器。`type: "comparison"` 与深度纹理配套。
+        let sampler_entry: Object = new_object();
+        set(
+            &sampler_entry,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_SHADOW_SAMPLER as f64),
+        )?;
+        set(
+            &sampler_entry,
+            FIELD_VISIBILITY,
+            &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+        )?;
+        let sampler_layout: Object = new_object();
+        set(
+            &sampler_layout,
+            FIELD_TYPE,
+            &JsValue::from_str(SAMPLER_TYPE_COMPARISON),
+        )?;
+        set(&sampler_entry, FIELD_SAMPLER, sampler_layout.as_ref())?;
+        push_into(&entries, 1usize, sampler_entry.as_ref())?;
+        // binding 2:光源矩阵 uniform(片元阶段要用它投影世界坐标)。
+        let frame_entry: Object = new_object();
+        set(
+            &frame_entry,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_SHADOW_FRAME as f64),
+        )?;
+        set(
+            &frame_entry,
+            FIELD_VISIBILITY,
+            &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+        )?;
+        let frame_layout: Object = new_object();
+        set(
+            &frame_layout,
+            FIELD_TYPE,
+            &JsValue::from_str(BUFFER_TYPE_UNIFORM),
+        )?;
+        set(&frame_entry, FIELD_BUFFER, frame_layout.as_ref())?;
+        push_into(&entries, 2usize, frame_entry.as_ref())?;
+
+        let group_descriptor: Object = new_object();
+        set(&group_descriptor, FIELD_ENTRIES, &entries)?;
+        call1(
+            &device,
+            METHOD_CREATE_BIND_GROUP_LAYOUT,
+            group_descriptor.as_ref(),
+        )
+    }
+
+    /// 主 pass 的 group 1 **bind group**(真正绑资源的那一步)。
+    ///
+    /// 与 [`WebGpuRenderer::build_shadow_sample_group_layout`] 分成两步
+    /// 的原因:主管线的 `pipeline layout` 里必须**已经**含 group 1 的
+    /// `GPUBindGroupLayout`(WGSL 在 `@group(1)` 声明了 binding,
+    /// layout 里没有这一项就是 validation error:
+    /// `The entry-point uses bindings in group 1 but [PipelineLayout]
+    /// doesn't have a BindGroupLayout for this index`),
+    /// 而 bind group 又必须等阴影纹理与光源矩阵 buffer 都建好 ——
+    /// 两者的先后关系不同,所以不能合成一步。
+    ///
+    /// # Arguments
+    ///
+    /// - `&JsValue` - group 1 的 `GPUBindGroupLayout`。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 创建失败时的错误文本。
+    pub fn create_shadow_sample_bind_group(&mut self, layout: &JsValue) -> Result<(), String> {
+        let device: JsValue = self.get_device().clone();
+        // ---- 比较采样器 ----
+        let sampler_descriptor: Object = new_object();
+        set(
+            &sampler_descriptor,
+            FIELD_COMPARE,
+            &JsValue::from_str(COMPARE_LESS),
+        )?;
+        set(
+            &sampler_descriptor,
+            FIELD_MAG_FILTER,
+            &JsValue::from_str(FILTER_LINEAR),
+        )?;
+        set(
+            &sampler_descriptor,
+            FIELD_MIN_FILTER,
+            &JsValue::from_str(FILTER_LINEAR),
+        )?;
+        let sampler: JsValue = call1(&device, METHOD_CREATE_SAMPLER, sampler_descriptor.as_ref())?;
+
+        // ---- bind group ----
+        let bind_entries: JsValue = make_array();
+        let view: JsValue = create_view(&self.get_shadow_texture().clone())?;
+        // ⚠️ **纹理资源直接就是 view 本身,不能再包一层 `{view: …}`。**
+        // WebGPU 的 `GPUBindingResource` 是个 union:buffer 槽给
+        // `GPUBufferBinding`(`{buffer}`),而**纹理槽直接收
+        // GPUTextureView**,规范里没有「view 字段」这种东西。包一层
+        // 的话 Chrome 会拿 union 去匹配 `GPUBufferBinding`,报出:
+        //
+        //   Failed to read the 'buffer' property from 'GPUBufferBinding':
+        //   Required member is undefined.
+        //
+        // 报错指向 buffer 槽,但真正出错的是**纹理**那条 —— union
+        // 匹配失败后的报错极具误导性,查这个问题时在这儿绕了很久。
+        let texture_binding: Object = new_object();
+        set(
+            &texture_binding,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_SHADOW_MAP as f64),
+        )?;
+        set(&texture_binding, FIELD_RESOURCE, &view)?;
+        push_into(&bind_entries, 0usize, texture_binding.as_ref())?;
+        let sampler_binding: Object = new_object();
+        set(
+            &sampler_binding,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_SHADOW_SAMPLER as f64),
+        )?;
+        set(&sampler_binding, FIELD_RESOURCE, &sampler)?;
+        push_into(&bind_entries, 1usize, sampler_binding.as_ref())?;
+        let frame_resource: Object = new_object();
+        set(
+            &frame_resource,
+            FIELD_BUFFER,
+            &self.get_shadow_frame_buffer().clone(),
+        )?;
+        let frame_binding: Object = new_object();
+        set(
+            &frame_binding,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_SHADOW_FRAME as f64),
+        )?;
+        set(&frame_binding, FIELD_RESOURCE, frame_resource.as_ref())?;
+        push_into(&bind_entries, 2usize, frame_binding.as_ref())?;
+
+        let bind_descriptor: Object = new_object();
+        set(&bind_descriptor, FIELD_LAYOUT, layout)?;
+        set(&bind_descriptor, FIELD_ENTRIES, &bind_entries)?;
+        let bind_group: JsValue =
+            call1(&device, METHOD_CREATE_BIND_GROUP, bind_descriptor.as_ref())
+                .map_err(|error: String| format!("group1 createBindGroup: {error}"))?;
+        self.set_shadow_sample_bind_group(bind_group);
+        Ok(())
     }
 
     /// 建顶点布局数组:一个 stride 48 B 的顶点 buffer + 一个 stride
@@ -356,6 +709,85 @@ impl WebGpuRenderer {
         self.set_frame_buffer(frame);
         self.set_shading_buffer(shading);
         self.set_bind_group(bind_group);
+        // 阴影贴图与「采样组」必须在主 uniform 之后建:group 1 的
+        // binding 2 要绑上面刚建的 `shadow_frame_buffer`,而阴影深度
+        // 纹理也要先存在才能 `createView`。
+        self.create_shadow_texture()?;
+        self.create_shadow_frame_buffer()?;
+        self.create_shadow_sample_bind_group(&self.get_shadow_sample_group_layout().clone())?;
+        Ok(())
+    }
+
+    /// 分配阴影深度纹理(`depth32float`,`SHADOW_MAP_SIZE` 见方)。
+    ///
+    /// 尺寸**固定**,不随画布变:阴影 frustum 的半宽由
+    /// [`crate::r#const::SHADOW_HALF_EXTENT`] 决定,贴图边长直接决定
+    /// 一个纹素覆盖多少米(`2 * 45 / 2048 ≈ 4.4 cm`)。跟着画布尺寸
+    /// 走会让同一个场景在两个分辨率下影子形状不同。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 创建失败时的错误文本。
+    pub fn create_shadow_texture(&mut self) -> Result<(), String> {
+        let device: JsValue = self.get_device().clone();
+        let descriptor: Object = new_object();
+        set(
+            &descriptor,
+            FIELD_SIZE,
+            &make_extent(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE),
+        )?;
+        set(
+            &descriptor,
+            FIELD_FORMAT,
+            &JsValue::from_str(SHADOW_DEPTH_FORMAT),
+        )?;
+        set(
+            &descriptor,
+            FIELD_USAGE,
+            &JsValue::from_f64(f64::from(USAGE_SHADOW_TEXTURE)),
+        )?;
+        let texture: JsValue = call1(&device, METHOD_CREATE_TEXTURE, descriptor.as_ref())?;
+        self.set_shadow_texture(texture);
+        Ok(())
+    }
+
+    /// 分配光源视投影矩阵的 uniform buffer。
+    ///
+    /// 同一个 buffer 被绑到**两处**:阴影管线(group 0 slot 0)拿它做
+    /// 顶点变换,主管线(group 1 slot 2)拿它在片元阶段算光空间坐标。
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 创建失败时的错误文本。
+    fn create_shadow_frame_buffer(&mut self) -> Result<(), String> {
+        let device: JsValue = self.get_device().clone();
+        let buffer: JsValue = create_buffer(
+            &device,
+            UNIFORM_SHADOW_FRAME_BYTES as usize,
+            USAGE_UNIFORM_BUFFER,
+        )?;
+        self.set_shadow_frame_buffer(buffer.clone());
+        // 阴影管线自己的 bind group:group 0 只有光源矩阵这一个 binding。
+        let layout: JsValue = self.get_shadow_group_layout().clone();
+        if layout.is_null() {
+            return Err(String::from(PIPELINE_LAYOUT_MISSING));
+        }
+        let entries: JsValue = make_array();
+        let resource: Object = new_object();
+        set(&resource, FIELD_BUFFER, &buffer)?;
+        let entry: Object = new_object();
+        set(
+            &entry,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_FRAME as f64),
+        )?;
+        set(&entry, FIELD_RESOURCE, resource.as_ref())?;
+        push_into(&entries, 0usize, entry.as_ref())?;
+        let descriptor: Object = new_object();
+        set(&descriptor, FIELD_LAYOUT, &layout)?;
+        set(&descriptor, FIELD_ENTRIES, &entries)?;
+        let bind_group: JsValue = call1(&device, METHOD_CREATE_BIND_GROUP, descriptor.as_ref())
+            .map_err(|error: String| format!("shadow-pass createBindGroup: {error}"))?;
+        self.set_shadow_bind_group(bind_group);
         Ok(())
     }
 
@@ -448,7 +880,33 @@ impl WebGpuRenderer {
         Ok(())
     }
 
+    /// 分配/扩容「阴影 pass 专用」的 instance buffer。
+    ///
+    /// # Arguments
+    ///
+    /// - `usize` - 需要的实例容量。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 创建失败时的错误文本。
+    fn reserve_shadow_instances(&mut self, capacity: usize) -> Result<(), String> {
+        if capacity <= self.get_shadow_instance_capacity() {
+            return Ok(());
+        }
+        let device: JsValue = self.get_device().clone();
+        let next: usize = capacity.next_power_of_two();
+        let bytes: usize = next * FLOATS_PER_INSTANCE * 4;
+        let buffer: JsValue = create_buffer(&device, bytes, USAGE_INSTANCE_BUFFER)?;
+        self.set_shadow_instance_buffer(buffer);
+        self.set_shadow_instance_capacity(next);
+        Ok(())
+    }
+
     /// 渲染一帧,返回本帧提交的三角形数。
+    ///
+    /// 阴影 pass 的三角形**也**计入返回值 —— 验收脚本读的
+    /// `gpu_submitted` 因此会随阴影 pass 的加入而上涨,这正是「阴影 pass
+    /// 真的跑了」的判据。
     ///
     /// # Arguments
     ///
@@ -466,6 +924,7 @@ impl WebGpuRenderer {
             width,
             height,
             near_cull_radius,
+            shadow_focus,
         } = params;
         self.ensure_depth(width, height)?;
         let device: JsValue = self.get_device().clone();
@@ -479,23 +938,93 @@ impl WebGpuRenderer {
             0.0,
             f32_slice_to_bytes(&frame),
         )?;
-        let shading: [f32; 48] = flatten_shading(shading_from_lighting(lighting, eye));
+        let shading: [f32; 56] = flatten_shading(shading_from_lighting(lighting, eye));
         write_buffer(
             &device,
             &self.get_shading_buffer().clone(),
             0.0,
             f32_slice_to_bytes(&shading),
         )?;
+        // 光源矩阵:**必须**走 `frame_bytes` 那套 GL→WebGPU 的深度搬运。
+        // 阴影 pass 的顶点着色器直接把结果当裁剪坐标用,而 WebGPU 的
+        // NDC 深度是 `[0, 1]`;不搬的话整张阴影图的深度全落在
+        // `[-1, 1]`,`ndc.z > 1.0` 的判据会把**所有**片元判成「视锥外」
+        // → 影子全丢,而且画面看不出任何异常。
+        let light_matrix: Mat4 = shadow_view_projection(shadow_focus, lighting.light_dir);
+        let light_bytes: [f32; 16] = frame_bytes(&light_matrix);
+        write_buffer(
+            &device,
+            &self.get_shadow_frame_buffer().clone(),
+            0.0,
+            f32_slice_to_bytes(&light_bytes),
+        )?;
 
         // ---- 画布纹理 ----
         let texture: JsValue = call0(&self.get_context().clone(), METHOD_GET_CURRENT_TEXTURE)?;
         let view: JsValue = create_view(&texture)?;
 
-// ---- pass ----
+        // ---- pass ----
         // `createCommandEncoder()` 是**零参数**方法。给它传一个
         // `null` 会让返回值不再是 GPUCommandEncoder,于是 submit 时报
         // `Failed to convert value to 'GPUCommandBuffer'`。
         let encoder: JsValue = call0(&device, METHOD_CREATE_COMMAND_ENCODER)?;
+
+        // ---- 1) 阴影 pass(纯深度)----
+        //
+        // 必须排在主 pass **之前**:主 pass 的片元着色器要在同一个
+        // command buffer 里采样这张图。两条 pass 在**同一个 encoder**
+        // 里,WebGPU 保证它们按顺序执行 —— 拆成两个 `submit` 就只能
+        // 靠「提交顺序恰好成立」这种运气了。
+        //
+        // `colorAttachments` 是**空数组**:纯深度 pass 没有颜色附件。
+        // 注意 WebGPU 的 `beginRenderPass` 要求这个键**存在**,写 `[]`
+        // 而不是省略 —— 省掉它会被读成 `undefined` 而不是「零个附件」。
+        let shadow_view: JsValue = create_view(&self.get_shadow_texture().clone())?;
+        let shadow_depth: Object = new_object();
+        set(&shadow_depth, FIELD_VIEW, &shadow_view)?;
+        set(
+            &shadow_depth,
+            FIELD_DEPTH_CLEAR_VALUE,
+            &JsValue::from_f64(1.0),
+        )?;
+        set(
+            &shadow_depth,
+            FIELD_DEPTH_LOAD_OP,
+            &JsValue::from_str(LOAD_OP_CLEAR),
+        )?;
+        set(
+            &shadow_depth,
+            FIELD_DEPTH_STORE_OP,
+            &JsValue::from_str(STORE_OP_STORE),
+        )?;
+        let shadow_pass_descriptor: Object = new_object();
+        let no_colors: JsValue = make_array();
+        set(&shadow_pass_descriptor, FIELD_COLOR_ATTACHMENTS, &no_colors)?;
+        set(
+            &shadow_pass_descriptor,
+            FIELD_DEPTH_STENCIL_ATTACHMENT,
+            &shadow_depth,
+        )?;
+        let shadow_pass: JsValue = call1(
+            &encoder,
+            METHOD_BEGIN_RENDER_PASS,
+            shadow_pass_descriptor.as_ref(),
+        )?;
+        call1(
+            &shadow_pass,
+            METHOD_SET_PIPELINE,
+            &self.get_shadow_pipeline().clone(),
+        )?;
+        set_bind_group(
+            &shadow_pass,
+            BINDING_GROUP,
+            &self.get_shadow_bind_group().clone(),
+        )?;
+        let shadow_triangles: u32 =
+            self.draw_shadow_pass(&shadow_pass, scene, shadow_focus, lighting)?;
+        call0(&shadow_pass, METHOD_END)?;
+
+        // ---- 2) 主 pass ----
         let color_attachment: Object = new_object();
         set(&color_attachment, FIELD_VIEW, &view)?;
         set(
@@ -550,6 +1079,15 @@ impl WebGpuRenderer {
 
         call1(&pass, METHOD_SET_PIPELINE, &self.get_pipeline().clone())?;
         set_bind_group(&pass, BINDING_GROUP, &self.get_bind_group().clone())?;
+        // group 1 = 阴影图 + 比较采样器 + 光源矩阵。**必须**在主
+        // pipeline 设好之后绑:bind group 与 pipeline layout 是按
+        // index 逐条对齐的,缺了 group 1 会得到「着色器读了未绑定的
+        // binding」validation error(整帧中止,画面保持上一帧)。
+        set_bind_group(
+            &pass,
+            BINDING_GROUP_SHADOW,
+            &self.get_shadow_sample_bind_group().clone(),
+        )?;
         // ⚠️ instance buffer 是**按需**建的(`reserve_instances` 在
         // 第一个批次时才分配)。第一帧这里如果直接绑,拿到的还是
         // `JsValue::NULL` —— `setVertexBuffer` 接受 null,但之后
@@ -604,7 +1142,7 @@ impl WebGpuRenderer {
         }
         if total == 0 {
             call0(&pass, METHOD_END)?;
-            return self.finish_frame(&device, &encoder, 0u32);
+            return self.finish_frame(&device, &encoder, shadow_triangles);
         }
 
         // 一次上传整帧实例,按批次切段。
@@ -630,19 +1168,118 @@ impl WebGpuRenderer {
             }
             ranges.push((mesh_index, first, count));
         }
-        write_buffer(
-            &device,
-            &instance_buffer,
-            0.0,
-            f32_slice_to_bytes(&all),
-        )?;
+        write_buffer(&device, &instance_buffer, 0.0, f32_slice_to_bytes(&all))?;
 
-        let mut triangles: u32 = 0;
+        let mut triangles: u32 = shadow_triangles;
         for (mesh_index, first, count) in ranges {
             triangles += self.draw_slice(&pass, mesh_index, first, count)?;
         }
         call0(&pass, METHOD_END)?;
         self.finish_frame(&device, &encoder, triangles)
+    }
+
+    /// 阴影 pass:逐实例剔除后把整帧实例一次性拼好、上传、画一遍。
+    ///
+    /// **复用主 pass 那份 instance buffer 与逐帧整体上传的策略**
+    /// (`queue.writeBuffer` 在队列时间线上先于 command buffer 执行 ——
+    /// 逐批次写会全部先跑完,每个 draw 读到最后一次写入的内容)。
+    /// 所以这里与主 pass 用**同一个 buffer**,靠 `firstInstance`
+    /// 切段;两段的实例内容不同(主 pass 带近处剔除,阴影 pass 不带),
+    /// 因此阴影 pass 必须排在主 pass 的上传**之前**。
+    ///
+    /// 不做近处剔除:被剔掉的实例如果还留着影子,地面上会出现一块
+    /// 「无中生有」的暗斑 —— 与 WebGL2 端同一理由。
+    ///
+    /// # Arguments
+    ///
+    /// - `&JsValue` - 阴影 render pass。
+    /// - `&crate::render::Scene` - 场景。
+    /// - `Vec3` - 阴影 frustum 中心(世界坐标)。
+    /// - `&SceneLighting` - 当前光照(取 `light_dir` 做剔除)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<u32, String>` - 本 pass 提交的三角形数。
+    fn draw_shadow_pass(
+        &mut self,
+        pass: &JsValue,
+        scene: &crate::render::Scene,
+        shadow_focus: Vec3,
+        lighting: &SceneLighting,
+    ) -> Result<u32, String> {
+        let device: JsValue = self.get_device().clone();
+        let hidden: Vec<usize> = crate::game::hidden_batches();
+        // 阴影 pass 只画 frustum 内的实例:整座城市每帧都往
+        // 2048² 的阴影贴图上提交顶点,而阴影 frustum 只覆盖玩家周围
+        // `SHADOW_HALF_EXTENT` 米 —— 视锥外那些画上去的深度**永远
+        // 不会被采样到**,是纯粹的浪费(WebGL2 端实测省了 20.9%)。
+        //
+        // 逐实例剔除而不是整批跳过的原因:一排行道树 / 一排路灯往往跨在
+        // 视锥边界上,整批丢会把还在范围内的影子也弄没。
+        //
+        // ⚠️ 判据函数是 `render.rs` 那份(带**上下两支探针**的版本),
+        // 不要换成「只看原点」的简化版:斜光下 40 m 高的楼,原点落点
+        // 在视锥外而楼底落点在视锥内,只看原点会凭空抹掉一整块长影子。
+        let mut staged: Vec<(usize, Vec<&crate::render::Instance>)> = Vec::new();
+        let mut total: usize = 0;
+        for (index, batch) in scene.batches.iter().enumerate() {
+            if batch.instances.is_empty() || hidden.contains(&index) {
+                continue;
+            }
+            let visible: Vec<&crate::render::Instance> = batch
+                .instances
+                .iter()
+                .filter(|instance: &&crate::render::Instance| {
+                    instance_affects_shadow(instance, shadow_focus, lighting.light_dir)
+                })
+                .collect();
+            if visible.is_empty() {
+                continue;
+            }
+            if self.get_meshes().get(batch.mesh_index).is_none() {
+                continue;
+            }
+            total += visible.len();
+            staged.push((batch.mesh_index, visible));
+        }
+        if total == 0 {
+            return Ok(0);
+        }
+        // ⚠️ **必须是阴影 pass 自己的 buffer,不能复用主 pass 那份。**
+        //
+        // `queue.writeBuffer` 排在**队列时间线**上,整条 command buffer
+        // 的所有 draw 之前就执行完了。于是同一帧里两次上传(阴影 135 个
+        // 实例、主管线 ~1,980 个)都会落在 draw 之前,**后写的覆盖先写的**:
+        // 阴影 pass 的 draw 读到的是主管线那份更大的数据,`firstInstance`
+        // 指向的偏移全错,模型矩阵乱七八糟 —— 画进深度图的是一堆乱码
+        // 三角形,实际深度比较下来「没有东西挡住光」,于是影子全丢。
+        //
+        // 症状极具欺骗性:pass 在跑、validation clean、三角形数也对,
+        // 但地面上一点影子都没有。
+        self.reserve_shadow_instances(total)?;
+        let instance_buffer: JsValue = self.get_shadow_instance_buffer().clone();
+        set_vertex_buffer(pass, SLOT_INSTANCE, &instance_buffer)?;
+        let mut all: Vec<f32> = Vec::with_capacity(total * FLOATS_PER_INSTANCE);
+        let mut ranges: Vec<(usize, u32, u32)> = Vec::with_capacity(staged.len());
+        for (mesh_index, instances) in staged {
+            let first: u32 = (all.len() / FLOATS_PER_INSTANCE) as u32;
+            let count: u32 = instances.len() as u32;
+            for instance in instances {
+                let before: usize = all.len();
+                all.extend_from_slice(instance.get_model_ref());
+                all.extend_from_slice(&instance.tint);
+                // pad 到 FLOATS_PER_INSTANCE:少写会让第 2 个及以后的
+                // 实例整体前移一个 f32,读到错位的 model matrix。
+                all.resize(before + FLOATS_PER_INSTANCE, 0.0);
+            }
+            ranges.push((mesh_index, first, count));
+        }
+        write_buffer(&device, &instance_buffer, 0.0, f32_slice_to_bytes(&all))?;
+        let mut triangles: u32 = 0;
+        for (mesh_index, first, count) in ranges {
+            triangles += self.draw_slice(pass, mesh_index, first, count)?;
+        }
+        Ok(triangles)
     }
 
     /// `finish()` + `submit`,并返回本帧三角形数。
@@ -912,7 +1549,7 @@ impl WebGpuRenderer {
     ///
     /// # Returns
     ///
-        /// configure 时记下的画布尺寸。
+    /// configure 时记下的画布尺寸。
     ///
     /// # Returns
     ///
@@ -924,7 +1561,7 @@ impl WebGpuRenderer {
     ///
     /// # Returns
     ///
-/// - `usize` - 容量(实例数)。
+    /// - `usize` - 容量(实例数)。
     pub fn get_instance_capacity(&self) -> usize {
         self.instance_capacity
     }
@@ -990,6 +1627,177 @@ impl WebGpuRenderer {
     /// - `usize` - 资产条数。
     pub fn set_gpu_mesh_count(&mut self, count: usize) {
         self.gpu_mesh_count = count;
+    }
+
+    /// 阴影管线。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPURenderPipeline` 句柄。
+    pub fn get_shadow_pipeline(&self) -> &JsValue {
+        &self.shadow_pipeline
+    }
+
+    /// 设置阴影管线。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPURenderPipeline` 句柄。
+    pub fn set_shadow_pipeline(&mut self, pipeline: JsValue) {
+        self.shadow_pipeline = pipeline;
+    }
+
+    /// 设置阴影管线的 pipeline layout。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUPipelineLayout` 句柄。
+    pub fn set_shadow_pipeline_layout(&mut self, layout: JsValue) {
+        self.shadow_pipeline_layout = layout;
+    }
+
+    /// 阴影管线的 bind group layout。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUBindGroupLayout` 句柄。
+    pub fn get_shadow_group_layout(&self) -> &JsValue {
+        &self.shadow_group_layout
+    }
+
+    /// 设置阴影管线的 bind group layout。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUBindGroupLayout` 句柄。
+    pub fn set_shadow_group_layout(&mut self, layout: JsValue) {
+        self.shadow_group_layout = layout;
+    }
+
+    /// 阴影管线的 bind group(group 0 = 光源矩阵)。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUBindGroup` 句柄。
+    pub fn get_shadow_bind_group(&self) -> &JsValue {
+        &self.shadow_bind_group
+    }
+
+    /// 设置阴影管线的 bind group。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUBindGroup` 句柄。
+    pub fn set_shadow_bind_group(&mut self, group: JsValue) {
+        self.shadow_bind_group = group;
+    }
+
+    /// 光源视投影矩阵 uniform buffer。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUBuffer` 句柄。
+    pub fn get_shadow_frame_buffer(&self) -> &JsValue {
+        &self.shadow_frame_buffer
+    }
+
+    /// 设置光源视投影矩阵 uniform buffer。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUBuffer` 句柄。
+    pub fn set_shadow_frame_buffer(&mut self, buffer: JsValue) {
+        self.shadow_frame_buffer = buffer;
+    }
+
+    /// 阴影深度纹理。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUTexture` 句柄。
+    pub fn get_shadow_texture(&self) -> &JsValue {
+        &self.shadow_texture
+    }
+
+    /// 设置阴影深度纹理。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUTexture` 句柄。
+    pub fn set_shadow_texture(&mut self, texture: JsValue) {
+        self.shadow_texture = texture;
+    }
+
+    /// 主管线的 group 1 bind group。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUBindGroup` 句柄。
+    pub fn get_shadow_sample_bind_group(&self) -> &JsValue {
+        &self.shadow_sample_bind_group
+    }
+
+    /// 取阴影 pass 专用的 instance buffer。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUBuffer` 句柄。
+    pub fn get_shadow_instance_buffer(&self) -> &JsValue {
+        &self.shadow_instance_buffer
+    }
+
+    /// 设置阴影 pass 专用的 instance buffer。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUBuffer` 句柄。
+    pub fn set_shadow_instance_buffer(&mut self, buffer: JsValue) {
+        self.shadow_instance_buffer = buffer;
+    }
+
+    /// 取阴影 instance buffer 的容量。
+    ///
+    /// # Returns
+    ///
+    /// - `usize` - 实例数。
+    pub fn get_shadow_instance_capacity(&self) -> usize {
+        self.shadow_instance_capacity
+    }
+
+    /// 设置阴影 instance buffer 的容量。
+    ///
+    /// # Arguments
+    ///
+    /// - `usize` - 实例数。
+    pub fn set_shadow_instance_capacity(&mut self, capacity: usize) {
+        self.shadow_instance_capacity = capacity;
+    }
+
+    /// 设置主管线的 group 1 bind group。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUBindGroup` 句柄。
+    pub fn set_shadow_sample_bind_group(&mut self, group: JsValue) {
+        self.shadow_sample_bind_group = group;
+    }
+
+    /// group 1 的 bind group layout。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUBindGroupLayout` 句柄。
+    pub fn get_shadow_sample_group_layout(&self) -> &JsValue {
+        &self.shadow_sample_group_layout
+    }
+
+    /// 设置 group 1 的 bind group layout。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUBindGroupLayout` 句柄。
+    pub fn set_shadow_sample_group_layout(&mut self, layout: JsValue) {
+        self.shadow_sample_group_layout = layout;
     }
 }
 
