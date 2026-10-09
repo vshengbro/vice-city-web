@@ -59,18 +59,38 @@ TANK_A = (0.68, 0.57, 0.44)
 TANK_B = (0.54, 0.44, 0.33)
 
 # How far the window surround stands proud of the wall, and how far the glass
-# sits back from that surround's face.  The 8 cm step is what turns a decal
-# into a hole: the sill faces up, the lintel faces down, and both catch light.
-FRAME_PROUD = 0.09
-GLASS_SET = 0.015
+# sits back from that surround's face.  The step between the two is what turns a
+# decal into a hole: the sill faces up, the lintel faces down, and both catch
+# light.
+#
+# SCALING.  These were sized for a turntable, not for the street.  At the old
+# 90 mm/15 mm pair the reveal measured 3.0 px at 40 m and 0.8 px at 150 m, so
+# the one detail that makes a facade read as architecture vanished exactly when
+# the player could see the building.  At 220 mm/100 mm the reveal holds up to
+# roughly 80 m and the surrounding chamfer stays sub-pixel only past it.
+#
+# ORDERING CONSTRAINT: ``GLASS_SET`` must stay strictly below ``FRAME_PROUD``.
+# The shaft is a SOLID box -- there is no boolean hole cut in the wall -- so
+# ``GLASS_SET`` cannot be a depth *into* the wall.  It is the pane's stand-off
+# above the wall face, and the reveal is the difference between the two.  Get
+# this backwards and the pane disappears inside solid geometry; see the sign
+# note at the window loop and ``check_window_recess.py``.
+FRAME_PROUD = 0.22
+GLASS_SET = 0.10
 
 
 def _shrub(color, k=1.0):
     return tuple(min(1.0, c * k) for c in color)
 
 
-def _lit_at(f, i, face, mod=11, thresh=2):
-    """Scattered, low-density lit-window mask (roughly ``thresh/mod`` of all)."""
+def _lit_at(f, i, face, mod=11, thresh=4):
+    """Scattered, low-density lit-window mask (roughly ``thresh/mod`` of all).
+
+    4/11 lights ~36% of the glazing.  The emissive band is the only facade cue
+    that survives distance -- a 10 cm reveal disappears at 150 m, a glowing pane
+    does not -- so the lit fraction is deliberately the largest single source of
+    value contrast in the whole category.
+    """
     return ((f * 7 + i * 3 + face * 5 + 1) % mod) < thresh
 
 
@@ -180,7 +200,7 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
              setbacks=(), pilasters=4, balcony_rows=(), cornice=True,
              ground_accent=True, base_color=None, trim=None,
              win_pitch=3.05, bal_pitch=4.6,
-             lit_mod=11, lit_thresh=2, upper_floor=0, clutter=True,
+             lit_mod=11, lit_thresh=4, upper_floor=0, clutter=True,
              rear_recess=False, ac_units=3):
     """Assemble one Art Deco building.
 
@@ -219,7 +239,7 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
     # face is the concrete roof -- markedly darker than the painted wall.
     shaft = a.part("shaft", base_color=wall)
     C.chamfer_box(shaft.mesh, (width, depth, total_h),
-                  center=(0, 0, total_h * 0.5), color=wall, bevel=0.07,
+                  center=(0, 0, total_h * 0.5), color=wall, bevel=0.18,
                   colors={"+z": ROOF})
 
     # lighter upper storey block on the tall variants: a colour zone, not
@@ -331,22 +351,27 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
             for fi, sgn in enumerate((-1, 1)):
                 y_wall = sgn * d2 * 0.5
                 y_f = y_wall + sgn * FRAME_PROUD
-                # The glass sits BEHIND the wall plane, inside the reveal.
-                # Sign matters: `sgn` is -1 for the street facade, so a
-                # positive inset has to move the pane TOWARD the building
-                # centre, which is `-sgn * GLASS_SET`.  Using `+sgn` (the
-                # obvious spelling) pushes the pane 15 mm PROUD of the wall
-                # and the whole recess collapses into a sticker -- which is
-                # exactly what the first QA render showed.
-                y_g = y_wall - sgn * GLASS_SET
+                # The glass must sit BETWEEN the wall face and the frame ring,
+                # i.e. OUTBOARD of the solid shaft but behind the proud frame.
+                #
+                # Sign: `sgn` is -1 for the street facade, where "further out"
+                # means MORE negative y.  So standing the pane off the wall is
+                # `+sgn * GLASS_SET`.  The mirror-image spelling (`-sgn`) drove
+                # the pane to y = -4.485 when the solid shaft already extends to
+                # -4.500 -- burying the entire glazing inside the wall, where
+                # the raycast probe measured 0.0% visibility and deleting every
+                # glass part changed 0.2-0.6% of pixels.  A negative sign here
+                # does not make a subtle recess; it makes the windows not exist.
+                y_g = y_wall + sgn * GLASS_SET
                 lit = _lit_at(f, cidx, fi, lit_mod, lit_thresh)
-                # glass: a solid panel whose outer face is GLASS_SET behind the
-                # wall, i.e. FRAME_PROUD - GLASS_SET behind the frame ring.
+                # glass: a solid panel whose OUTER face is GLASS_SET proud of
+                # the wall, i.e. FRAME_PROUD - GLASS_SET behind the frame ring.
                 gp = window_lit if lit else windows
                 gc = GLASS_LIT if lit else GLASS
-                # The glass extends 0.12 m further INWARD from y_g, i.e. in
-                # direction -sgn, so the centre is y_g - sgn * 0.06.  (Getting
-                # this sign wrong re-projects the pane back out of the wall.)
+                # The 0.12 m pane body runs INWARD from that outer face
+                # (direction -sgn, toward the building centre), so its centre
+                # is y_g - sgn * 0.06 and it ends up seated in a ~20 mm rebate
+                # rather than floating free of the wall.
                 C.box(gp.mesh, (ww, 0.12, wh),
                       center=(x, y_g - sgn * 0.06, z), color=gc)
                 if sgn > 0 and not rear_recess:
