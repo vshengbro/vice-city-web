@@ -346,9 +346,26 @@ def _tank():
     # point lands exactly on Z = 0 -- verify_assets check 7 requires a vehicle
     # to rest on y = 0, and a hard-coded 0.44 centreline against a hard-coded
     # 0.13 radius is how that check gets failed by 50 mm.
+    #
+    # AXIS ORDER MATTERS HERE.  ``_tank_track_path`` returns (along, 0, up) --
+    # component 0 runs down the tank's LENGTH (y), because that is the axis the
+    # stadium shape is described on.  It therefore has to be emitted as the
+    # path's Y, with the per-side lateral offset on X:
+    #
+    #     (sy * 1.36, p[0], p[2])     <- correct
+    #     (p[0], sy * 1.36, p[2])     <- crossed the hull
+    #
+    # The crossed spelling looked fine because both terms are numbers and the
+    # tube still swept a closed band on the ground.  Measured, though, the band
+    # came out 6.36 m long in X against a hull only 2.64 m wide, so each band
+    # speared clean through the hull and stuck out 3 m to port and starboard,
+    # while the five road wheels sat on a completely separate 5.92 m span with
+    # nothing enclosing them.  That is the "wheels read as floating blobs with
+    # no continuous track" symptom: it was never about the band's thickness.
+    # `check_track.py` in tools/blender guards the orientation.
     for sy in (-1, 1):
         C.tube(gear.mesh,
-               [(p[0], sy * 1.36, p[2]) for p in _tank_track_path(TRACK_R)],
+               [(sy * 1.36, p[0], p[2]) for p in _tank_track_path(TRACK_R)],
                TRACK_R, seg=6, color=STEEL_DK, caps=True, smooth=False)
 
     # ---- road wheels, sprocket, idler, return rollers ---------------------
