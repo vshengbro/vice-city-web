@@ -748,6 +748,30 @@ pub(crate) const DEBUG_VISIBILITY_HOOK_NAME: &str = "__VCW_DEBUG__";
 pub(crate) const RES_PARAM: &str = "res";
 /// 缺省绘制缓冲缩放;`0.0` = 不额外缩放,跟随 devicePixelRatio。
 pub(crate) const DEFAULT_RES: f32 = 0.0;
+/// 昼夜相位的 query 参数名(`?phase=dusk`,不含 `?` / `=`)。
+///
+/// 与 [`RES_PARAM`] 一样是**开机读一次**的参数:它设定的是**游戏状态**
+/// (`input.phase`),而 T 键与 HUD 滑块都能改这个状态 ——
+/// 逐帧重读会把玩家的改动每帧覆盖回去。
+pub(crate) const PHASE_PARAM: &str = "phase";
+/// `?phase=noon` 的取值(正午,默认相位)。
+pub(crate) const PHASE_QUERY_NOON: &str = "noon";
+/// `?phase=dusk` 的取值(黄昏,低角度斜射光,影子最长)。
+pub(crate) const PHASE_QUERY_DUSK: &str = "dusk";
+/// `?phase=night` 的取值(夜晚)。
+pub(crate) const PHASE_QUERY_NIGHT: &str = "night";
+#[cfg(test)]
+/// 单元测试断言文案:`?phase=` 的取值必须映射到对应相位。
+pub(crate) const T_PHASE_QUERY_MAPS: &str = "?phase={value} 必须映射到 {phase},实际 {got:?}";
+#[cfg(test)]
+/// 单元测试断言文案:未知取值必须回退,而不是悄悄解析成某档相位。
+pub(crate) const T_PHASE_QUERY_UNKNOWN: &str = "?phase={value} 是未知取值,必须回退,实际 {got:?}";
+#[cfg(test)]
+/// 断言文案模板里 `{value}` 占位符的名字。
+pub(crate) const PHASE_FIELD_VALUE: &str = "value";
+#[cfg(test)]
+/// 单元测试里故意非法的一个 `?phase=` 取值(前缀合法但整体不匹配)。
+pub(crate) const T_PHASE_QUERY_PROBE: &str = "duskish";
 #[cfg(test)]
 
 /// 单元测试断言文案:射线必须命中挡在视线中间的墙。

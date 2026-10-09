@@ -387,6 +387,33 @@ impl DayPhase {
         }
     }
 
+    /// 由 `?phase=` 的取值反推相位。
+    ///
+    /// 与 [`DayPhase::from_slider`] 同样的枚举 → 相位映射,但输入是
+    /// query 参数的**原始文本**:验收链接要能一步到达任意相位
+    /// (`?phase=dusk`),而正午的影子被自己挡住、黄昏的影子横穿马路,
+    /// 两者只有从 URL 直接指定才拍得出对照帧。
+    ///
+    /// 未知取值返回 `None` 而不是落回某一档:拼错 `?phase=duks` 应当
+    /// 立刻看出「参数写错了」,而不是静默出一张正午的截图,让人以为
+    /// 黄昏根本没生效。
+    ///
+    /// # Arguments
+    ///
+    /// - `&str` - `location.search` 里的取值(`dusk` / `noon` / `night`)。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<Self>` - 对应相位;取值不认识时为 `None`。
+    pub fn from_query(value: &str) -> Option<Self> {
+        match value {
+            PHASE_QUERY_NOON => Some(DayPhase::Noon),
+            PHASE_QUERY_DUSK => Some(DayPhase::Dusk),
+            PHASE_QUERY_NIGHT => Some(DayPhase::Night),
+            _ => None,
+        }
+    }
+
     /// 显示名(HTML overlay 用)。
     ///
     /// # Returns
@@ -5161,11 +5188,13 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use crate::r#const::{
-        SHADOW_CULL_MARGIN, SHADOW_GROUNDED_EPS, SHADOW_HALF_EXTENT,
-        T_SHADOW_CULLS_OUTSIDE, T_SHADOW_GROUNDED_SAFE, T_SHADOW_KEEPS_CENTRE,
-        T_SHADOW_KEEPS_MARGIN, T_SHADOW_TALL_KEPT,
+        PHASE_FIELD_VALUE, PHASE_QUERY_DUSK, PHASE_QUERY_NIGHT, PHASE_QUERY_NOON,
+        SHADOW_CULL_MARGIN, SHADOW_GROUNDED_EPS, SHADOW_HALF_EXTENT, T_PHASE_QUERY_MAPS,
+        T_PHASE_QUERY_PROBE, T_PHASE_QUERY_UNKNOWN, T_SHADOW_CULLS_OUTSIDE,
+        T_SHADOW_GROUNDED_SAFE, T_SHADOW_KEEPS_CENTRE, T_SHADOW_KEEPS_MARGIN,
+        T_SHADOW_TALL_KEPT,
     };
-    use crate::render::{Instance, instance_affects_shadow, normalize3};
+    use crate::render::{DayPhase, Instance, instance_affects_shadow, normalize3};
     use crate::r#type::Vec3;
 
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值。
@@ -5296,6 +5325,51 @@ mod tests {
                     ("height", &format!("{height:.0}")),
                     ("dist", &format!("{dist:.2}")),
                     ("reach", &format!("{:.2}", reach()))
+                ]
+            )
+        );
+    }
+
+    /// `?phase=` 的三个取值必须分别落到三档相位。
+    #[test]
+    fn phase_query_maps_every_value() {
+        let cases: [(String, DayPhase); 3] = [
+            (String::from(PHASE_QUERY_NOON), DayPhase::Noon),
+            (String::from(PHASE_QUERY_DUSK), DayPhase::Dusk),
+            (String::from(PHASE_QUERY_NIGHT), DayPhase::Night),
+        ];
+        for (value, want) in cases {
+            let got: Option<DayPhase> = DayPhase::from_query(&value);
+            assert!(
+                got == Some(want),
+                "{}",
+                fill(
+                    T_PHASE_QUERY_MAPS,
+                    &[
+                        (PHASE_FIELD_VALUE, &value),
+                        ("phase", want.as_str()),
+                        ("got", &format!("{got:?}"))
+                    ]
+                )
+            );
+        }
+    }
+
+    /// 拼错的取值必须**回退**,不能悄悄落回某一档相位。
+    ///
+    /// 用 `duskish` 而不是空串:空串在「参数缺失」时也会出现,那样这条
+    /// 测试证明不了「非法取值会被拒」,只证明了「空值会回退」。
+    #[test]
+    fn phase_query_rejects_unknown_value() {
+        let got: Option<DayPhase> = DayPhase::from_query(T_PHASE_QUERY_PROBE);
+        assert!(
+            got.is_none(),
+            "{}",
+            fill(
+                T_PHASE_QUERY_UNKNOWN,
+                &[
+                    (PHASE_FIELD_VALUE, T_PHASE_QUERY_PROBE),
+                    ("got", &format!("{got:?}"))
                 ]
             )
         );

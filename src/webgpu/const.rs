@@ -774,9 +774,7 @@ fn vs_shadow(
     let model : mat4x4<f32> = mat4x4<f32>(row0, row1, row2, row3);
     let world : vec4<f32> = model * vec4<f32>(position, 1.0);
     let clip : vec4<f32> = shadow_frame.view_proj * world;
-    // ---- TEMP DIAGNOSTIC: keep x/y, force depth to 0.5 so ANY triangle
-    // that reaches the rasterizer leaves an unmistakable 0.5 in the map.
-    return vec4<f32>(clip.xy, 0.5, 1.0);
+    return clip;
 }
 "#;
 

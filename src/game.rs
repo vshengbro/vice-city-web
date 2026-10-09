@@ -2997,12 +2997,34 @@ fn query_value(key: &str) -> Option<String> {
     let search: Option<String> = window().and_then(|w: Window| w.location().search().ok());
     let query: String = search?;
     for pair in query.trim_start_matches('?').split('&') {
-        let (name, value): (&str, &str) = pair.split_once('=')?;
+        // ⚠️ 这里**不能**用 `?` 提前退出整个函数:查询串里只要有一个
+        // 不带 `=` 的裸参数(`?flag&phase=dusk`),后面真正要的 key
+        // 就再也读不到了,症状是「链接里的参数被静默忽略」。
+        // `query_number` 早就用 `continue` 绕开了这个坑,这里对齐它。
+        let Some((name, value)): Option<(&str, &str)> = pair.split_once('=') else {
+            continue;
+        };
         if name == key {
             return Some(value.to_string());
         }
     }
     None
+}
+
+/// `?phase=` 指定的初始昼夜相位。
+///
+/// **开机读一次**,不像 [`hidden_batches`] 那样逐帧重读。理由是这个参数
+/// 设定的是**游戏状态**(`input.phase`)而不是一次性的旁路参数:T 键与
+/// HUD 滑块都能改这个状态,逐帧重读会把玩家的选择每帧覆盖回去。
+///
+/// # Returns
+///
+/// - `DayPhase` - `?phase=noon|dusk|night` 对应的相位;缺省或取值不认识时
+///   回退到 [`DEFAULT_PHASE`],与不带这个参数时的行为完全一致。
+pub(crate) fn query_phase() -> DayPhase {
+    query_value(PHASE_PARAM)
+        .and_then(|value: String| DayPhase::from_query(&value))
+        .unwrap_or(DEFAULT_PHASE)
 }
 
 /// 是否显式要求跳过 WebGPU(走 WebGL2)。
@@ -8631,7 +8653,13 @@ pub fn boot() {
         walk_request: [0.0, 0.0],
         safe_mode: false,
         speed_scale: 1.0,
-        input: InputState::default(),
+        // `?phase=noon|dusk|night` 决定初始相位。放在**状态构造处**而不是
+        // 之后逐帧覆盖,是为了让 HUD 滑块 / T 键从第一帧起就与真实状态
+        // 一致 —— 否则滑块会显示 `NOON` 而实际渲染的是黄昏。
+        input: InputState {
+            phase: query_phase(),
+            ..InputState::default()
+        },
         // 渲染后端**稍后**才建(见 `try_init_webgpu`):WebGPU 的设备获取
         // 是异步的,而 `boot()` 是同步的;而画布此刻必须还没被任何一次
         // `getContext` 碰过,否则 WebGPU 永久拿不到这块画布。
@@ -8714,6 +8742,10 @@ pub fn boot() {
     bind_pointer_events(&handles);
     bind_combat_mouse(&handles);
     bind_keyboard(&handles);
+
+    // `?phase=` 的初始值要同时刷到 HUD 上,否则滑块停在 `NOON`、
+    // 标签写着 `NOON`,画面却是黄昏 —— 截图上看不出哪个才是真相。
+    sync_phase_ui(&handles, query_phase());
 
     // ---- 昼夜滑块 ----
     if let Some(slider) = &handles.phase_slider {
