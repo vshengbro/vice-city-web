@@ -4,7 +4,7 @@
   "up_axis": "Y",
   "unit": "meter",
   "asset_count": 99,
-  "tri_count": 132297,
+  "tri_count": 141529,
   "categories": [
     "animal",
     "beach",
@@ -27,16 +27,16 @@
       "id": "bldg_deco_pink",
       "category": "building",
       "file": "bldg_deco_pink.json",
-      "tri_count": 2680,
-      "part_count": 31,
+      "tri_count": 3580,
+      "part_count": 39,
       "bounds": {
         "min": [
-          -6.09,
+          -6.22,
           0.0,
-          -5.1
+          -5.22
         ],
         "max": [
-          6.09,
+          6.22,
           20.02,
           6.63
         ]
@@ -46,8 +46,8 @@
       "id": "bldg_deco_teal",
       "category": "building",
       "file": "bldg_deco_teal.json",
-      "tri_count": 2920,
-      "part_count": 27,
+      "tri_count": 4200,
+      "part_count": 37,
       "bounds": {
         "min": [
           -5.59,
@@ -65,16 +65,16 @@
       "id": "bldg_cream_block",
       "category": "building",
       "file": "bldg_cream_block.json",
-      "tri_count": 3020,
-      "part_count": 28,
+      "tri_count": 3752,
+      "part_count": 36,
       "bounds": {
         "min": [
-          -9.2,
+          -9.22,
           0.0,
-          -5.7
+          -5.72
         ],
         "max": [
-          9.2,
+          9.22,
           16.62,
           7.13
         ]
@@ -103,16 +103,16 @@
       "id": "bldg_coral_hall",
       "category": "building",
       "file": "bldg_coral_hall.json",
-      "tri_count": 2516,
-      "part_count": 31,
+      "tri_count": 3416,
+      "part_count": 40,
       "bounds": {
         "min": [
-          -7.09,
+          -7.22,
           0.0,
           -6.22
         ],
         "max": [
-          7.09,
+          7.22,
           16.62,
           7.63
         ]
@@ -141,8 +141,8 @@
       "id": "bldg_lilac_tower",
       "category": "building",
       "file": "bldg_lilac_tower.json",
-      "tri_count": 3556,
-      "part_count": 29,
+      "tri_count": 4668,
+      "part_count": 38,
       "bounds": {
         "min": [
           -4.84,
@@ -160,16 +160,16 @@
       "id": "bldg_aqua_arcade",
       "category": "building",
       "file": "bldg_aqua_arcade.json",
-      "tri_count": 3248,
-      "part_count": 30,
+      "tri_count": 3952,
+      "part_count": 37,
       "bounds": {
         "min": [
-          -7.7,
+          -7.72,
           0.0,
           -6.22
         ],
         "max": [
-          7.7,
+          7.72,
           20.02,
           7.63
         ]
@@ -179,8 +179,8 @@
       "id": "bldg_sand_midrise",
       "category": "building",
       "file": "bldg_sand_midrise.json",
-      "tri_count": 3176,
-      "part_count": 31,
+      "tri_count": 4240,
+      "part_count": 39,
       "bounds": {
         "min": [
           -6.59,
@@ -198,8 +198,8 @@
       "id": "bldg_white_landmark",
       "category": "building",
       "file": "bldg_white_landmark.json",
-      "tri_count": 3500,
-      "part_count": 27,
+      "tri_count": 4780,
+      "part_count": 37,
       "bounds": {
         "min": [
           -6.34,
@@ -217,8 +217,8 @@
       "id": "bldg_pink_terrace",
       "category": "building",
       "file": "bldg_pink_terrace.json",
-      "tri_count": 3420,
-      "part_count": 31,
+      "tri_count": 4680,
+      "part_count": 40,
       "bounds": {
         "min": [
           -7.09,

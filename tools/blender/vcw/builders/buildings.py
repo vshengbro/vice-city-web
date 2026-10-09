@@ -201,12 +201,24 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
              ground_accent=True, base_color=None, trim=None,
              win_pitch=3.05, bal_pitch=4.6,
              lit_mod=11, lit_thresh=4, upper_floor=0, clutter=True,
-             rear_recess=False, ac_units=3):
+             rear_recess=False, ac_units=3, crown="auto"):
     """Assemble one Art Deco building.
 
     ``setbacks`` is a sequence of ``(height_above_ground, scale)`` -- above the
     given height the footprint shrinks to ``scale`` of its original half-extent,
-    which produces the classic stepped tower silhouette.
+    which produces the classic stepped tower silhouette.  These now cut the
+    SHAFT into real bands; previously they moved the trim but left the wall
+    full width, which stranded the upper-floor glazing inside solid geometry.
+
+    ``upper_floor`` is where the lighter upper-storey colour zone starts.  It
+    is DERIVED from the floor count when left at 0 -- a 9-storey tower used to
+    get no upper mass at all simply because nobody remembered to pass it, and
+    that is what left the top half of most towers a single dead colour field.
+
+    ``crown`` selects the mechanical top treatment: ``"louvre"`` (five deep
+    slots), ``"vents"`` (three shallow ones) or ``"none"``.  ``"auto"`` picks
+    ``"louvre"`` for a tall tower and ``"vents"`` for a low one, so the twelve
+    variants do not all ship the same belt.
 
     The remaining keyword arguments tune detail density.  They exist so the
     category can spend its triangle budget where it buys the most, and so a
@@ -216,6 +228,17 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
     a = C.Asset(asset_id, "building")
     wall = base_color or PALETTE[key]
     trim_c = trim or TRIM
+
+    # Derive the upper-storey start from the actual floor count.  Two thirds
+    # of the way up is the classic Deco division: a base block in the main
+    # colour, a lighter tower above it.  Before this, 10 of the 12 variants
+    # passed upper_floor=0 and got no zone at all.
+    if upper_floor <= 0 and floors >= 4:
+        upper_floor = max(2, int(round(floors * 0.66)))
+    if upper_floor >= floors:
+        upper_floor = max(1, floors - 1)
+    if crown == "auto":
+        crown = "louvre" if floors >= 6 else "vents"
 
     def scale_at(z):
         """Footprint scale at height z, after any setbacks."""
@@ -233,38 +256,112 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
 
     total_h = floors * floor_h
 
-    # ---- main shaft ------------------------------------------------------
-    # Chamfered: the four vertical arrises of a 12 m wall are what stop it
-    # rendering as one dead value under a single directional light.  The +z
-    # face is the concrete roof -- markedly darker than the painted wall.
-    shaft = a.part("shaft", base_color=wall)
-    C.chamfer_box(shaft.mesh, (width, depth, total_h),
-                  center=(0, 0, total_h * 0.5), color=wall, bevel=0.18,
-                  colors={"+z": ROOF})
+    # Height of each setback, ascending, with a 0.0 base.  These are the
+    # boundaries of the tower's storey BANDS.
+    band_starts = [0.0] + sorted(h for (h, _sc) in setbacks)
 
-    # lighter upper storey block on the tall variants: a colour zone, not
-    # geometry.  It wraps the shaft by 2 cm so the two never share a plane.
+    def band_of(z):
+        """Index of the band containing z."""
+        i = 0
+        for k, h in enumerate(band_starts):
+            if z >= h - 1e-9:
+                i = k
+        return i
+
+    # ---- main shaft ------------------------------------------------------
+    # WHY ONE BOX PER BAND, NOT ONE BOX FOR THE WHOLE TOWER.
+    #
+    # The shaft used to be a single ``chamfer_box(width, depth, total_h)`` --
+    # full footprint, full height, with ``setbacks`` applied to nothing.  Every
+    # other part (windows, string courses, balconies) IS placed at
+    # ``scale_at(z)``, so above the first setback the windows were emitted at
+    # the inset while the wall they were supposed to sit in never moved.  The
+    # glazing was therefore sealed inside solid geometry, and the visible wall
+    # above the setback was one full-width dead field.  A +Y ray cast from the
+    # street measured exactly that: on bldg_deco_teal only 4 of 9 floors had
+    # any visible glazing, and the first floor that lost it was the first
+    # floor above the first setback -- for all six setback variants, and for
+    # none of the three that declare none.
+    #
+    # Emitting a chamfered box per band makes the ziggurat real geometry, so
+    # the upper-floor glazing lands on a wall that is actually there.
+    shaft = C.Part("shaft", base_color=wall)
+    for bi, z_lo in enumerate(band_starts):
+        z_hi = band_starts[bi + 1] if bi + 1 < len(band_starts) \
+            else total_h
+        if z_hi - z_lo < 1e-6:
+            continue
+        s = scale_at(z_lo + 1e-4)
+        bw, bd = width * s, depth * s
+        # Each upper band overlaps the one below by 1 cm at its BASE, so the
+        # step reads as a solid shoulder instead of two boxes meeting in a
+        # plane.  The overlap is added at the bottom, never the top: adding
+        # it at the bottom would push the ground band 5 mm below z = 0 and
+        # the verifier's ground-resting check would fail the whole asset.
+        z_bot = z_lo - 0.01 if bi > 0 else z_lo
+        # Part names must be UNIQUE within an asset: the verifier rejects a
+        # duplicate, and a renderer binding materials by name would collide.
+        seg = C.Part("shaft_band%d" % bi, base_color=wall) \
+            if bi > 0 else shaft
+        C.chamfer_box(seg.mesh, (bw, bd, z_hi - z_bot),
+                      center=(0, 0, (z_hi + z_bot) * 0.5), color=wall,
+                      bevel=0.18, colors={"+z": ROOF})
+        if bi > 0:
+            a.add(seg)
+    if shaft.mesh.faces:
+        a.add(shaft)
+
+    # Lighter upper storey block on the tall variants: a colour zone, not
+    # geometry.  It is now emitted PER BAND and at that band's own setback
+    # scale, so the lighter mass actually wraps the wall that exists at that
+    # height.  Previously it was one full-base-footprint slab from
+    # ``upper_floor`` to the roof, which on a ziggurat tower stood proud of the
+    # narrower upper bands like a collar around a chimney -- and, where the
+    # bands were full width, it buried the crown outright.
     if upper_floor > 0:
-        z0 = upper_floor * floor_h
-        if z0 < total_h - 0.5:
-            up_c = _shrub(wall, 1.09)
-            up = a.part("upper_walls", base_color=up_c)
+        up = C.Part("upper_walls", base_color=_shrub(wall, 1.09))
+        z_start = upper_floor * floor_h
+        for bi, z_lo in enumerate(band_starts):
+            z_hi = band_starts[bi + 1] if bi + 1 < len(band_starts) \
+                else total_h
+            if z_hi <= z_start or z_lo >= total_h - 0.5:
+                continue
+            s = scale_at(z_lo + 1e-4)
+            # Wrap this band only, and stop 1 cm short of its top so the
+            # band above (a different colour zone) is not overlapped.
+            z0 = max(z_lo, z_start)
+            if z_hi - z0 < 0.5:
+                continue
             C.chamfer_box(up.mesh,
-                          (width + 0.04, depth + 0.04, total_h + 0.02 - z0),
-                          center=(0, 0, (total_h + 0.02 + z0) * 0.5),
-                          color=up_c, bevel=0.05, colors={"+z": ROOF})
+                          (width * s + 0.05, depth * s + 0.05, z_hi - z0),
+                          center=(0, 0, (z_hi + z0) * 0.5),
+                          color=_shrub(wall, 1.09), bevel=0.05,
+                          colors={"+z": ROOF})
+        if up.mesh.faces:
+            a.add(up)
 
     # vertical pilasters -- the signature Deco fluting.
     # All pilasters share ONE part: they are the same colour and material, and
-    # one part keeps the part count sane on a 12-storey facade.
+    # one part keeps the part count sane on a 12-storey facade.  They are
+    # emitted PER BAND at that band's own width, because a full-height
+    # full-width pilaster on a ziggurat tower hangs out past the setback as a
+    # row of floating fins with nothing behind them.
     pil = C.Part("pilasters", base_color=_shrub(wall, 1.06))
-    for i in range(pilasters):
-        t = (i + 0.5) / pilasters - 0.5          # -0.5 .. +0.5
-        x = t * width * 0.94
-        w = width * 0.030
-        C.chamfer_box(pil.mesh, (w, depth + 0.16, total_h * 0.94),
-                      center=(x, 0, total_h * 0.47), color=_shrub(wall, 1.06),
-                      bevel=0.035)
+    for bi, z_lo in enumerate(band_starts):
+        z_hi = band_starts[bi + 1] if bi + 1 < len(band_starts) \
+            else total_h
+        if z_hi - z_lo < 0.5:
+            continue
+        s = scale_at(z_lo + 1e-4)
+        bw, bd = width * s, depth * s
+        band_h = z_hi - z_lo
+        for i in range(pilasters):
+            t = (i + 0.5) / pilasters - 0.5          # -0.5 .. +0.5
+            x = t * bw * 0.94
+            w = bw * 0.030
+            C.chamfer_box(pil.mesh, (w, bd + 0.16, band_h - 0.06),
+                          center=(x, 0, (z_hi + z_lo) * 0.5),
+                          color=_shrub(wall, 1.06), bevel=0.035)
     a.add(pil)
 
     # horizontal string courses every floor (one shared part).  The lighter
@@ -294,8 +391,11 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
             continue
         w_out, d_out = width * prev, depth * prev
         w_in, d_in = width * s, depth * s
-        slab_w = (w_out + w_in) * 0.5
-        slab_d = (d_out + d_in) * 0.5
+        # The slab caps the LOWER step, so it must span the FULL OUTER
+        # footprint -- not the average of the outer and inner footprints.
+        # Averaging left the terrace roof suspended in the middle of the wall
+        # instead of reading as the exposed roof of the storey below.
+        slab_w, slab_d = w_out, d_out
         C.chamfer_box(setback_slab.mesh, (slab_w, slab_d, 0.24),
                       center=(0, 0, h - 0.12), color=CONCRETE, bevel=0.06,
                       colors={"+z": ROOF_DK, "-z": CONCRETE_DK})
@@ -424,6 +524,89 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
                           center=(x + sx * 1.045, y, z0 + 0.37), color=trim_c,
                           colors={"-z": rail_dk, "+z": _shrub(trim_c, 1.05)})
         a.add(balconies)
+
+    # ---- mechanical crown: louvre band + rooftop plant -------------------
+    # WHY.  Once the setbacks are real, the tower narrows near the top and the
+    # last few floors are the part a player sees against the sky.  Left alone
+    # they are just more of the same wall colour -- the "large, uninterrupted
+    # volume" complaint again, one band higher up.  A service zone reads
+    # differently from a habitable storey precisely because it is not the same
+    # thing: narrow horizontal louvres instead of windows, plus plant on the
+    # roof.  Both survive at gameplay distance, which a 22 cm window reveal
+    # does not.
+    #
+    # The treatment is a CHOICE per asset (see ``crown``), not one band stamped
+    # on everything: 14 identical mechanical belts would be its own kind of
+    # bland.
+    #
+    # ANCHORED TO THE TOP OF THE TOWER.  A mechanical penthouse is, by
+    # definition, the top of the building -- so the band goes on the last
+    # floors, not at the ``upper_floor`` colour break two thirds of the way
+    # up.  (The first attempt put it there and left the genuinely topmost
+    # storey a bare wall with the sign board on it, which is the exact
+    # complaint one band lower.)
+    mech_h = 0.34 if crown == "louvre" else 0.26
+    louvre_rows = 5 if crown == "louvre" else 3
+    mech_floor = max(2, floors - 2)          # first floor of the crown zone
+    me_z0 = max(0.0, mech_floor * floor_h)
+    # The louvre band sits on the lowest floors that are still habitable --
+    # INSIDE the fenestrated zone, so it replaces window rows rather than
+    # adding a band to an otherwise dead upper shaft.
+    if crown != "none" and floors >= 4 and mech_floor >= 1:
+        # The crown zone runs from the first crown floor all the way to just
+        # under the cornice, so the top storeys are a service band rather
+        # than the same wall colour one more time.
+        #
+        # PER-HEIGHT PLACEMENT, NOT ONE SCALE FOR THE WHOLE BAND.  A setback
+        # can cut the band in half: placing every blade at the narrowest
+        # scale the band touches drove them 2.3 m INSIDE the wider lower
+        # storey (measured: blades at y=-2.20 where the wall was at -4.50),
+        # i.e. sealed in solid geometry and invisible.  Each blade is placed
+        # at the scale of its OWN height, so it always sits on the wall that
+        # exists there.
+        zc0 = mech_floor * floor_h
+        zc1 = total_h - 0.9
+        if zc1 - zc0 > 1.0:
+            louvre = C.Part("mech_louvres", base_color=METAL_DK,
+                            metallic=0.35)
+            slot = C.Part("mech_louvre_slots", base_color=GLASS,
+                          roughness=0.3)
+            pitch = (zc1 - zc0) / float(louvre_rows + 1)
+            for r in range(louvre_rows):
+                zl = zc0 + pitch * (r + 0.5)
+                s_r = scale_at(zl)
+                bw, bd = width * s_r, depth * s_r
+                # front and back: a recessed dark slot with a proud blade,
+                # i.e. the same stand-off trick as a window frame but 10x
+                # wider and 6x shorter, so it reads as a slot not a window
+                for sgn in (-1, 1):
+                    y_wall = sgn * bd * 0.5
+                    C.box(louvre.mesh, (bw * 0.80, 0.26, mech_h),
+                          center=(0, y_wall + sgn * 0.09, zl), color=METAL_DK,
+                          colors={"+z": _shrub(METAL_DK, 1.22)})
+                    C.box(slot.mesh, (bw * 0.76, 0.10, mech_h * 0.42),
+                          center=(0, y_wall + sgn * 0.17, zl), color=GLASS)
+                # the two ends, narrower
+                for sx in (-1, 1):
+                    x_wall = sx * bw * 0.5
+                    C.box(louvre.mesh, (0.26, bd * 0.76, mech_h),
+                          center=(x_wall + sx * 0.09, 0, zl), color=METAL_DK,
+                          colors={"+z": _shrub(METAL_DK, 1.22)})
+                    C.box(slot.mesh, (0.10, bd * 0.72, mech_h * 0.42),
+                          center=(x_wall + sx * 0.17, 0, zl), color=GLASS)
+            a.add(louvre)
+            a.add(slot)
+
+            # a service floor band capping the louvre zone, sized to the
+            # wall at its OWN height
+            band2 = C.Part("mech_band_cap", base_color=_shrub(trim_c, 0.72))
+            s_cap = scale_at(zc1)
+            C.chamfer_box(band2.mesh, (width * s_cap + 0.26,
+                                      depth * s_cap + 0.26, 0.26),
+                          center=(0, 0, zc1 + 0.13), color=_shrub(trim_c, 0.72),
+                          bevel=0.05,
+                          colors={"+z": _shrub(trim_c, 0.92)})
+            a.add(band2)
 
     # ---- ground floor: dark plinth, shopfront band, real entrance -------
     if ground_accent:
@@ -560,6 +743,36 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
                    color=METAL_DK)
     a.add(acs)
 
+    # ---- rooftop vent bank ----------------------------------------------
+    # A mechanical crown needs something on the roof to justify the louvre
+    # band under it.  Curbs + a flared cone cap, the way real roof plant is
+    # built, and all of it is silhouette against the sky -- the part of a
+    # tower a player actually reads from a block away.  Capped at 3 units so
+    # the slimmest setback roof does not turn into a forest of pipes.
+    if crown != "none" and rw > 3.5:
+        curb = C.Part("vent_curbs", base_color=CONCRETE_DK)
+        stack = C.Part("vent_stacks", base_color=METAL)
+        cowl = C.Part("vent_cowls", base_color=METAL_DK, metallic=0.45)
+        n_vent = 3 if rw > 8.0 else 2
+        for i in range(n_vent):
+            vx = (-rw * 0.16 + i * rw * 0.30) if n_vent > 1 else 0.0
+            vy = rd * 0.30
+            vh = 0.95 + 0.28 * (i % 2)
+            vr = 0.26 if rw > 6.0 else 0.21
+            C.chamfer_box(curb.mesh, (vr * 3.0, vr * 3.0, 0.26),
+                          center=(vx, vy, tz + 0.13), color=CONCRETE_DK,
+                          bevel=0.04, colors={"+z": _shrub(CONCRETE_DK, 1.18)})
+            C.cylinder(stack.mesh, vr, vh, 8,
+                       center=(vx, vy, tz + 0.26 + vh * 0.5), color=METAL)
+            # flared cap: a truncated cone, so it is a solid of revolution
+            # rather than a floating disc
+            C.cone(cowl.mesh, vr * 1.55, 0.26, 8,
+                   center=(vx, vy, tz + 0.26 + vh + 0.13),
+                   color=METAL_DK, radius_top=vr * 1.55)
+        a.add(curb)
+        a.add(stack)
+        a.add(cowl)
+
     if clutter:
         # Reserve the footprints the fixed roof furniture already owns, then
         # place the loose clutter into whatever is left.  Candidates that do
@@ -624,9 +837,14 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
 
     # blank neon sign backing board on the front facade (signs attach to this).
     # Mounted on whichever setback band contains this height, so on a ziggurat
-    # the board lands on the wall it is actually in front of.
+    # the board lands on the wall it is actually in front of.  It is held BELOW
+    # the mechanical crown: a 4 m blank board across the service band hides the
+    # louvres on the storeys the player actually looks at.
     sb = C.Part("sign_board", base_color=METAL_DK, roughness=0.8)
     sb_z = total_h * 0.74
+    if crown != "none":
+        sb_z = min(sb_z, (mech_floor - 1) * floor_h - 1.6)
+    sb_z = max(sb_z, 6.0)
     sbs = scale_at(sb_z)
     sb_w = min(width * sbs * 0.52, 4.2)
     sb_y = -(depth * sbs * 0.5 + 0.14)
@@ -638,6 +856,30 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
               center=(sgn * sb_w * 0.42, sb_y + 0.02, sb_z - 0.95),
               color=METAL_DK)
     a.add(sb)
+
+    # ---- corner buttresses: vertical articulation on the upper mass ------
+    # The audit measured buildings at 3.34x colour modulation against palms
+    # at 34.8x -- the flattest major category -- because every large face
+    # carried one value.  A corner buttress is the cheapest articulation that
+    # works at gameplay distance: it changes the NORMAL on two vertical
+    # edges and takes a distinctly darker value, so the tower corner reads as
+    # a corner even when the facade is in shadow.
+    if floors >= 4:
+        bt = C.Part("corner_buttresses", base_color=_shrub(wall, 0.74))
+        bz0 = upper_floor * floor_h
+        s_b = scale_at(bz0 + 1e-4)
+        bw2, bd2 = width * s_b, depth * s_b
+        bt_h = total_h - bz0
+        if bt_h > 1.5:
+            for sx in (-1, 1):
+                for sy in (-1, 1):
+                    C.chamfer_box(
+                        bt.mesh, (bw2 * 0.17, bd2 * 0.17, bt_h - 0.01),
+                        center=(sx * bw2 * 0.415, sy * bd2 * 0.415,
+                                bz0 + bt_h * 0.5),
+                        color=_shrub(wall, 0.74), bevel=0.06,
+                        colors={"+z": _shrub(wall, 0.88)})
+            a.add(bt)
     return a
 
 
@@ -653,70 +895,74 @@ def build_all():
     out.append(building(
         "bldg_deco_pink", "pink", 12.0, 10.0, 5,
         setbacks=((11.0, 0.78),), pilasters=5, balcony_rows=(1, 2, 3, 4),
-        lit_mod=9, lit_thresh=2, upper_floor=3, bal_pitch=4.0))
+        lit_mod=9, lit_thresh=2, upper_floor=3, bal_pitch=4.0,
+        crown="vents"))
 
     # 2. tall teal tower with a pronounced ziggurat top
     out.append(building(
         "bldg_deco_teal", "teal", 11.0, 9.0, 9,
         setbacks=((14.0, 0.82), (23.0, 0.62), (27.0, 0.44)), pilasters=4,
-        balcony_rows=(2, 4, 6), upper_floor=6, bal_pitch=4.0))
+        balcony_rows=(2, 4, 6), upper_floor=6, bal_pitch=4.0,
+        crown="louvre"))
 
     # 3. wide cream apartment block, 4 storeys, no setback
     out.append(building(
         "bldg_cream_block", "cream", 18.0, 11.0, 4,
         pilasters=7, balcony_rows=(1, 2, 3), win_pitch=3.2, bal_pitch=3.6,
-        lit_mod=13, lit_thresh=3))
+        lit_mod=13, lit_thresh=3, crown="vents"))
 
-    # 4. mint corner shop, 3 storeys
+    # 4. mint corner shop, 3 storeys -- too short for a service zone
     out.append(building(
         "bldg_mint_shop", "mint", 10.0, 8.0, 3,
         pilasters=4, balcony_rows=(2,), win_pitch=2.9, bal_pitch=4.6,
-        rear_recess=True))
+        rear_recess=True, crown="none"))
 
     # 5. coral art-deco hall with a single setback and awning
     out.append(building(
         "bldg_coral_hall", "coral", 14.0, 12.0, 4,
         setbacks=((9.5, 0.80),), pilasters=5, balcony_rows=(1, 3),
-        win_pitch=3.1, bal_pitch=4.4, rear_recess=True))
+        win_pitch=3.1, bal_pitch=4.4, rear_recess=True, crown="vents"))
 
     # 6. apricot low-rise motel block, 2 storeys -- the short end of the range
     out.append(building(
         "bldg_apricot_motel", "apricot", 16.0, 9.0, 2, floor_h=3.3,
         pilasters=6, balcony_rows=(1,), win_pitch=3.6, bal_pitch=7.0,
-        lit_mod=9, lit_thresh=1))
+        lit_mod=9, lit_thresh=1, crown="none"))
 
     # 7. lilac slim high-rise, 12 storeys, double setback -- the tall end
     out.append(building(
         "bldg_lilac_tower", "lilac", 9.5, 8.5, 12, floor_h=3.3,
         setbacks=((20.0, 0.85), (32.0, 0.70)), pilasters=4,
         balcony_rows=(3, 5, 7, 9, 11), upper_floor=8, win_pitch=3.1,
-        bal_pitch=4.2, lit_mod=11, lit_thresh=2, ac_units=2))
+        bal_pitch=4.2, lit_mod=11, lit_thresh=2, ac_units=2,
+        crown="louvre"))
 
     # 8. aqua aquarium-style block with deep balconies
     out.append(building(
         "bldg_aqua_arcade", "aqua", 15.0, 12.0, 5,
         pilasters=6, balcony_rows=(1, 2, 3, 4), upper_floor=3,
-        win_pitch=3.1, bal_pitch=3.8, rear_recess=True))
+        win_pitch=3.1, bal_pitch=3.8, rear_recess=True, crown="vents"))
 
     # 9. sand-coloured 6-storey mid-rise
     out.append(building(
         "bldg_sand_midrise", "sand", 13.0, 10.0, 6,
         setbacks=((13.0, 0.88),), pilasters=5, balcony_rows=(2, 3, 4, 5),
-        upper_floor=4, win_pitch=3.0, bal_pitch=3.8, lit_mod=13, lit_thresh=3))
+        upper_floor=4, win_pitch=3.0, bal_pitch=3.8, lit_mod=13, lit_thresh=3,
+        crown="louvre"))
 
     # 10. white deco landmark with a ziggurat crown
     out.append(building(
         "bldg_white_landmark", "white", 12.5, 12.5, 10,
         setbacks=((16.0, 0.85), (26.0, 0.66), (31.0, 0.46)), pilasters=4,
         balcony_rows=(2, 4, 6, 8), upper_floor=7, win_pitch=3.2,
-        bal_pitch=4.0, lit_mod=9, lit_thresh=2))
+        bal_pitch=4.0, lit_mod=9, lit_thresh=2, crown="louvre"))
 
     # 11. pink twin-setback 7 storey
     out.append(building(
         "bldg_pink_terrace", "pink", 14.0, 10.0, 7,
         setbacks=((10.0, 0.86), (19.0, 0.68)), pilasters=5,
         balcony_rows=(1, 3, 5), upper_floor=5, win_pitch=3.1, bal_pitch=4.2,
-        rear_recess=True))
+        rear_recess=True, crown="louvre"))
 
     # 12. teal industrial-loft, 3 storeys, wide and shallow.  Width is held at
     # 17 m (8.5 m half-extent) so the whole asset stays clear of the engine's
@@ -724,6 +970,6 @@ def build_all():
     out.append(building(
         "bldg_teal_loft", "teal", 17.0, 9.0, 3,
         pilasters=7, balcony_rows=(2,), win_pitch=3.5, bal_pitch=6.6,
-        lit_mod=7, lit_thresh=1))
+        lit_mod=7, lit_thresh=1, crown="none"))
 
     return out
