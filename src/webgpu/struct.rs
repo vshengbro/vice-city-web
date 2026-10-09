@@ -131,6 +131,39 @@ pub struct ShadingUniforms {
 /// 字段 —— 阴影参数会静默变成色调映射的曝光值,画面偏亮且无影。
 pub(crate) const SHADING_VEC4_COUNT: usize = 14;
 
+/// bloom 参数 uniform 的字节布局(3 × vec4 = 48 字节)。
+///
+/// 字段顺序必须与 WGSL 那个 `BloomParams` 结构体**逐项一致**,
+/// 少一个 `vec4` 不会编译报错,只会让模糊核读成阈值。
+///
+/// 每条 pass 有**自己**那份 buffer(见
+/// [`WebGpuRenderer::bloom_buffers`]),所以这个结构体里同时带着
+/// 「提取要的阈值」「两条模糊各要的方向」「合成要的强度」——
+/// 每个 pass 只读自己那两个分量,其余是陪坐。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BloomUniforms {
+    /// `x` = 亮度阈值(线性空间,提取用),
+    /// `y` = 合成强度,`zw` = 模糊方向(uv 单位,H 为 `(dx, 0)`、
+    /// V 为 `(0, dy)`)。
+    ///
+    /// 方向**跟着每次上传走**而不是写死在 WGSL 里,是与 WebGL2 端
+    /// `u_direction` 同一个做法 —— 那边的水平 / 垂直模糊共用一个
+    /// program,方向就是 uniform。
+    pub params: [f32; 4],
+    /// 高斯核的前 4 个权重(w0..w3)。
+    pub kernel: [f32; 4],
+    /// `x` = 第 5 个权重(w4),`yz` = 一个纹素覆盖的 uv 尺寸,
+    /// `w` = 保留。
+    pub texel: [f32; 4],
+}
+
+/// bloom 参数 uniform 的字节数(3 × vec4 = 48 字节)。
+///
+/// ⚠️ 必须与 [`BloomUniforms`] 的字段数**逐项一致**:少分配的话
+/// `writeBuffer` 会抛 `writeBuffer size exceeds buffer size`,
+/// 而不是静默截断。
+pub(crate) const BLOOM_VEC4_COUNT: usize = 3;
+
 /// 视投影矩阵的字节序(列主序,直接 `writeBuffer`)。
 ///
 /// # Arguments
@@ -267,6 +300,105 @@ mod r#tests {
         assert_eq!(out[at(2, 1)], 0.0, "clip.y gained a z term");
         // 第 2 行第 2 项:0.5·(-1) + 0.5·(-1) = -1。
         assert_eq!(out[at(2, 2)], -1.0, "z row not remapped");
+    }
+
+    /// bloom 的高斯核必须是**归一化**的,否则每过一趟模糊画面就暗一截。
+    ///
+    /// 5 抽头核的总权重是 `w0 + 2 × (w1 + w2 + w3 + w4)` —— 中间
+    /// 那四个抽头各取两次(`uv ± offset`)。这条钉住的就是「有人把某个
+    /// 权重改成 0.2 却忘了重新归一化」那个坑:它不会报任何编译错误,
+    /// 只是整幅画莫名变暗,而且很难联想到是这一行。
+    ///
+    /// 1e-5 的容差来自那五个常数**只保留 6 位小数**:`0.227027`
+    /// 写成 `0.227027027` 时总和恰好 1.0,而这里用的是 WebGL2 端
+    /// 那个 6 位版本,差值在 1e-5 量级。
+    #[test]
+    fn bloom_blur_kernel_weights_sum_to_one() {
+        let total: f32 = bloom_blur_kernel_total();
+        assert!(
+            (total - 1.0).abs() < 1.0e-5,
+            "bloom 高斯核没有归一化:总权重 {total}(应 ≈ 1.0),\
+             每过一次模糊画面就暗一截"
+        );
+        // 权重必须单调递减,否则光晕会出现一个亮环而不是平滑衰减。
+        let weights: [f32; 5] = BLOOM_BLUR_WEIGHTS;
+        for index in 1..5usize {
+            assert!(
+                weights[index] < weights[index - 1],
+                "核权重必须在索引 {} 处下降:{:?}",
+                index,
+                weights
+            );
+        }
+    }
+
+    /// bloom 三张目标必须正好是画布的**一半**分辨率。
+    ///
+    /// 这条钉住 [`bloom_target_size`] 的缩放系数:写成别的值(比如
+    /// `0.25` 或 `1.0`)不会报任何错,只是光晕的半径跟着变 —— 半
+    /// 分辨率下 1 个纹素的模糊步长等于全分辨率下的 2 个,所以改缩放
+    /// 就等于悄悄改了 `BLOOM_BLUR_SPREAD`。
+    #[test]
+    fn bloom_targets_are_exactly_half_the_canvas() {
+        // 与 WebGL2 端 `ensure_targets` 里的 `scaled(width, BLOOM_SCALE)`
+        // 同一个系数。
+        assert_eq!(BLOOM_SCALE, 0.5, "bloom 缩放系数被改了");
+        for (width, height) in [(1280u32, 720u32), (800u32, 600u32), (1920u32, 1080u32)] {
+            let size: (u32, u32) = bloom_target_size(width, height);
+            assert_eq!(
+                size,
+                (width / 2, height / 2),
+                "{width}x{height} 的 bloom 目标应该是 {width}x{height} 的一半"
+            );
+        }
+    }
+
+    /// 极小 / 零尺寸必须被抬到 1 像素,不能是 0。
+    ///
+    /// `createTexture` 的 `size` 是 `GPUExtent3D`,宽或高为 0 会被 WebGPU
+    /// 判 invalid —— 而那是**异步**错误,表现为整帧消失、console 里没有
+    /// 任何线索。窗口被拖到极小、或 `?res=0` 这类边界输入都会走到这里。
+    #[test]
+    fn bloom_target_size_never_collapses_to_zero() {
+        assert_eq!(bloom_target_size(0, 0), (1, 1));
+        assert_eq!(bloom_target_size(1, 1), (1, 1), "1x1 画布的半分辨率是 0.5,要抬到 1");
+    }
+
+    /// 合成的辉光强度必须与 WebGL2 端那个表达式逐项相同。
+    ///
+    /// 钉住 `BLOOM_STRENGTH * emissive_gain.max(BLOOM_MIN_GAIN)`:
+    /// 少了 `max` 的下限,正午相位 `emissive_gain` 只有 0.18(低于
+    /// 0.35 的下限),辉光会被压到 `BLOOM_STRENGTH × 0.35` —— 忘了
+    /// `max` 的话正午的湿路面高光就完全没有辉光了,而且从黄昏帧上
+    /// 看**完全正常**,只有切到正午才暴露。
+    #[test]
+    fn bloom_composite_strength_matches_the_webgl2_formula() {
+        // 正午:emissive_gain 低于下限,必须被兜住。
+        let mut lighting: SceneLighting =
+            SceneLighting::for_phase(crate::render::DayPhase::Noon);
+        assert!(
+            lighting.emissive_gain < BLOOM_MIN_GAIN,
+            "前提不成立:noon 相位的 emissive_gain {} 不低于下限 {BLOOM_MIN_GAIN},\
+             这条测试测不出 max 的作用",
+            lighting.emissive_gain
+        );
+        assert_eq!(
+            bloom_composite_strength(&lighting),
+            BLOOM_STRENGTH * BLOOM_MIN_GAIN,
+            "noon 相位低于下限,辉光必须被 BLOOM_MIN_GAIN 兜住(忘了 max)"
+        );
+        // 黄昏:emissive_gain 高于下限,取线性那一支。
+        lighting = SceneLighting::for_phase(crate::render::DayPhase::Dusk);
+        assert!(
+            lighting.emissive_gain > BLOOM_MIN_GAIN,
+            "前提不成立:dusk 相位的 emissive_gain {} 低于下限 {BLOOM_MIN_GAIN}",
+            lighting.emissive_gain
+        );
+        assert_eq!(
+            bloom_composite_strength(&lighting),
+            BLOOM_STRENGTH * lighting.emissive_gain,
+            "dusk 相位高于下限,辉光必须是线性的那一支"
+        );
     }
 
     /// 游戏里真实存在的黄昏光方向(`render.rs` 里 `DUSK` 那一档)。
@@ -437,4 +569,115 @@ pub struct WebGpuRenderer {
     pub(crate) instance_capacity: usize,
     /// 验收探针:GPU 侧资产表长度。
     pub(crate) gpu_mesh_count: usize,
+    /// 主场景颜色目标(全分辨率,画布 preferred format)。
+    ///
+    /// ⚠️ **有 bloom 就不能直接把主 pass 画进 swapchain。** 亮度提取
+    /// 要采样主场景的颜色,而 `getCurrentTexture()` 给的那张纹理
+    /// 只有 `RENDER_ATTACHMENT | COPY_SRC`,**不能**被采样(除非
+    /// `configure` 时显式要 `TEXTURE_BINDING`,而本项目没有)。
+    ///
+    /// 所以主 pass 画进这张全分辨率离屏目标,合成那一条 pass 再把它
+    /// 读回来、加完辉光画进 swapchain —— 与 WebGL2 端
+    /// `RenderTarget::bind(context, Some(scene))` 完全同构。
+    pub(crate) bloom_scene: JsValue,
+    /// 亮度提取的目标纹理(半分辨率)。
+    pub(crate) bloom_bright: JsValue,
+    /// 水平模糊的输出纹理(ping)。
+    pub(crate) bloom_ping: JsValue,
+    /// 竖直模糊的输出纹理(pong,也是合成读的「模糊结果」)。
+    pub(crate) bloom_pong: JsValue,
+    /// 四张后处理目标当前的尺寸,(0, 0) = 还没建。
+    ///
+    /// 记的是**画布**尺寸而不是 bloom 那三张的尺寸:四张一起重建,
+    /// 一个尺寸就够(见 [`WebGpuRenderer::ensure_bloom_targets`]）。
+    pub(crate) bloom_size: (u32, u32),
+    /// 四条 bloom pass **各一个**的 uniform buffer。
+    ///
+    /// ⚠️ **不能共用一个。** `queue.writeBuffer` 排在队列时间线上,
+    /// 整条 command buffer 之前就执行完了 —— 同帧往**同一个** buffer
+    /// 写三次,只有最后一次的内容会生效。而提取 / 模糊 H / 模糊 V /
+    /// 合成四份数据**互不相同**(各自的阈值、方向、强度),于是共用
+    /// 的话两条模糊 pass 会读到同一个方向,竖直模糊退化成第二次水平
+    /// 模糊,光晕变成横向条纹。
+    ///
+    /// 这与阴影 pass 那个「实例 buffer 必须另开一份」是同一条队列
+    /// 时间线陷阱。
+    pub(crate) bloom_buffers: [JsValue; BLOOM_PASS_COUNT],
+    /// bloom 颜色输入用的**普通**(非比较)采样器。
+    ///
+    /// ⚠️ 与阴影那张 `comparison` 采样器是**两个不同的对象**:WebGPU
+    /// 的深度纹理只配 `sampler_comparison`,而 `rgba8unorm` 颜色纹理
+    /// 只配普通 `sampler` —— 拿错会得到 validation error。
+    pub(crate) bloom_sampler: JsValue,
+    /// 提取 / 模糊三条 pipeline 的 bind group layout(3 槽:uniform +
+    /// sampler + texture,形状完全一致)。
+    pub(crate) bloom_group_layout: JsValue,
+    /// 合成那条 5 槽 bind group layout(多一对 sampler + 模糊图)。
+    pub(crate) bloom_composite_group_layout: JsValue,
+    /// 四条 bloom pipeline 各自的 `(pipeline, bind group)` 配对。
+    ///
+    /// 收在一个数组里而不是摊成八个字段:它们一一对应,拆开就会出现
+    /// 「某条 pipeline 用了别人的 bind group」这种静默不兼容 ——
+    /// WebGPU 只在真正 `setBindGroup` 那一刻才报 validation error,
+    /// 症状是那一帧消失而前面几帧都正常。
+    pub(crate) bloom_passes: [GpuBloomPass; BLOOM_PASS_COUNT],
+}
+
+/// 一条 bloom pass 要上传的那份 uniform 的**参数**
+/// (不含核权重 —— 那是所有 pass 共用的)。
+///
+/// # Arguments
+///
+/// - `threshold` - `params.x`:亮度阈值,只对提取那条有意义。
+/// - `strength` - `params.y`:辉光强度,只对合成那条有意义。
+/// - `direction` - `params.zw`:模糊方向(uv 单位)。
+/// - `size` - 这条 pass **读写的那张目标**的尺寸。
+///
+/// 具名成 struct 而不是四元组:四元组那四个位置在下游只能靠
+/// `uploads[i].2` 这种下标读,而提取与合成两条的形状一样
+/// (方向恒为 `(0.0, 0.0)`),读错了编译器不会报错。字段名让
+/// 「这条 pass 的方向是什么」变成一句能读的话。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BloomPassUpload {
+    /// `params.x`:亮度阈值(线性空间)。
+    pub(crate) threshold: f32,
+    /// `params.y`:合成强度。
+    pub(crate) strength: f32,
+    /// `params.zw`:模糊方向(uv 单位)。
+    pub(crate) direction: (f32, f32),
+    /// 这条 pass 读写的那张目标的尺寸。
+    pub(crate) size: (u32, u32),
+}
+
+/// bloom 一共要跑的四条 pass(顺序即下标)。
+///
+/// 提取 → 水平模糊 → 竖直模糊 → 合成,下标与
+/// [`WebGpuRenderer::bloom_passes`] 一一对应。
+pub(crate) const BLOOM_PASS_COUNT: usize = 4;
+
+/// 提取那条 pass 在 [`WebGpuRenderer::bloom_passes`] 里的下标。
+pub(crate) const BLOOM_PASS_EXTRACT: usize = 0;
+
+/// 水平模糊那条 pass 在 [`WebGpuRenderer::bloom_passes`] 里的下标。
+pub(crate) const BLOOM_PASS_BLUR_H: usize = 1;
+
+/// 竖直模糊那条 pass 在 [`WebGpuRenderer::bloom_passes`] 里的下标。
+pub(crate) const BLOOM_PASS_BLUR_V: usize = 2;
+
+/// 合成那条 pass 在 [`WebGpuRenderer::bloom_passes`] 里的下标。
+pub(crate) const BLOOM_PASS_COMPOSITE: usize = 3;
+
+/// 一条 bloom pipeline 与它的 bind group 的配对句柄。
+///
+/// ⚠️ **刻意不带 `Copy`**:两个字段都是 `JsValue`,而 `JsValue` 只是
+/// `Clone` 不是 `Copy`(wasm-bindgen 把它当成栈上的临时句柄)。所以
+/// 传递整张表时用 [`WebGpuRenderer::get_bloom_passes`] 按值克隆 ——
+/// 每帧一次、四个句柄,代价可以忽略,换来的是调用点不必操心
+/// 借用与 `&mut self` 的冲突。
+#[derive(Debug, Clone)]
+pub struct GpuBloomPass {
+    /// `GPURenderPipeline`。
+    pub pipeline: JsValue,
+    /// 与 `pipeline` 的 pipeline layout 严格对应的 `GPUBindGroup`。
+    pub bind_group: JsValue,
 }

@@ -64,10 +64,26 @@ impl WebGpuRenderer {
             instance_buffer: JsValue::NULL,
             instance_capacity: 0,
             gpu_mesh_count: 0,
+            bloom_scene: JsValue::NULL,
+            bloom_bright: JsValue::NULL,
+            bloom_ping: JsValue::NULL,
+            bloom_pong: JsValue::NULL,
+            bloom_size: (0, 0),
+            bloom_buffers: empty_bloom_buffers(),
+            bloom_sampler: JsValue::NULL,
+            bloom_group_layout: JsValue::NULL,
+            bloom_composite_group_layout: JsValue::NULL,
+            bloom_passes: empty_bloom_passes(),
         };
         renderer.create_pipeline()?;
         renderer.create_shadow_pipeline()?;
         renderer.create_uniform_buffers()?;
+        // bloom 的顺序与依赖:
+        //   采样器 / uniform buffer / 两条 bind group layout → 四条 pipeline
+        //   三张半分辨率目标 → 四个 bind group
+        // 所以 pipeline 先建(它们只要 layout),目标与 bind group 留给
+        // [`WebGpuRenderer::ensure_bloom_targets`] 在拿到画布尺寸时建。
+        renderer.create_bloom_resources()?;
         renderer.reserve_instances(INSTANCE_PREALLOC)?;
         Ok(renderer)
     }
@@ -718,6 +734,371 @@ impl WebGpuRenderer {
         Ok(())
     }
 
+    /// 建 bloom 那四条 pipeline 的资源(采样器 / uniform buffer /
+    /// 两条 bind group layout / 四条 pipeline)。
+    ///
+    /// 与主 / 阴影两条管线一样整段包在 validation error scope 里:
+    /// 着色器编译错误、bind group layout 与 bind group 不匹配、颜色
+    /// 目标格式对不上,**全是异步报上来的** —— 不开 error scope 的
+    /// 症状是「画面纯黑,console 一句话没有」。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 创建失败时的可读原因。
+    pub fn create_bloom_resources(&mut self) -> Result<(), String> {
+        let device: JsValue = self.get_device().clone();
+        push_error_scope(&device, VALIDATION_SCOPE);
+        let built: Result<(), String> = self.build_bloom_resources_inner();
+        pop_error_scope(&device, VALIDATION_SCOPE);
+        built
+    }
+
+    /// 真正建 bloom 资源的那几步(外层负责 error scope)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时的错误文本。
+    fn build_bloom_resources_inner(&mut self) -> Result<(), String> {
+        let device: JsValue = self.get_device().clone();
+        // ---- 普通采样器 ----
+        // ⚠️ **不能**复用阴影那张比较采样器:深度纹理只配
+        // `sampler_comparison`,而这里的 `rgba8unorm` 颜色纹理只配
+        // 普通 `sampler`。混用的结果是 validation error。
+        let sampler_descriptor: Object = new_object();
+        set(
+            &sampler_descriptor,
+            FIELD_MAG_FILTER,
+            &JsValue::from_str(FILTER_LINEAR),
+        )?;
+        set(
+            &sampler_descriptor,
+            FIELD_MIN_FILTER,
+            &JsValue::from_str(FILTER_LINEAR),
+        )?;
+        let sampler: JsValue = call1(&device, METHOD_CREATE_SAMPLER, sampler_descriptor.as_ref())?;
+        self.set_bloom_sampler(sampler);
+
+        // ---- 每条 pass 一个 uniform buffer ----
+        // 见 [`WebGpuRenderer::bloom_buffers`]:同帧往**同一个** buffer
+        // 写四次,只有最后一次生效,而四份数据互不相同。
+        //
+        // 收集进 `Vec` 再转成定长数组而不是直接按下标写:数组需要先有
+        // 一个占位初值,而 `create_buffer` 返回 `Result`、闭包里没法用
+        // `?` 传播错误(`array::from_fn` 的闭包返回裸值)。`Vec` 让错误
+        // 走正常的 `?`,数组在收集完之后一次性建出来。
+        let mut buffers: Vec<JsValue> = Vec::with_capacity(BLOOM_PASS_COUNT);
+        for _slot in 0..BLOOM_PASS_COUNT {
+            buffers.push(create_buffer(
+                &device,
+                UNIFORM_BLOOM_BYTES as usize,
+                USAGE_UNIFORM_BUFFER,
+            )?);
+        }
+        self.set_bloom_buffers(buffers.try_into().map_err(|_| {
+            String::from("bloom uniform buffer count must match BLOOM_PASS_COUNT")
+        })?);
+
+        // ---- 两条 bind group layout ----
+        let group_layout: JsValue = self.build_bloom_group_layout()?;
+        let composite_layout: JsValue = self.build_bloom_composite_group_layout()?;
+        // ⚠️ **四条 pipeline 各要一条自己的 pipeline layout。**
+        //
+        // 四条管线虽然共享同一个 WGSL 模块,但 `fs_composite` 这个入口
+        // **静态引用了 binding 3 与 4**(那对模糊图 sampler + 纹理)。
+        // WebGPU 校验的是「这条入口用到的每个 binding 都能在 pipeline
+        // layout 里找到」—— 于是拿 3 槽 layout 去建合成那条 pipeline
+        // 必然报 validation error,而且是**异步**报上来的:合成 pass
+        // 整条不被执行,画面停在 clear 的天空色,console 里只有一行
+        // `binding 3 is not declared in the pipeline layout`。
+        //
+        // 反过来「全都用 5 槽那条」也不行:setBindGroup 要求 bind group
+        // 与 pipeline layout 的那一组**逐项等价**(group-equivalent),
+        // 3 槽的 bind group 不等价于 5 槽的 layout。所以两条 layout
+        // 分别配两条 pipeline layout。
+        let pipeline_layout: JsValue = Self::single_group_pipeline_layout(&device, &group_layout)?;
+        let composite_pipeline_layout: JsValue =
+            Self::single_group_pipeline_layout(&device, &composite_layout)?;
+
+        // ---- 四条 pipeline ----
+        // 前三条输出到 bloom 的半分辨率目标(`rgba8unorm`),第四条输出到
+        // 画布 swapchain。
+        let passes: [(&str, &str); BLOOM_PASS_COUNT] = [
+            (ENTRY_BLOOM_EXTRACT, BLOOM_TARGET_FORMAT),
+            (ENTRY_BLOOM_BLUR_H, BLOOM_TARGET_FORMAT),
+            (ENTRY_BLOOM_BLUR_V, BLOOM_TARGET_FORMAT),
+            // ⚠️ 合成那条的 target format **必须**等于画布的
+            // preferred format。写错(比如照抄上面那个 `rgba8unorm`)
+            // 的症状是:前三条 pass 正常跑,合成 pass 的附件与
+            // pipeline 声明不匹配,WebGPU 直接把整条 command buffer
+            // 判 invalid —— 画布保持 clear 的那一帧天空色,
+            // 而 validation 文本只在 error scope 里看得到。
+            (ENTRY_BLOOM_COMPOSITE, self.get_format()),
+        ];
+        let mut built: [GpuBloomPass; BLOOM_PASS_COUNT] = empty_bloom_passes();
+        for (index, (entry, format)) in passes.iter().enumerate() {
+            // 合成那条走 5 槽那条 pipeline layout,其余三条走 3 槽那条。
+            let layout: &JsValue = if index == BLOOM_PASS_COMPOSITE {
+                &composite_pipeline_layout
+            } else {
+                &pipeline_layout
+            };
+            built[index] = GpuBloomPass {
+                pipeline: self.build_bloom_pipeline(entry, format, layout)?,
+                bind_group: JsValue::NULL,
+            };
+        }
+        self.set_bloom_passes(built);
+        self.set_bloom_group_layout(group_layout);
+        self.set_bloom_composite_group_layout(composite_layout);
+        // ⚠️ **bind group 这里还不能建** —— 它们要绑 bloom 那三张
+        // 半分辨率目标,而目标要等画布尺寸才知道多大,由
+        // [`WebGpuRenderer::ensure_bloom_targets`] 负责。提前建的话
+        // 拿到的是 `null` 纹理,`createBindGroup` 会静默建出一个
+        // 永不正确的 group(报错要等到真正 `setBindGroup` 那一刻)。
+        Ok(())
+    }
+
+    /// 建一条只含 group 0 的 `GPUPipelineLayout`。
+    ///
+    /// bloom 那四条管线都只绑 group 0,所以各自只需要一条这样布局 ——
+    /// 但**四条各要一条**:合成那条的入口静态引用了 5 个 binding,
+    /// 用 3 槽那条去建会被 WebGPU 判 invalid(见
+    /// [`WebGpuRenderer::create_bloom_resources`] 的说明)。
+    ///
+    /// # Arguments
+    ///
+    /// - `&JsValue` - `GPUDevice`。
+    /// - `&JsValue` - group 0 的 `GPUBindGroupLayout`。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<JsValue, String>` - 建好的 `GPUPipelineLayout`。
+    fn single_group_pipeline_layout(device: &JsValue, group_layout: &JsValue) -> Result<JsValue, String> {
+        let layouts: JsValue = make_array();
+        push_into(&layouts, 0usize, group_layout)?;
+        let descriptor: Object = new_object();
+        set(&descriptor, FIELD_BIND_GROUP_LAYOUTS, &layouts)?;
+        call1(device, METHOD_CREATE_PIPELINE_LAYOUT, descriptor.as_ref())
+    }
+
+    /// 建 bloom 提取 / 模糊 / 合成三条 pipeline 中的一条。
+    ///
+    /// # Arguments
+    ///
+    /// - `&str` - 片元着色器入口点名。
+    /// - `&str` - 颜色目标格式。
+    /// - `&JsValue` - 共用的 pipeline layout。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<JsValue, String>` - 建好的 `GPURenderPipeline`。
+    fn build_bloom_pipeline(
+        &self,
+        entry: &str,
+        format: &str,
+        pipeline_layout: &JsValue,
+    ) -> Result<JsValue, String> {
+        let device: JsValue = self.get_device().clone();
+        let vertex_module: JsValue = create_shader_module(&device, SHADER_FULLSCREEN_VERTEX)?;
+        let fragment_module: JsValue = create_shader_module(&device, SHADER_BLOOM_FRAGMENT)?;
+
+        let vertex_stage: Object = new_object();
+        set(&vertex_stage, FIELD_MODULE, &vertex_module)?;
+        set(
+            &vertex_stage,
+            FIELD_ENTRY_POINT,
+            &JsValue::from_str(ENTRY_FULLSCREEN_VERTEX),
+        )?;
+        // ⚠️ **没有 `buffers`**。全屏三角形靠 `vertex_index` 算位置,
+        // 整条 pipeline 一个顶点缓冲都不绑 —— 声明一个空数组是必要的
+        // (省略的话 WebGPU 读成 `undefined` 而不是「零个」),但
+        // 更重要的是**别**照抄主管线那份 48 B + 80 B 的布局,
+        // 那会让着色器的 `@builtin(vertex_index)` 与一堆
+        // `setVertexBuffer` 全都变成多余的。
+        let empty_buffers: JsValue = make_array();
+        set(&vertex_stage, FIELD_BUFFERS, &empty_buffers)?;
+
+        let fragment_stage: Object = new_object();
+        set(&fragment_stage, FIELD_MODULE, &fragment_module)?;
+        set(&fragment_stage, FIELD_ENTRY_POINT, &JsValue::from_str(entry))?;
+        let targets: JsValue = make_array();
+        let color_target: Object = new_object();
+        set(&color_target, FIELD_FORMAT, &JsValue::from_str(format))?;
+        push_into(&targets, 0usize, color_target.as_ref())?;
+        set(&fragment_stage, FIELD_TARGETS, &targets)?;
+
+        let primitive: Object = new_object();
+        set(
+            &primitive,
+            FIELD_TOPOLOGY,
+            &JsValue::from_str(TOPOLOGY_TRIANGLE_LIST),
+        )?;
+        // ⚠️ 不剔除:全屏三角形只有一面,而且它的屏幕空间绕序取决于
+        // WGSL 里那个 `(0,0) (2,0) (0,2)` —— 与画布的上下方向无关,
+        // 所以剔背面会在某一侧平台上把整个 pass 剔没。
+        set(
+            &primitive,
+            FIELD_CULL_MODE,
+            &JsValue::from_str(CULL_MODE_NONE),
+        )?;
+        set(
+            &primitive,
+            FIELD_FRONT_FACE,
+            &JsValue::from_str(FRONT_FACE_CCW),
+        )?;
+
+        let descriptor: Object = new_object();
+        set(&descriptor, FIELD_LAYOUT, pipeline_layout)?;
+        set(&descriptor, FIELD_VERTEX, &vertex_stage)?;
+        set(&descriptor, FIELD_FRAGMENT, &fragment_stage)?;
+        set(&descriptor, FIELD_PRIMITIVE, &primitive)?;
+        // ⚠️ **没有 `depthStencil`**。后处理 pass 深度测试既不需要
+        // 也不该要 —— 带着一条深度附件去画全屏三角形,读的是上一 pass
+        // 留下的深度值,而不是无条件写满。
+        let multisample: Object = new_object();
+        set(&multisample, FIELD_COUNT, &JsValue::from_f64(1.0))?;
+        set(&descriptor, FIELD_MULTISAMPLE, multisample.as_ref())?;
+
+        call1(&device, METHOD_CREATE_RENDER_PIPELINE, descriptor.as_ref())
+    }
+
+    /// bloom 提取 / 两条模糊的 bind group layout(3 槽)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<JsValue, String>` - `GPUBindGroupLayout`。
+    fn build_bloom_group_layout(&self) -> Result<JsValue, String> {
+        self.build_bloom_layout(BLOOM_LAYOUT_SHAPE_PLAIN)
+    }
+
+    /// bloom 合成的 bind group layout(5 槽:多一对模糊图 sampler + 纹理)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<JsValue, String>` - `GPUBindGroupLayout`。
+    fn build_bloom_composite_group_layout(&self) -> Result<JsValue, String> {
+        self.build_bloom_layout(BLOOM_LAYOUT_SHAPE_COMPOSITE)
+    }
+
+    /// 按形状建 bloom 的 bind group layout。
+    ///
+    /// # Arguments
+    ///
+    /// - `bool` - `true` = 合成那条 5 槽,`false` = 提取 / 模糊那条 3 槽。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<JsValue, String>` - `GPUBindGroupLayout`。
+    fn build_bloom_layout(&self, composite: bool) -> Result<JsValue, String> {
+        let device: JsValue = self.get_device().clone();
+        let entries: JsValue = make_array();
+        // binding 0:bloom uniform。
+        let params_entry: Object = new_object();
+        set(
+            &params_entry,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_BLOOM_PARAMS as f64),
+        )?;
+        set(
+            &params_entry,
+            FIELD_VISIBILITY,
+            &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+        )?;
+        let params_layout: Object = new_object();
+        set(
+            &params_layout,
+            FIELD_TYPE,
+            &JsValue::from_str(BUFFER_TYPE_UNIFORM),
+        )?;
+        set(&params_entry, FIELD_BUFFER, params_layout.as_ref())?;
+        push_into(&entries, 0usize, params_entry.as_ref())?;
+        // binding 1:普通(filtering)采样器。
+        let sampler_entry: Object = new_object();
+        set(
+            &sampler_entry,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_BLOOM_SAMPLER as f64),
+        )?;
+        set(
+            &sampler_entry,
+            FIELD_VISIBILITY,
+            &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+        )?;
+        let sampler_layout: Object = new_object();
+        set(
+            &sampler_layout,
+            FIELD_TYPE,
+            &JsValue::from_str(SAMPLER_TYPE_FILTERING),
+        )?;
+        set(&sampler_entry, FIELD_SAMPLER, sampler_layout.as_ref())?;
+        push_into(&entries, 1usize, sampler_entry.as_ref())?;
+        // binding 2:颜色输入纹理(sampleType 必须是 `float`)。
+        let texture_entry: Object = new_object();
+        set(
+            &texture_entry,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_BLOOM_SOURCE as f64),
+        )?;
+        set(
+            &texture_entry,
+            FIELD_VISIBILITY,
+            &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+        )?;
+        let texture_layout: Object = new_object();
+        set(
+            &texture_layout,
+            FIELD_SAMPLE_TYPE,
+            &JsValue::from_str(SAMPLE_TYPE_FLOAT),
+        )?;
+        set(&texture_entry, FIELD_TEXTURE, texture_layout.as_ref())?;
+        push_into(&entries, 2usize, texture_entry.as_ref())?;
+        // binding 3 / 4:合成专用的模糊图采样器 + 纹理。
+        if composite {
+            let blur_sampler_entry: Object = new_object();
+            set(
+                &blur_sampler_entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_BLOOM_BLUR_SAMPLER as f64),
+            )?;
+            set(
+                &blur_sampler_entry,
+                FIELD_VISIBILITY,
+                &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+            )?;
+            let blur_sampler_layout: Object = new_object();
+            set(
+                &blur_sampler_layout,
+                FIELD_TYPE,
+                &JsValue::from_str(SAMPLER_TYPE_FILTERING),
+            )?;
+            set(&blur_sampler_entry, FIELD_SAMPLER, blur_sampler_layout.as_ref())?;
+            push_into(&entries, 3usize, blur_sampler_entry.as_ref())?;
+            let blur_texture_entry: Object = new_object();
+            set(
+                &blur_texture_entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_BLOOM_BLUR_MAP as f64),
+            )?;
+            set(
+                &blur_texture_entry,
+                FIELD_VISIBILITY,
+                &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+            )?;
+            let blur_texture_layout: Object = new_object();
+            set(
+                &blur_texture_layout,
+                FIELD_SAMPLE_TYPE,
+                &JsValue::from_str(SAMPLE_TYPE_FLOAT),
+            )?;
+            set(&blur_texture_entry, FIELD_TEXTURE, blur_texture_layout.as_ref())?;
+            push_into(&entries, 4usize, blur_texture_entry.as_ref())?;
+        }
+
+        let descriptor: Object = new_object();
+        set(&descriptor, FIELD_ENTRIES, &entries)?;
+        call1(&device, METHOD_CREATE_BIND_GROUP_LAYOUT, descriptor.as_ref())
+    }
+
     /// 分配阴影深度纹理(`depth32float`,`SHADOW_MAP_SIZE` 见方)。
     ///
     /// 尺寸**固定**,不随画布变:阴影 frustum 的半宽由
@@ -928,6 +1309,8 @@ impl WebGpuRenderer {
         } = params;
         self.ensure_depth(width, height)?;
         let device: JsValue = self.get_device().clone();
+        // 后处理目标跟着画布尺寸走 —— 与 `ensure_depth` 同一个时机。
+        self.ensure_bloom_targets(width, height)?;
 
         // ---- uniform ----
 
@@ -958,10 +1341,6 @@ impl WebGpuRenderer {
             0.0,
             f32_slice_to_bytes(&light_bytes),
         )?;
-
-        // ---- 画布纹理 ----
-        let texture: JsValue = call0(&self.get_context().clone(), METHOD_GET_CURRENT_TEXTURE)?;
-        let view: JsValue = create_view(&texture)?;
 
         // ---- pass ----
         // `createCommandEncoder()` 是**零参数**方法。给它传一个
@@ -1025,8 +1404,13 @@ impl WebGpuRenderer {
         call0(&shadow_pass, METHOD_END)?;
 
         // ---- 2) 主 pass ----
+        // ⚠️ 颜色附件是**离屏**的主场景目标,不是 swapchain ——
+        // 提取 pass 要把它采样回来算亮度,而 `getCurrentTexture()`
+        // 给的那张不能被采样(只有 `RENDER_ATTACHMENT | COPY_SRC`)。
+        // 合成那一条 pass 才把它画回 swapchain。
+        let scene_view: JsValue = create_view(&self.get_bloom_scene().clone())?;
         let color_attachment: Object = new_object();
-        set(&color_attachment, FIELD_VIEW, &view)?;
+        set(&color_attachment, FIELD_VIEW, &scene_view)?;
         set(
             &color_attachment,
             FIELD_CLEAR_VALUE,
@@ -1142,6 +1526,13 @@ impl WebGpuRenderer {
         }
         if total == 0 {
             call0(&pass, METHOD_END)?;
+            // ⚠️ **不能**在这里直接 finish:主 pass 现在画进的是**离屏**
+            // 的 `bloom_scene`,不是画布。于是即使一个实例都没有,合成那条
+            // pass 也**必须**跑 —— 它才是把离屏画面搬回 swapchain 的
+            // 唯一一步(把那帧天空色拷到屏幕上)。提前返回的话画布这一
+            // 帧完全不写,于是停留在上一帧的内容,表现为「切到空场景后
+            // 画面冻住」。
+            self.draw_bloom_chain(&device, &encoder, lighting)?;
             return self.finish_frame(&device, &encoder, shadow_triangles);
         }
 
@@ -1175,7 +1566,137 @@ impl WebGpuRenderer {
             triangles += self.draw_slice(&pass, mesh_index, first, count)?;
         }
         call0(&pass, METHOD_END)?;
+
+        // ---- 3) bloom:提取 → 模糊 H → 模糊 V ----
+        // ---- 4) 合成:主场景 + 辉光 → swapchain ----
+        //
+        // ⚠️ **必须在同一个 encoder 里、且必须排在主 pass 之后。**
+        // 提取要采样主 pass 刚写完的那张离屏目标,合成要把它读回来。
+        // 拆成第二个 `submit` 只能靠「提交顺序恰好成立」这种运气,
+        // 而且跨 submit 读刚写的纹理是 WebGPU 明确不允许的。
+        self.draw_bloom_chain(&device, &encoder, lighting)?;
         self.finish_frame(&device, &encoder, triangles)
+    }
+
+    /// 跑完整条 bloom 链并把结果合成到画布。
+    ///
+    /// 四条 pass 与阴影 / 主 pass **共用同一个 command encoder**,
+    /// 整帧只 `finish()` + `submit()` 一次。
+    ///
+    /// # Arguments
+    ///
+    /// - `&JsValue` - `GPUDevice`。
+    /// - `&JsValue` - 本帧的 `GPUCommandEncoder`。
+    /// - `&SceneLighting` - 当前光照(合成强度取 `emissive_gain`)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时的错误文本。
+    fn draw_bloom_chain(
+        &mut self,
+        device: &JsValue,
+        encoder: &JsValue,
+        lighting: &SceneLighting,
+    ) -> Result<(), String> {
+        let size: (u32, u32) = self.get_bloom_size();
+        let half: (u32, u32) = bloom_target_size(size.0, size.1);
+        let spread: f32 = BLOOM_BLUR_SPREAD;
+        let strength: f32 = bloom_composite_strength(lighting);
+        let texel_x: f32 = 1.0 / (half.0.max(1) as f32);
+        let texel_y: f32 = 1.0 / (half.1.max(1) as f32);
+
+        // ⚠️ **四条 pass 各写自己的 uniform buffer。** `queue.writeBuffer`
+        // 在队列时间线上先于整条 command buffer 执行,共用一个 buffer
+        // 的话只有最后那次上传生效 —— 两条模糊会拿到同一个方向,
+        // 光晕变成横向条纹。见 [`WebGpuRenderer::bloom_buffers`]。
+        //
+        // 下标用 [`BLOOM_PASS_*`] 具名常量标出来,而不是靠位置隐含 ——
+        // `uploads` 的顺序与 [`BLOOM_PASS_COUNT`] 那个数组的字面量顺序
+        // 必须逐项对上,而提取 / 合成两条的 uniform 长得**完全一样**
+        // (`(0.0, 0.0, (0.0, 0.0), …)`),一旦中间插进一条就看不出错位。
+        // 方向值与 WebGL2 端 `render_bloom` 逐项相同
+        // (`texel * BLOOM_BLUR_SPREAD`,H 取 x、V 取 y)。
+        let mut uploads: [BloomPassUpload; BLOOM_PASS_COUNT] =
+            [BloomPassUpload::default(); BLOOM_PASS_COUNT];
+        // 提取:方向无关,但仍要占两个分量(WGSL 的 struct 布局固定)。
+        uploads[BLOOM_PASS_EXTRACT] = BloomPassUpload {
+            threshold: BLOOM_THRESHOLD,
+            size: half,
+            ..BloomPassUpload::default()
+        };
+        // 模糊 H:沿 u 走。
+        uploads[BLOOM_PASS_BLUR_H] = BloomPassUpload {
+            direction: (texel_x * spread, 0.0),
+            size: half,
+            ..BloomPassUpload::default()
+        };
+        // 模糊 V:沿 v 走。
+        uploads[BLOOM_PASS_BLUR_V] = BloomPassUpload {
+            direction: (0.0, texel_y * spread),
+            size: half,
+            ..BloomPassUpload::default()
+        };
+        // 合成:方向无关,只有强度有意义。
+        uploads[BLOOM_PASS_COMPOSITE] = BloomPassUpload {
+            strength,
+            size,
+            ..BloomPassUpload::default()
+        };
+        let buffers: [JsValue; BLOOM_PASS_COUNT] = self.get_bloom_buffers();
+        for (index, upload) in uploads.iter().enumerate() {
+            let bytes: [f32; 12] = flatten_bloom(bloom_uniforms(
+                upload.threshold,
+                upload.strength,
+                upload.direction,
+                upload.size,
+            ));
+            write_buffer(device, &buffers[index], 0.0, f32_slice_to_bytes(&bytes))?;
+        }
+
+        // 提取 / 两条模糊写进半分辨率目标,合成写进 swapchain。
+        let canvas_view: JsValue =
+            create_view(&call0(&self.get_context().clone(), METHOD_GET_CURRENT_TEXTURE)?)?;
+        let targets: [JsValue; BLOOM_PASS_COUNT] = [
+            create_view(&self.get_bloom_bright().clone())?,
+            create_view(&self.get_bloom_ping().clone())?,
+            create_view(&self.get_bloom_pong().clone())?,
+            canvas_view,
+        ];
+        let passes: [GpuBloomPass; BLOOM_PASS_COUNT] = self.get_bloom_passes().clone();
+        for index in 0..BLOOM_PASS_COUNT {
+            // 每条 pass 的附件都是纯覆盖 —— 后处理不读上一 pass 的
+            // 输出作为附件内容,所以 `loadOp: "clear"` + `clearValue: 0`
+            // 既是必须的,也是最省的一条路径。
+            let attachment: Object = new_object();
+            set(&attachment, FIELD_VIEW, &targets[index])?;
+            set(&attachment, FIELD_CLEAR_VALUE, &make_rgba(0.0, 0.0, 0.0))?;
+            set(
+                &attachment,
+                FIELD_LOAD_OP,
+                &JsValue::from_str(LOAD_OP_CLEAR),
+            )?;
+            set(
+                &attachment,
+                FIELD_STORE_OP,
+                &JsValue::from_str(STORE_OP_STORE),
+            )?;
+            let descriptor: Object = new_object();
+            let colors: JsValue = make_array();
+            push_into(&colors, 0usize, attachment.as_ref())?;
+            set(&descriptor, FIELD_COLOR_ATTACHMENTS, &colors)?;
+            // ⚠️ **不**带 `depthStencilAttachment`:后处理三条半分辨率
+            // pass 与合成那条都只碰颜色,挂一条深度附件会强制它们
+            // 共享主 pass 的深度纹理尺寸 —— 而主 pass 那张是全分辨率。
+            let pass: JsValue =
+                call1(encoder, METHOD_BEGIN_RENDER_PASS, descriptor.as_ref())?;
+            call1(&pass, METHOD_SET_PIPELINE, &passes[index].pipeline)?;
+            set_bind_group(&pass, BINDING_GROUP, &passes[index].bind_group)?;
+            // 全屏三角形:`draw(3)` 而不是 `drawIndexed` —— 整条
+            // pipeline 一个顶点缓冲都没绑。
+            call1(&pass, METHOD_DRAW, &JsValue::from_f64(3.0))?;
+            call0(&pass, METHOD_END)?;
+        }
+        Ok(())
     }
 
     /// 阴影 pass:逐实例剔除后把整帧实例一次性拼好、上传、画一遍。
@@ -1376,6 +1897,189 @@ impl WebGpuRenderer {
         let texture: JsValue = call1(&device, METHOD_CREATE_TEXTURE, descriptor.as_ref())?;
         self.set_depth_texture(texture);
         self.set_depth_size(size);
+        Ok(())
+    }
+
+    /// 画布尺寸变化时重建 bloom 的四张后处理目标,并重建四个
+    /// bind group。
+    ///
+    /// **必须**跟着 resize 走:bloom 目标不是 `SHADOW_MAP_SIZE` 那样
+    /// 的固定尺寸(阴影图的纹素对应固定的世界面积,而 bloom 的纹素
+    /// 只是「模糊核的一个步长」),它按 `BLOOM_SCALE` 跟着画布走 ——
+    /// 与 WebGL2 端 `ensure_targets` 的处理一致。
+    ///
+    /// 重建时 bind group 也**必须**一起重建:它们绑的是这些纹理的
+    /// view,而纹理换了对象,旧 view 会指向已经销毁的纹理。
+    ///
+    /// # Arguments
+    ///
+    /// - `u32` - 画布宽。
+    /// - `u32` - 画布高。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 创建失败时的错误文本。
+    pub fn ensure_bloom_targets(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let canvas_size: (u32, u32) = (width.max(1), height.max(1));
+        let first_time: bool = self.get_bloom_passes()[BLOOM_PASS_EXTRACT]
+            .bind_group
+            .is_null();
+        if canvas_size != self.get_bloom_size() || first_time {
+            let half: (u32, u32) = bloom_target_size(canvas_size.0, canvas_size.1);
+            // ---- 全分辨率主场景目标 ----
+            // 格式必须与画布 preferred format **逐项相同**,否则合成
+            // 那条 pipeline 的 target 与附件不匹配,整帧被判 invalid。
+            let scene: JsValue = self.create_postprocess_texture(
+                canvas_size.0,
+                canvas_size.1,
+                self.get_format(),
+            )?;
+            // ---- 三张半分辨率 bloom 目标 ----
+            let bright: JsValue = self.create_postprocess_texture(
+                half.0,
+                half.1,
+                BLOOM_TARGET_FORMAT,
+            )?;
+            let ping: JsValue =
+                self.create_postprocess_texture(half.0, half.1, BLOOM_TARGET_FORMAT)?;
+            let pong: JsValue =
+                self.create_postprocess_texture(half.0, half.1, BLOOM_TARGET_FORMAT)?;
+            self.set_bloom_scene(scene);
+            self.set_bloom_bright(bright);
+            self.set_bloom_ping(ping);
+            self.set_bloom_pong(pong);
+            self.set_bloom_size(canvas_size);
+            self.create_bloom_bind_groups()?;
+        }
+        Ok(())
+    }
+
+    /// 建一张后处理用的颜色纹理(可渲染 + 可采样)。
+    ///
+    /// # Arguments
+    ///
+    /// - `u32` - 宽(像素)。
+    /// - `u32` - 高(像素)。
+    /// - `&str` - 纹理格式。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<JsValue, String>` - 建好的 `GPUTexture`。
+    fn create_postprocess_texture(
+        &self,
+        width: u32,
+        height: u32,
+        format: &str,
+    ) -> Result<JsValue, String> {
+        let device: JsValue = self.get_device().clone();
+        let descriptor: Object = new_object();
+        set(&descriptor, FIELD_SIZE, &make_extent(width, height))?;
+        set(&descriptor, FIELD_FORMAT, &JsValue::from_str(format))?;
+        // ⚠️ `RENDER_ATTACHMENT | TEXTURE_BINDING` 两个都要:这四张既
+        // 是某个 pass 的颜色附件,又是下一个 pass 采样回来的输入。
+        set(
+            &descriptor,
+            FIELD_USAGE,
+            &JsValue::from_f64(f64::from(USAGE_BLOOM_TARGET)),
+        )?;
+        call1(&device, METHOD_CREATE_TEXTURE, descriptor.as_ref())
+    }
+
+    /// 给四条 bloom pass 各建一个 bind group。
+    ///
+    /// ⚠️ 每个 bind group 的**颜色输入**是上一 pass 的输出:
+    /// 提取读主场景 → 模糊 H 读 bright → 模糊 V 读 ping →
+    /// 合成读「主场景 + pong」。所以这里是一次性的**链式**绑定,
+    /// 不能少任何一环。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 创建失败时的错误文本。
+    fn create_bloom_bind_groups(&mut self) -> Result<(), String> {
+        let device: JsValue = self.get_device().clone();
+        let sampler: JsValue = self.get_bloom_sampler().clone();
+        let buffers: [JsValue; BLOOM_PASS_COUNT] = self.get_bloom_buffers();
+        let scene_view: JsValue = create_view(&self.get_bloom_scene().clone())?;
+        // 每条 pass 的颜色输入:前三张是 bloom 目标,合成那条是主场景。
+        let sources: [JsValue; BLOOM_PASS_COUNT] = [
+            scene_view.clone(),
+            create_view(&self.get_bloom_bright().clone())?,
+            create_view(&self.get_bloom_ping().clone())?,
+            scene_view.clone(),
+        ];
+        // 合成那条的「模糊图」是竖直模糊的输出。
+        let blur_maps: [Option<JsValue>; BLOOM_PASS_COUNT] = [
+            None,
+            None,
+            None,
+            Some(create_view(&self.get_bloom_pong().clone())?),
+        ];
+        let mut passes: [GpuBloomPass; BLOOM_PASS_COUNT] = self.get_bloom_passes().clone();
+        for index in 0..BLOOM_PASS_COUNT {
+            let layout: JsValue = if index == BLOOM_PASS_COMPOSITE {
+                self.get_bloom_composite_group_layout().clone()
+            } else {
+                self.get_bloom_group_layout().clone()
+            };
+            let entries: JsValue = make_array();
+            // slot 0:bloom uniform。
+            let resource: Object = new_object();
+            set(&resource, FIELD_BUFFER, &buffers[index])?;
+            let entry: Object = new_object();
+            set(
+                &entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_BLOOM_PARAMS as f64),
+            )?;
+            set(&entry, FIELD_RESOURCE, resource.as_ref())?;
+            push_into(&entries, 0usize, entry.as_ref())?;
+            // slot 1:采样器。
+            let entry: Object = new_object();
+            set(
+                &entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_BLOOM_SAMPLER as f64),
+            )?;
+            set(&entry, FIELD_RESOURCE, &sampler)?;
+            push_into(&entries, 1usize, entry.as_ref())?;
+            // slot 2:颜色输入。⚠️ **裸 view**,不是 `{view: …}`。
+            let entry: Object = new_object();
+            set(
+                &entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_BLOOM_SOURCE as f64),
+            )?;
+            set(&entry, FIELD_RESOURCE, &sources[index])?;
+            push_into(&entries, 2usize, entry.as_ref())?;
+            // slot 3 / 4:合成专用的模糊图。
+            if let Some(blur_map) = blur_maps[index].clone() {
+                let entry: Object = new_object();
+                set(
+                    &entry,
+                    FIELD_BINDING,
+                    &JsValue::from_f64(BINDING_BLOOM_BLUR_SAMPLER as f64),
+                )?;
+                set(&entry, FIELD_RESOURCE, &sampler)?;
+                push_into(&entries, 3usize, entry.as_ref())?;
+                let entry: Object = new_object();
+                set(
+                    &entry,
+                    FIELD_BINDING,
+                    &JsValue::from_f64(BINDING_BLOOM_BLUR_MAP as f64),
+                )?;
+                set(&entry, FIELD_RESOURCE, &blur_map)?;
+                push_into(&entries, 4usize, entry.as_ref())?;
+            }
+            let descriptor: Object = new_object();
+            set(&descriptor, FIELD_LAYOUT, &layout)?;
+            set(&descriptor, FIELD_ENTRIES, &entries)?;
+            let group: JsValue =
+                call1(&device, METHOD_CREATE_BIND_GROUP, descriptor.as_ref()).map_err(
+                    |error: String| format!("bloom pass {index} createBindGroup: {error}"),
+                )?;
+            passes[index].bind_group = group;
+        }
+        self.set_bloom_passes(passes);
         Ok(())
     }
 
@@ -1798,6 +2502,191 @@ impl WebGpuRenderer {
     /// - `JsValue` - `GPUBindGroupLayout` 句柄。
     pub fn set_shadow_sample_group_layout(&mut self, layout: JsValue) {
         self.shadow_sample_group_layout = layout;
+    }
+
+    /// 四条 bloom pipeline 各自的句柄(按值克隆一份)。
+    ///
+    /// # Returns
+    ///
+    /// - `[GpuBloomPass; BLOOM_PASS_COUNT]` - pipeline + bind group 配对。
+    ///
+    /// ⚠️ **按值返回副本**:`GpuBloomPass` 只 `Clone` 不 `Copy`
+    /// (字段是 `JsValue`),而调用方往往在持有 `&mut self` 的同时要
+    /// 读这张表 —— 例如 [`WebGpuRenderer::draw_bloom_chain`] 先克隆
+    /// 再去改别的字段。
+    pub fn get_bloom_passes(&self) -> [GpuBloomPass; BLOOM_PASS_COUNT] {
+        self.bloom_passes.clone()
+    }
+
+    /// 设置四条 bloom pipeline 的句柄。
+    ///
+    /// # Arguments
+    ///
+    /// - `[GpuBloomPass; BLOOM_PASS_COUNT]` - pipeline + bind group 配对。
+    pub fn set_bloom_passes(&mut self, passes: [GpuBloomPass; BLOOM_PASS_COUNT]) {
+        self.bloom_passes = passes;
+    }
+
+    /// 四条 bloom pass 各自的 uniform buffer(只读副本)。
+    ///
+    /// # Returns
+    ///
+    /// - `[JsValue; BLOOM_PASS_COUNT]` - uniform buffer 句柄。
+    pub fn get_bloom_buffers(&self) -> [JsValue; BLOOM_PASS_COUNT] {
+        self.bloom_buffers.clone()
+    }
+
+    /// 设置四条 bloom pass 的 uniform buffer。
+    ///
+    /// # Arguments
+    ///
+    /// - `[JsValue; BLOOM_PASS_COUNT]` - uniform buffer 句柄。
+    pub fn set_bloom_buffers(&mut self, buffers: [JsValue; BLOOM_PASS_COUNT]) {
+        self.bloom_buffers = buffers;
+    }
+
+    /// bloom 颜色输入的普通采样器。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUSampler` 句柄。
+    pub fn get_bloom_sampler(&self) -> &JsValue {
+        &self.bloom_sampler
+    }
+
+    /// 设置 bloom 颜色输入的普通采样器。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUSampler` 句柄。
+    pub fn set_bloom_sampler(&mut self, sampler: JsValue) {
+        self.bloom_sampler = sampler;
+    }
+
+    /// bloom 提取 / 模糊的 bind group layout。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUBindGroupLayout` 句柄。
+    pub fn get_bloom_group_layout(&self) -> &JsValue {
+        &self.bloom_group_layout
+    }
+
+    /// 设置 bloom 提取 / 模糊的 bind group layout。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUBindGroupLayout` 句柄。
+    pub fn set_bloom_group_layout(&mut self, layout: JsValue) {
+        self.bloom_group_layout = layout;
+    }
+
+    /// bloom 合成的 bind group layout。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUBindGroupLayout` 句柄。
+    pub fn get_bloom_composite_group_layout(&self) -> &JsValue {
+        &self.bloom_composite_group_layout
+    }
+
+    /// 设置 bloom 合成的 bind group layout。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUBindGroupLayout` 句柄。
+    pub fn set_bloom_composite_group_layout(&mut self, layout: JsValue) {
+        self.bloom_composite_group_layout = layout;
+    }
+
+    /// 主场景离屏颜色目标。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUTexture` 句柄。
+    pub fn get_bloom_scene(&self) -> &JsValue {
+        &self.bloom_scene
+    }
+
+    /// 设置主场景离屏颜色目标。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUTexture` 句柄。
+    pub fn set_bloom_scene(&mut self, texture: JsValue) {
+        self.bloom_scene = texture;
+    }
+
+    /// 亮度提取目标。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUTexture` 句柄。
+    pub fn get_bloom_bright(&self) -> &JsValue {
+        &self.bloom_bright
+    }
+
+    /// 设置亮度提取目标。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUTexture` 句柄。
+    pub fn set_bloom_bright(&mut self, texture: JsValue) {
+        self.bloom_bright = texture;
+    }
+
+    /// 水平模糊目标(ping)。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUTexture` 句柄。
+    pub fn get_bloom_ping(&self) -> &JsValue {
+        &self.bloom_ping
+    }
+
+    /// 设置水平模糊目标(ping)。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUTexture` 句柄。
+    pub fn set_bloom_ping(&mut self, texture: JsValue) {
+        self.bloom_ping = texture;
+    }
+
+    /// 竖直模糊目标(pong)。
+    ///
+    /// # Returns
+    ///
+    /// - `&JsValue` - `GPUTexture` 句柄。
+    pub fn get_bloom_pong(&self) -> &JsValue {
+        &self.bloom_pong
+    }
+
+    /// 设置竖直模糊目标(pong)。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUTexture` 句柄。
+    pub fn set_bloom_pong(&mut self, texture: JsValue) {
+        self.bloom_pong = texture;
+    }
+
+    /// 后处理目标当前尺寸(记的是画布尺寸)。
+    ///
+    /// # Returns
+    ///
+    /// - `(u32, u32)` - 宽高。
+    pub fn get_bloom_size(&self) -> (u32, u32) {
+        self.bloom_size
+    }
+
+    /// 设置后处理目标当前尺寸(记的是画布尺寸)。
+    ///
+    /// # Arguments
+    ///
+    /// - `(u32, u32)` - 宽高。
+    pub fn set_bloom_size(&mut self, size: (u32, u32)) {
+        self.bloom_size = size;
     }
 }
 

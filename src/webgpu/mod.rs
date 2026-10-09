@@ -3,6 +3,8 @@ mod r#fn;
 mod r#impl;
 mod r#struct;
 
+pub use ::core::array;
+
 pub use super::{
     js_sys::{Array, Function, JSON, Object, Promise, Reflect, Uint8Array},
     wasm_bindgen::{JsCast, JsValue},
@@ -18,7 +20,8 @@ pub use r#struct::*;
 pub(crate) use crate::{
     camera::Mat4,
     r#const::{
-        BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FLOOR, REPLACE_MESH_OUT_OF_RANGE, SHADOW_MAP_SIZE,
+        BAKED_CONTACT_AO_HEIGHT, BLOOM_BLUR_SPREAD, BLOOM_MIN_GAIN, BLOOM_SCALE, BLOOM_STRENGTH,
+        BLOOM_THRESHOLD, CONTACT_SHADOW_FLOOR, REPLACE_MESH_OUT_OF_RANGE, SHADOW_MAP_SIZE,
         SHADOW_PCF_RADIUS,
     },
     mesh::{f32_slice_to_bytes, u32_slice_to_bytes},

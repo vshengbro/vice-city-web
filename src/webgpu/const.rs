@@ -259,6 +259,12 @@ pub(crate) const FRONT_FACE_CCW: &str = "ccw";
 /// 背面剔除。
 pub(crate) const CULL_MODE_BACK: &str = "back";
 
+/// **不**剔除(`cullMode: "none"`)。
+///
+/// 后处理那三条 pass 用它:全屏三角形只有一面,没有「正反面」可言,
+/// 而 WGSL 那边算出来的绕序不必依赖(也不该依赖)画布的上下方向。
+pub(crate) const CULL_MODE_NONE: &str = "none";
+
 /// `GPUError.message` —— 原型 getter,必须显式读。
 pub(crate) const ERROR_FIELD_MESSAGE: &str = "message";
 
@@ -428,6 +434,12 @@ pub(crate) const METHOD_DRAW_INDEXED: &str = "drawIndexed";
 /// `GPURenderPassEncoder.end`。
 pub(crate) const METHOD_END: &str = "end";
 
+/// `GPURenderPassEncoder.draw(vertexCount)`。
+///
+/// 全屏三角形那条 pass 用它 —— 与几何 pass 的 `drawIndexed` 是两个
+/// 方法名,拿错会得到 `drawIndexed is not a function`。
+pub(crate) const METHOD_DRAW: &str = "draw";
+
 /// `GPUDevice.pushErrorScope`。
 pub(crate) const METHOD_PUSH_ERROR_SCOPE: &str = "pushErrorScope";
 
@@ -451,6 +463,110 @@ pub(crate) const FIELD_TARGETS: &str = "targets";
 
 /// `GPUMultisampleState.count`。
 pub(crate) const FIELD_COUNT: &str = "count";
+
+// ===========================================================================
+// bloom(亮度提取 + 可分离高斯模糊 + 合成)
+// ===========================================================================
+
+/// `GPUTextureBindingLayout.sampleType` = `"float"`。
+///
+/// ⚠️ bloom 那两张颜色纹理必须声明成 `float`(而不是阴影那张的
+/// `depth`):声明错采样类型时,绑 `rgba8unorm` 会被判 invalid,
+/// 而且错误是**异步**报上来的 —— 画面直接黑,console 里一个字都没有。
+pub(crate) const SAMPLE_TYPE_FLOAT: &str = "float";
+
+/// `GPUSamplerBindingLayout.type` = `"filtering"`。
+///
+/// ⚠️ **与阴影那张 `comparison` 是两回事。** bloom 的 `rgba8unorm`
+/// 颜色纹理只能配 `sampler`(filtering / non-filtering),配
+/// `sampler_comparison` 会被 WebGPU 判 invalid。
+pub(crate) const SAMPLER_TYPE_FILTERING: &str = "filtering";
+
+/// bloom 全屏三角形顶点着色器的入口点名。
+///
+/// 与主管线的 [`ENTRY_VERTEX`]:**刻意分开** —— 后处理 pass 用的是
+/// 「一个覆盖裁剪空间的大三角形,`vertex_index` 自己算位置」,
+/// 不吃任何顶点缓冲,和几何那条管线没有一点共同之处。
+pub(crate) const ENTRY_FULLSCREEN_VERTEX: &str = "vs_fullscreen";
+
+/// bloom 亮度提取的片元入口点名。
+pub(crate) const ENTRY_BLOOM_EXTRACT: &str = "fs_extract";
+
+/// bloom **水平**模糊的片元入口点名。
+pub(crate) const ENTRY_BLOOM_BLUR_H: &str = "fs_blur_h";
+
+/// bloom **竖直**模糊的片元入口点名。
+pub(crate) const ENTRY_BLOOM_BLUR_V: &str = "fs_blur_v";
+
+/// bloom 合成的片元入口点名。
+pub(crate) const ENTRY_BLOOM_COMPOSITE: &str = "fs_composite";
+
+/// bloom uniform 的 binding 槽位 0:阈值 / 强度 / 模糊核 / texel 尺寸。
+pub(crate) const BINDING_BLOOM_PARAMS: u32 = 0;
+
+/// bloom 颜色输入的采样器 binding 槽位。
+///
+/// 提取 / 模糊 / 合成**共用**这一个槽位(形状都是
+/// `GPUSamplerBindingLayout` 的 `filtering`),所以合成那条 5 槽
+/// layout 里它出现两次(第 1 与第 3 槽)。
+pub(crate) const BINDING_BLOOM_SAMPLER: u32 = 1;
+
+/// bloom 颜色输入的纹理 binding 槽位。
+pub(crate) const BINDING_BLOOM_SOURCE: u32 = 2;
+
+/// bloom 模糊图在**合成** layout 里的第二个采样器槽位。
+pub(crate) const BINDING_BLOOM_BLUR_SAMPLER: u32 = 3;
+
+/// bloom 模糊图在**合成** layout 里的第二个纹理槽位。
+pub(crate) const BINDING_BLOOM_BLUR_MAP: u32 = 4;
+
+/// bloom 离屏颜色目标:`RENDER_ATTACHMENT | TEXTURE_BINDING`。
+///
+/// 四张(scene / bright / ping / pong)都要读写两遍:被上一个 pass 写
+/// 进去,又被下一个 pass 当 `texture_2d<f32>` 采样回来。少
+/// `TEXTURE_BINDING` 的症状是 validation error 指向 bind group 条目
+/// 而不是纹理本身。
+pub(crate) const USAGE_BLOOM_TARGET: u32 = USAGE_RENDER_ATTACHMENT | USAGE_TEXTURE_BINDING;
+
+/// bloom 三张半分辨率目标的颜色格式。
+///
+/// ⚠️ **不等于**画布的 preferred format(`bgra8unorm`)。bloom 中间
+/// 目标用 `rgba8unorm` 就够,而且它是**被 pipeline 声明**的格式 ——
+/// 半分辨率目标上写 `bgra8unorm` 也能跑,但没有任何理由(那些数据
+/// 从不上屏)。只有**合成**那条必须与画布一致,见
+/// `build_bloom_resources_inner` 里那段说明。
+pub(crate) const BLOOM_TARGET_FORMAT: &str = "rgba8unorm";
+
+/// `build_bloom_layout` 的形状选择:提取 / 两条模糊(3 槽)。
+pub(crate) const BLOOM_LAYOUT_SHAPE_PLAIN: bool = false;
+
+/// `build_bloom_layout` 的形状选择:合成(5 槽)。
+pub(crate) const BLOOM_LAYOUT_SHAPE_COMPOSITE: bool = true;
+
+/// bloom uniform buffer 的字节数(3 × vec4 = 48 字节)。
+///
+/// ⚠️ 三块 vec4:`params`(阈值 / 强度 / 方向)、`kernel`(核权重前 4 个)、
+/// `texel`(第 5 个权重 + 纹素尺寸)。这个数**必须**跟着
+/// [`crate::webgpu::r#struct::BloomUniforms`] 与
+/// [`crate::webgpu::r#struct::BLOOM_VEC4_COUNT`] 一起改:少分配的话
+/// `writeBuffer` 会直接抛 `writeBuffer size exceeds buffer size`,
+/// 而不是静默截断。
+pub(crate) const UNIFORM_BLOOM_BYTES: u32 =
+    crate::webgpu::r#struct::BLOOM_VEC4_COUNT as u32 * 16;
+
+/// bloom 高斯核的 5 个权重(中心 + 4 个对称抽头)。
+///
+/// 与 WebGL2 端 `BLOOM_BLUR_FRAGMENT_SHADER` 里那个
+/// `WEIGHTS[5] = float[5](0.227027, 0.1945946, 0.1216216, 0.054054,
+/// 0.016216)` **逐项相同**,而且是 9 抽头线性采样优化的高斯核
+/// (等价于 9 个独立抽头,只用 5 次纹理读取)。
+///
+/// ⚠️ 必须留在 Rust 侧再上传成 uniform,而不是抄进 WGSL 字符串:
+/// 这样 `bloom_blur_kernel_weights_sum_to_one` 才能钉住「归一化」这个
+/// 性质 —— 一旦有人把某个权重改成 0.2 而忘了重新归一化,整幅画面会
+/// 莫名其妙变暗 10%,而没有任何编译错误。
+pub(crate) const BLOOM_BLUR_WEIGHTS: [f32; 5] =
+    [0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216];
 
 // ===========================================================================
 // 其它规范字面量
@@ -942,6 +1058,140 @@ fn fs_main(
     }
     mapped = mix(mapped, shading.sky_color.xyz, fog);
     return vec4<f32>(linear_to_srgb(mapped), 1.0);
+}
+"#;
+
+/// 全屏三角形顶点着色器(bloom 四条 pass 共用)。
+///
+/// 与 WebGL2 端 [`crate::render`] 里那份 `FULLSCREEN_VERTEX_SHADER`
+/// **同一个形状**:`vertex_index` 自己算出裁剪空间位置,所以整条
+/// pipeline 的 `buffers` 是空的 —— 不绑任何顶点缓冲,也不需要
+/// instance buffer。
+///
+/// ⚠️ **`p` 的 y 不取反。** WebGL 那份算完是
+/// `vec4(p * 2.0 - 1.0, 0.0, 1.0)`,而 WebGPU 的 NDC **+y 在屏幕
+/// 上方**(与 OpenGL 一致,见 [`SHADER_FRAGMENT`] 里 `sample_shadow`
+/// 那段实测记录),所以两条后端的 `v_uv` 语义相同、可以直接照抄
+/// 公式 —— 取反反而会把合成 pass 上下颠倒。
+///
+/// ⚠️ 必须 `return clip`(真实裁剪坐标),不能塞
+/// `vec4(clip.xy, 0.5, 1.0)` —— 那是几何 pass 踩过的坑。
+pub(crate) const SHADER_FULLSCREEN_VERTEX: &str = r#"
+struct FullscreenOut {
+    @builtin(position) clip : vec4<f32>,
+    @location(0) uv : vec2<f32>,
+};
+
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) index : u32) -> FullscreenOut {
+    // 一个覆盖裁剪空间的三角形:(0,0) (2,0) (0,2)。
+    let p : vec2<f32> = vec2<f32>(
+        f32((index << 1u) & 2u),
+        f32(index & 2u),
+    );
+    var out : FullscreenOut;
+    out.clip = vec4<f32>(p * 2.0 - vec2<f32>(1.0, 1.0), 0.0, 1.0);
+    out.uv = p;
+    return out;
+}
+"#;
+
+/// bloom 的片元着色器:亮度提取 + 可分离高斯模糊(方向由 uniform 给)
+/// + 合成。
+///
+/// 三条 pass 合成一个模块、四个入口点,原因有两个:
+///
+/// 1. **布局完全一致** —— 都只绑 group 0 的三个 binding
+///    (uniform / sampler / texture),所以四条 pipeline 能共用同一个
+///    `GPUPipelineLayout`,不必建四份。
+/// 2. **高斯核来自 uniform 而不是 WGSL 常量** —— 与 WebGL2 端那份
+///    `const float WEIGHTS[5]` 同一个值,但走 uniform 后
+///    `bloom_blur_kernel_weights_sum_to_one` 才钉得住「归一化」。
+///
+/// ⚠️ **合成那个入口多绑一对 sampler + 纹理**(槽位 3 / 4),所以它
+/// 用的是**另一条** bind group layout。
+pub(crate) const SHADER_BLOOM_FRAGMENT: &str = r#"
+struct BloomParams {
+    // x = 亮度阈值, y = 合成强度, zw = 模糊方向(uv 单位)。
+    params : vec4<f32>,
+    // 高斯核权重 w0..w3。
+    kernel : vec4<f32>,
+    // x = 核权重 w4, yz = 一个纹素的 uv 尺寸。
+    texel : vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> bloom : BloomParams;
+@group(0) @binding(1) var source_sampler : sampler;
+@group(0) @binding(2) var source_color : texture_2d<f32>;
+
+// 只有合成那一个入口用得到这一对。
+@group(0) @binding(3) var blur_sampler : sampler;
+@group(0) @binding(4) var blur_map : texture_2d<f32>;
+
+// 取第 index 个核权重(index ∈ 0..4)。第 5 个(w4)放在 texel.x,
+// 所以这里单独分流而不是直接索引 kernel。
+fn kernel_weight(index : i32) -> f32 {
+    if (index == 4) {
+        return bloom.texel.x;
+    }
+    return bloom.kernel[index];
+}
+
+// 亮度提取:软阈值,只留下比阈值亮得多的部分。
+// 与 WebGL2 端 BLOOM_EXTRACT_FRAGMENT_SHADER 逐项对应 —— 软阈值
+// (threshold 与 threshold-knee 之间的 smoothstep)比硬阈值好:硬阈值会让
+// 亮度刚好越线的像素「突然」出现光晕,看起来像描边。
+@fragment
+fn fs_extract(
+    @location(0) uv : vec2<f32>,
+) -> @location(0) vec4<f32> {
+    let color : vec3<f32> = textureSample(source_color, source_sampler, uv).rgb;
+    let luma : f32 = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let threshold : f32 = bloom.params.x;
+    let knee : f32 = max(threshold * 0.6, 0.001);
+    var soft : f32 = clamp(luma - threshold + knee, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee);
+    let contribution : f32 = max(soft, luma - threshold) / max(luma, 0.0001);
+    return vec4<f32>(color * contribution, 1.0);
+}
+
+// 5 抽头线性采样优化的高斯核(等价于 9 抽头,只用 5 次纹理读取)。
+// 方向来自 uniform:水平传 (texel.x * spread, 0),竖直传 (0, texel.y * spread)。
+fn blur(uv : vec2<f32>) -> vec4<f32> {
+    let direction : vec2<f32> = bloom.params.zw;
+    var color : vec3<f32> = textureSample(source_color, source_sampler, uv).rgb
+        * kernel_weight(0);
+    for (var i : i32 = 1; i < 5; i = i + 1) {
+        let offset : vec2<f32> = direction * f32(i);
+        let weight : f32 = kernel_weight(i);
+        color = color + textureSample(source_color, source_sampler, uv + offset).rgb * weight;
+        color = color + textureSample(source_color, source_sampler, uv - offset).rgb * weight;
+    }
+    return vec4<f32>(color, 1.0);
+}
+
+// 水平模糊:方向 (texel.x * spread, 0)。
+@fragment
+fn fs_blur_h(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+    return blur(uv);
+}
+
+// 竖直模糊:方向 (0, texel.y * spread)。两条模糊共用同一个 blur 函数体
+// (与 WebGL2 端 u_direction 共用一个 program 同理),区别只在 uniform。
+// 写死成两个函数体的话,核权重就得分叉两份,改一处忘另一处的症状是
+// 「光晕一边糊一边不糊」。
+@fragment
+fn fs_blur_v(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+    return blur(uv);
+}
+
+// 合成:主场景颜色 + 模糊后的 bloom,加法混合。
+// 强度 bloom.params.y 由 Rust 侧算好再上传。
+@fragment
+fn fs_composite(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+    let color : vec3<f32> = textureSample(source_color, source_sampler, uv).rgb;
+    let glow : vec3<f32> = textureSample(blur_map, blur_sampler, uv).rgb;
+    return vec4<f32>(color + glow * bloom.params.y, 1.0);
 }
 "#;
 

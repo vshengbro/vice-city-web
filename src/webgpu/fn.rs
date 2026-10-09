@@ -521,6 +521,175 @@ pub fn flatten_shading(shading: ShadingUniforms) -> [f32; 56] {
     out
 }
 
+/// 展平 bloom 参数 uniform 成 `BLOOM_VEC4_COUNT` × 4 个 f32。
+///
+/// 与 [`flatten_shading`] 同一种做法:WebGPU 的 uniform 按 16 字节
+/// 对齐,所以每块都刚好是 4 个 f32,下标可以手算。
+///
+/// # Arguments
+///
+/// - `BloomUniforms` - 结构形态的 uniform。
+///
+/// # Returns
+///
+/// - `[f32; 12]` - 可直接上传的字节序。
+pub fn flatten_bloom(bloom: BloomUniforms) -> [f32; 12] {
+    let blocks: [[f32; 4]; BLOOM_VEC4_COUNT] = [bloom.params, bloom.kernel, bloom.texel];
+    let mut out: [f32; 12] = [0.0; 12];
+    for (index, block) in blocks.iter().enumerate() {
+        let base: usize = index * 4;
+        out[base] = block[0];
+        out[base + 1] = block[1];
+        out[base + 2] = block[2];
+        out[base + 3] = block[3];
+    }
+    out
+}
+
+/// bloom 三张半分辨率目标的尺寸(相对画布)。
+///
+/// # Arguments
+///
+/// - `u32` - 画布宽(像素)。
+/// - `u32` - 画布高(像素)。
+///
+/// # Returns
+///
+/// - `(u32, u32)` - bloom 目标宽高,至少 1 像素见方。
+///
+/// 与 WebGL2 端 `ensure_targets` 那个 `scaled(width, BLOOM_SCALE)`
+/// **同一个缩放系数**(`BLOOM_SCALE = 0.5`),而且同样走
+/// `.max(1.0)`:0 像素高的目标是 `createTexture` 会被拒。
+pub fn bloom_target_size(width: u32, height: u32) -> (u32, u32) {
+    let scaled: fn(u32, f32) -> u32 =
+        |base: u32, factor: f32| (((base as f32) * factor).max(1.0)) as u32;
+    (scaled(width, BLOOM_SCALE), scaled(height, BLOOM_SCALE))
+}
+
+/// 全空的 bloom uniform buffer 句柄数组(建之前的状态)。
+///
+/// # Returns
+///
+/// - `[JsValue; BLOOM_PASS_COUNT]` - 每个元素都是 `JsValue::NULL`。
+pub fn empty_bloom_buffers() -> [JsValue; BLOOM_PASS_COUNT] {
+    [JsValue::NULL; BLOOM_PASS_COUNT]
+}
+
+/// 全空的 bloom pipeline / bind group 配对数组(建之前的状态)。
+///
+/// ⚠️ `array::from_fn` 从 [`crate::webgpu`] 的 `mod.rs` 统一 import
+/// (§6.4 要求 import 集中在那里,§1.3 又不写 `std::` 限定路径,所以走
+/// crate 根的 `::core`)。这里能直接写 `array::from_fn` 是因为
+/// [`super::mod`] 已经把它 re-export 出来了。
+///
+/// # Returns
+///
+/// - `[GpuBloomPass; BLOOM_PASS_COUNT]` - 每条的 pipeline 与 bind group 都是 `JsValue::NULL`。
+pub fn empty_bloom_passes() -> [GpuBloomPass; BLOOM_PASS_COUNT] {
+    // ⚠️ 用 `from_fn` 而不是 `[expr; N]` 重复式:后者要求元素是 `Copy`,
+    // 而 `GpuBloomPass` 只 `Clone` 不 `Copy`(字段是 `JsValue`)。
+    // 这正是那条编译期类型标注约束在起作用的地方。
+    array::from_fn(|_index: usize| GpuBloomPass {
+        pipeline: JsValue::NULL,
+        bind_group: JsValue::NULL,
+    })
+}
+
+/// bloom 高斯核的**总权重**。
+///
+/// 这个 5 抽头核在模糊时每个 `i ∈ 1..4` 取**两次**(`uv ± offset`),
+/// 只有中心抽头取一次,所以总权重是 `w0 + 2 × (w1+w2+w3+w4)` 而不是
+/// 五个数直接相加。
+///
+/// # Returns
+///
+/// - `f32` - 总权重,归一化时恰好 1.0。
+///
+/// ⚠️ 这是**纯 CPU 端**的核验,GPU 上跑的那份权重是从
+/// [`BLOOM_BLUR_WEIGHTS`] 上传过去的同一组数 —— 所以两者不可能漂移。
+pub fn bloom_blur_kernel_total() -> f32 {
+    let weights: [f32; 5] = BLOOM_BLUR_WEIGHTS;
+    // 中心抽头只取一次,其余四个各取两次(`uv ± offset`) —— 所以
+    // `split_at(1)` 正好把「取一次的那一个」与「取两次的那四个」分开。
+    let (center, taps): (&[f32], &[f32]) = weights.split_at(1);
+    let mut total: f32 = center[0];
+    for weight in taps.iter() {
+        total += 2.0 * weight;
+    }
+    total
+}
+
+/// 合成 pass 的辉光强度。
+///
+/// 与 WebGL2 端 `render_composite` 里那个 uniform **逐项相同**:
+/// `BLOOM_STRENGTH * emissive_gain.max(BLOOM_MIN_GAIN)`。
+///
+/// ⚠️ `max` 那个下限不能省:正午相位的 `emissive_gain` 只有 0.18,
+/// 低于 0.35 的下限 —— 少了 `max` 的话正午的辉光强度会掉到
+/// `0.85 × 0.18`,而黄昏帧**完全正常**,只有切到正午才暴露。
+///
+/// # Arguments
+///
+/// - `&SceneLighting` - 当前光照。
+///
+/// # Returns
+///
+/// - `f32` - 传给 `bloom.params.y` 的辉光强度。
+pub fn bloom_composite_strength(lighting: &SceneLighting) -> f32 {
+    BLOOM_STRENGTH * lighting.emissive_gain.max(BLOOM_MIN_GAIN)
+}
+
+/// 组装一条 bloom pass 的 uniform。
+///
+/// 四条 pass **共用这一个形状**(WGSL 那个 `BloomParams` 的布局是固定的),
+/// 区别只在填进去的数值:提取填阈值、两条模糊各填一个方向、合成填强度。
+/// 与 WebGL2 端同一个 program 靠 `u_direction` 切换水平 / 垂直的做法一致。
+///
+/// # Arguments
+///
+/// - `f32` - `params.x`:亮度阈值(提取用)。
+/// - `f32` - `params.y`:合成强度(合成用)。
+/// - `(f32, f32)` - `params.zw`:模糊方向(uv 单位)。
+/// - `(u32, u32)` - 这条 pass **读写的那张目标**的尺寸,用来算纹素大小。
+///
+/// # Returns
+///
+/// - `BloomUniforms` - 可直接 [`flatten_bloom`] 的 uniform。
+///
+/// ⚠️ `size` 必须是**目标本身**的尺寸而不是画布尺寸:两条模糊跑在
+/// 半分辨率目标上,一个纹素覆盖 2 个全分辨率像素。传错的话模糊步长
+/// 会大一倍,光晕看起来虚了一圈。
+pub fn bloom_uniforms(
+    threshold: f32,
+    strength: f32,
+    direction: (f32, f32),
+    size: (u32, u32),
+) -> BloomUniforms {
+    let weights: [f32; 5] = BLOOM_BLUR_WEIGHTS;
+    // ⚠️ **上传前按实际总权重归一化。** 模糊是「采样 × 加权求和」,
+    // 总权重小于 1 就等于每过一趟把画面压暗 1 − total,两次之后光晕
+    // 整体塌掉一截。归一化让「有人改了某个权重却忘了重新配平」这个
+    // 改动在**亮度上完全无害**(只会改变光晕的形状)。当前这组权重
+    // 本来就归一化(total ≈ 0.9999994),所以这一步对现值是恒等变换 ——
+    // 它防的是下一次改动。
+    let total: f32 = bloom_blur_kernel_total();
+    let scale: f32 = if total > 0.0 { 1.0 / total } else { 1.0 };
+    let normalized: [f32; 5] = weights.map(|weight: f32| weight * scale);
+    let packed: (&[f32], &[f32]) = normalized.split_at(4);
+    BloomUniforms {
+        params: [threshold, strength, direction.0, direction.1],
+        kernel: [packed.0[0], packed.0[1], packed.0[2], packed.0[3]],
+        // `x` = 第 5 个权重(WGSL 那边 `kernel_weight(4)` 从这里取),
+        // `yz` = 一个纹素覆盖的 uv 尺寸。
+        texel: [
+            packed.1[0],
+            1.0 / (size.0.max(1) as f32),
+            1.0 / (size.1.max(1) as f32),
+            0.0,
+        ],
+    }
+}
+
 /// 实例模型矩阵原点到眼点的距离(供近处剔除用)。
 ///
 /// # Arguments
