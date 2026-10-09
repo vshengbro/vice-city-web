@@ -285,7 +285,7 @@ def _wheel(m, x, y, radius, width):
 # The track band's tube radius, and therefore the height its centreline rides
 # at.  One number, because the path height and the sweep radius have to agree
 # for the tank to rest on Z = 0 -- see ``_tank_track_path``.
-TRACK_R = 0.13
+TRACK_R = 0.20
 
 
 def _tank_track_path(r):
@@ -352,9 +352,16 @@ def _tank():
                TRACK_R, seg=6, color=STEEL_DK, caps=True, smooth=False)
 
     # ---- road wheels, sprocket, idler, return rollers ---------------------
-    # Six road wheels per side plus sprocket and idler, in a lighter metal
+    # Five road wheels per side plus sprocket and idler, in a lighter metal
     # against the near-black track: that value break is what makes a track run
     # read as running gear at 60 m instead of as a plain black rectangle.
+    #
+    # Five, not six, because at ``TRACK_R = 0.20`` the swept band's vertical
+    # extent is 3 * 0.20 = 0.60, which now stands PROUD of the road wheels'
+    # top at 2 * 0.29 = 0.58.  At the old 0.13 the band only reached 0.39 and
+    # every wheel poked 0.19 m above it, so the wheels owned the silhouette
+    # and the band read as a thin dark smear behind them.  A sixth wheel only
+    # added more of the thing that was dominating the read.
     #
     # EVERY WHEEL IS CENTRED ON ITS OWN RADIUS.  A wheel tangent to the ground
     # at Z = 0 has its axis at z = r, so the centre height and the radius
@@ -364,9 +371,14 @@ def _tank():
     # verify_assets check 7 (a vehicle may not sink below y = 0) with the
     # track band itself resting correctly on 0.  One helper now ties the two.
     wheel_r = 0.29
+    # Five wheels on the SAME -2.15 .. +2.15 span the six-wheel run of 0.86
+    # already covered, just at an even 1.075 stride with one gap less to fill.
+    # Keeping the span is the point: dropping to range(5) without respacing
+    # would have pulled the last wheel in to y = 0.43 and left a 1.7 m bare
+    # stretch of track under the engine deck.
     for sy in (-1, 1):
-        for i in range(6):
-            _wheel(metal.mesh, sy * 1.36, -2.15 + i * 0.86, wheel_r, 0.30)
+        for i in range(5):
+            _wheel(metal.mesh, sy * 1.36, -2.15 + i * 1.075, wheel_r, 0.30)
         _wheel(metal.mesh, sy * 1.36, 2.70, 0.34, 0.32)     # drive sprocket
         _wheel(metal.mesh, sy * 1.36, -2.90, 0.34, 0.32)    # front idler
         for i in range(3):                                   # return rollers
@@ -790,6 +802,36 @@ def _cruise_hull_rings():
     return _hull_rings(_CRUISE_STATIONS)
 
 
+def _cruise_deck_rings():
+    """The deck slab that closes the step from hull deck to deckhouse base.
+
+    The hull's deck is at z = 20 and every deckhouse tier starts at z = 22,
+    so without a slab between them the two are joined by nothing: a 2.0 m
+    slot, open along the whole length, that you can see the far side of the
+    ship through from any beam-on angle.
+
+    THE SLAB FOLLOWS THE HULL, IT DOES NOT OVERHANG IT.  One four-point cross
+    section per station:
+
+    * the bottom ring sits at the hull's own deck plane, half width
+      ``hb - r`` -- exactly the width of the hull's flat top at that station,
+      so the two surfaces meet with no gap and no cantilever;
+    * the top ring is at the deckhouse base, half width ``hb - 0.4``, which
+      is inside the hull's maximum beam AND wider than the widest deckhouse
+      tier, so the slot is closed for every horizontal sight line.
+
+    Rings advance stern to bow like the hull's (see ``_hull_rings``) and each
+    profile is CCW in its own plane, which is the winding ``core.loft`` wants.
+    """
+    zt = min(t[3] for t in _LINER_TIERS)      # the deckhouse base, 22.0
+    rings = []
+    for (y, hb, _z0, z_deck, r) in reversed(_CRUISE_STATIONS):
+        wb = hb - r                             # the hull's flat top width
+        wt = hb - 0.4                           # inside the max beam
+        rings.append([(wb, y, z_deck), (wt, y, zt), (-wt, y, zt), (-wb, y, z_deck)])
+    return rings
+
+
 _CRUISE_STATIONS = [
     # y,     half_beam, z_bottom, z_deck, radius
     (130.0, 8.0, 6.0, 20.0, 1.2),     # transom
@@ -805,12 +847,52 @@ _CRUISE_STATIONS = [
 ]
 
 
+def _cruise_port_bands(z0, z1):
+    """Window bands for one deckhouse tier, as (z_lo, z_hi, w, h, margin).
+
+    Returns the tier's ``z0 .. z1`` span cut into horizontal bands, each band
+    carrying the ports it should emit and the plain-hull margin that should
+    sit at either end of its run.
+
+    A band is described by an absolute height, and both the height AND the
+    port width shrink on each repeat, so the tier reads bottom-up as
+    STRIP / band of ports / STRIP / band / STRIP with a falling rhythm
+    rather than as one tall field of identical boxes.  Varying the pitch
+    band to band is what breaks the single-frequency moire a uniform grid
+    produces -- the eye latches onto a single horizontal frequency and
+    aliases against it, and that noise is worse than the missing detail.
+
+    The remainder above the last band is left as plain hull, which is both
+    what a real liner does with its upper decks and what keeps the top of
+    the deckhouse from reading as one more band.
+    """
+    bands = []
+    z = z0
+    # plain hull between two bands.  0.6 m, not less: this strip IS the
+    # banding, so it has to survive being 200 m away, and at 0.6 m of plain
+    # hull between 1.05 m ports the run reads as a dashed dark band against
+    # white rather than as a grey wall.  It also has to clear the trim strip
+    # the promenade band puts at z1 - 1.2, or the top band's ports would sit
+    # inside that trim instead of above it.
+    strip = 0.6
+    # (band height, port width, port height) per repeat, tallest first
+    for (bh, pw, ph) in ((3.2, 2.60, 1.05), (2.4, 3.60, 0.95),
+                         (1.8, 4.60, 0.85)):
+        if z + bh + strip > z1 - 0.9:
+            break
+        # end margin shrinks with the band, so each run stops well short of
+        # its tier end and leaves plain superstructure on both sides
+        bands.append((z, z + bh, pw, ph, 1.4 + 1.6 * (bh / 3.2)))
+        z += bh + strip
+    return bands
+
+
 def _cruise():
-    """Passenger cruise ship: hull, four deck tiers, window bands, funnel.
+    """Passenger cruise ship: hull, main deck, four deck tiers, window bands.
 
     The biggest asset in the set and the one that most needs discipline: the
-    window bands alone are 5 tiers x 2 sides x ~24 ports, so every one of
-    those is a plain 12-triangle box rather than a 28-triangle chamfered one.
+    window bands alone are a few dozen ports per tier, so every one of those
+    is a plain 12-triangle box rather than a 28-triangle chamfered one.
     That single decision is what keeps the asset inside the budget.
     """
     a = C.Asset("ship_cruise", "vehicle")
@@ -824,6 +906,16 @@ def _cruise():
     C.recolor_faces_where(
         hull, lambda n, c: 8.0 < c[2] < 12.0 and abs(n[2]) < 0.9, BOOT_TOP)
     C.recolor_faces_where(hull, lambda n, c: n[2] > 0.4, LINER_DK)
+
+    # ---- main deck slab: closes the 2.0 m step up to the deckhouse ----------
+    # The hull deck is at z = 20, the deckhouse tiers start at z = 22, and
+    # nothing joined the two.  Its own part, so the slab's outwardness is
+    # measured on its own shell instead of riding on the hull's.
+    deck = a.part("deck", base_color=LINER_DK, roughness=0.50)
+    C.loft(deck.mesh, _cruise_deck_rings(), LINER_DK,
+           cap_start_flip=False, cap_end_flip=True)
+    if C.signed_volume(deck.mesh) <= 0.0:
+        deck.mesh.faces = [(x, z, y) for (x, y, z) in deck.mesh.faces]
 
     # ---- superstructure: four slabs of decreasing width -------------------
     house = a.part("house", base_color=LINER_WHITE, roughness=0.40)
@@ -844,21 +936,47 @@ def _cruise():
     C.box(house.mesh, (24.0, 12.0, 1.2), center=(0.0, -92.0, 30.6),
           color=LINER_SHADE)
 
-    # ---- window bands: repetitive, small, plain boxes ---------------------
+    # ---- window bands -----------------------------------------------------
     # A liner's read at distance is a set of near-black horizontal bands
-    # against white.  Each port is a plain 12-triangle box (NOT a chamfered
-    # one): ~400 ports at 28 triangles each would eat 11,000 triangles and
-    # blow the budget on a detail the eye cannot resolve at 200 m.
+    # against white, NOT a field of individual dots.  A port is a 12-triangle
+    # box, and 338 of them laid out on one uniform pitch and one uniform size
+    # is a moire risk the eye resolves as texture noise -- exactly what the
+    # asset is trying not to be.
+    #
+    # So each tier's height is divided into BANDS: a run of ports with a
+    # plain hull strip above and below it.  Two things make the result read
+    # as banding rather than as 338 boxes:
+    #
+    #   * the vertical PITCH VARIES between bands (a tall band gets wide
+    #     ports, a short one gets narrow ones), so there is no single
+    #     horizontal frequency the eye can lock onto and alias against;
+    #   * each band's ports are cut off short of both ends by its own
+    #     margin, so the run has real plain hull at each end rather than
+    #     running tier-edge to tier-edge.
+    #
+    # Port count and triangle cost: ~200 boxes instead of ~338, i.e. ~2 400
+    # triangles instead of ~4 050 -- the saving is spent on the deckhouse.
     win = a.part("windows", base_color=WINDOW_BAND, roughness=0.30)
     for (y0, y1, hw, z0, z1) in _LINER_TIERS:
-        rows = max(1, int((z1 - z0) / 2.6))
-        for r in range(rows):
-            z = z0 + (z1 - z0) * ((r + 0.5) / rows)
-            n = max(4, int((y1 - y0) / 4.2))
+        for (_z_lo, _z_hi, port_w, port_h, margin) in _cruise_port_bands(z0, z1):
+            run = (y1 - y0) - 2.0 * margin      # usable length of the band
+            if run <= port_w:
+                continue
+            # The port count follows from the GAP, not from the port width:
+            # n ports spread over run - port_w leave a pitch of
+            # (run - port_w) / (n - 1), and solving that for a pitch of at
+            # least port_w + gap keeps every port visibly separate.  Deriving
+            # n from the width alone would let the ports overlap into one
+            # solid dark stripe, which is the thing banding is meant to avoid.
+            gap = port_w * 0.55
+            n = int((run - port_w) / (port_w + gap)) + 1
+            z = (_z_lo + _z_hi) * 0.5
+            first = y0 + margin + port_w * 0.5
+            pitch = 0.0 if n < 2 else (run - port_w) / float(n - 1)
             for i in range(n):
-                y = y0 + (y1 - y0) * ((i + 0.5) / n)
+                y = first + pitch * i
                 for sy in (-1, 1):
-                    C.box(win.mesh, (0.40, 2.30, 0.95),
+                    C.box(win.mesh, (0.40, port_w, port_h),
                           center=(sy * (hw + 0.18), y, z), color=WINDOW_BAND)
     # bridge windows: one wide band, forward
     C.box(win.mesh, (24.0, 0.40, 1.30), center=(0.0, -92.1, 33.6),

@@ -4,7 +4,7 @@
   "up_axis": "Y",
   "unit": "meter",
   "asset_count": 99,
-  "tri_count": 134287,
+  "tri_count": 132207,
   "categories": [
     "animal",
     "beach",
@@ -407,16 +407,16 @@
       "id": "wep_tank",
       "category": "vehicle",
       "file": "wep_tank.json",
-      "tri_count": 2336,
+      "tri_count": 2240,
       "part_count": 6,
       "bounds": {
         "min": [
-          -3.158888,
+          -3.298289,
           0.0,
           -3.56
         ],
         "max": [
-          2.934317,
+          3.060488,
           2.75,
           3.5
         ]
@@ -464,8 +464,8 @@
       "id": "ship_cruise",
       "category": "vehicle",
       "file": "ship_cruise.json",
-      "tri_count": 5784,
-      "part_count": 8,
+      "tri_count": 3800,
+      "part_count": 9,
       "bounds": {
         "min": [
           -16.75,
