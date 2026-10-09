@@ -683,24 +683,6 @@ struct Shading {
 
 
 @vertex
-/// Body of the `vs_main` free function.
-///
-/// # Arguments
-///
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `vec4<f32>` - A `vec4<f32>` parameter.
-/// - `vec4<f32>` - A `vec4<f32>` parameter.
-/// - `vec4<f32>` - A `vec4<f32>` parameter.
-/// - `vec4<f32>` - A `vec4<f32>` parameter.
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `u32` - A 32-bit unsigned integer (`u32`).
-///
-/// # Returns
-///
-/// - `Varyings` - A `Varyings` value.
 fn vs_main(
     @location(0) position : vec3<f32>,
     @location(1) normal : vec3<f32>,
@@ -824,17 +806,6 @@ struct ShadowFrame {
 
 @group(1) @binding(2) var<uniform> shadow_frame : ShadowFrame;
 
-/// Body of the `tonemap_luma` free function.
-///
-/// # Arguments
-///
-/// - `f32` - A 32-bit float (`f32`).
-/// - `f32` - A 32-bit float (`f32`).
-/// - `f32` - A 32-bit float (`f32`).
-///
-/// # Returns
-///
-/// - `f32` - A 32-bit float.
 fn tonemap_luma(luma : f32, exposure : f32, white : f32) -> f32 {
     let w : f32 = select(1.0, white, white > 0.0000001);
     let x : f32 = max(luma, 0.0) * exposure;
@@ -843,17 +814,6 @@ fn tonemap_luma(luma : f32, exposure : f32, white : f32) -> f32 {
 
 // 色相保持:只压亮度再按比例缩回 RGB,保住粉/薄荷这类浅色的色相。
 // 逐通道 clamp 会把 1.5 亮度的粉红面去色成纯白 —— 那正是「一片惨白」。
-/// Body of the `tonemap` free function.
-///
-/// # Arguments
-///
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `f32` - A 32-bit float (`f32`).
-/// - `f32` - A 32-bit float (`f32`).
-///
-/// # Returns
-///
-/// - `vec3<f32>` - A `vec3<f32>` value.
 fn tonemap(value : vec3<f32>, exposure : f32, white : f32) -> vec3<f32> {
     let luma : f32 = dot(value, vec3<f32>(0.2126, 0.7152, 0.0722));
     if (luma <= 0.000001) {
@@ -865,15 +825,6 @@ fn tonemap(value : vec3<f32>, exposure : f32, white : f32) -> vec3<f32> {
     return value * scale;
 }
 
-/// Body of the `linear_to_srgb` free function.
-///
-/// # Arguments
-///
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-///
-/// # Returns
-///
-/// - `vec3<f32>` - A `vec3<f32>` value.
 fn linear_to_srgb(value : vec3<f32>) -> vec3<f32> {
     let c : vec3<f32> = clamp(value, vec3<f32>(0.0), vec3<f32>(1.0));
     let lo : vec3<f32> = c * 12.92;
@@ -949,21 +900,6 @@ fn sample_shadow(world : vec3<f32>, n_dot_l : f32) -> f32 {
 }
 
 @fragment
-/// Body of the `fs_main` free function.
-///
-/// # Arguments
-///
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `vec3<f32>` - A `vec3<f32>` parameter.
-/// - `f32` - A 32-bit float (`f32`).
-/// - `f32` - A 32-bit float (`f32`).
-///
-/// # Returns
-///
-/// - `@location(0) vec4<f32>` - A `@location(0) vec4<f32>` value.
 fn fs_main(
     @location(0) normal : vec3<f32>,
     @location(1) color : vec3<f32>,
