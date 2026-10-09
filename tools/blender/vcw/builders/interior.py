@@ -69,19 +69,45 @@ PART_TOP = 2.75
 BANDS = ((3.70, 4.30), (5.30, 5.90))
 BAND_OUT = 0.30          # how far a band stands proud of the wall
 BAND_GLASS = 0.30        # upper part of each band is glass, lower part is trim
+# How far the glass is set BACK from the surrounding wall face.  A belt course
+# that stands proud is a painted stripe; one whose glazing is set back into a
+# rebate reads as a window because the reveal's sill and lintel catch the
+# directional light.  0.10 m keeps the pane behind the wall plane while still
+# leaving a 0.20 m of projecting trim above and below it.
+BAND_RECESS = 0.10
+EDGE_BEVEL = 0.05       # arris chamfer on every shell / floor / stair box
 
 
 def _shade(c, k):
     return tuple(min(1.0, x * k) for x in c)
 
 
-def _box(part, x0, x1, y0, y1, z0, z1, color, colors=None):
+def _box(part, x0, x1, y0, y1, z0, z1, color, colors=None, bevel=0.0):
     """One axis-aligned solid box from explicit bounds (never from a centre).
 
     Bounds in, box out: a centre/size pair on a wall is a rounding error away
     from a 0.25 m wall being 0.24 m wide, and the doorway depends on the wall
     thickness being exactly WALL_T.
+
+    ``bevel`` chamfers every arris.  It is the only lever this file had for
+    making a surface interesting: the runtime shades with one directional light
+    and no texture, so a hard 90 deg edge has no value break at all and every
+    wall, floor and stair box rendered as one dead planar field -- the reason
+    these two assets read as flat vector illustration.  A chamfer puts a strip
+    at an intermediate normal on all four sides of each edge, so the arris
+    catches light without needing a single extra material.
     """
+    if bevel > 0.0:
+        # chamfer_box takes a size + centre, and sizes a bevel off its own
+        # shortest edge, so clamp: a 0.25 m wall cannot carry a 0.05 m chamfer
+        # on both ends without degenerating.
+        b = min(bevel, 0.24 * min(x1 - x0, y1 - y0, z1 - z0))
+        C.chamfer_box(part.mesh,
+                      (x1 - x0, y1 - y0, z1 - z0),
+                      center=(0.5 * (x0 + x1), 0.5 * (y0 + y1),
+                              0.5 * (z0 + z1)),
+                      color=color, bevel=b, colors=colors)
+        return part
     C.box(part.mesh,
           (x1 - x0, y1 - y0, z1 - z0),
           center=(0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.5 * (z0 + z1)),
@@ -90,27 +116,68 @@ def _box(part, x0, x1, y0, y1, z0, z1, color, colors=None):
 
 
 def _wrap_band(a, x_in, x_out, y_in, y_out, z_lo, glass_h):
-    """One belt course: eight solid boxes that lap the corners of the shell.
+    """One belt course: a projecting frame with the glazing set BACK in it.
 
-    Each course is a lower trim sub-band and an upper glass sub-band, four
-    boxes each, so the glass reads as a distinct colour zone.  The four boxes
-    deliberately OVERLAP at the corners instead of butting, which is what a
-    real projecting string course does.  Overlap is safe for the exporter:
-    every box stays a closed shell of positive volume, and adjacent boxes
-    share no coincident vertices, so the welded-component split still sees
+    The course is no longer a solid band sitting proud of the wall.  Instead
+    each elevation gets a trim sill, a trim lintel and a recessed pane:
+
+      * sill/lintel run the full outer footprint and stand ``BAND_OUT`` proud,
+        so they keep the belt-course silhouette and catch the key light on top;
+      * the pane sits ``BAND_RECESS`` BEHIND the wall face between them, which
+        is what turns a painted stripe into a window -- the eye reads the sill,
+        the gap and the lintel as three separate depth planes.
+
+    Measured before this change, the band sat 50 mm OUTSIDE the shell plane
+    with no reveal at all (shell front z=4.500, band z=4.550), so every
+    window was a flat applied decal.
+
+    The four sides deliberately OVERLAP at the corners rather than butting, as
+    a real projecting string course does.  Overlap is safe for the exporter:
+    each box stays a closed shell of positive volume, and adjacent boxes share
+    no coincident vertices, so the welded-component split still sees
     independent manifolds rather than a T-junction.
     """
     ox0, ox1 = x_in - BAND_OUT, x_out + BAND_OUT
     oy0, oy1 = y_in - BAND_OUT, y_out + BAND_OUT
-    for z_a, z_b, col in ((z_lo, z_lo + glass_h, TRIM),
-                          (z_lo + glass_h, z_lo + 2.0 * glass_h, GLASS)):
-        d = {"+z": _shade(col, 1.07), "-z": _shade(col, 0.80)}
-        # front and back run the full outer width...
-        _box(a, ox0, ox1, oy0, y_in, z_a, z_b, col, d)
-        _box(a, ox0, ox1, y_out, oy1, z_a, z_b, col, d)
-        # ...and left and right run the full outer depth, closing the corners.
-        _box(a, ox0, x_in, oy0, oy1, z_a, z_b, col, d)
-        _box(a, x_out, ox1, oy0, oy1, z_a, z_b, col, d)
+    z_sill0, z_sill1 = z_lo, z_lo + glass_h
+    z_pane0, z_pane1 = z_sill1, z_sill1 + glass_h
+    z_lint0, z_lint1 = z_pane1, z_pane1 + glass_h
+    sill_d = {"+z": _shade(TRIM, 1.07), "-z": _shade(TRIM, 0.80)}
+    lint_d = {"+z": _shade(TRIM, 0.92), "-z": _shade(TRIM, 0.62)}
+    # The pane is inset from the shell face on all four sides, so the reveal
+    # between it and the projecting sill/lintel is a genuine gap on every
+    # elevation rather than only on the street front.
+    px0, px1 = x_in + BAND_RECESS, x_out - BAND_RECESS
+    py0, py1 = y_in + BAND_RECESS, y_out - BAND_RECESS
+    pane = {"+z": _shade(GLASS, 1.25), "-z": _shade(GLASS, 0.72)}
+
+    for (fz0, fz1, fcol, fd) in ((z_sill0, z_sill1, TRIM, sill_d),
+                                 (z_lint0, z_lint1, TRIM, lint_d)):
+        _box(a, ox0, ox1, oy0, y_in, fz0, fz1, fcol, fd)
+        _box(a, ox0, ox1, y_out, oy1, fz0, fz1, fcol, fd)
+        _box(a, ox0, x_in, oy0, oy1, fz0, fz1, fcol, fd)
+        _box(a, x_out, ox1, oy0, oy1, fz0, fz1, fcol, fd)
+
+    _box(a, px0, px1, py0, py1, z_pane0, z_pane1, GLASS, pane)
+
+    # JAMBS.  Without these the recess had a lip above and below but no vertical
+    # returns, so from a near-side-on angle the whole course still read as a
+    # painted stripe -- the eye needs two shadowed vertical edges to accept the
+    # surface as a hole rather than a decal.  Each jamb is a thin vertical fin
+    # standing proud of the wall and running the full height of the pane, set
+    # just inboard of the pane edge so it frames the reveal without covering it.
+    jw = 0.09
+    jd = {"+z": _shade(TRIM, 1.04), "-z": _shade(TRIM, 0.70)}
+    z_a, z_b = z_sill1, z_pane1
+    # Front (-Y) and back (+Y): each jamb fin spans from the outer face of its
+    # own band edge inward to the pane plane, so the reveal is a real gap.
+    for jx0, jx1 in ((px0 - jw, px0), (px1, px1 + jw)):
+        _box(a, jx0, jx1, y_in - BAND_OUT, py0, z_a, z_b, TRIM, jd)
+        _box(a, jx0, jx1, py1, y_out + BAND_OUT, z_a, z_b, TRIM, jd)
+    # Left (-X) and right (+X): same, turned through 90 degrees.
+    for jy0, jy1 in ((py0 - jw, py0), (py1, py1 + jw)):
+        _box(a, x_in - BAND_OUT, px0, jy0, jy1, z_a, z_b, TRIM, jd)
+        _box(a, px1, x_out + BAND_OUT, jy0, jy1, z_a, z_b, TRIM, jd)
 
 
 def showcase(asset_id, width, depth, wall, accent, awning=False):
@@ -146,31 +213,34 @@ def showcase(asset_id, width, depth, wall, accent, awning=False):
     _box(shell, x_in - WALL_T, x_in, y_in - WALL_T, y_out + WALL_T,
          0.0, WALL_H, ext, {"-x": _shade(ext, 1.05), "+x": inn,
                              "+y": inn, "-y": inn,
-                             "+z": _shade(ext, 1.08), "-z": _shade(ext, 0.5)})
+                             "+z": _shade(ext, 1.08), "-z": _shade(ext, 0.5)},
+         bevel=EDGE_BEVEL)
     # RIGHT: exterior faces +x.
     _box(shell, x_out, x_out + WALL_T, y_in - WALL_T, y_out + WALL_T,
          0.0, WALL_H, ext, {"+x": _shade(ext, 1.05), "-x": inn,
                              "+y": inn, "-y": inn,
-                             "+z": _shade(ext, 1.08), "-z": _shade(ext, 0.5)})
+                             "+z": _shade(ext, 1.08), "-z": _shade(ext, 0.5)},
+         bevel=EDGE_BEVEL)
     # BACK: exterior faces +y.
     _box(shell, x_in - WALL_T, x_out + WALL_T, y_out, y_out + WALL_T,
          0.0, WALL_H, ext, {"+y": _shade(ext, 1.05), "-y": inn,
                              "+x": inn, "-x": inn,
-                             "+z": _shade(ext, 1.08), "-z": _shade(ext, 0.5)})
+                             "+z": _shade(ext, 1.08), "-z": _shade(ext, 0.5)},
+         bevel=EDGE_BEVEL)
     # FRONT (-Y), in three boxes around a 1.60 x 2.30 m opening.
     front = {"-y": _shade(ext, 1.05), "+y": inn, "+x": inn, "-x": inn,
              "+z": _shade(ext, 1.08), "-z": _shade(ext, 0.5)}
     _box(shell, x_in - WALL_T, -DOOR_HALF, y_in - WALL_T, y_in,
-         0.0, WALL_H, ext, front)
+         0.0, WALL_H, ext, front, bevel=EDGE_BEVEL)
     _box(shell, DOOR_HALF, x_out + WALL_T, y_in - WALL_T, y_in,
-         0.0, WALL_H, ext, front)
+         0.0, WALL_H, ext, front, bevel=EDGE_BEVEL)
     _box(shell, -DOOR_HALF, DOOR_HALF, y_in - WALL_T, y_in,
-         DOOR_TOP, WALL_H, ext, front)
+         DOOR_TOP, WALL_H, ext, front, bevel=EDGE_BEVEL)
 
     # ---- 2. ground floor slab -------------------------------------------
     fg = a.part("floor_ground", base_color=FLOOR_BOARD)
     _box(fg, x_in, x_out, y_in, y_out, 0.0, GROUND_TOP, FLOOR_BOARD,
-         {"+z": FLOOR_BOARD, "-z": CONCRETE_DK})
+         {"+z": FLOOR_BOARD, "-z": CONCRETE_DK}, bevel=EDGE_BEVEL)
 
     # ---- 3. upper floor: an L, not a slab, so the stairwell is a real well -
     x_stair_in = x_out - STAIR_W
@@ -178,9 +248,11 @@ def showcase(asset_id, width, depth, wall, accent, awning=False):
     y_stair_top = y_stair_bot + STAIR_STEPS * STAIR_RUN
     fu = a.part("floor_upper", base_color=FLOOR_BOARD)
     _box(fu, x_in, x_stair_in, y_in, y_out, UPPER_BOT, UPPER_TOP,
-         FLOOR_BOARD, {"+z": FLOOR_BOARD, "-z": _shade(FLOOR_BOARD, 0.78)})
+         FLOOR_BOARD, {"+z": FLOOR_BOARD, "-z": _shade(FLOOR_BOARD, 0.78)},
+         bevel=EDGE_BEVEL)
     _box(fu, x_stair_in, x_out, y_stair_top, y_out, UPPER_BOT, UPPER_TOP,
-         FLOOR_BOARD, {"+z": FLOOR_BOARD, "-z": _shade(FLOOR_BOARD, 0.78)})
+         FLOOR_BOARD, {"+z": FLOOR_BOARD, "-z": _shade(FLOOR_BOARD, 0.78)},
+         bevel=EDGE_BEVEL)
 
     # ---- 4. stair: one box per step, the top step flush with UPPER_TOP ----
     st = a.part("stair", base_color=STAIR_TREAD)
@@ -189,22 +261,24 @@ def showcase(asset_id, width, depth, wall, accent, awning=False):
         _box(st, x_stair_in, x_out, y_stair_bot + i * STAIR_RUN,
              y_stair_bot + (i + 1) * STAIR_RUN, GROUND_TOP, top,
              STAIR_TREAD, {"+z": _shade(STAIR_TREAD, 1.04),
-                           "-z": _shade(STAIR_TREAD, 0.72)})
+                           "-z": _shade(STAIR_TREAD, 0.72)},
+             bevel=0.012)
 
     # ---- 5. interior partition (ground storey only, head height below the
     #         upper slab so the ceiling reads) ------------------------------
     iw = a.part("interior_wall", base_color=accent)
     _box(iw, x_in, x_stair_in - 1.70, PART_Y0, PART_Y1,
          GROUND_TOP, PART_TOP, accent,
-         {"+z": _shade(accent, 1.10), "-z": _shade(accent, 0.74)})
+         {"+z": _shade(accent, 1.10), "-z": _shade(accent, 0.74)},
+         bevel=EDGE_BEVEL)
 
     # ---- 6. roof slab -----------------------------------------------------
     rf = a.part("roof", base_color=ROOF)
     _box(rf, x_in - WALL_T, x_out + WALL_T, y_in - WALL_T, y_out + WALL_T,
          WALL_H, WALL_H + 0.20, ROOF,
-         {"+z": ROOF_DK, "-z": _shade(ROOF, 0.86)})
+         {"+z": ROOF_DK, "-z": _shade(ROOF, 0.86)}, bevel=EDGE_BEVEL)
 
-    # ---- 7. window belt courses (solid boxes, upper storey only) ----------
+    # ---- 7. window belt courses (recessed reveals, upper storey only) -----
     win = a.part("windows", base_color=GLASS, roughness=0.25)
     for z_lo, _z_hi in BANDS:
         _wrap_band(win, x_in, x_out, y_in, y_out, z_lo, BAND_GLASS)
@@ -213,7 +287,8 @@ def showcase(asset_id, width, depth, wall, accent, awning=False):
     cn = a.part("cornice", base_color=TRIM)
     _box(cn, x_in - 0.35, x_out + 0.35, y_in - 0.35, y_out + 0.35,
          WALL_H - 0.35, WALL_H - 0.10, TRIM,
-         {"+z": _shade(TRIM, 1.06), "-z": _shade(TRIM, 0.80)})
+         {"+z": _shade(TRIM, 1.06), "-z": _shade(TRIM, 0.80)},
+         bevel=EDGE_BEVEL)
     pz0, pz1 = WALL_H + 0.20, WALL_H + 0.75
     px0, px1 = -0.5 * width, 0.5 * width
     py0, py1 = -0.5 * depth, 0.5 * depth

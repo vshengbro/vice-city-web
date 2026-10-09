@@ -4,7 +4,7 @@
   "up_axis": "Y",
   "unit": "meter",
   "asset_count": 99,
-  "tri_count": 133151,
+  "tri_count": 134287,
   "categories": [
     "animal",
     "beach",
@@ -255,7 +255,7 @@
       "id": "bldg_loft_showcase",
       "category": "building",
       "file": "bldg_loft_showcase.json",
-      "tri_count": 504,
+      "tri_count": 1072,
       "part_count": 8,
       "bounds": {
         "min": [
@@ -274,7 +274,7 @@
       "id": "bldg_shop_showcase",
       "category": "building",
       "file": "bldg_shop_showcase.json",
-      "tri_count": 516,
+      "tri_count": 1084,
       "part_count": 9,
       "bounds": {
         "min": [
