@@ -30,7 +30,7 @@ use euv::{
 
 use crate::{
     camera::{CAMERA_MIN_HEIGHT, Camera, Mat4, OCCLUSION_MIN_DISTANCE, PRESS_IN_DISTANCE},
-    collision::{BodyKind, CollisionWorld, DynamicBody, placement_box},
+    collision::{BodyKind, CAR_FOOTPRINT, CollisionWorld, DynamicBody, placement_box},
     combat::{
         AiState, Arsenal, Enemy, Faction, HurtState, Mission, Pedestrian, Wanted, Weapon,
         apply_damage, body_matrix, falloff, flat_distance, has_line_of_sight, regen_armor,
@@ -228,8 +228,6 @@ const WORLD_HALF: f32 = 150.0;
 const PED_RADIUS: f32 = 0.35;
 /// 敌人的等效碰撞圆半径(米)。
 const ENEMY_RADIUS: f32 = 0.35;
-/// 车辆的等效碰撞圆半径(米)。
-const CAR_RADIUS: f32 = 1.25;
 /// 玩家质量(单位:一个「人」)。
 const PLAYER_MASS: f32 = 1.0;
 /// 行人质量(单位:一个「人」)。
@@ -7174,16 +7172,16 @@ fn resolve_dynamic_bodies(game: &mut Game) {
     let mut bodies: Vec<DynamicBody> = Vec::new();
     // 槽位 0 恒为玩家自己;在车里时那一格的碰撞体是车。
     let player_at: Vec3 = game.player.get_position();
+    // 车用**有向盒**足迹([`CAR_FOOTPRINT`] + 真实 yaw),不再用 1.25 m 的
+    // 圆:`resolve_all` 会拿它跟静态形状再分离一次,用圆的话 `drive` 刚
+    // 停在 2.283 m 的车会被这一层缩回 1.25 m,车头重新插进墙里。
+    let car_body: fn(Vec3, f32) -> DynamicBody = |at: Vec3, yaw: f32| -> DynamicBody {
+        DynamicBody::new_box(BodyKind::Car, [at[0], at[2]], CAR_FOOTPRINT, yaw, CAR_MASS)
+    };
     match driven {
         Some(index) => {
             if let Some(car) = game.traffic.get_cars_ref().get(index) {
-                let at: Vec3 = car.get_position();
-                bodies.push(DynamicBody::new(
-                    BodyKind::Car,
-                    [at[0], at[2]],
-                    CAR_RADIUS,
-                    CAR_MASS,
-                ));
+                bodies.push(car_body(car.get_position(), car.get_yaw()));
             }
         }
         None => {
@@ -7199,13 +7197,7 @@ fn resolve_dynamic_bodies(game: &mut Game) {
         if driven == Some(index) {
             continue;
         }
-        let at: Vec3 = car.get_position();
-        bodies.push(DynamicBody::new(
-            BodyKind::Car,
-            [at[0], at[2]],
-            CAR_RADIUS,
-            CAR_MASS,
-        ));
+        bodies.push(car_body(car.get_position(), car.get_yaw()));
     }
     for enemy in &game.enemies {
         let at: Vec3 = enemy.get_position();

@@ -38,8 +38,34 @@ const SLIDE_STEP: f32 = 0.05;
 /// 一步里至少要走完这个比例才继续推进,否则判定为撞墙收手。
 const SLIDE_MIN_PROGRESS: f32 = 0.25;
 
-/// 车辆等效碰撞圆半径(米):比玩家大,车身也更宽。
-pub const CAR_RADIUS: f32 = 1.25;
+/// 车辆碰撞足迹:半长(沿车头方向)与半宽(垂直车头方向),单位米。
+///
+/// 数值由 `assets/car_sedan.json` 的 `bounds` 量得:`x` 跨度 4.566 m
+/// (车长,沿资产本地 X = 车头方向)、`z` 跨度 1.851 m(车宽)。乘 0.5 得半长
+/// 2.283 m 与半宽 0.926 m。`truck_pickup` 是 5.364 × 1.992,取轿车这一档
+/// 作为整车族的代表:多出来的 0.07 m 半长对撞墙手感没有可察觉的影响,
+/// 而按最长的车定尺会让轿车离墙更远,反而更容易在窄巷里剐蹭。
+///
+/// **为什么不能继续用 1.25 m 的圆:** 圆的最远点在 `1.25 m` 处,而车头在
+/// `2.283 m` 处 —— 车身有整整 **1.033 m** 悬在碰撞边界之外。实测(把车
+/// 满油门怼进最近的楼)车头最深扎进建筑 AABB **1.033 m**,也就是用户报的
+/// 「车穿过建筑围墙」的可见深度。宽度方向圆反而比车宽(0.926 m)还大
+/// 0.32 m,所以侧面不会漏 —— 漏的只有车头与车尾,也就是**迎着墙开进去
+/// 之后看见车身插在墙里**的那一面。
+///
+/// 外部读者:`game::resolve_dynamic_bodies` 用它给每辆车建有向盒碰撞体,
+/// 删掉或改成私有不符 §18。
+pub const CAR_FOOTPRINT: Vec2 = [2.283, 0.926];
+
+/// 车辆每步推进的子步长(米)。
+///
+/// 满油门(24 m/s)一帧走 `24 × FIXED_DT × 4 = 1.60 m`,而碰撞世界里
+/// **最薄**的静态盒只有 0.133 m(交通锥,见 `prop_traffic_cone` ×
+/// `CONE_COLLIDER_SCALE`)。1.60 / 0.133 = **12 倍** —— 单步推进足以跳过
+/// 任何一堵薄墙,`push_out_aabb` 那一帧根本看不到重叠,于是既不挡也不推,
+/// 车就过去了。取 0.05 m(与 [`SLIDE_STEP`] 同一档)后单步只有墙厚的
+/// 38%,再也跨不过去。
+const CAR_STEP: f32 = 0.05;
 
 /// 相机当作球体扫描时的半径(米)。
 ///
@@ -454,17 +480,109 @@ impl CollisionWorld {
         current
     }
 
-    /// 用车辆半径做分离 —— [`Self::resolve_with_radius`] 的固定版本。
+    /// 用车辆的**真实有向足迹**做分离 —— 车与静态形状碰撞的唯一入口。
+    ///
+    /// 与 [`Self::resolve_with_radius`] 的区别有两条,两条都对应一个实测到的
+    /// 缺陷:
+    ///
+    /// 1. **足迹是有向盒,不是圆。** 车的真实车身是 4.566 × 1.851 m
+    ///    ([`CAR_FOOTPRINT`]),而 1.25 m 的圆最远只到 1.25 m —— 车头有
+    ///    **1.033 m** 悬在碰撞边界外。满油门怼楼时实测车头扎进建筑 AABB
+    ///    1.033 m,这就是「车穿过建筑围墙」的可见深度。
+    /// 2. **位移按 [`CAR_STEP`] 切成子步,每步各做一次分离。** 满油门一帧
+    ///    推进 1.60 m,而碰撞世界里最薄的静态盒只有 0.133 m,单步足以跨过
+    ///    任何一堵薄墙 —— 那一帧分离看不到重叠,车就过去了。
+    ///
+    /// 子步还顺带解决了「圆被从薄盒的错误面弹出去」:每一步的穿透量都远
+    /// 小于盒厚,落点永远走不到 `push_out_aabb` 的「点在盒内」分支,也就
+    /// 永远不会被猜错面送到墙的另一侧。
     ///
     /// # Arguments
     ///
-    /// - `Vec2` - 待分离的世界 XZ 坐标。
+    /// - `Vec2` - 车心当前的世界 XZ 坐标(本帧起点)。
+    /// - `Vec2` - 本帧想要的总位移(米)。
+    /// - `f32` - 车身朝向(弧度,绕 Y 轴,与 `TrafficCar::get_yaw` 同一约定)。
     ///
     /// # Returns
     ///
-    /// - `Vec2` - 分离并钳进边界后的世界 XZ 坐标。
-    pub fn resolve_car(&self, point: Vec2) -> Vec2 {
-        self.resolve_with_radius(point, CAR_RADIUS)
+    /// - `Vec2` - 分离后的世界 XZ 坐标。
+    pub fn resolve_car_footprint(&self, here: Vec2, delta: Vec2, yaw: f32) -> Vec2 {
+        let want: f32 = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        if want <= SLIDE_EPSILON {
+            return here;
+        }
+        let steps: usize = (want / CAR_STEP).ceil().max(1.0) as usize;
+        let mut current: Vec2 = here;
+        // 每一小步落在**整帧位移的一个精确分数**上,而不是「把 delta 平分
+        // steps 份再累加」。后者在最后一步不会正好落回 `here + delta`:
+        // 120 步的浮点累加误差实测约 1e-6 m,比 `f32::EPSILON`(1.19e-7)
+        // 大一个数量级,于是调用点那一句「车有没有被挡」在**空旷地面上
+        // 也会判成撞墙**,车每帧被砍掉 75% 的速度。插值写法让最后一步
+        // 乘的是 `1.0`,结果与 `here + delta` 逐位相同。
+        for step_index in 1..=steps {
+            let fraction: f32 = step_index as f32 / steps as f32;
+            let wanted: Vec2 = [here[0] + delta[0] * fraction, here[1] + delta[1] * fraction];
+            let before: Vec2 = current;
+            let step: Vec2 = [wanted[0] - before[0], wanted[1] - before[1]];
+            current = self.resolve_car_box(wanted, yaw);
+            // 这一小步基本被挡干净了就收手:车贴着墙不该还在原地反复
+            // 推离(那会让它「立正」贴墙,失去蹭着墙走的能力)。
+            let achieved: Vec2 = [current[0] - before[0], current[1] - before[1]];
+            let want_dot: f32 = step[0] * step[0] + step[1] * step[1];
+            let got_dot: f32 = achieved[0] * step[0] + achieved[1] * step[1];
+            if got_dot < want_dot * SLIDE_MIN_PROGRESS {
+                current = car_slide(current, step, wanted);
+                break;
+            }
+        }
+        current
+    }
+
+    /// 有向车辆足迹 vs 全部静态形状的分离(一次性,不切子步)。
+    ///
+    /// `resolve_car_footprint` 的单步内核,单独暴露是为了能直接单测「一步
+    /// 里车能不能穿过去」。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 车心待分离的世界 XZ 坐标。
+    /// - `f32` - 车身朝向(弧度,绕 Y 轴)。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 分离后的世界 XZ 坐标。
+    pub fn resolve_car_box(&self, point: Vec2, yaw: f32) -> Vec2 {
+        let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+        // 车身基向量,和 `TrafficCar::drive` 的第 3 步完全同一套:
+        // `fwd = [cos yaw, -sin yaw]`、`right = [fwd[1], -fwd[0]]`。
+        // 符号必须一模一样 —— 这里的 `right` 若取成 `[−fwd[1], fwd[0]]`,
+        // 车身盒就成了左右翻转的镜像,斜着靠墙时会被判到墙的另一侧去。
+        let forward: Vec2 = [cos_yaw, -sin_yaw];
+        let side: Vec2 = [forward[1], -forward[0]];
+        let mut current: Vec2 = point;
+        for _ in 0..RESOLVE_ITERATIONS {
+            let mut moved: bool = false;
+            for shape in self.get_shapes() {
+                let hit: Option<(Vec2, f32)> = match shape {
+                    Shape::Aabb { center, half } => {
+                        push_out_box_aabb(*center, *half, current, forward, side, CAR_FOOTPRINT)
+                    }
+                    Shape::Circle {
+                        center,
+                        radius: other,
+                    } => push_out_circle(*center, *other, current, CAR_FOOTPRINT[1]),
+                };
+                if let Some((direction, depth)) = hit {
+                    current[0] += direction[0] * depth;
+                    current[1] += direction[1] * depth;
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        current
     }
 
     /// 点是否落在某个形状内部(调试 / 自测用,不做分离)。
@@ -577,32 +695,14 @@ impl CollisionWorld {
     /// - `Vec<Vec2>` - 与输入同序的最终世界 XZ 位置。
     pub fn resolve_all(&self, bodies: &[DynamicBody]) -> Vec<Vec2> {
         let mut placed: Vec<DynamicBody> = bodies.to_vec();
-        // 静态分离:每个体用自己的半径走一遍已有的迭代分离。
+        // 静态分离:每个体用自己的**足迹**走一遍已有的迭代分离。
+        //
+        // 车的足迹是有向盒(`DynamicBody::new_box`),走的必须是
+        // `push_out_box_aabb` —— 若这里退回圆的 `push_out_aabb`,它会把车
+        // 按 1.25 m 推离墙面,而 `TrafficCar::drive` 刚把它停在 2.283 m,
+        // 于是这一层又把车缩回 1.25 m,车头重新插进墙里 1.033 m。
         for body in placed.iter_mut() {
-            let mut current: Vec2 = body.position;
-            for _ in 0..RESOLVE_ITERATIONS {
-                let mut moved: bool = false;
-                for shape in self.get_shapes() {
-                    let hit: Option<(Vec2, f32)> = match shape {
-                        Shape::Aabb { center, half } => {
-                            push_out_aabb(*center, *half, current, body.get_radius())
-                        }
-                        Shape::Circle {
-                            center,
-                            radius: other,
-                        } => push_out_circle(*center, *other, current, body.get_radius()),
-                    };
-                    if let Some((direction, depth)) = hit {
-                        current[0] += direction[0] * depth;
-                        current[1] += direction[1] * depth;
-                        moved = true;
-                    }
-                }
-                if !moved {
-                    break;
-                }
-            }
-            body.position = current;
+            body.position = self.separate_static(body.position, body);
         }
         // 动态分离:质量加权的两两分离(玩家按玩家半径,车按车半径……)。
         let separated: Vec<Vec2> = self.resolve_dynamic(&placed);
@@ -612,32 +712,55 @@ impl CollisionWorld {
         // 动态让位可能又把谁推进了墙,最后再对静态收敛一次。
         let mut out: Vec<Vec2> = Vec::with_capacity(placed.len());
         for body in &placed {
-            let mut current: Vec2 = body.position;
-            for _ in 0..RESOLVE_ITERATIONS {
-                let mut moved: bool = false;
-                for shape in self.get_shapes() {
-                    let hit: Option<(Vec2, f32)> = match shape {
-                        Shape::Aabb { center, half } => {
-                            push_out_aabb(*center, *half, current, body.get_radius())
-                        }
-                        Shape::Circle {
-                            center,
-                            radius: other,
-                        } => push_out_circle(*center, *other, current, body.get_radius()),
-                    };
-                    if let Some((direction, depth)) = hit {
-                        current[0] += direction[0] * depth;
-                        current[1] += direction[1] * depth;
-                        moved = true;
-                    }
-                }
-                if !moved {
-                    break;
-                }
-            }
-            out.push(current);
+            out.push(self.separate_static(body.position, body));
         }
         out
+    }
+
+    /// 把一个动态体按它**自己的足迹**推出所有静态形状(迭代至稳定)。
+    ///
+    /// 车的足迹是有向盒,走 [`push_out_box_aabb`];其余实体是圆,走
+    /// [`push_out_circle`]。这里必须按足迹分流而不是一律按圆 —— 一律按圆
+    /// 会把 [`TrafficCar::drive`](crate::traffic::TrafficCar::drive) 刚停在
+    /// 半车长处的车又缩回 1.25 m,车头重新插进墙里。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 待分离的世界 XZ 坐标。
+    /// - `&DynamicBody` - 提供足迹与朝向;**不读它的 `position`**。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 分离并迭代收敛后的世界 XZ 坐标。
+    fn separate_static(&self, point: Vec2, body: &DynamicBody) -> Vec2 {
+        let (sin_yaw, cos_yaw): (f32, f32) = body.get_yaw().sin_cos();
+        let forward: Vec2 = [cos_yaw, -sin_yaw];
+        let side: Vec2 = [forward[1], -forward[0]];
+        let footprint: Vec2 = body.get_footprint();
+        let mut current: Vec2 = point;
+        for _ in 0..RESOLVE_ITERATIONS {
+            let mut moved: bool = false;
+            for shape in self.get_shapes() {
+                let hit: Option<(Vec2, f32)> = match shape {
+                    Shape::Aabb { center, half } => {
+                        push_out_box_aabb(*center, *half, current, forward, side, footprint)
+                    }
+                    Shape::Circle {
+                        center,
+                        radius: other,
+                    } => push_out_circle(*center, *other, current, footprint[1]),
+                };
+                if let Some((direction, depth)) = hit {
+                    current[0] += direction[0] * depth;
+                    current[1] += direction[1] * depth;
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        current
     }
 
     /// 一点到所有静态形状表面的最短距离(米)。
@@ -898,24 +1021,33 @@ pub enum BodyKind {
     Enemy,
 }
 
-/// 一个参与动态分离的实体(圆形足迹 + 质量)。
+/// 一个参与动态分离的实体(**有向足迹** + 质量)。
 ///
 /// 质量是物理分离的唯一输入:撞静止的车时人会被弹开而车几乎不动,
 /// 两辆车相撞则按质量比分配速度。质量单位取「人」的整数倍,便于读数。
+///
+/// 足迹默认是圆(`[radius, radius]`,yaw = 0);车例外 —— 车把这个字段填成
+/// [`CAR_FOOTPRINT`] 并带上朝向。**这一步不是可选的润色:** `resolve_all`
+/// 在 `TrafficCar::drive` **之后**再跑一遍静态分离,若它还用 1.25 m 的圆
+/// 把车推离墙,`drive` 里刚算好的 2.283 m 会被缩回 1.25 m,车头重新插进
+/// 墙里 —— 也就是这个缺陷在同一条调用链上被复活一次。
 #[derive(Clone, Copy, Debug)]
 pub struct DynamicBody {
     /// 实体类型(决定同类之间是否也要分开)。
     pub kind: BodyKind,
-    /// 圆心世界 XZ 坐标。
+    /// 足迹中心的世界 XZ 坐标(圆则是圆心)。
     pub position: Vec2,
-    /// 碰撞圆半径(米)。
-    pub radius: f32,
+    /// 足迹半长 / 半宽(米);圆填 `[radius, radius]`。
+    pub footprint: Vec2,
+    /// 足迹朝向(弧度,绕 Y 轴,与 `TrafficCar::get_yaw` 同一约定);
+    /// 圆形忽略这一项。
+    pub yaw: f32,
     /// 质量(以「一个人」为单位,1.0 = 一个人)。
     pub mass: f32,
 }
 
 impl DynamicBody {
-    /// 构造一个动态碰撞体。
+    /// 构造一个**圆形**动态碰撞体。
     ///
     /// # Arguments
     ///
@@ -931,7 +1063,37 @@ impl DynamicBody {
         Self {
             kind,
             position,
-            radius,
+            footprint: [radius, radius],
+            yaw: 0.0,
+            mass,
+        }
+    }
+
+    /// 构造一个**有向盒**动态碰撞体(车用)。
+    ///
+    /// # Arguments
+    ///
+    /// - `BodyKind` - 实体类型。
+    /// - `Vec2` - 足迹中心的世界 XZ 坐标。
+    /// - `Vec2` - 足迹半长 / 半宽(米)。
+    /// - `f32` - 足迹朝向(弧度,绕 Y 轴)。
+    /// - `f32` - 质量(以「一个人」为单位)。
+    ///
+    /// # Returns
+    ///
+    /// - `Self` - 就绪的动态碰撞体。
+    pub const fn new_box(
+        kind: BodyKind,
+        position: Vec2,
+        footprint: Vec2,
+        yaw: f32,
+        mass: f32,
+    ) -> Self {
+        Self {
+            kind,
+            position,
+            footprint,
+            yaw,
             mass,
         }
     }
@@ -954,14 +1116,171 @@ impl DynamicBody {
         self.kind
     }
 
-    /// 该实体的碰撞半径。
+    /// 该实体的碰撞半径(米)。
+    ///
+    /// 取足迹两轴的**最大值**:圆形足迹下两者相等,就是原来的半径;车
+    /// 走这条通道时拿到半车长 2.283 m,用于车与车的圆近似互相分离。
     ///
     /// # Returns
     ///
     /// - `f32` - 半径(米)。
     pub fn get_radius(&self) -> f32 {
-        self.radius
+        self.footprint[0].max(self.footprint[1])
     }
+
+    /// 该实体的足迹半长 / 半宽(米)。
+    ///
+    /// # Returns
+    ///
+    /// - `Vec2` - 足迹半尺寸。
+    pub fn get_footprint(&self) -> Vec2 {
+        self.footprint
+    }
+
+    /// 该实体足迹的朝向(弧度,绕 Y 轴)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 朝向(弧度)。
+    pub fn get_yaw(&self) -> f32 {
+        self.yaw
+    }
+}
+
+/// 车身(有向盒)中心在一条任意方向轴上的投影半径。
+///
+/// # Arguments
+///
+/// - `Vec2` - 投影轴(无需归一化,结果按轴长线性缩放)。
+/// - `Vec2` - 车头方向单位向量。
+/// - `Vec2` - 车身侧向单位向量。
+/// - `Vec2` - 车身半长 / 半宽(米)。
+///
+/// # Returns
+///
+/// - `f32` - 车心到该轴的投影半径(米)。
+///
+/// **必须取两段的绝对值之和。** 带符号直接相加会在 yaw 接近 45° 时互相
+/// 抵消成 0,车就被当成一个点,什么墙都撞不上。
+fn car_projection(axis: Vec2, forward: Vec2, side: Vec2, footprint: Vec2) -> f32 {
+    let along: f32 = footprint[0] * (forward[0] * axis[0] + forward[1] * axis[1]).abs();
+    let across: f32 = footprint[1] * (side[0] * axis[0] + side[1] * axis[1]).abs();
+    along + across
+}
+
+/// 有向盒(车)vs 轴对齐盒(建筑 / 道具)的分离量。
+///
+/// **为什么要一个专门的函数,而不是把圆放大:** 圆对所有方向一视同仁,而车
+/// 是长条形的 —— 同一辆车车头要离墙 `half_long`,车身侧面只要离墙
+/// `half_wide`。用圆去近似,两个方向只能取同一个值,取小了车头扎进墙
+/// (实测 1.033 m),取大了侧面凭空多出半米空隙、车在窄巷里剐蹭。两者在
+/// 二维里等价于:车在盒的**局部坐标**里做一次「圆心到矩形」的距离测试。
+///
+/// 算法走标准 SAT(分离轴定理):两个凸多边形分离 ⟺ 存在一条轴使两个投影
+/// 不相交。盒只有 3 条候选轴 —— 盒自身的两条 + 车的两条车身轴。取**穿透
+/// 最浅**的那条轴把车推出去,所以车会被沿最省力的方向滑开,而不是被卡在
+/// 墙角。这与玩家用的 `resolve_slide` 是同一套思路。
+///
+/// # Arguments
+///
+/// - `Vec2` - 静态盒中心的世界 XZ 坐标。
+/// - `Vec2` - 静态盒的半尺寸(米)。
+/// - `Vec2` - 车心的世界 XZ 坐标。
+/// - `Vec2` - 车身前向单位向量(世界 XZ)。
+/// - `Vec2` - 车身左向单位向量(世界 XZ)。
+/// - `Vec2` - 车的半长 / 半宽(米)。
+///
+/// # Returns
+///
+/// - `Option<(Vec2, f32)>` - `(推出方向, 推出距离)`;不重叠时为 `None`。
+fn push_out_box_aabb(
+    center: Vec2,
+    half: Vec2,
+    point: Vec2,
+    forward: Vec2,
+    side: Vec2,
+    footprint: Vec2,
+) -> Option<(Vec2, f32)> {
+    let offset: Vec2 = [point[0] - center[0], point[1] - center[1]];
+    // 四条候选轴:车身两条 + 世界 X / Z 两条。`gap` > 0 表示该轴上两者
+    // 已经分离 —— 只要有一条如此,按 SAT 这两个凸多边形就不相交。
+    let axes: [Vec2; 4] = [forward, side, [1.0, 0.0], [0.0, 1.0]];
+    // 车心在一条**任意方向**轴上的投影半径 = 车身矩形在轴上的半长投影。
+    // 两端点各投一次,取两段**绝对值之和** —— 带符号相加会互相抵消,
+    // yaw 接近 45° 时算出 0,车就被当成一个点。
+    let mut separated: bool = false;
+    let mut best: Option<(Vec2, f32)> = None;
+    for (index, axis) in axes.into_iter().enumerate() {
+        // 世界轴(后两条)的静态半径就是盒自己的半长;车身轴要投一次。
+        let box_radius: f32 = match index {
+            0 | 1 => half[0] * axis[0].abs() + half[1] * axis[1].abs(),
+            2 => half[0],
+            _ => half[1],
+        };
+        let gap: f32 = (offset[0] * axis[0] + offset[1] * axis[1]).abs()
+            - box_radius
+            - car_projection(axis, forward, side, footprint);
+        if gap > 0.0 {
+            separated = true;
+            break;
+        }
+        // 选**最浅**的那条轴:最浅 = 沿它分离最省力,车于是被推去最
+        // 容易脱身的方向,而不是被卡在墙角。
+        let depth: f32 = -gap;
+        if best
+            .as_ref()
+            .is_none_or(|(_axis, kept): &(Vec2, f32)| depth < *kept)
+        {
+            best = Some((axis, depth));
+        }
+    }
+    if separated {
+        return None;
+    }
+    let (mut axis, depth) = best?;
+    // 推出方向必须**指向盒的外侧**。偏移量为 0(车心与盒心重合)时没有
+    // 符号可言,取轴的第一非零分量的正负定一个确定的方向。
+    let projection: f32 = offset[0] * axis[0] + offset[1] * axis[1];
+    let sign: f32 = if projection > 0.0 {
+        1.0
+    } else if projection < 0.0 {
+        -1.0
+    } else if axis[0] != 0.0 {
+        axis[0].signum()
+    } else {
+        axis[1].signum()
+    };
+    axis = [axis[0] * sign, axis[1] * sign];
+    Some((axis, depth))
+}
+
+/// 车被墙挡住时的切向滑动:保留 `step` 的切向分量。
+///
+/// # Arguments
+///
+/// - `Vec2` - 分离之后的位置。
+/// - `Vec2` - 这一小步想要的位移。
+/// - `Vec2` - 分离之前想去的落点(用来算修正量)。
+///
+/// # Returns
+///
+/// - `Vec2` - 沿墙滑过之后的位置。
+fn car_slide(pushed: Vec2, step: Vec2, wanted: Vec2) -> Vec2 {
+    let correction: Vec2 = [pushed[0] - wanted[0], pushed[1] - wanted[1]];
+    let length: f32 = (correction[0] * correction[0] + correction[1] * correction[1]).sqrt();
+    if length <= SLIDE_EPSILON {
+        return pushed;
+    }
+    let normal: Vec2 = [correction[0] / length, correction[1] / length];
+    let into: f32 = step[0] * normal[0] + step[1] * normal[1];
+    if into >= 0.0 {
+        return pushed;
+    }
+    let tangent: Vec2 = [step[0] - normal[0] * into, step[1] - normal[1] * into];
+    if (tangent[0] * tangent[0] + tangent[1] * tangent[1]).sqrt() <= SLIDE_EPSILON {
+        return pushed;
+    }
+    [pushed[0] + tangent[0], pushed[1] + tangent[1]]
 }
 
 /// 圆形 vs AABB 的分离量。
@@ -1072,7 +1391,7 @@ pub fn placement_box(min: Vec3, max: Vec3, yaw: f32, scale: f32, position: Vec3)
 
 #[cfg(test)]
 mod tests {
-    use crate::collision::{BodyKind, CollisionWorld, DynamicBody};
+    use crate::collision::{BodyKind, CAR_FOOTPRINT, CollisionWorld, DynamicBody};
     use crate::r#const::{
         T_COLLISION_SLIDE_KEEPS_TANGENT, T_COLLISION_SLIDE_OPEN_GROUND_X,
         T_COLLISION_SLIDE_OPEN_GROUND_Z, T_COLLISION_SLIDE_STOPS_AT_WALL, T_DYNAMIC_MASS_WEIGHTED,
@@ -1081,6 +1400,33 @@ mod tests {
         T_SOFT_LIMIT_STOPS_AT_VOID, T_SOFT_PUSH_ZERO_INSIDE,
     };
     use crate::r#type::Vec2;
+
+    /// 回归测试:车的碰撞足迹必须是真实车身尺寸,而不是 1.25 m 的圆。
+    ///
+    /// 圆只到 1.25 m 而车头在 2.283 m,车头就有 1.033 m 悬在碰撞边界之外。
+    const T_CAR_FOOTPRINT_NOT_A_DISC: &str = "车的碰撞足迹必须按真实车身算,而不是 1.25 m 的圆";
+
+    /// 回归测试:车开到建筑 / 围墙里必须被挡住,车头不许插进去。
+    const T_CAR_NEVER_INSIDE_A_WALL: &str = "车身不得插进建筑围墙";
+
+    /// 回归测试:一帧的位移不得跨过最薄的墙(高速穿墙)。
+    const T_CAR_NO_WALL_TUNNEL: &str = "满油门一帧不得穿过薄墙";
+
+    /// 回归测试:斜着撞墙必须沿墙滑过去,而不是被弹到墙的另一侧。
+    const T_CAR_SLIDES_ALONG_WALL: &str = "斜着撞墙必须沿墙滑过去";
+
+    /// 测试里代表「车头正对 −X 墙面」的朝向(游戏约定 forward = [cos, −sin])。
+    ///
+    /// 写成 π 的字面值而不是引用 `std::f32::consts::PI`:§6.1 要求子模块里
+    /// 不出现限定 std 路径,这里是 `#[cfg(test)]` 内的模块私有常量。
+    /// 取 `f32::consts::PI` 的 f32 最近值(clippy 的 excessive_precision)。
+    const YAW_FACING_NEG_X: f32 = 3.141_592_5;
+
+    /// 测试里代表 45° 斜向位移的分解系数(1.6 m / √2 ≈ 1.1313708)。
+    const STRIDE_DIAGONAL: f32 = 1.131_370_8;
+
+    /// 泡测试的朝向步长:15°(π / 12 ≈ 0.2617994)。
+    const YAW_STEP_RAD: f32 = 0.261_799_4;
 
     /// 墙占 x ∈ [-10, 0](盒心 -5、半尺寸 5),内表面在 x = 0,墙体在 -X 侧。
     ///
@@ -1369,6 +1715,231 @@ mod tests {
             "{}: 车应被推出墙外,实得 x={}",
             T_DYNAMIC_STATIC_TOO,
             out[0][0]
+        );
+    }
+
+    // ---- 车辆足迹回归(用户报:车穿过建筑围墙)--------------------
+    //
+    // 墙占 x ∈ [-10, 0]:盒心 (-5, 0)、半长 5,近面在 x = 0。
+    /// 一面正对车头的建筑外墙。
+    fn building_world() -> CollisionWorld {
+        let mut world: CollisionWorld = CollisionWorld::new();
+        world.push_aabb([-5.0, 0.0], [5.0, 10.0]);
+        world
+    }
+
+    /// 车头怼墙:停在墙外的距离必须是**半车长**,不是 1.25 m。
+    ///
+    /// 这是用户报的那个缺陷本身。旧的 `resolve_car` 用 1.25 m 的圆,
+    /// 于是车心停在 `x = 1.25`,而车头在 `1.25 + 2.283 = 3.533` ——
+    /// **整整 1.033 m 的车身插在墙里**。
+    #[test]
+    fn a_car_stops_a_whole_car_length_short_of_a_wall() {
+        let world: CollisionWorld = building_world();
+        // 车头朝 −X(yaw = π),从 +X 侧一路开到墙前。
+        let yaw: f32 = YAW_FACING_NEG_X;
+        let resolved: Vec2 = world.resolve_car_footprint([20.0, 0.0], [-30.0, 0.0], yaw);
+        // 车心离墙面至少要有半车长,车才整个儿在外面。
+        assert!(
+            resolved[0] >= CAR_FOOTPRINT[0] - 1.0e-2,
+            "{}: 车心应停在离墙 {:.3} m 处(半车长),实得 x={}",
+            T_CAR_FOOTPRINT_NOT_A_DISC,
+            CAR_FOOTPRINT[0],
+            resolved[0]
+        );
+        // 车身最远点(车头)也不许进墙。
+        let nose: f32 = resolved[0] - CAR_FOOTPRINT[0];
+        assert!(
+            nose >= -1.0e-2,
+            "{}: 车头扎进墙里 {:.3} m,落点 x={}",
+            T_CAR_NEVER_INSIDE_A_WALL,
+            -nose,
+            resolved[0]
+        );
+    }
+
+    /// 满油门怼楼:无论开多少帧,车身任何一角都不得进墙。
+    ///
+    /// 用**车身的四个角**判定而不是车心 —— 车心在墙外而车头插进去,
+    /// 正是旧的圆足迹掩盖掉的那种情况(实测车头最深 1.033 m)。
+    ///
+    /// 容差取 `SKIN = 1e-4 m`(0.1 mm):车贴着墙面时 SAT 推离的浮点残差
+    /// 实测在 3e-7 m 量级,那是 `f32` 精度而不是穿透。1.033 m 的缺陷与
+    /// 3e-7 m 的噪声相差六个数量级,这条断言不可能被噪声蒙混过去。
+    #[test]
+    fn a_car_driven_at_full_speed_never_clips_into_a_building() {
+        const SKIN: f32 = 1.0e-4;
+        let world: CollisionWorld = building_world();
+        for yaw_deg in [0.0f32, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0] {
+            let yaw: f32 = yaw_deg.to_radians();
+            let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+            let forward: Vec2 = [cos_yaw, -sin_yaw];
+            let side: Vec2 = [forward[1], -forward[0]];
+            let mut at: Vec2 = [20.0, 0.0];
+            // 满油门一帧 1.60 m,共 200 帧,一路撞到底。
+            for frame in 0..200 {
+                at = world.resolve_car_footprint(at, [forward[0] * 1.6, forward[1] * 1.6], yaw);
+                for sx in [-1.0f32, 1.0] {
+                    for sz in [-1.0f32, 1.0] {
+                        let corner: Vec2 = [
+                            at[0]
+                                + forward[0] * CAR_FOOTPRINT[0] * sx
+                                + side[0] * CAR_FOOTPRINT[1] * sz,
+                            at[1]
+                                + forward[1] * CAR_FOOTPRINT[0] * sx
+                                + side[1] * CAR_FOOTPRINT[1] * sz,
+                        ];
+                        let inside: bool = corner[0] < -SKIN && corner[1].abs() < 10.0;
+                        assert!(
+                            !inside,
+                            "{}: yaw {yaw_deg}° 第 {frame} 帧车身角 {corner:?} 已在墙内(墙占 x<=0)",
+                            T_CAR_NEVER_INSIDE_A_WALL
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 满油门一帧不得跨过**一堵薄墙**(被实测出来的真实场景)。
+    ///
+    /// 碰撞世界里最薄的静态盒是 0.133 m(交通锥),一帧 1.60 m = 12 倍。
+    /// 旧实现一次 `resolve_car(proposed)` 只看落点:车从墙这侧一步跨到
+    /// 墙那侧时落点已经离墙比 1.25 m 还远,`push_out_aabb` 返回 `None`,
+    /// 于是既不挡也不推 —— 车就过去了。
+    ///
+    /// 起点必须让**车头**恰好停在墙的这一侧(还差一丁点没到),这样这一帧
+    /// 才会真的跨过整堵墙;若按车心算起点,车头一开始就伸到墙那边去了。
+    #[test]
+    fn a_full_speed_frame_cannot_tunnel_through_a_thin_wall() {
+        const THIN: f32 = 0.133;
+        const FRAME: f32 = 1.6;
+        let mut world: CollisionWorld = CollisionWorld::new();
+        // 0.133 m 厚的薄墙,两面在 x = ∓0.0665;车从 +X 一侧冲 −X。
+        world.push_aabb([0.0, 0.0], [THIN * 0.5, 10.0]);
+        // 车头正好贴在 +X 面上:车心 = 面 + 半车长。
+        let near_face: f32 = THIN * 0.5;
+        let start: f32 = near_face + CAR_FOOTPRINT[0];
+        // 不切子步的话这一帧落点在 start - 1.6,早已越到墙的另一侧。
+        let resolved: Vec2 =
+            world.resolve_car_footprint([start, 0.0], [-FRAME, 0.0], YAW_FACING_NEG_X);
+        assert!(
+            resolved[0] >= -CAR_FOOTPRINT[0] - 1.0e-3,
+            "{}: 起点 x={start:.3}、一帧想走 {FRAME} m(墙只有 {THIN} m 厚),车却到了 x={:.3} —— 已在墙的另一侧",
+            T_CAR_NO_WALL_TUNNEL,
+            resolved[0]
+        );
+        // 车头不许越过墙的远面(x = −THIN/2)。
+        let nose: f32 = resolved[0] - CAR_FOOTPRINT[0];
+        assert!(
+            nose >= -near_face - 1.0e-3,
+            "{}: 车头 x={nose:.4} 已越过墙的远面 {near_face:.4}",
+            T_CAR_NO_WALL_TUNNEL
+        );
+    }
+
+    /// 斜着撞**薄墙**:必须**沿墙滑过去**,而不是穿墙。
+    ///
+    /// 墙厚 0.20 m —— 窄巷隔断的量级。这一条测的是**薄墙**上的穿透:
+    /// 0.20 m 的墙配上一帧 1.60 m 的位移,旧实现一次
+    /// `resolve_car(proposed)` 根本看不到重叠(落点已经在墙那边 1.4 m
+    /// 处,比 1.25 m 的圆还远),于是既不挡也不推。判据取「沿墙滑动时
+    /// 不得越过墙的远面」,而不是滑行距离 —— 距离多少取决于手感和墙长,
+    /// 不是一个能证伪的性质。
+    #[test]
+    fn a_car_hitting_a_thin_wall_at_an_angle_slides_along_it() {
+        const THIN: f32 = 0.20;
+        let mut world: CollisionWorld = CollisionWorld::new();
+        // 墙占 x ∈ [-THIN, 0]。Z 方向必须**足够长**:车沿墙滑行时一直往
+        // +Z 走,墙若在 Z 上也有限长,车滑过端头之后就是真的开到墙外面
+        // 去了,再往 -X 走当然畅通无阻 —— 那是正确物理,不是缺陷。
+        world.push_aabb([-THIN * 0.5, 0.0], [THIN * 0.5, 400.0]);
+        // 一路往 −X 带 +Z 斜着撞(45°),跑满 200 帧(每帧 0.283 m = 1.60/√2,
+        // 正好是 `TrafficCar::drive` 满油门斜向走一帧的距离)。
+        let stride: f32 = STRIDE_DIAGONAL;
+        let mut at: Vec2 = [20.0, 14.0];
+        for frame in 0..200 {
+            at = world.resolve_car_footprint(at, [-stride, stride], YAW_FACING_NEG_X);
+            assert!(
+                at[0] >= -THIN - 1.0e-3,
+                "{}: 第 {frame} 帧车被弹到了墙的另一侧 x={}(墙只占 x ∈ [{}, 0])",
+                T_CAR_SLIDES_ALONG_WALL,
+                at[0],
+                -THIN
+            );
+        }
+        // 切向必须保住:沿墙滑了一段距离,而不是钉死在接触点上。
+        assert!(
+            at[1] > 5.0,
+            "{}: 切向位移被吃光,实得 z={}(应沿墙滑到 z 明显增大)",
+            T_CAR_SLIDES_ALONG_WALL,
+            at[1]
+        );
+        // 车身离墙的距离必须按**半车长**算(yaw = π,车头正对墙面)。
+        // 旧的圆足迹停在 x = 1.25 —— 车身侧面离墙 1.033 m,看上去就是
+        // 「车飘在墙外一米」;足迹修正后停在 2.283 m。
+        assert!(
+            (at[0] - CAR_FOOTPRINT[0]).abs() < 1.0e-2,
+            "{}: 贴墙时车心离墙面 {:.3} m,应等于半车长 {:.3} m",
+            T_CAR_FOOTPRINT_NOT_A_DISC,
+            at[0],
+            CAR_FOOTPRINT[0]
+        );
+    }
+
+    /// 把上面几条合起来**泡很久**:各朝向的车满油门怼同一栋楼,跑满 600 帧,
+    /// 车身的任何一个角都不许进墙。
+    ///
+    /// 单帧的测试各自只覆盖一个几何,真正在游戏里出问题的是**连续**状态:
+    /// 车贴着墙蹭、车头慢慢压进去又弹出来。这一条按 15° 的朝向步长把整圈
+    /// 都过一遍,每一帧都重新解一次,断言取**四个角**的最小间隙。
+    #[test]
+    fn a_car_soaked_at_every_yaw_never_enters_a_building() {
+        const FRAME: f32 = 1.6;
+        let mut world: CollisionWorld = CollisionWorld::new();
+        // 一面长墙:x ∈ [-12, 0],Z 上足够长,车任何朝向都撞得到它。
+        world.push_aabb([-6.0, 0.0], [6.0, 600.0]);
+        let mut worst: f32 = f32::MAX;
+        for step in 0..24 {
+            // yaw = π 让车头大致对着墙(游戏里 forward = [cos, −sin])。
+            let yaw: f32 = YAW_FACING_NEG_X + step as f32 * YAW_STEP_RAD;
+            let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+            let forward: Vec2 = [cos_yaw, -sin_yaw];
+            let side: Vec2 = [forward[1], -forward[0]];
+            let (dir_x, dir_z): (f32, f32) = (forward[0], forward[1]);
+            // 从墙外 30 m 处朝墙开,不给它停在接触点上的机会。
+            let mut at: Vec2 = [30.0 + 30.0 * forward[0], 100.0 + 30.0 * forward[1]];
+            for frame in 0..600 {
+                let step_len: f32 = FRAME;
+                at = world.resolve_car_footprint(at, [dir_x * step_len, dir_z * step_len], yaw);
+                // 车身四角相对墙的内表面(x = 0)的最小间隙。
+                for sign_l in [-1.0f32, 1.0] {
+                    for sign_w in [-1.0f32, 1.0] {
+                        let corner_x: f32 = at[0]
+                            + forward[0] * sign_l * CAR_FOOTPRINT[0]
+                            + side[0] * sign_w * CAR_FOOTPRINT[1];
+                        let gap: f32 = corner_x;
+                        if gap < worst {
+                            worst = gap;
+                        }
+                        assert!(
+                            gap >= -1.0e-3,
+                            "{}: yaw={:.2} 第 {frame} 帧,车身某角 x={:.4} 已进墙 {:.4} m",
+                            T_CAR_NEVER_INSIDE_A_WALL,
+                            yaw,
+                            gap,
+                            -gap
+                        );
+                    }
+                }
+            }
+        }
+        // 泡完之后车确实贴着墙待过(证明断言不是「因为车根本没靠近才过」)。
+        assert!(
+            worst < 0.5,
+            "{}: 600 帧里车身离墙最近 {:.3} m,却从未接近 —— 这条测试没有真的撞到墙",
+            T_CAR_NEVER_INSIDE_A_WALL,
+            worst
         );
     }
 }

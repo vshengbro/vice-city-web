@@ -488,10 +488,16 @@ impl TrafficCar {
             fwd[1] * forward_speed + right[1] * lateral,
         ];
         let here: Vec3 = self.get_position();
-        let proposed: Vec2 = [here[0] + velocity[0] * dt, here[2] + velocity[1] * dt];
-        let resolved: Vec2 = world.resolve_car(proposed);
-        let blocked: bool = (resolved[0] - proposed[0]).abs() > f32::EPSILON
-            || (resolved[1] - proposed[1]).abs() > f32::EPSILON;
+        let delta: Vec2 = [velocity[0] * dt, velocity[1] * dt];
+        // 车的碰撞足迹是**有向盒**而不是 1.25 m 的圆:车身真实尺寸
+        // 4.566 × 1.851 m,圆只到 1.25 m,于是车头有 1.033 m 悬在碰撞边界
+        // 之外 —— 满油门怼楼时车头真的会插进建筑 AABB 那么深(实测)。
+        // 这一步内部还把位移切成 0.05 m 的子步,单步 1.60 m 跨不过任何
+        // 一堵薄墙(最薄的静态盒 0.133 m)。详见
+        // [`crate::collision::CollisionWorld::resolve_car_footprint`]。
+        let resolved: Vec2 = world.resolve_car_footprint([here[0], here[2]], delta, self.get_yaw());
+        let blocked: bool = (resolved[0] - (here[0] + delta[0])).abs() > f32::EPSILON
+            || (resolved[1] - (here[2] + delta[1])).abs() > f32::EPSILON;
         self.set_position([resolved[0], here[1], resolved[1]]);
         if blocked {
             // 撞墙:速度砍掉,但**不清侧向** —— 蹭着墙甩尾是真实车该有的
