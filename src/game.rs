@@ -10,7 +10,7 @@
 //! - 场景按资产分批([`render::SceneBatch`]),同类资产只解析一次。
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, Ref, RefCell, RefMut},
     collections::HashMap,
     rc::Rc,
 };
@@ -1834,6 +1834,7 @@ pub(crate) struct InputState {
     steer_key: String,
 }
 
+/// Default construction for [`InputState`].
 impl Default for InputState {
     /// default。
     fn default() -> Self {
@@ -1854,6 +1855,7 @@ impl Default for InputState {
     }
 }
 
+/// Inherent implementation of [`InputState`].
 impl InputState {
     /// 某个键是否按住(按 `KeyboardEvent.code` 判定,兼容所有键盘布局)。
     ///
@@ -2022,6 +2024,26 @@ pub struct Game {
     /// 输入状态。
     pub input: InputState,
     /// 渲染后端。
+    /// 本帧**真的**提交给 GPU 的三角形数。
+    ///
+    /// HUD 上那个 `{N} tris` 读的是 `scene.total_triangles`,一个静态
+    /// 常量 —— WebGL2 与 WebGPU 会显示同一个数,哪怕其中一个后端一帧
+    /// 都没画出来。要判断某个后端是否真的在画,只能看这个字段。
+    pub gpu_submitted: u32,
+
+    /// 资产是否已经构建完、可以往 GPU 上传了。
+    ///
+    /// ⚠️ WebGPU 的设备获取是**异步**的,而资产加载也是异步的,两条
+    /// `spawn_local` 谁先跑完是不确定的:资产那边可能先把 mesh 全部
+    /// 推给**上一个** renderer(或根本没 renderer),于是 WebGPU 装好
+    /// 时自己手里是空的 —— 表现为「上传 80 个 mesh 成功、每帧也报告
+    /// 提交了几十万三角形,画布却只有一片天空」:那些批次查不到 mesh,
+    /// 被静默跳过。
+    ///
+    /// 这里用一个布尔量把「有 renderer」和「有资产」两件事**都**满足
+    /// 之后的上传串起来,顺序问题就不存在了。
+    pub assets_built: bool,
+
     pub renderer: Option<Renderer>,
     /// 已加载的资产数量。
     pub loaded_assets: usize,
@@ -2943,7 +2965,7 @@ pub fn hidden_batches() -> Vec<usize> {
 /// # Returns
 ///
 /// - `f32` - 解析出的数值。
-fn query_number(key: &str, fallback: f32) -> f32 {
+pub(crate) fn query_number(key: &str, fallback: f32) -> f32 {
     let search: Option<String> = window().and_then(|w: Window| w.location().search().ok());
     let Some(query): Option<String> = search else {
         return fallback;
@@ -2957,6 +2979,43 @@ fn query_number(key: &str, fallback: f32) -> f32 {
         }
     }
     fallback
+}
+
+/// 查询串里某个 key 的**字符串**值。
+///
+/// `query_number` 只能读数字(`?res=1.0`),而 `?backend=webgl2` 是枚举,
+/// 所以这里另取一次原始文本。
+///
+/// # Arguments
+///
+/// - `&str` - 查询参数名。
+///
+/// # Returns
+///
+/// - `Option<String>` - 解码后的值。
+fn query_value(key: &str) -> Option<String> {
+    let search: Option<String> = window().and_then(|w: Window| w.location().search().ok());
+    let query: String = search?;
+    for pair in query.trim_start_matches('?').split('&') {
+        let (name, value): (&str, &str) = pair.split_once('=')?;
+        if name == key {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// 是否显式要求跳过 WebGPU(走 WebGL2)。
+///
+/// # Arguments
+///
+/// - `&str` - 要匹配的枚举值。
+///
+/// # Returns
+///
+/// - `bool` - 查询串里出现了该值。
+fn query_backend_is(value: &str) -> bool {
+    query_value(BACKEND_PARAM).as_deref() == Some(value)
 }
 
 /// 按蓝图把已加载的资产铺成场景批次。
@@ -3241,24 +3300,44 @@ pub fn rebuild_streamed_surface(
 /// - `&Scene` - 场景(提供新网格数据)。
 /// - `&[usize]` - 被改写过的 `Scene::meshes` 下标。
 fn reupload_streamed_meshes(renderer: &mut Renderer, scene: &Scene, rewritten: &[usize]) {
-    let Renderer::WebGl(webgl) = renderer else {
-        // 纯软件后端的 `draw` 直接读 `scene.meshes`,没有第二份 GPU 拷贝。
-        return;
-    };
+    // WebGPU 后端有和 WebGL2 **完全相同**的约束:GPU 资产表必须与
+    // `scene.meshes` 一一对应且顺序一致,所以两条 GPU 路径都要重传。
+    // 软件后端的 `draw` 直接读 `scene.meshes`,没有第二份 GPU 拷贝。
     let mut failures: usize = 0;
-    for index in rewritten {
-        let Some(mesh) = scene.meshes.get(*index) else {
-            continue;
-        };
-        if let Err(error) = webgl.replace_mesh(*index, mesh) {
-            failures += 1;
-            if failures <= REPLACE_MESH_REPORT_LIMIT {
-                console_log(&format!(
-                    "{LOG_REPLACE_MESH_FAILED} {index} ({} verts): {error}",
-                    mesh.vertices.len()
-                ));
+    match renderer {
+        Renderer::WebGl(webgl) => {
+            for index in rewritten {
+                let Some(mesh) = scene.meshes.get(*index) else {
+                    continue;
+                };
+                if let Err(error) = webgl.replace_mesh(*index, mesh) {
+                    failures += 1;
+                    if failures <= REPLACE_MESH_REPORT_LIMIT {
+                        console_log(&format!(
+                            "{LOG_REPLACE_MESH_FAILED} {index} ({} verts): {error}",
+                            mesh.vertices.len()
+                        ));
+                    }
+                }
             }
         }
+        Renderer::WebGpu(gpu) => {
+            for index in rewritten {
+                let Some(mesh) = scene.meshes.get(*index) else {
+                    continue;
+                };
+                if let Err(error) = gpu.replace_mesh(*index, mesh) {
+                    failures += 1;
+                    if failures <= REPLACE_MESH_REPORT_LIMIT {
+                        console_log(&format!(
+                            "{LOG_REPLACE_MESH_FAILED} {index} ({} verts): {error}",
+                            mesh.vertices.len()
+                        ));
+                    }
+                }
+            }
+        }
+        Renderer::Software(_) => return,
     }
     if failures > 0 {
         console_log(&format!(
@@ -3990,7 +4069,7 @@ fn bind_pointer_events(handles: &GameHandles) {
                 return;
             }
             {
-                let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                let mut game: RefMut<Game> = handles.game.borrow_mut();
                 apply_look_delta(&mut game.camera, dx, dy);
             }
             event.prevent_default();
@@ -4023,7 +4102,7 @@ fn bind_pointer_events(handles: &GameHandles) {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
             let locked: bool = is_pointer_locked();
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             game.input.pointer_locked = locked;
             if !locked {
                 game.input.dragging = false;
@@ -4041,7 +4120,7 @@ fn bind_pointer_events(handles: &GameHandles) {
             };
             let (x, y): (f64, f64) = (mouse.client_x() as f64, mouse.client_y() as f64);
             {
-                let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                let mut game: RefMut<Game> = handles.game.borrow_mut();
                 game.input.dragging = true;
                 game.input.last_pointer = [x, y];
             }
@@ -4065,7 +4144,7 @@ fn bind_pointer_events(handles: &GameHandles) {
                 let dx: f64 = x - game.input.last_pointer[0];
                 let dy: f64 = y - game.input.last_pointer[1];
                 drop(game);
-                let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                let mut game: RefMut<Game> = handles.game.borrow_mut();
                 apply_look_delta(&mut game.camera, dx, dy);
                 game.input.last_pointer = [x, y];
             }
@@ -4075,7 +4154,7 @@ fn bind_pointer_events(handles: &GameHandles) {
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             game.input.dragging = false;
         }));
         attach(canvas, EVENT_POINTERUP, closure);
@@ -4083,7 +4162,7 @@ fn bind_pointer_events(handles: &GameHandles) {
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             game.input.dragging = false;
         }));
         attach(canvas, EVENT_POINTERCANCEL, closure);
@@ -4097,7 +4176,7 @@ fn bind_pointer_events(handles: &GameHandles) {
                 return;
             };
             let delta: f64 = wheel.delta_y();
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             // 滚轮改的是**期望距离**,不是当前距离 —— 当前距离由遮挡
             // 回避每帧改写,直接写它会被下一帧的回避覆盖掉,滚轮就失灵。
             let zoomed: f32 =
@@ -4134,7 +4213,7 @@ fn bind_pointer_events(handles: &GameHandles) {
             };
             let (x, y): (f64, f64) = (touch.client_x() as f64, touch.client_y() as f64);
             {
-                let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                let mut game: RefMut<Game> = handles.game.borrow_mut();
                 let previous: [f64; 2] = game.input.last_pointer;
                 if game.input.last_pinch > 0.0 {
                     // 从双指恢复成单指:只重置基准,不跳转视角。
@@ -4164,7 +4243,7 @@ fn bind_pointer_events(handles: &GameHandles) {
                         return;
                     };
                     let (x, y): (f64, f64) = (touch.client_x() as f64, touch.client_y() as f64);
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     let previous: [f64; 2] = game.input.last_pointer;
                     let dx: f64 = x - previous[0];
                     let dy: f64 = y - previous[1];
@@ -4190,7 +4269,7 @@ fn bind_pointer_events(handles: &GameHandles) {
                     // 持着 `RefMut` 调 `forward()` 就是一次真实的重入 borrow
                     // —— WASM 里 panic 不可 catch,直接白屏。
                     let (mut camera, previous_pinch, previous_center): (Camera, f64, [f64; 2]) = {
-                        let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                        let mut game: RefMut<Game> = handles.game.borrow_mut();
                         let previous_pinch: f64 = game.input.last_pinch;
                         let previous_center: [f64; 2] = game.input.last_pointer;
                         let camera: Camera = std::mem::take(&mut game.camera);
@@ -4212,14 +4291,14 @@ fn bind_pointer_events(handles: &GameHandles) {
                         }
                     }
                     {
-                        let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                        let mut game: RefMut<Game> = handles.game.borrow_mut();
                         game.camera = camera;
                         game.input.last_pinch = distance;
                         game.input.last_pointer = [center_x, center_y];
                     }
                 }
                 _ => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     game.input.last_pinch = 0.0;
                 }
             }
@@ -4230,7 +4309,7 @@ fn bind_pointer_events(handles: &GameHandles) {
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             game.input.last_pinch = 0.0;
         }));
         attach(canvas, EVENT_TOUCHEND, closure);
@@ -4238,7 +4317,7 @@ fn bind_pointer_events(handles: &GameHandles) {
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             game.input.last_pinch = 0.0;
         }));
         attach(canvas, EVENT_TOUCHCANCEL, closure);
@@ -4339,7 +4418,7 @@ fn bind_combat_mouse(handles: &GameHandles) {
                 return;
             }
             let (x, y): (f64, f64) = (mouse.client_x() as f64, mouse.client_y() as f64);
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             game.input.fire_held = true;
             game.input.fire_pressed = true;
             game.input.aim_point = [x, y];
@@ -4357,7 +4436,7 @@ fn bind_combat_mouse(handles: &GameHandles) {
             if mouse.button() != MOUSE_BUTTON_LEFT {
                 return;
             }
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             game.input.fire_held = false;
             game.input.fire_released = true;
         }));
@@ -4371,7 +4450,7 @@ fn bind_combat_mouse(handles: &GameHandles) {
                 return;
             };
             let (x, y): (f64, f64) = (mouse.client_x() as f64, mouse.client_y() as f64);
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             game.input.aim_point = [x, y];
         }));
         attach(canvas, EVENT_MOUSEMOVE, closure);
@@ -4412,7 +4491,7 @@ fn bind_keyboard(handles: &GameHandles) {
                 return;
             }
             let is_press: bool = {
-                let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                let mut game: RefMut<Game> = handles.game.borrow_mut();
                 let was: bool = game.input.held(&code);
                 game.input.keys.insert(code.clone(), true);
                 // 转向键互相抢占时「后按的赢」,所以必须记下这一下是谁按的。
@@ -4429,64 +4508,64 @@ fn bind_keyboard(handles: &GameHandles) {
             }
             match code.as_str() {
                 KEYT => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     game.input.phase = game.input.phase.next();
                     let phase: DayPhase = game.input.phase;
                     drop(game);
                     sync_phase_ui(&handles, phase);
                 }
                 KEYF => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     toggle_vehicle(&mut game);
                 }
                 KEY_RELOAD => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     if game.arsenal.reload() {
                         game.player.set_notice(String::from(NOTICE_RELOADED));
                     }
                 }
                 DIGIT1 => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     game.arsenal.set_weapon(Weapon::Pistol);
                     rebind_weapon_batch(&mut game);
                 }
                 DIGIT2 => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     game.arsenal.set_weapon(Weapon::Smg);
                     rebind_weapon_batch(&mut game);
                 }
                 DIGIT3 => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     game.arsenal.set_weapon(Weapon::Bat);
                     rebind_weapon_batch(&mut game);
                 }
                 KEY_MISSION => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     toggle_mission(&mut game);
                 }
                 KEY_CAMERA => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     toggle_camera_mode(&mut game);
                 }
                 KEY_MAP => {
                     // Tab 是**地图**,不是第三人称切换(见 `toggle_map`)。
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     game.map_open = !game.map_open;
                     drop(game);
                     sync_map_visibility(&handles);
                 }
                 KEY_SPACE => {
                     // 只置标志,不直接写垂直速度:物理积分在 `step_vertical`。
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     game.jump_queued = true;
                 }
                 KEY_GRENADE => {
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     throw_grenade(&mut game);
                 }
                 KEY_UNARMED => {
                     // 收起武器:手上没模型,开火键也不再结算 —— GTA V 的 H。
-                    let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.game.borrow_mut();
                     if game.arsenal.get_weapon() != Weapon::Unarmed {
                         game.arsenal.set_weapon(Weapon::Unarmed);
                         rebind_weapon_batch(&mut game);
@@ -4504,7 +4583,7 @@ fn bind_keyboard(handles: &GameHandles) {
                 return;
             };
             let code: String = keyboard.code();
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             game.input.keys.insert(code.clone(), false);
             // 拥有方向盘的那个键松开了,控制权作废,回到「谁在按就听谁」。
             if game.input.steer_key == code {
@@ -4878,6 +4957,10 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
         // 和击杀数一起挂出来:三角形塌成 0 就是几何没生成,击杀数用来确认
         // 战斗回路是活的。
         let tris: usize = game.scene.total_triangles;
+        // `gpu_submitted`:本帧**真的**提交给 GPU 的三角形数(见 render
+        // 循环里那个同名变量)。`tris` 是静态场景常量,不能用来判断
+        // 某个后端有没有画出来东西。
+        let gpu_submitted: usize = game.gpu_submitted as usize;
         let kills: u32 = game.kills;
         let loaded: usize = game.loaded_assets;
         // 验收脚本要导航到样板楼门口才能验证「进门 → 上楼」,所以把门外的
@@ -5065,7 +5148,7 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
             .collect::<Vec<String>>()
             .join(",");
         let json: String = format!(
-            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf},\"mapOpen\":{map_open},\"grenadesLeft\":{grenades},\"liveGrenades\":{live_grenades},\"grenadeTubes\":{tubes}{DEBUG_CLOSE}",
+            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"gpuSubmitted\":{gpu_submitted},\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf},\"mapOpen\":{map_open},\"grenadesLeft\":{grenades},\"liveGrenades\":{live_grenades},\"grenadeTubes\":{tubes}{DEBUG_CLOSE}",
             x = position[0],
             z = position[2],
             yaw = game.player.get_yaw(),
@@ -5336,6 +5419,10 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
             webgl.get_gpu_mesh_count(),
             webgl.get_gpu_index_oob(),
             webgl.get_gpu_index_count()
+        ),
+        Some(Renderer::WebGpu(gpu)) => format!(
+            "{{\"meshes\":{},\"oob\":0,\"lastIndexCount\":0}}",
+            gpu.get_gpu_mesh_count()
         ),
         Some(Renderer::Software(_)) => String::from(JSON_NULL),
         None => String::from(JSON_NULL),
@@ -8274,6 +8361,19 @@ fn step_and_render(
     let mut triangles: u32 = 0;
     if let Some(renderer) = game.renderer.as_mut() {
         let result: Result<u32, String> = match renderer {
+            // ⚠️ 注意:HUD 上那个 `{N} tris` 是 `scene.total_triangles`,
+            // 一个**静态常量** —— WebGL2 和 WebGPU 都会显示同一个数,哪怕
+            // 某个后端一帧都没画出来。所以验收必须看这里这个「本帧真的
+            // 提交了多少三角形」的 `gpu_submitted`。
+            Renderer::WebGpu(gpu) => gpu.render(crate::webgpu::RenderParams {
+                scene: &game.scene,
+                view_proj: &view_proj,
+                lighting: &lighting,
+                eye: game.camera.eye(),
+                width,
+                height,
+                near_cull_radius: near_cull,
+            }),
             Renderer::WebGl(webgl) => webgl.render(
                 &game.scene,
                 &view_proj,
@@ -8298,6 +8398,11 @@ fn step_and_render(
             Err(message) => {
                 // WebGL 运行期出错 → 永久回退到软件渲染,而不是黑屏。
                 console_log(&format!("[vcw] WebGL render failed: {message}"));
+                // WebGPU 运行期出错同样回退:它和 WebGL2 共用同一块画布,
+                // 所以换成 Canvas2D 之前要先确认画布上现在挂的是 WebGPU
+                // 上下文 —— 而一块 canvas 只能有一个上下文类型,换不了。
+                // 因此这里只对 WebGL2 生效,WebGPU 的失败路径在
+                // `try_init_webgpu` 里(那时画布还没被 WebGL2 碰过)。
                 if let Renderer::WebGl(_) = renderer {
                     let canvas: HtmlCanvasElement = game.canvas.clone();
                     match SoftwareRenderer::new(&canvas) {
@@ -8313,6 +8418,7 @@ fn step_and_render(
             }
         };
     }
+    game.gpu_submitted = triangles;
     game.frame_count += 1;
     triangles
 }
@@ -8370,7 +8476,7 @@ fn start_loop(handles: GameHandles) {
             game.accumulator
         };
         let triangles: u32 = {
-            let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.game.borrow_mut();
             let triangles: u32 =
                 step_and_render(&mut game, elapsed, &mut accumulator, width, height);
             game.accumulator = accumulator;
@@ -8480,31 +8586,14 @@ pub fn boot() {
     };
     sync_canvas_size(&canvas);
 
-    // ---- 渲染后端:WebGL2 优先,失败回退 Canvas2D ----
-    let (renderer, backend_note): (Option<Renderer>, String) = match WebGlRenderer::new(&canvas) {
-        Ok(webgl) => {
-            let renderer: Renderer = Renderer::WebGl(Box::new(webgl));
-            (Some(renderer), BACKEND_WEBGL2.to_string())
-        }
-        Err(gl_error) => {
-            // WebGL 失败的**原因**必须打出来:shader 链接失败时错误串里
-            // 带着 program 名和 info log,丢掉它就只剩一句
-            // 「Canvas2D unavailable」,排查时完全无从下手。
-            console_log(&format!("[vcw] WebGL2 init failed: {gl_error}"));
-            match SoftwareRenderer::new(&canvas) {
-                Ok(software) => (
-                    Some(Renderer::Software(software)),
-                    format!("Canvas2D (WebGL2 unavailable: {gl_error})"),
-                ),
-                Err(canvas_error) => {
-                    console_log(&format!("[vcw] no rendering backend: {canvas_error}"));
-                    show_loading_error(NO_RENDERING_BACKEND_AVAILABLE_WEBGL2_AND_CA);
-                    (None, canvas_error)
-                }
-            }
-        }
-    };
-    console_log(&format!("[vcw] renderer = {backend_note}"));
+    // ---- 渲染后端不在这里建。----
+    //
+    // 一块 canvas 只能持有**一个**上下文类型,所以「先建 WebGL2 再想
+    // WebGPU」在原理上就不成立:`getContext("webgpu")` 会永久返回 null。
+    // 真正的选择发生在 `try_init_webgpu` 里,而且必须发生在任何一次
+    // `getContext` 之前 —— 所以 `boot()` 此刻**一块画布都还没碰**。
+    //
+    // 回退链:WebGPU → WebGL2 → Canvas2D,见 `try_init_webgpu`。
 
     // 默认是**第三人称跟随**:相机离角色 FOLLOW_DISTANCE 米、俯角 FOLLOW_PITCH。
     // 曾经还有一个「街区网格全景」机位(`apply_default_view`),由 R 键触发;
@@ -8540,7 +8629,12 @@ pub fn boot() {
         safe_mode: false,
         speed_scale: 1.0,
         input: InputState::default(),
-        renderer,
+        // 渲染后端**稍后**才建(见 `try_init_webgpu`):WebGPU 的设备获取
+        // 是异步的,而 `boot()` 是同步的;而画布此刻必须还没被任何一次
+        // `getContext` 碰过,否则 WebGPU 永久拿不到这块画布。
+        gpu_submitted: 0,
+        assets_built: false,
+        renderer: None,
         loaded_assets: 0,
         total_assets: required.len(),
         frame_count: 0,
@@ -8653,10 +8747,184 @@ pub fn boot() {
     // ---- 主循环先跑起来:这样加载进度条期间也有帧在渲染 ----
     start_loop(handles.clone());
 
+    // ---- WebGPU:构造必须异步(requestAdapter / requestDevice 都是
+    // Promise),所以整条链跑在自己的 spawn_local 里,而不是塞进上面
+    // 那个同步的 `WebGlRenderer::new` 分支。
+    //
+    // **关键顺序约束:WebGPU 必须第一个抢画布。** 一块 canvas 只能有
+    // **一个**上下文类型 —— `getContext("2d")` 之后再
+    // `getContext("webgpu")` 永远返回 null(反之亦然)。所以只要先建了
+    // WebGL2,WebGPU 就永远起不来。因此这一段跑在同步 boot 的**前面**,
+    // 并且用 `?backend=webgl2` 跳过时才开始 WebGL2。
+    //
+    // 回退链:WebGPU → WebGL2 → Canvas2D。三段都在同一块画布上,
+    // 任何一步失败就把控制权交给下一段。
+    let handles_for_gpu: GameHandles = handles.clone();
+    let canvas_for_gpu: HtmlCanvasElement = canvas.clone();
+    spawn_local(async move {
+        try_init_webgpu(&handles_for_gpu, &canvas_for_gpu).await;
+    });
+
     // ---- 异步加载资产 ----
     spawn_local(async move {
         load_assets_and_build(handles).await;
     });
+}
+
+/// 尝试安装 WebGPU 后端;失败时按需补上 WebGL2 / Canvas2D。
+///
+/// # Arguments
+///
+/// - `&GameHandles` - 句柄。
+/// - `&HtmlCanvasElement` - 画布。
+///
+/// # Returns
+///
+/// - `()` - 结果只体现在 `game.renderer` 与 console 上。
+async fn try_init_webgpu(handles: &GameHandles, canvas: &HtmlCanvasElement) {
+    if query_backend_is(BACKEND_QUERY_WEBGL2) {
+        console_log(&format!(
+            "[vcw] {BACKEND_PARAM}={BACKEND_QUERY_WEBGL2}: skipping WebGPU"
+        ));
+        install_legacy_backend(handles, canvas);
+        return;
+    }
+    console_log("[vcw] requesting WebGPU adapter...");
+    match crate::webgpu::WebGpuRenderer::new(canvas).await {
+        Ok(gpu) => {
+            console_log(&format!("[vcw] renderer = {}", BACKEND_WEBGPU));
+            {
+                let mut game: RefMut<Game> = handles.game.borrow_mut();
+                game.renderer = Some(Renderer::WebGpu(Box::new(gpu)));
+            }
+            // 资产可能早就构建完了 —— 那就**现在**补传。WebGPU 的设备
+            // 获取是异步的,它比资产加载慢或快都正常;两个条件
+            // (`assets_built` + renderer 就位)都满足才真正上传。
+            upload_pending_meshes(handles);
+        }
+        Err(error) => {
+            console_log(&error);
+            console_log(&format!("[vcw] falling back to {}", BACKEND_WEBGL2));
+            install_legacy_backend(handles, canvas);
+        }
+    }
+}
+
+/// WebGPU 装不上时的老后端(WebGL2 → Canvas2D)。
+///
+/// **这块画布此刻可能已经不属于我们了。** `getContext` 是**一次性的**:
+/// 一旦 `acquire()` 走到 `canvas.get_context("webgpu")` 并且成功,这块
+/// canvas 就永久绑死在 WebGPU 上,`getContext("webgl2")` 与
+/// `getContext("2d")` 从此**永远**返回 `null`。所以本函数报出的
+/// 「WebGL2 unavailable / Canvas2D unavailable」在 WebGPU 半路失败的
+/// 情况下是**预期结果**,不是新故障 —— 真正的原因在上一行日志里。
+///
+/// 能救回来的只有一种情况:`navigator.gpu` 根本不存在(非 secure
+/// context / 浏览器不支持),那时画布还没被碰过。
+///
+/// # Arguments
+///
+/// - `&GameHandles` - 句柄。
+/// - `&HtmlCanvasElement` - 画布。
+///
+/// # Returns
+///
+/// - `()` - 结果只体现在 `game.renderer` 与 console 上。
+fn install_legacy_backend(handles: &GameHandles, canvas: &HtmlCanvasElement) {
+    let (renderer, backend_note): (Option<Renderer>, String) = match WebGlRenderer::new(canvas) {
+        Ok(webgl) => (
+            Some(Renderer::WebGl(Box::new(webgl))),
+            BACKEND_WEBGL2.to_string(),
+        ),
+        Err(gl_error) => {
+            // WebGL 失败的**原因**必须打出来:shader 链接失败时错误串里
+            // 带着 program 名和 info log,丢掉它就只剩一句
+            // 「Canvas2D unavailable」,排查时完全无从下手。
+            console_log(&format!("[vcw] WebGL2 init failed: {gl_error}"));
+            match SoftwareRenderer::new(canvas) {
+                Ok(software) => (
+                    Some(Renderer::Software(software)),
+                    format!("Canvas2D (WebGL2 unavailable: {gl_error})"),
+                ),
+                Err(canvas_error) => {
+                    console_log(&format!("[vcw] no rendering backend: {canvas_error}"));
+                    show_loading_error(NO_RENDERING_BACKEND_AVAILABLE_WEBGL2_AND_CA);
+                    (None, canvas_error)
+                }
+            }
+        }
+    };
+    console_log(&format!("[vcw] renderer = {backend_note}"));
+    if let Some(value) = renderer {
+        let mut game: RefMut<Game> = handles.game.borrow_mut();
+        game.renderer = Some(value);
+    }
+}
+
+/// WebGPU 是**事后**装上的,资产可能已经建好 —— 补一次上传。
+///
+/// # Arguments
+///
+/// - `&GameHandles` - 句柄。
+///
+/// # Returns
+///
+/// - `()` - 结果只体现在 console 上。
+fn upload_pending_meshes(handles: &GameHandles) {
+    let mut failures: usize = 0;
+    let mut meshes: usize = 0;
+    // 和 `load_assets_and_build` 里那次上传用同一条「先把 renderer
+    // `take()` 出来,借完再放回去」的路:`upload_mesh` 需要 `&mut renderer`,
+    // 而 mesh 数据住在 `game.scene` 里,两个都在同一个 `RefCell` 后面,
+    // 同时借会 panic。
+    let taken: Option<Renderer> = handles.game.borrow_mut().renderer.take();
+    let Some(mut renderer): Option<Renderer> = taken else {
+        return;
+    };
+    let built: bool = handles.game.borrow().assets_built;
+    let mesh_count: usize = handles.game.borrow().scene.meshes.len();
+    if !built || mesh_count == 0 {
+        handles.game.borrow_mut().renderer = Some(renderer);
+        return;
+    }
+    // 已经有 mesh 的后端**不要**重传:GPU 表的下标必须与
+    // `scene.meshes` 严格一一对应,重复 push 会整体错位一格。
+    let needs_upload: bool = match &renderer {
+        Renderer::WebGpu(gpu) => gpu.get_meshes().is_empty(),
+        Renderer::WebGl(webgl) => webgl.get_gpu_mesh_count() == 0,
+        Renderer::Software(_) => false,
+    };
+    if needs_upload {
+        let game_ref: Ref<'_, Game> = handles.game.borrow();
+        meshes = game_ref.scene.meshes.len();
+        for (index, mesh) in game_ref.scene.meshes.iter().enumerate() {
+            let outcome: Result<usize, String> = match &mut renderer {
+                Renderer::WebGpu(gpu) => gpu.upload_mesh(mesh),
+                Renderer::WebGl(webgl) => webgl.upload_mesh(mesh),
+                Renderer::Software(_) => break,
+            };
+            if let Err(error) = outcome {
+                failures += 1;
+                if failures <= MESH_UPLOAD_ERROR_LIMIT {
+                    console_log(&format!(
+                        "[vcw] deferred upload_mesh FAILED for mesh {index} ({} verts): {error}",
+                        mesh.vertices.len()
+                    ));
+                }
+            }
+        }
+    }
+    // 上面的 `game_ref` 是块内借用,到这里已经随块结束 —— 千万别
+    // `drop(handles.game.borrow())`:那是拿**引用**去 drop,什么也没做,
+    // 下一行 `borrow_mut()` 照样 panic。
+    handles.game.borrow_mut().renderer = Some(renderer);
+    if failures > 0 {
+        console_log(&format!(
+            "[vcw] {failures} of {meshes} meshes failed deferred upload"
+        ));
+    } else if needs_upload {
+        console_log(&format!("[vcw] deferred upload of {meshes} meshes done"));
+    }
 }
 
 /// 拉取 manifest + 全部资产 JSON,构建场景,推进进度条。
@@ -8836,7 +9104,7 @@ async fn load_assets_and_build(handles: GameHandles) {
     let instance_count: usize = scene.instance_count();
     let triangle_count: usize = scene.total_triangles;
     {
-        let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+        let mut game: RefMut<Game> = handles.game.borrow_mut();
         game.scene = scene;
         game.ground_batch = ground_batch;
         game.water_batch = water_batch;
@@ -8857,7 +9125,7 @@ async fn load_assets_and_build(handles: GameHandles) {
     // 必须在 build_scene 之后、GPU 上传之后做:骨架批次是 build_scene 之后
     // 新增的批次,资产 bounds 要用来推导碰撞体。
     {
-        let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+        let mut game: RefMut<Game> = handles.game.borrow_mut();
         game.asset_bounds = asset_bounds.clone();
         // 车道 X 用 `lane_x()` 从 `street_axis()` 现算一遍,和蓝图里的字面值
         // 互相校验:如果街道网格改了而蓝图没改,这里能立刻发现。
@@ -8909,10 +9177,22 @@ async fn load_assets_and_build(handles: GameHandles) {
         // 报错,连 `tris` 计数还是 482420,因为没上传的 mesh 压根没有 VAO,
         // `draw_batch` 查不到就静默跳过。这里把每个失败都打进 console,
         // 让症状和原因对得上。
-        if let Some(Renderer::WebGl(mut webgl)) = game.renderer.take() {
+        game.assets_built = true;
+        // renderer 可能还没有(WebGPU 还在 await requestDevice)。
+        // 下面这段只负责「此刻已经就位的那个 renderer」;迟到的那个
+        // 由 `upload_pending_meshes` 补传(它装好时会补调一次)。
+        if let Some(mut renderer) = game.renderer.take() {
             let mut upload_failures: usize = 0;
             for (index, mesh) in game.scene.meshes.iter().enumerate() {
-                if let Err(error) = webgl.upload_mesh(mesh) {
+                // 两条 GPU 路径的「GPU 表下标 == Scene::meshes 下标」约束
+                // 完全相同,所以上传循环共用,只有 WebGL2 那两个验收探针
+                // (`oob` / `lastIndexCount`)是它独有的。
+                let outcome: Result<usize, String> = match &mut renderer {
+                    Renderer::WebGl(webgl) => webgl.upload_mesh(mesh),
+                    Renderer::WebGpu(gpu) => gpu.upload_mesh(mesh),
+                    Renderer::Software(_) => continue,
+                };
+                if let Err(error) = outcome {
                     upload_failures += 1;
                     if upload_failures <= MESH_UPLOAD_ERROR_LIMIT {
                         console_log(&format!(
@@ -8934,9 +9214,17 @@ async fn load_assets_and_build(handles: GameHandles) {
                     game.player_batches.len()
                 ));
             }
-            game.renderer = Some(Renderer::WebGl(webgl));
+            game.renderer = Some(renderer);
         }
     }
+
+    // WebGPU 很可能此刻**还没**装好(`requestDevice` 是 Promise),上面
+    // 那个循环等于什么都没干。装好的那一刻 `try_init_webgpu` 会再调一次
+    // `upload_pending_meshes`,把 mesh 补传进去。
+    //
+    // ⚠️ 必须在上面那个 `borrow_mut()` 块**外面**调用:那个函数自己
+    // 也要 `borrow_mut()`,块内再借一次会 panic。
+    upload_pending_meshes(&handles);
 
     set_progress(100.0, &format!("ready · {asset_count} assets"));
     hide_loading();
@@ -8955,7 +9243,7 @@ fn finish_with_fallback(handles: &GameHandles, message: String) {
     set_progress(96.0, FALLING_BACK_TO_BUILT_IN_SCENE);
     let scene: Scene = build_fallback_scene();
     {
-        let mut game: std::cell::RefMut<Game> = handles.game.borrow_mut();
+        let mut game: RefMut<Game> = handles.game.borrow_mut();
         game.using_fallback = true;
         game.load_error = Some(message.clone());
         game.scene = scene;

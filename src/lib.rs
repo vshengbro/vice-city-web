@@ -30,8 +30,14 @@ mod r#render;
 mod r#spawn;
 mod r#traffic;
 mod r#type;
+mod r#webgpu;
 
 pub use euv::{App, wasm_bindgen::prelude::*};
+
+/// §6.1:子模块只能 `use super::*;`,所以 `euv` 的这几个模块在 crate 根
+/// **重新导出**一次 —— `src/webgpu/mod.rs` 就能通过 `pub use super::…`
+/// 拿到它们,不必自己写 `use euv::…`。
+pub use euv::{js_sys, wasm_bindgen, wasm_bindgen_futures, web_sys};
 
 /// 挂载静态视图树并启动游戏循环。
 ///

@@ -26,12 +26,12 @@ use crate::{
 ///
 /// 资产 JSON 里 part 有 `emissive`,展开时追加第 4 个 vec3,这样霓虹招牌
 /// 可以在着色阶段直接按自发光强度叠加,不需要再查一次表。
-pub const STRIDE_FLOATS: usize = 12;
+pub(crate) const STRIDE_FLOATS: usize = 12;
 
 /// 单个 instance 在 buffer 里的字节跨度,必须等于
 /// `FLOATS_PER_INSTANCE * 4`,并作为 instanced 属性的 `vertex_attrib_pointer`
 /// stride 使用。
-pub const INSTANCE_STRIDE_BYTES: i32 = (FLOATS_PER_INSTANCE * 4) as i32;
+pub(crate) const INSTANCE_STRIDE_BYTES: i32 = (FLOATS_PER_INSTANCE * 4) as i32;
 
 /// 每个实例在 instance buffer 里的 f32 数量:
 /// model matrix 4 个 vec4(16 f32)+ tint vec3 + 1 个 vec4 填充 = 28 f32 = 7×vec4。
@@ -49,7 +49,7 @@ pub const INSTANCE_STRIDE_BYTES: i32 = (FLOATS_PER_INSTANCE * 4) as i32;
 /// - `reserve_instances` 每实例分配的字节数 ÷ 4
 /// - `upload_mesh` 里 `vertex_attrib_pointer` 的 stride(字节)
 ///   三者只要有一个不一致,第 2 个及以后的实例就会读到错位的 model/tint。
-pub const FLOATS_PER_INSTANCE: usize = 20;
+pub(crate) const FLOATS_PER_INSTANCE: usize = 20;
 
 /// instance buffer 的预分配实例数。
 ///
@@ -74,7 +74,7 @@ const INSTANCE_PREALLOC: usize = 64;
 /// 半径会把整条街的楼、行道树、路灯**全部**剔光,画面只剩地面和天空
 /// (实测第三人称取样只有 34 种颜色、轨道机位 4571 种)。第三人称用
 /// `NEAR_CULL_RADIUS_FOLLOW` —— 见那里的说明。
-pub const NEAR_CULL_RADIUS: f32 = 26.0;
+pub(crate) const NEAR_CULL_RADIUS: f32 = 26.0;
 
 /// 第三人称模式的近处遮挡剔除半径(米)。
 ///
@@ -82,7 +82,7 @@ pub const NEAR_CULL_RADIUS: f32 = 26.0;
 /// 一切走:角色 7 m、路缘 8 m、对面楼 12 m。这个半径只负责剔掉「真的
 /// 糊在镜头上」的东西(半径内 = 半米量级),遮挡由相机的球体探针负责
 /// 回避 —— 两者是互补的,不是重复的。
-pub const NEAR_CULL_RADIUS_FOLLOW: f32 = 0.35;
+pub(crate) const NEAR_CULL_RADIUS_FOLLOW: f32 = 0.35;
 
 /// 实例中心到眼点的距离(取模型矩阵的平移列)。
 ///
@@ -213,6 +213,7 @@ pub struct MeshAssetGpu {
     pub triangle_count: usize,
 }
 
+/// Inherent implementation of [`MeshAssetGpu`].
 impl MeshAssetGpu {
     /// 三角形数量的只读副本。
     ///
@@ -334,6 +335,7 @@ pub enum DayPhase {
     Night,
 }
 
+/// Inherent implementation of [`DayPhase`].
 impl DayPhase {
     /// 相位名(HUD 与调试快照用)。
     ///
@@ -453,6 +455,7 @@ pub struct SceneLighting {
     pub fog_end: f32,
 }
 
+/// Inherent implementation of [`SceneLighting`].
 impl SceneLighting {
     /// 取某个相位的默认光照参数。
     ///
@@ -907,6 +910,7 @@ pub struct Instance {
     pub(crate) tint: Vec3,
 }
 
+/// Inherent implementation of [`Instance`].
 impl Instance {
     /// model matrix 的只读引用。
     ///
@@ -1062,6 +1066,7 @@ pub struct Scene {
     pub total_triangles: usize,
 }
 
+/// Inherent implementation of [`Scene`].
 impl Scene {
     /// 追加一个已解析的资产,返回其索引。
     ///
@@ -1916,6 +1921,7 @@ pub enum QualityTier {
     Low,
 }
 
+/// Inherent implementation of [`QualityTier`].
 impl QualityTier {
     /// 该档位下是否跑 SSR。
     ///
@@ -1950,6 +1956,7 @@ pub struct AdaptiveQuality {
     samples: u32,
 }
 
+/// Inherent implementation of [`AdaptiveQuality`].
 impl AdaptiveQuality {
     /// 初始为 [`QualityTier::High`],尚未采样。
     ///
@@ -2138,6 +2145,7 @@ struct RenderTarget {
     height: i32,
 }
 
+/// Inherent implementation of [`RenderTarget`].
 impl RenderTarget {
     /// 分配一张颜色纹理(RGBA8,线性过滤,边缘钳制)。
     ///
@@ -2546,6 +2554,7 @@ struct PipelineTargets {
     allocated: (u32, u32),
 }
 
+/// Inherent implementation of [`WebGlRenderer`].
 impl WebGlRenderer {
     /// GL 上下文的克隆句柄。
     ///
@@ -4830,6 +4839,7 @@ trait DynIntoWebGl {
     fn dyn_into_webgl(self) -> WebGl2RenderingContext;
 }
 
+/// Implements [`DynIntoWebGl`] for [`euv`].
 impl DynIntoWebGl for euv::js_sys::Object {
     /// dyn into webgl。
     ///
@@ -4880,6 +4890,7 @@ pub struct SoftwareRenderer {
     context: euv::web_sys::CanvasRenderingContext2d,
 }
 
+/// Inherent implementation of [`SoftwareRenderer`].
 impl SoftwareRenderer {
     /// 2D 上下文的克隆句柄。
     ///
@@ -5061,6 +5072,7 @@ trait DynInto2d {
     fn dyn_into_2d(self) -> euv::web_sys::CanvasRenderingContext2d;
 }
 
+/// Implements [`DynInto2d`] for [`euv`].
 impl DynInto2d for euv::js_sys::Object {
     /// dyn into 2d。
     ///
@@ -5122,12 +5134,15 @@ fn vertex_position(mesh: &MeshAssetGpu, index: u32) -> Vec3 {
 
 /// 实际使用的渲染后端。
 pub enum Renderer {
+    /// WebGPU(WGSL,instancing)。构造是异步的,`?backend=webgl2` 可跳过。
+    WebGpu(Box<crate::webgpu::WebGpuRenderer>),
     /// WebGL2(GLSL ES 3.00,instancing)。
     WebGl(Box<WebGlRenderer>),
     /// Canvas2D 软件渲染(背面剔除 + 画家算法)。
     Software(SoftwareRenderer),
 }
 
+/// Inherent implementation of [`Renderer`].
 impl Renderer {
     /// 后端名字(显示在 HUD 上)。
     ///
@@ -5136,6 +5151,7 @@ impl Renderer {
     /// - `&'static str` - 计算结果。
     pub fn backend_name(&self) -> &'static str {
         match self {
+            Renderer::WebGpu(_) => WEBGPU,
             Renderer::WebGl(_) => WEBGL2,
             Renderer::Software(_) => CANVAS2D,
         }
