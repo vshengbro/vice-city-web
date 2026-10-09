@@ -450,6 +450,33 @@ pub(crate) const T_DYNAMIC_NO_MOVE_WHEN_CLEAR: &str = "不重叠的动态体不�
 /// 回归测试:同类实体之间也必须分开(人不能穿人)。
 pub(crate) const T_DYNAMIC_SAME_KIND_SEPARATES: &str = "同类动态实体之间也必须分开";
 
+/// 回归测试:实心足迹不得把只存在于头顶以上的几何算进去(空气墙)。
+#[cfg(test)]
+pub(crate) const T_SOLID_BOUNDS_STILL_AN_AIR_WALL: &str =
+    "实心足迹仍把头顶以上的几何算进了碰撞盒(空气墙)";
+
+/// 回归测试:测试夹具本身必须真的有空气墙,否则这条断言是空的。
+#[cfg(test)]
+pub(crate) const T_SOLID_BOUNDS_FIXTURE_TOO_WEAK: &str = "测试用的资产包围盒不够大,证明不了空气墙";
+
+/// 回归测试:实心足迹不得把一面真实的外墙整块删掉。
+#[cfg(test)]
+pub(crate) const T_SOLID_BOUNDS_DELETED_A_REAL_WALL: &str =
+    "实心足迹把一面真实的建筑外墙整块删掉了";
+
+/// 回归测试:实心足迹必须落在资产自己声明的包围盒之内。
+#[cfg(test)]
+pub(crate) const T_SOLID_BOUNDS_GREW_PAST_ASSET_BOUNDS: &str =
+    "实心足迹超出了资产自己声明的包围盒";
+
+/// 回归测试:人行道上不得存在看不见的空气墙。
+#[cfg(test)]
+pub(crate) const T_AIR_WALL_ON_THE_SIDEWALK: &str = "人行道上有一堵看不见的空气墙";
+
+/// 回归测试:空气墙探针必须真的采到过点位,否则这条断言是空的。
+#[cfg(test)]
+pub(crate) const T_AIR_WALL_PROBE_FOUND_NO_SPOTS: &str = "空气墙探针一个点位都没采到";
+
 /// 回归测试:动态层也必须把实体从静态形状里推出来。
 pub(crate) const T_DYNAMIC_STATIC_TOO: &str = "动态体也必须被推出静态形状";
 
@@ -960,6 +987,15 @@ pub(crate) const U_AO_HEIGHT: &str = "u_ao_height";
 /// 顶点接触 AO 最深压暗系数 uniform 名。
 pub(crate) const U_AO_FLOOR: &str = "u_ao_floor";
 
+/// 顶点接触 AO 水平作用半径 uniform 名。
+pub(crate) const U_AO_REACH: &str = "u_ao_reach";
+
+/// 顶点接触 AO 水平项平滑宽度 uniform 名。
+pub(crate) const U_AO_FEATHER: &str = "u_ao_feather";
+
+/// 顶点接触 AO 高度下界 uniform 名。
+pub(crate) const U_AO_MIN_HEIGHT: &str = "u_ao_min_height";
+
 /// 天光(半球上半球)环境色 uniform 名。
 pub(crate) const U_SKY_AMBIENT: &str = "u_sky_ambient";
 
@@ -1170,6 +1206,32 @@ pub(crate) const BAKED_CONTACT_AO_HEIGHT: f32 = 1.2;
 
 /// 顶点接触 AO 在 y=0 处的最深压暗系数(0.34 = 压到 66% 亮度)。
 pub(crate) const CONTACT_SHADOW_FLOOR: f32 = 0.66;
+
+/// 顶点接触 AO 的**水平**作用半径(米)。
+///
+/// 从 y=0 往上按 [`BAKED_CONTACT_AO_HEIGHT`] 压暗只能表达
+/// 「贴地」,表达不了「靠得近」—— 而接触 AO 的定义恰恰是后者。
+/// 地面整片都在 y≈0 上,所以只按高度压的话,**全城每一块地面都吃到
+/// `CONTACT_SHADOW_FLOOR`**,墙根与开阔地一样暗。
+///
+/// 这一项按「顶点离本模型世界原点的 XZ 距离」压暗:半径外不再压。
+/// 取 6.0 m:覆盖楼前人行道 + 路缘,再远就是开阔街道,不该压。
+pub(crate) const CONTACT_SHADOW_REACH: f32 = 6.0;
+
+/// 接触 AO 的水平项平滑宽度(米)。
+///
+/// 不用硬过渡(`dist < reach ? ... : ...`)是为了避免在半径处出现
+/// 一圈可见的明暗硬边 —— 那在平地上比「压得不够」更像 bug。
+pub(crate) const CONTACT_SHADOW_FEATHER: f32 = 2.0;
+
+/// 接触 AO 的**高度下界**(米):低于这个 y 的顶点不吃这一项。
+///
+/// 取 0.30,高于地面网格的最高点(`LOT_GROUND = 0.16`、
+/// `SIDEWALK = 0.14`、`ROAD = 0.0`,见 `game.rs` 的 `build_ground_near`)。
+/// 于是**地面网格完全不吃顶点接触 AO** —— 开阔地被无端压暗是
+/// 这一项历史上最大的表现问题,而地面贴墙的暗部本来就该由
+/// SSAO 负责(顶点着色器结构上不知道墙在哪)。
+pub(crate) const CONTACT_SHADOW_MIN_HEIGHT: f32 = 0.30;
 
 /// `light_dir.y` 超过这个值就认为视线与 up 共线,必须换 up 向量。
 pub(crate) const SHADOW_DEGENERATE_UP_Y: f32 = 0.98;

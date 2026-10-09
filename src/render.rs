@@ -16,8 +16,8 @@ use euv::{
 
 use crate::{
     camera::{Mat4, is_back_facing},
-    mesh::{GpuMesh, f32_slice_to_bytes},
     r#const::*,
+    mesh::{GpuMesh, f32_slice_to_bytes},
     r#type::{Mat4Data, Rgb8, Vec3},
 };
 
@@ -1256,10 +1256,17 @@ out vec3 v_world;
 out float v_contact_ao;
 
 uniform vec3 u_eye;
-// 接触 AO 的高度衰减:从 y=0 处的最深压暗线性过渡到 y=u_ao_height。
+// 接触 AO 的**垂直**衰减:从 y=0 处的最深压暗线性过渡到 y=u_ao_height。
 uniform float u_ao_height;
 // 接触 AO 的最深压暗系数(1.0 = 不压暗)。
 uniform float u_ao_floor;
+// 接触 AO 的**水平**范围(米):模型自身包围盒在 XZ 上离这个顶点
+// 多远就不再压暗。0 = 关掉水平项。
+uniform float u_ao_reach;
+// 压暗在水平方向上的平滑宽度(米),避免包围盒边缘出现硬转折。
+uniform float u_ao_feather;
+// 接触 AO 的高度下界(米):低于这个 y 的顶点不吃这一项。
+uniform float u_ao_min_height;
 
 void main() {
     mat4 model = mat4(i_row0, i_row1, i_row2, i_row3);
@@ -1270,14 +1277,45 @@ void main() {
     v_tint = i_tint;
     v_world = world.xyz;
     v_eye_distance = distance(world.xyz, u_eye);
-    // 贴地越近压得越暗,到 u_ao_height 之上完全不压。
-    // 0.001 的下限保证除法不炸,同时也让 y<0 的面(不该有,但资产
-    // 里可能有)走到最深压暗而不是 NaN。
-    v_contact_ao = mix(
-        u_ao_floor,
-        1.0,
-        clamp(world.y / max(u_ao_height, 0.001), 0.0, 1.0)
-    );
+
+    // ---- 顶点烘焙接触 AO:按「离自己的几何基座有多近」压暗 ----
+    //
+    // ⚠️ 这里曾经只有 `clamp(world.y / u_ao_height, 0, 1)` 一项,那是个
+    // **世界高度**代理量:地面整体就在 y=0 上,于是全城每一块地面
+    // 都取到 clamp(0) = 0,统一吃到 `u_ao_floor` 的最深压暗,
+    // 与「附近有没有东西」完全无关 —— 实测(2026-10-10,LOFT 样板楼
+    // 南墙 z=35 外,WebGPU)沿墙法向 1.0 → 6.5 m 的地面 luma 只在
+    // 103.935..109.707 之间动(range 5.77 / 均值 5.2%),是一条平线。
+    //
+    // 而「墙根的地面该压暗」这件事,顶点着色器**结构上做不到**:
+    // 地面是一整张 480 m 见方的网格,它的顶点只知道自己在世界里的
+    // 位置,不知道自己旁边有没有一堵墙。这正是 SSAO 的职责
+    // (见 [`FRAGMENT_SHADER`] 里的 `ao_factor`),而 SSAO 那条管线
+    // 之前因为单位混用恒定输出 1.0(全亮),于是这项一直独自承担,
+    // 又只做到了「全城统一压暗」。
+    //
+    // 所以这里的分工是:
+    // - **地面 ↔ 墙**的接触暗部 = SSAO(已修好,见 SSAO 段落的注释);
+    // - **模型 ↔ 自己基座**的接触暗部 = 本项,即楼身下段 / 树干根部的
+    //   自遮蔽。判据必须是**水平距离**(离自己那栋东西的根有多近),
+    //   不是世界高度。
+    //
+    // 两项**相乘**成一条曲线而不是分别乘两个因子:离基座近且贴地 →
+    // 压到 `u_ao_floor`;离得远或站得高 → 回到 1.0(完全不压)。
+    // 模型矩阵第 4 列就是世界平移(见 `Instance::new` 的 model 布局)。
+    vec2 base = vec2(i_row3.x, i_row3.z);
+    float horizontal = length(world.xz - base);
+    float reach = max(u_ao_reach, 0.001);
+    float feather = max(u_ao_feather, 0.001);
+    // 1 = 紧贴基座,0 = 已经走出作用半径。
+    float proximity = 1.0 - smoothstep(reach - feather, reach, horizontal);
+    // 只压「贴着自己基座、且高度在接触带内」的顶点。
+    // 下界 u_ao_min_height 高于地面网格的最高点(LOT_GROUND = 0.16),
+    // 于是**地面永远不吃这一项** —— 开阔地不会被无端压暗,而地面
+    // 贴墙的暗部交给 SSAO。上界 u_ao_height 让楼身高处完全放开。
+    float low_enough = smoothstep(u_ao_min_height, u_ao_min_height + 0.001, world.y)
+                     * (1.0 - smoothstep(u_ao_height - 0.001, u_ao_height, world.y));
+    v_contact_ao = 1.0 - (1.0 - u_ao_floor) * low_enough * proximity;
     gl_Position = u_view_proj * world;
 }
 "#;
@@ -1398,7 +1436,19 @@ vec3 kernel_direction(int index) {
     return vec3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
 }
 
-// 从线性深度 + uvscreen 反推视空间坐标(与 SSAO 采样端共用)。
+// 从**线性深度(米)**+ uvscreen 反推视空间坐标。
+//
+// ⚠️ `linear_depth` 的单位必须是**米**,不是 `depth / u_far_plane`。
+// `GBUFFER_FRAGMENT_SHADER` 把线性深度写成 `clamp(-view_z / u_far, 0, 1)`,
+// 调用方必须先乘回 `u_far_plane` 才能喂进来 —— 见 `main()` 里的
+// `float linear_depth = depth * u_far_plane;`。
+//
+// 这里曾经直接传归一化深度,于是视空间坐标小了两个数量级
+// (D/FAR),而 `radius = u_radius / max(depth*u_far, 0.5)` 按**米**算,
+// 两者一除把采样点甩到 `uv` 边界之外,8 个 kernel 方向里活下来的
+// 永远是 0 个 —— `occlusion` 恒为 0,SSAO 输出恒为 `1.0`,
+// 画面上「一帧都没有遮蔽」。实测(2026-10-10):D=2..25 m 时
+// kept = 0/8,修好后同一处 kept = 8/8。
 vec3 view_position(vec2 uv, float linear_depth) {
     vec2 ndc = uv * 2.0 - 1.0;
     return vec3(ndc.x * u_proj_params.x, ndc.y * u_proj_params.y, -1.0) * linear_depth;
@@ -1412,16 +1462,31 @@ void main() {
         return;
     }
     vec3 normal = normalize(g.rgb * 2.0 - 1.0);
-    vec3 origin = view_position(v_uv, depth);
+    // ⚠️ `depth` 是**归一化**深度(G-buffer 的 alpha),视空间坐标需要
+    // **米**,所以先乘回 `u_far_plane`。见上面 `view_position` 的说明。
+    float linear_depth = depth * u_far_plane;
+    vec3 origin = view_position(v_uv, linear_depth);
 
-    // 用一个固定的世界尺度把屏幕空间偏移换算成视空间偏移。
-    float radius = u_radius / max(depth * u_far_plane, 0.5);
+    // 采样半径固定为世界尺度 `u_radius` 米(SSAO_RADIUS)。
+    //
+    // 这里原来写的是 `u_radius / max(depth * u_far_plane, 0.5)`
+    // —— 那是在**米**的单位里当成了视空间单位来除,半径被缩掉了
+    // 1/depth,近处样本挤成一团、远处大到离谱。半径本来就该是
+    // 「世界空间多少米内算遮蔽」,所以直接用 `u_radius`。
+    float radius = u_radius;
     float occlusion = 0.0;
+    // 实际参与统计的采样数,见循环后的除法说明。
+    float used = 0.0;
     for (int i = 0; i < KERNEL; ++i) {
         vec3 dir = kernel_direction(i);
         // 只取面向观察者的一半(SSAO 的经典构造:背面的样本贡献很小)。
         vec3 sample_view = origin + dir * radius;
-        vec2 sample_uv = sample_view.xy / max(-sample_view.z, 1e-3);
+        // ⚠️ 这一步必须与 `view_position()` 的映射**互逆**:
+        // `view_position` 写的是 `view.xy = ndc.xy * u_proj_params * d`,
+        // 所以反投影要**除以** `u_proj_params`。原来漏了这个除法 ——
+        // 采样点被放大到 `u_proj_params`(= tan(fov/2) * aspect ≈ 2.05)倍,
+        // 大量样本落到画面外被下面的 `continue` 丢掉。
+        vec2 sample_uv = sample_view.xy / max(-sample_view.z, 1e-3) / u_proj_params;
         sample_uv = sample_uv * 0.5 + 0.5;
         if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0) {
             continue;
@@ -1434,12 +1499,22 @@ void main() {
         float expected = -sample_view.z / u_far_plane;
         float diff = expected - sample_depth;
         if (diff > 0.0) {
-            // 越贴近表面、差值越大,遮蔽越强。
+            // 越贴近表面、差值越大,遮蔽越强。`diff` 与归一化半径同单位。
             float falloff = 1.0 - clamp(diff / max(radius / u_far_plane, 1e-4), 0.0, 1.0);
             occlusion += falloff * falloff;
         }
+        used += 1.0;
     }
-    float ao = 1.0 - clamp(occlusion / float(KERNEL), 0.0, 1.0);
+    // 除以**实际用上的采样数**,不是 KERNEL。
+    //
+    // 画幅边缘的样本会因为投影落到屏幕外而被 `continue` 掉,
+    // 除以 KERNEL 会让「越靠画面边缘越亮」—— 一条假的、随分辨率
+    // 变化的亮边。`used == 0`(整个半球都在屏外)时退回 1.0:
+    // 没有可用的信息就是「无遮挡」,不能反过来当成全遮蔽。
+    float ao = 1.0;
+    if (used > 0.0) {
+        ao = 1.0 - clamp(occlusion / used, 0.0, 1.0);
+    }
     ao = pow(ao, u_power);
     out_color = vec4(ao, ao, ao, 1.0);
 }
@@ -2504,6 +2579,9 @@ pub struct WebGlRenderer {
     uniform_wet_height: Option<WebGlUniformLocation>,
     uniform_ao_height: Option<WebGlUniformLocation>,
     uniform_ao_floor: Option<WebGlUniformLocation>,
+    uniform_ao_reach: Option<WebGlUniformLocation>,
+    uniform_ao_feather: Option<WebGlUniformLocation>,
+    uniform_ao_min_height: Option<WebGlUniformLocation>,
     uniform_gbuffer_view: Option<WebGlUniformLocation>,
     uniform_gbuffer_far: Option<WebGlUniformLocation>,
     uniform_ssao_gbuffer: Option<WebGlUniformLocation>,
@@ -2770,6 +2848,33 @@ impl WebGlRenderer {
     /// - `Option<&WebGlUniformLocation>` - uniform 位置。
     pub fn get_uniform_ao_floor(&self) -> Option<&WebGlUniformLocation> {
         self.uniform_ao_floor.as_ref()
+    }
+
+    /// 接触 AO 水平作用半径 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ao_reach(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ao_reach.as_ref()
+    }
+
+    /// 接触 AO 水平项平滑宽度 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ao_feather(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ao_feather.as_ref()
+    }
+
+    /// 接触 AO 高度下界 uniform 的位置。
+    ///
+    /// # Returns
+    ///
+    /// - `Option<&WebGlUniformLocation>` - uniform 位置。
+    pub fn get_uniform_ao_min_height(&self) -> Option<&WebGlUniformLocation> {
+        self.uniform_ao_min_height.as_ref()
     }
 
     /// G-buffer 视图矩阵 uniform 的位置。
@@ -3600,6 +3705,12 @@ impl WebGlRenderer {
             context.get_uniform_location(&program, U_AO_HEIGHT);
         let u_ao_floor: Option<WebGlUniformLocation> =
             context.get_uniform_location(&program, U_AO_FLOOR);
+        let u_ao_reach: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&program, U_AO_REACH);
+        let u_ao_feather: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&program, U_AO_FEATHER);
+        let u_ao_min_height: Option<WebGlUniformLocation> =
+            context.get_uniform_location(&program, U_AO_MIN_HEIGHT);
         let gl_context: WebGl2RenderingContext = context.clone();
         let uniform_shadow_map: Option<WebGlUniformLocation> =
             gl_context.get_uniform_location(&program, U_SHADOW_MAP);
@@ -3725,6 +3836,9 @@ impl WebGlRenderer {
             uniform_wet_height: u_wet_height,
             uniform_ao_height: u_ao_height,
             uniform_ao_floor: u_ao_floor,
+            uniform_ao_reach: u_ao_reach,
+            uniform_ao_feather: u_ao_feather,
+            uniform_ao_min_height: u_ao_min_height,
             uniform_gbuffer_view,
             uniform_gbuffer_far,
             uniform_ssao_gbuffer,
@@ -4605,6 +4719,11 @@ impl WebGlRenderer {
         // 顶点烘焙接触 AO 的形状参数。
         context.uniform1f(self.get_uniform_ao_height(), BAKED_CONTACT_AO_HEIGHT);
         context.uniform1f(self.get_uniform_ao_floor(), CONTACT_SHADOW_FLOOR);
+        // 水平项:按「离自己几何基座有多近」压暗,而不是只按世界高度。
+        context.uniform1f(self.get_uniform_ao_reach(), CONTACT_SHADOW_REACH);
+        context.uniform1f(self.get_uniform_ao_feather(), CONTACT_SHADOW_FEATHER);
+        // 高度下界:低于它的顶点不吃接触 AO(地面网格最高 0.16 m)。
+        context.uniform1f(self.get_uniform_ao_min_height(), CONTACT_SHADOW_MIN_HEIGHT);
 
         let mut drawn_triangles: u32 = 0;
         for (index, batch) in scene.batches.iter().enumerate() {
@@ -5190,17 +5309,20 @@ mod tests {
     use crate::r#const::{
         PHASE_FIELD_VALUE, PHASE_QUERY_DUSK, PHASE_QUERY_NIGHT, PHASE_QUERY_NOON,
         SHADOW_CULL_MARGIN, SHADOW_GROUNDED_EPS, SHADOW_HALF_EXTENT, T_PHASE_QUERY_MAPS,
-        T_PHASE_QUERY_PROBE, T_PHASE_QUERY_UNKNOWN, T_SHADOW_CULLS_OUTSIDE,
-        T_SHADOW_GROUNDED_SAFE, T_SHADOW_KEEPS_CENTRE, T_SHADOW_KEEPS_MARGIN,
-        T_SHADOW_TALL_KEPT,
+        T_PHASE_QUERY_PROBE, T_PHASE_QUERY_UNKNOWN, T_SHADOW_CULLS_OUTSIDE, T_SHADOW_GROUNDED_SAFE,
+        T_SHADOW_KEEPS_CENTRE, T_SHADOW_KEEPS_MARGIN, T_SHADOW_TALL_KEPT,
     };
-    use crate::render::{DayPhase, Instance, instance_affects_shadow, normalize3};
+    use crate::r#const::{
+        BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FEATHER, CONTACT_SHADOW_FLOOR,
+        CONTACT_SHADOW_MIN_HEIGHT, CONTACT_SHADOW_REACH, SSAO_RADIUS, U_AO_FEATHER, U_AO_FLOOR,
+        U_AO_HEIGHT, U_AO_MIN_HEIGHT, U_AO_REACH, U_BLOOM_DIR, U_BLOOM_THRESHOLD,
+    };
     use crate::render::{
         BLOOM_BLUR_FRAGMENT_SHADER, BLOOM_EXTRACT_FRAGMENT_SHADER, COMPOSITE_FRAGMENT_SHADER,
         FRAGMENT_SHADER, GBUFFER_FRAGMENT_SHADER, GLOW_FRAGMENT_SHADER, SHADOW_FRAGMENT_SHADER,
         SHADOW_VERTEX_SHADER, SSAO_FRAGMENT_SHADER, SSR_FRAGMENT_SHADER, VERTEX_SHADER,
     };
-    use crate::r#const::{U_BLOOM_DIR, U_BLOOM_THRESHOLD};
+    use crate::render::{DayPhase, Instance, instance_affects_shadow, normalize3};
     use crate::r#type::Vec3;
 
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值。
@@ -5430,15 +5552,204 @@ mod tests {
             }
         }
         // 被 Rust 侧实际查过的 uniform 名 → 必须逐个在上面出现过。
-        const LOOKED_UP: [(&str, &str); 2] = [
+        const LOOKED_UP: [(&str, &str); 7] = [
             ("U_BLOOM_THRESHOLD", U_BLOOM_THRESHOLD),
             ("U_BLOOM_DIR", U_BLOOM_DIR),
+            ("U_AO_HEIGHT", U_AO_HEIGHT),
+            ("U_AO_FLOOR", U_AO_FLOOR),
+            ("U_AO_REACH", U_AO_REACH),
+            ("U_AO_FEATHER", U_AO_FEATHER),
+            ("U_AO_MIN_HEIGHT", U_AO_MIN_HEIGHT),
         ];
         for (constant, name) in LOOKED_UP {
             assert!(
                 declared.contains(&name),
                 "get_uniform_location({constant} = \"{name}\") 在任何 GLSL 里都查不到 —— \
                  它会返回 None,而 uniform1f(None, …) 是静默空操作,该 uniform 永远取默认值。"
+            );
+        }
+    }
+
+    /// GLSL `smoothstep(a, b, x)` 的 Rust 写法。
+    ///
+    /// # Arguments
+    ///
+    /// - `a` - 下界。
+    /// - `b` - 上界(要求 `a < b`)。
+    /// - `x` - 输入。
+    ///
+    /// # Returns
+    ///
+    /// 平滑后的 `0..=1`。
+    fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+        let t: f32 = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// 顶点接触 AO 的 Rust 镜像,与 `VERTEX_SHADER` 里那一段逐字对应。
+    ///
+    /// 放在测试里而不是只测 GLSL 字符串,是因为缺陷本质是**数值**的:
+    /// 字符串照样能通过「声明了 uniform」那类检查,只有跑一遍数值
+    /// 才会发现开阔地是不是被无端压暗了。
+    ///
+    /// # Arguments
+    ///
+    /// - `world_y` - 顶点的世界高度(米)。
+    /// - `horizontal` - 顶点到本模型世界原点的 XZ 水平距离(米)。
+    ///
+    /// # Returns
+    ///
+    /// 亮度系数 `1.0`(不压暗)..=`CONTACT_SHADOW_FLOOR`(贴基座最暗)。
+    fn contact_ao_factor(world_y: f32, horizontal: f32) -> f32 {
+        let reach: f32 = CONTACT_SHADOW_REACH;
+        let feather: f32 = CONTACT_SHADOW_FEATHER;
+        let low: f32 = CONTACT_SHADOW_MIN_HEIGHT;
+        let high: f32 = BAKED_CONTACT_AO_HEIGHT;
+        let proximity: f32 = 1.0 - smoothstep(reach - feather, reach, horizontal);
+        let low_enough: f32 = smoothstep(low, low + 0.001, world_y)
+            * (1.0 - smoothstep(high - 0.001, high, world_y));
+        1.0 - (1.0 - CONTACT_SHADOW_FLOOR) * low_enough * proximity
+    }
+
+    /// 缺陷本体:接触 AO 拿**世界高度**当「离墙多近」的代理量。
+    ///
+    /// 旧表达式 `mix(u_ao_floor, 1.0, clamp(world.y / u_ao_height, 0, 1))`
+    /// 对同一高度的两个顶点给出**完全相同**的压暗 —— 离基座 0.3 m
+    /// 的和 40 m 外的都是 `CONTACT_SHADOW_FLOOR`。修好后应是前者更暗、
+    /// 后者回到 1.0。
+    ///
+    /// 实测(2026-10-10,LOFT 样板楼南墙 z=35 外,沿墙法向 1.0 → 6.5 m
+    /// 的地面 luma,采样带就是地面本身、干净无车辆):WebGPU
+    /// `103.935..109.707`(range 5.77,斜率 -0.431 luma/m)、
+    /// WebGL2 `106.750..108.750`(range 2.00,斜率 -0.111 luma/m)。
+    /// 两条都是平线,墙根与 6.5 m 外看不出差别。
+    #[test]
+    fn contact_ao_darkens_by_horizontal_proximity_not_world_height() {
+        // 楼身下段,同一高度,只改到基座的水平距离。
+        let y: f32 = 0.5;
+        let at_base: f32 = contact_ao_factor(y, 0.3);
+        let nearby: f32 = contact_ao_factor(y, 3.0);
+        let open: f32 = contact_ao_factor(y, 40.0);
+
+        assert!(
+            at_base < open - 0.05,
+            "同高度 y={y}:离基座 0.3 m 的 {at_base:.4} 必须明显比 40 m 外的 {open:.4} 更暗 —— \
+             旧公式按 world.y 算,两者会完全相等"
+        );
+        assert!(
+            nearby < open,
+            "离基座 3.0 m 的 {nearby:.4} 应比 40 m 外的 {open:.4} 暗"
+        );
+        assert!(
+            (open - 1.0).abs() < 1e-5,
+            "离基座 40 m 已在 CONTACT_SHADOW_REACH={CONTACT_SHADOW_REACH} m 之外,\
+             接触 AO 必须完全回到 1.0,实测 {open:.5}"
+        );
+    }
+
+    /// **地面网格整片不吃顶点接触 AO。**
+    ///
+    /// 这是用户报「地面的光追效果不对」时最直接的成因:旧公式按
+    /// `world.y / u_ao_height` 压暗,而路面 `ROAD = 0.0`、人行道
+    /// `SIDEWALK = 0.14`、地块 `LOT_GROUND = 0.16`(取自 `game.rs`
+    /// 的 `build_ground_near`)全都远低于
+    /// `BAKED_CONTACT_AO_HEIGHT = 1.2`,于是全城每一块地面都取到
+    /// `clamp(0) = 0` 吃满最深压暗 —— 墙根与开阔街道一样暗。
+    ///
+    /// 修法是加高度下界 `CONTACT_SHADOW_MIN_HEIGHT`(0.30 m,高于
+    /// 地面网格最高点),让这一项只负责「楼身下段 / 树干根部」的自遮蔽;
+    /// 地面贴墙的暗部交给 SSAO —— 顶点着色器结构上不知道墙在哪。
+    #[test]
+    fn contact_ao_leaves_the_ground_mesh_untouched() {
+        for (name, y) in [("road", 0.0_f32), ("sidewalk", 0.14), ("lot", 0.16)] {
+            // 即便就站在一栋楼正下方(水平距离 0),也必须是 1.0。
+            let value: f32 = contact_ao_factor(y, 0.0);
+            assert!(
+                (value - 1.0).abs() < 1e-5,
+                "{name}(y={y})属于地面网格,不该吃顶点接触 AO —— 实测 {value:.5}; \
+                 CONTACT_SHADOW_MIN_HEIGHT={CONTACT_SHADOW_MIN_HEIGHT} 本该把它整个排除"
+            );
+        }
+        assert!(
+            CONTACT_SHADOW_MIN_HEIGHT > 0.16,
+            "高度下界 {CONTACT_SHADOW_MIN_HEIGHT} 必须高于地面网格最高点 0.16 \
+             (LOT_GROUND),否则路面仍会被无端压暗"
+        );
+    }
+
+    /// 高处顶点不吃「贴墙根」的压暗。
+    ///
+    /// 若垂直上界失效,一栋 40 m 高的楼会整条压暗,表现为
+    /// 「每栋楼都自带一圈黑边」。上界由 `BAKED_CONTACT_AO_HEIGHT` 封顶。
+    #[test]
+    fn contact_ao_skips_the_proximity_term_above_the_height_band() {
+        let y: f32 = BAKED_CONTACT_AO_HEIGHT * 4.0;
+        let value: f32 = contact_ao_factor(y, 0.0);
+        assert!(
+            (value - 1.0).abs() < 1e-5,
+            "y={y:.2}(远超 BAKED_CONTACT_AO_HEIGHT={BAKED_CONTACT_AO_HEIGHT})且贴着基座时\
+             接触 AO 必须是 1.0,实测 {value:.5}"
+        );
+    }
+
+    /// SSAO 必须真的采到东西 —— 修之前是 `ao == 1.0`(一帧遮蔽都没有)。
+    ///
+    /// 缺陷本体:`view_position()` 返回**视空间米**,而调用方传的是
+    /// **归一化**深度(`depth / far`),于是原点小了两个数量级;同时
+    /// 半径写的是 `u_radius / max(depth * u_far, 0.5)` —— 按米算的
+    /// 半径除以了一个已经含 `far` 的量。两处一叠加,采样点被甩出
+    /// `uv` 的 `0..=1`,8 个 kernel 方向**一个都活不下来**,`occlusion`
+    /// 恒 0、SSAO 恒输出 1.0:整条管线静默空转,而且没有任何编译或
+    /// 运行错误。
+    ///
+    /// 这里按修好的公式(`linear_depth = depth * u_far`,`radius = u_radius`)
+    /// 在常见视距上复算一遍,断言样本点仍落在画面内。
+    #[test]
+    fn ssao_keeps_its_kernel_samples_inside_the_frame() {
+        let far: f32 = 600.0; // FAR_PLANE
+        let radius: f32 = SSAO_RADIUS;
+        // u_proj_params = (tan(fov/2) * aspect, tan(fov/2));取 70° fov、16:9。
+        let proj_x: f32 = 1.1547 * (16.0 / 9.0);
+        let proj_y: f32 = 1.1547;
+        // 中心像素的 ndc 是 0 —— 最容易出事的那个位置。
+        for distance in [2.0_f32, 5.0, 10.0, 25.0, 50.0] {
+            // 归一化深度 → 米。
+            let linear: f32 = (distance / far) * far;
+            let origin: [f32; 3] = [0.0, 0.0, -linear];
+            let mut kept: usize = 0;
+            for i in 0..8 {
+                let fi: f32 = i as f32 + 0.5;
+                let phi: f32 = fi * 2.39996323;
+                let cos_theta: f32 = (1.0 - fi / 8.0).sqrt();
+                let sin_theta: f32 = (fi / 8.0).sqrt();
+                let dir: [f32; 3] = [
+                    phi.cos() * sin_theta,
+                    phi.sin() * sin_theta,
+                    cos_theta,
+                ];
+                let sv: [f32; 3] = [
+                    origin[0] + dir[0] * radius,
+                    origin[1] + dir[1] * radius,
+                    origin[2] + dir[2] * radius,
+                ];
+                // ⚠️ 这一步必须与 `view_position()` 的映射**互逆**:
+        // `view_position` 写的是 `view.xy = ndc.xy * u_proj_params * d`,
+        // 所以反投影要**除以** `u_proj_params`。原着色器漏了这个除法 ——
+        // 采样点被放大到 `u_proj_params`(≈ 2.05)倍,大量样本落到画面外
+        // 被 `continue` 丢掉。这是第三个独立缺陷:即使前两处单位都改对,
+        // 只活下来的样本依然不足以构成有意义的遮蔽。
+        let uv: [f32; 2] = [
+                    sv[0] / (-sv[2]).max(1e-3) / proj_x * 0.5 + 0.5,
+                    sv[1] / (-sv[2]).max(1e-3) / proj_y * 0.5 + 0.5,
+                ];
+                if uv[0] >= 0.0 && uv[0] <= 1.0 && uv[1] >= 0.0 && uv[1] <= 1.0 {
+                    kept += 1;
+                }
+            }
+            assert!(
+                kept >= 6,
+                "D={distance:.0} m 处 8 个 kernel 方向只活下来 {kept} 个 —— \
+                 SSAO 又会退化成输出 1.0 的空转(SSAO_RADIUS={radius})"
             );
         }
     }
