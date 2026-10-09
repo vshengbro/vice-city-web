@@ -477,6 +477,36 @@ pub(crate) const T_AIR_WALL_ON_THE_SIDEWALK: &str = "人行道上有一堵看不
 #[cfg(test)]
 pub(crate) const T_AIR_WALL_PROBE_FOUND_NO_SPOTS: &str = "空气墙探针一个点位都没采到";
 
+/// 单元测试夹具:路灯资产本体(真实 JSON,避免测试和资产脱节)。
+#[cfg(test)]
+pub(crate) const FIXTURE_PROP_STREETLIGHT_JSON: &str = include_str!("../assets/prop_streetlight.json");
+
+/// 单元测试夹具:交通信号灯资产本体。
+#[cfg(test)]
+pub(crate) const FIXTURE_PROP_TRAFFICLIGHT_JSON: &str =
+    include_str!("../assets/prop_trafficlight.json");
+
+/// 单元测试断言文案:夹具资产 JSON 解析失败。
+#[cfg(test)]
+pub(crate) const E_FIXTURE_ASSET_JSON: &str = "夹具资产 JSON 解析失败";
+
+/// 单元测试断言文案:资产必须声明自己的包围盒。
+#[cfg(test)]
+pub(crate) const E_FIXTURE_NO_DECLARED_BOUNDS: &str = "夹具资产没有声明包围盒";
+
+/// 单元测试断言文案:加载器必须把实心足迹登记进 bounds 表。
+#[cfg(test)]
+pub(crate) const E_FIXTURE_SOLID_BOUNDS_UNREGISTERED: &str = "加载器没有登记实心足迹";
+
+/// 单元测试断言文案:量纲(实测实心足迹 X 宽度)。
+#[cfg(test)]
+pub(crate) const T_SOLID_BOUNDS_X_WIDTH: &str = "实心足迹 x 宽度";
+
+/// 单元测试夹具:水城街机城(一面带内顶点为零的真墙)。
+#[cfg(test)]
+pub(crate) const FIXTURE_BLDG_AQUA_ARCADE_JSON: &str =
+    include_str!("../assets/bldg_aqua_arcade.json");
+
 /// 回归测试:动态层也必须把实体从静态形状里推出来。
 pub(crate) const T_DYNAMIC_STATIC_TOO: &str = "动态体也必须被推出静态形状";
 

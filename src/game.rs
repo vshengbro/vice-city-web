@@ -3510,16 +3510,18 @@ fn find_or_create_batch(scene: &mut Scene, mesh_index: usize) -> usize {
 
 /// 按场景蓝图把静态碰撞体铺进碰撞世界。
 ///
-/// 建筑 / 车辆 → AABB(从资产 `bounds` 按 yaw 旋转足迹取外接盒);棕榈 /
-/// 垃圾桶 / 消防栓 / 交通锥 → 圆(从 `bounds` 取足迹短边的一半)。
+/// 建筑 / 车辆 / 道具 → AABB。盒子**不是**资产的整体包围盒,而是
+/// [`solid_bounds`] 算出的**人体高度带内的实心足迹**:二维世界没有高度,
+/// 高过头顶的雨篷 / 路灯臂 / 屋顶设备不该挡人,算进去就是空气墙。
+/// 棕榈 → 圆(树干半径,见下)。
 ///
-/// **全部由资产包围盒推导** —— 场景蓝图只给位置 + yaw + scale,碰撞体跟着
-/// 资产自动变,不存在第二份手写的魔法坐标表(见 §1.3c 与模块文档)。
+/// **全部由资产几何自动推导** —— 场景蓝图只给位置 + yaw + scale,碰撞体
+/// 跟着资产自动变,不存在第二份手写的魔法坐标表(见 §1.3c 与模块文档)。
 ///
 /// # Arguments
 ///
 /// - `&mut CollisionWorld` - 碰撞世界。
-/// - `&HashMap<String, Bounds>` - 资产 id → 该资产声明的包围盒。
+/// - `&HashMap<String, Bounds>` - 资产 id → 实心足迹包围盒(见 [`solid_bounds`])。
 /// - `f32` - 流式生成中心的世界 X(米)。
 /// - `f32` - 流式生成中心的世界 Z(米)。
 fn build_collision_world(
@@ -3609,10 +3611,23 @@ fn prop_collider_scale(asset: &str) -> f32 {
 
 /// 往碰撞世界里推一个 AABB 摆放实例(建筑 / 车辆 / 方块道具)。
 ///
+/// 碰撞盒取的是 [`solid_bounds`] 的**实心足迹**,不是资产 `bounds`。
+/// 二维碰撞世界是**没有高度**的:`push_aabb` 在任意 Y 上都挡人。所以
+/// 一个只存在于头顶以上的盒子(雨篷、檐口、路灯臂、信号灯横杆、屋顶
+/// 水箱、百叶)对行走的人完全不存在,却照样在马路牙子上立一堵看不见的
+/// 墙 —— 这就是「空气墙」。实测 `prop_streetlight` 的资产包围盒是
+/// 2.20 × 0.60 m,灯臂 + 灯罩都在 5.2 m 以上,而真正挡人的只有
+/// 0.52 × 0.52 m 的灯座;`prop_trafficlight` 是 1.85 × 0.58 m 对
+/// 0.48 × 0.48 m 的基座。四条街的每个路口都有四盏,于是每个路口都被
+/// 一圈隐形栏杆围住。
+///
+/// 代价:楼本身仍然实心挡人(见 [`solid_bounds`] 的取法),不会把真实围墙
+/// 变成可穿墙。
+///
 /// # Arguments
 ///
 /// - `&mut CollisionWorld` - 碰撞世界。
-/// - `&HashMap<String, Bounds>` - 资产 id → 包围盒。
+/// - `&HashMap<String, Bounds>` - 资产 id → 实心足迹包围盒。
 /// - `&str` - 资产 id。
 /// - `Vec3` - 摆放位置(世界坐标)。
 /// - `f32` - 绕 Y 轴的朝向(弧度)。
@@ -3628,6 +3643,93 @@ fn push_box(
     let (min, max) = local_bounds(bounds_map, asset);
     let (center, half): (Vec2, Vec2) = placement_box(min, max, yaw, scale, position);
     world.push_aabb(center, half);
+}
+
+/// 载入一个资产后登记它的碰撞足迹。
+///
+/// 这一层单独拎出来不是为了省代码,是为了让回归测试能钉住**接线**:
+/// `solid_bounds` 本身测对了不算数,载.loader 忘了调用它、或者又改回
+/// `asset.get_bounds()`,空气墙会原封不动地回来 —— 而那种改动不会让
+/// 任何一条只测 `solid_bounds` 的断言变红。
+///
+/// # Arguments
+///
+/// - `&mut HashMap<String, Bounds>` - 资产 id → 碰撞足迹。
+/// - `&str` - 资产 id。
+/// - `&MeshAsset` - 已解析的资产。
+fn collider_bounds(bounds: &mut HashMap<String, Bounds>, id: &str, asset: &MeshAsset) {
+    bounds.insert(String::from(id), solid_bounds(asset));
+}
+
+/// 取一个资产在**人体高度带**里的实心足迹(本地 XZ 包围盒)。
+///
+/// 粒度是**三角形**而不是 part,这一点两头都不能省:
+///
+/// - 按 part 取会漏。`signal_post` 一个 part 从 y 0.26 跨到 4.60 m,
+///   底下是立柱、上面是 3 m 长的横杆,整取等于把横杆又算回碰撞盒。
+/// - 按顶点取会错。`shaft` 是一个 y 0 → 17 m 的 `chamfer_box`,**带内
+///   一个顶点都没有**,按顶点取会把这面真墙整块删掉。
+///
+/// 三角形自带自己的 y 区间,所以两种资产都对。
+///
+/// 退化情况(资产没带三角形、或一点实体都没有)退回资产 `bounds`:
+/// 少一堵墙总比少一堵墙还外加一堵空气墙好,而且能被回归测试抓到。
+///
+/// # Arguments
+///
+/// - `&MeshAsset` - 已解析的资产。
+///
+/// # Returns
+///
+/// - `Bounds` - 实心足迹的 `(min, max)`;y 取资产 `bounds` 原值(二维世界不看 y)。
+fn solid_bounds(asset: &MeshAsset) -> Bounds {
+    let fallback: Bounds = match asset.bounds.clone() {
+        Some(bounds) => bounds,
+        None => Bounds {
+            min: [-0.5, 0.0, -0.5],
+            max: [0.5, 2.0, 0.5],
+        },
+    };
+    let y_lo: f32 = fallback.min[1].max(BODY_BAND_LO);
+    let y_hi: f32 = fallback.max[1].min(BODY_BAND_HI);
+    if y_hi < y_lo {
+        return fallback;
+    }
+    let mut lo: [f32; 2] = [f32::MAX, f32::MAX];
+    let mut hi: [f32; 2] = [f32::MIN, f32::MIN];
+    let mut found: bool = false;
+    for part in &asset.parts {
+        for face in &part.faces {
+            let Some(tri): Option<Vec3> = part.positions.get(face[0]).copied() else {
+                continue;
+            };
+            let Some(second): Option<Vec3> = part.positions.get(face[1]).copied() else {
+                continue;
+            };
+            let Some(third): Option<Vec3> = part.positions.get(face[2]).copied() else {
+                continue;
+            };
+            let y_min: f32 = tri[1].min(second[1]).min(third[1]);
+            let y_max: f32 = tri[1].max(second[1]).max(third[1]);
+            if y_max < y_lo || y_min > y_hi {
+                continue;
+            }
+            found = true;
+            for corner in [tri, second, third] {
+                lo[0] = lo[0].min(corner[0]);
+                lo[1] = lo[1].min(corner[2]);
+                hi[0] = hi[0].max(corner[0]);
+                hi[1] = hi[1].max(corner[2]);
+            }
+        }
+    }
+    if !found {
+        return fallback;
+    }
+    Bounds {
+        min: [lo[0], fallback.min[1], lo[1]],
+        max: [hi[0], fallback.max[1], hi[1]],
+    }
 }
 /// 取一个资产声明的本地包围盒,缺省时退化成 1 m 见方。
 ///
@@ -3686,6 +3788,12 @@ fn on_lane(x: f32) -> bool {
 
 /// 棕榈树干碰撞半径(米)—— 只挡人,树叶可以从中穿过。
 const PALM_TRUNK_RADIUS: f32 = 0.4;
+/// 实心足迹的高度带下沿(米):小腿高度。矮于此的地面贴片 / 车道涂装不该挡人。
+const BODY_BAND_LO: f32 = 0.10;
+/// 实心足迹的高度带上沿(米):头顶高度。二维碰撞世界没有高度概念,
+/// 所以高于这条线的几何(雨篷 / 檐口 / 路灯臂 / 屋顶设备)对行走的玩家
+/// 不存在 —— 把它们算进碰撞盒就是空气墙。
+const BODY_BAND_HI: f32 = 1.90;
 /// 车道缓冲区半宽(米):街道中轴线两侧这么多米内不放静态碰撞体。
 const LANE_CLEAR_MARGIN: f32 = 1.8;
 
@@ -9021,9 +9129,7 @@ async fn load_assets_and_build(handles: GameHandles) {
                 // 以及 `ped_suit` 的原始 part(玩家骨架要按 part 切分)。
                 match parse_asset(id, &text) {
                     Ok(asset) => {
-                        if let Some(bounds) = asset.get_bounds() {
-                            asset_bounds.insert(id.to_string(), bounds.clone());
-                        }
+                        collider_bounds(&mut asset_bounds, id, &asset);
                         if *id == PED_SUIT {
                             ped_suit = Some(asset.clone());
                         }
@@ -9421,10 +9527,16 @@ mod tests {
     use crate::collision::CollisionWorld;
     use crate::combat::Pedestrian;
     use crate::r#const::{
-        AXIS_STRAFE, CAR_SEDAN, GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY, KEY_BATCH,
-        PED_SUIT, PED_TALK_SLOT_STEP, PISTOL_MAGAZINE, PLAYER_BODY_HEIGHT, RELOAD_TIME,
-        SLOT_FORMER_RELOAD_KEY, SLOT_RELOAD_KEY, T_C_NO_LONGER_RELOADS, T_CAR_BODY_BATCH_MISSING,
-        T_CAR_BODY_BATCH_NOT_TAIL, T_CAR_BODY_BATCH_SHARED, T_JUMP_CLEARS_A_LEDGE,
+        AXIS_STRAFE, BLDG_AQUA_ARCADE, BLDG_DECO_PINK, BLDG_LILAC_TOWER, CAR_SEDAN,
+        E_FIXTURE_ASSET_JSON, E_FIXTURE_NO_DECLARED_BOUNDS, E_FIXTURE_SOLID_BOUNDS_UNREGISTERED,
+        FIXTURE_BLDG_AQUA_ARCADE_JSON,
+        FIXTURE_PROP_STREETLIGHT_JSON, FIXTURE_PROP_TRAFFICLIGHT_JSON, GRAVITY,
+        GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY, KEY_BATCH, PED_SUIT, PED_TALK_SLOT_STEP,
+        PISTOL_MAGAZINE, PLAYER_BODY_HEIGHT, PROP_BENCH, PROP_NEWSSTAND, PROP_PHONE_BOOTH,
+        PROP_STREETLIGHT, PROP_TRAFFICLIGHT, RELOAD_TIME, SLOT_FORMER_RELOAD_KEY, SLOT_RELOAD_KEY,
+        T_AIR_WALL_ON_THE_SIDEWALK, T_AIR_WALL_PROBE_FOUND_NO_SPOTS, T_C_NO_LONGER_RELOADS,
+        T_CAR_BODY_BATCH_MISSING, T_CAR_BODY_BATCH_NOT_TAIL, T_CAR_BODY_BATCH_SHARED,
+        T_JUMP_CLEARS_A_LEDGE,
         T_JUMP_LANDS_STANDING, T_JUMP_ONLY_FROM_GROUND, T_JUMP_RISES_BEFORE_FALLING,
         T_PALM_ON_ROADWAY, T_PALM_ROW_IS_UNIFORM, T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT,
         T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS, T_RELOAD_CONSUMES_RESERVE, T_RELOAD_KEY_IS_GTA_R,
@@ -9443,6 +9555,9 @@ mod tests {
         T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_SUBSTEP_NOT_NO_OP,
         T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP,
         T_SHOWCASE_WALK_LOSES_SLIDE, T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP,
+        T_SOLID_BOUNDS_DELETED_A_REAL_WALL, T_SOLID_BOUNDS_FIXTURE_TOO_WEAK,
+        T_SOLID_BOUNDS_GREW_PAST_ASSET_BOUNDS, T_SOLID_BOUNDS_STILL_AN_AIR_WALL,
+        T_SOLID_BOUNDS_X_WIDTH,
         T_STATIC_LEN_ASSUMED_CONSTANT, T_VERTICAL_REST_ON_FLOOR, T_WHEEL_AXLE_STILL,
         T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD, T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
     };
@@ -9482,11 +9597,11 @@ mod tests {
         PLAYER_RADIUS, SHOWCASE_DOOR_HALF, SHOWCASE_GROUND_TOP, SHOWCASE_STAIR_LEAD,
         SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN, SHOWCASE_STAIR_STEPS, SHOWCASE_STAIR_WIDTH,
         SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS, SIDEWALK_WIDTH, STREAM_REBUILD_STEP,
-        STREET_HALF_WIDTH, STREET_PITCH, ShowcaseSpec, ShowcaseSpecs, blocks_near,
+        STREET_HALF_WIDTH, STREET_PITCH, WORLD_HALF, ShowcaseSpec, ShowcaseSpecs, blocks_near,
         build_city_buildings, build_city_palms, build_city_peds, build_city_props,
         build_city_signs, build_collision_world, build_ground_near, build_showcase_interiors,
-        build_water_near, on_roadway, showcase_placements, showcase_specs, stream_needs_rebuild,
-        street_axis, street_indices_in,
+        build_water_near, collider_bounds, on_roadway, push_box, showcase_placements,
+        showcase_specs, stream_needs_rebuild, street_axis, street_indices_in,
     };
     use crate::interior::{Floor, FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
@@ -11248,6 +11363,184 @@ mod tests {
                 spec.asset
             );
         }
+    }
+
+    #[test]
+    fn solid_bounds_drops_geometry_that_only_exists_above_head() {
+        let streetlight: MeshAsset =
+            super::parse_asset(PROP_STREETLIGHT, FIXTURE_PROP_STREETLIGHT_JSON)
+                .expect(E_FIXTURE_ASSET_JSON);
+        let mut registered: HashMap<String, Bounds> = HashMap::new();
+        collider_bounds(&mut registered, PROP_STREETLIGHT, &streetlight);
+        let solid: Bounds = registered
+            .get(PROP_STREETLIGHT)
+            .cloned()
+            .expect(E_FIXTURE_SOLID_BOUNDS_UNREGISTERED);
+        let width: f32 = solid.get_max()[0] - solid.get_min()[0];
+        let depth: f32 = solid.get_max()[2] - solid.get_min()[2];
+        let narrow: bool = width < 0.8 && depth < 0.8;
+        assert!(narrow, "{} {} {}", T_SOLID_BOUNDS_X_WIDTH, T_SOLID_BOUNDS_STILL_AN_AIR_WALL, width);
+        assert!(
+            streetlight
+                .get_bounds()
+                .is_some_and(|b: &Bounds| b.get_max()[0] - b.get_min()[0] > 2.0),
+            "{}",
+            T_SOLID_BOUNDS_FIXTURE_TOO_WEAK
+        );
+    }
+
+    #[test]
+    fn solid_bounds_keeps_a_wall_that_has_no_vertex_in_the_body_band() {
+        let arcade: MeshAsset =
+            super::parse_asset(BLDG_AQUA_ARCADE, FIXTURE_BLDG_AQUA_ARCADE_JSON)
+                .expect(E_FIXTURE_ASSET_JSON);
+        let mut registered: HashMap<String, Bounds> = HashMap::new();
+        collider_bounds(&mut registered, BLDG_AQUA_ARCADE, &arcade);
+        let solid: Bounds = registered
+            .get(BLDG_AQUA_ARCADE)
+            .cloned()
+            .expect(E_FIXTURE_SOLID_BOUNDS_UNREGISTERED);
+        let declared: Bounds = arcade
+            .get_bounds()
+            .cloned()
+            .expect(E_FIXTURE_NO_DECLARED_BOUNDS);
+        let width: f32 = solid.get_max()[0] - solid.get_min()[0];
+        let declared_width: f32 = declared.get_max()[0] - declared.get_min()[0];
+        assert!(
+            width > 0.85 * declared_width,
+            "{} {} {}",
+            T_SOLID_BOUNDS_X_WIDTH, T_SOLID_BOUNDS_DELETED_A_REAL_WALL, width
+        );
+    }
+
+    #[test]
+    fn solid_bounds_never_exceeds_the_declared_asset_bounds() {
+        for (id, json) in [
+            (PROP_TRAFFICLIGHT, FIXTURE_PROP_TRAFFICLIGHT_JSON),
+            (PROP_STREETLIGHT, FIXTURE_PROP_STREETLIGHT_JSON),
+        ] {
+            let asset: MeshAsset = super::parse_asset(id, json).expect(E_FIXTURE_ASSET_JSON);
+            let declared: Bounds = asset
+                .get_bounds()
+                .cloned()
+                .expect(E_FIXTURE_NO_DECLARED_BOUNDS);
+            let mut registered: HashMap<String, Bounds> = HashMap::new();
+            collider_bounds(&mut registered, id, &asset);
+            let solid: Bounds = registered
+                .get(id)
+                .cloned()
+                .expect("loader registered the asset");
+            assert!(
+                solid.get_min()[0] >= declared.get_min()[0] - 1e-4
+                    && solid.get_max()[0] <= declared.get_max()[0] + 1e-4
+                    && solid.get_min()[2] >= declared.get_min()[2] - 1e-4
+                    && solid.get_max()[2] <= declared.get_max()[2] + 1e-4,
+                "{} {}",
+                T_SOLID_BOUNDS_GREW_PAST_ASSET_BOUNDS, id
+            );
+        }
+    }
+
+    fn sidewalk_lights_world(declared: bool) -> CollisionWorld {
+        let mut bounds: HashMap<String, Bounds> = HashMap::new();
+        for (id, json) in [
+            (PROP_TRAFFICLIGHT, FIXTURE_PROP_TRAFFICLIGHT_JSON),
+            (PROP_STREETLIGHT, FIXTURE_PROP_STREETLIGHT_JSON),
+        ] {
+            let asset: MeshAsset = super::parse_asset(id, json).expect(E_FIXTURE_ASSET_JSON);
+            if declared {
+                let box_bounds: Bounds = asset
+                    .get_bounds()
+                    .cloned()
+                    .expect(E_FIXTURE_NO_DECLARED_BOUNDS);
+                bounds.insert(String::from(id), box_bounds);
+            } else {
+                collider_bounds(&mut bounds, id, &asset);
+            }
+        }
+        let mut world: CollisionWorld = CollisionWorld::new();
+        world.set_player_radius(PLAYER_RADIUS);
+        world.set_half_extent([WORLD_HALF, WORLD_HALF]);
+        for prop in build_city_props(0.0, 0.0) {
+            if prop.asset != PROP_STREETLIGHT && prop.asset != PROP_TRAFFICLIGHT {
+                continue;
+            }
+            push_box(
+                &mut world,
+                &bounds,
+                prop.asset,
+                [prop.position[0], 0.0, prop.position[2]],
+                prop.yaw,
+                1.0,
+            );
+        }
+        world
+    }
+
+    fn sidewalk_spots() -> Vec<Vec2> {
+        let mut out: Vec<Vec2> = Vec::new();
+        for line in street_indices_in(-1.0, 1.0) {
+            let axis: f32 = street_axis(line);
+            for across in [
+                STREET_HALF_WIDTH + 1.0,
+                STREET_HALF_WIDTH + 1.4,
+                STREET_HALF_WIDTH + 1.8,
+                STREET_HALF_WIDTH + 2.2,
+                STREET_HALF_WIDTH + 2.6,
+                STREET_HALF_WIDTH + 3.0,
+            ] {
+                // 30 m is a streetlight's own position: standing there is
+                // standing at its base, which IS solid. Probe the reach of its
+                // arm (1.9 m along the kerb) instead.
+                for along in [
+                    -28.6f32, -28.2, -28.0, -27.0, -15.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 5.0,
+                    27.0, 28.0, 28.2, 28.6,
+                ] {
+                    out.push([axis + across, along]);
+                    out.push([along, axis - across]);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_streetlight_or_traffic_light_arm_blocks_the_sidewalk() {
+        let air_walled: CollisionWorld = sidewalk_lights_world(true);
+        let fixed: CollisionWorld = sidewalk_lights_world(false);
+        let spots: Vec<Vec2> = sidewalk_spots();
+        let mut opened: usize = 0;
+        let mut newly_blocked: Vec<Vec2> = Vec::new();
+        let mut still_walled: Vec<Vec2> = Vec::new();
+        for spot in &spots {
+            let was: bool = air_walled.contains_point(*spot);
+            let now: bool = fixed.contains_point(*spot);
+            if now && !was {
+                newly_blocked.push(*spot);
+            } else if was && !now {
+                opened += 1;
+            } else if now {
+                still_walled.push(*spot);
+            }
+        }
+        assert!(
+            still_walled.is_empty(),
+            "{} {:?}",
+            T_AIR_WALL_ON_THE_SIDEWALK, still_walled
+        );
+        assert!(!spots.is_empty(), "{}", T_AIR_WALL_PROBE_FOUND_NO_SPOTS);
+        assert!(
+            newly_blocked.is_empty(),
+            "{} {:?}",
+            T_SOLID_BOUNDS_DELETED_A_REAL_WALL, newly_blocked
+        );
+        assert!(
+            opened > 0,
+            "{} {} of {}",
+            T_SOLID_BOUNDS_FIXTURE_TOO_WEAK,
+            opened,
+            spots.len()
+        );
     }
 
     /// 回归测试(第 9 条):附近有伴时,行人必须能**真的**开始聊天。
