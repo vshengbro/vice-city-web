@@ -332,6 +332,47 @@ mod r#tests {
         }
     }
 
+    /// 全屏三角形的 `uv.y` **必须**与 `clip.y` 反向 —— 这是 bloom 上线
+    /// 当天整幅画面上下颠倒的那条根因。
+    ///
+    /// 两个方向是**各自独立**的约定,必须分开记:
+    ///
+    /// - `clip` 用的是 **NDC**:WebGPU 的 NDC **+y 朝上**,`clip.y = +1`
+    ///   是屏幕**最上面**那一行。于是三角形顶点 `p.y = 0`(即
+    ///   `clip.y = −1`)落在**下方** —— `p` 的 y **不能**取反,取反了
+    ///   三角形就朝屏幕外面长,连覆盖都做不对。
+    /// - `uv` 用的是**纹理采样坐标**:WebGPU 的纹理 **v = 0 在最上面
+    ///   一行**(`textureSample` 的原点与 NDC 的 y 朝向相反)。于是
+    ///   `p.y = 0` 那条边(屏幕**下方**)必须去采 `v ≈ 1`,即
+    ///   `uv.y = 1 − p.y`。
+    ///
+    /// 这条测试把整条后处理链条钉成「**按行号一一对应**」:第 `r` 行
+    /// 的片元采第 `r` 行,提取 / 两条模糊 / 合成全都行号不变 —— 所以它
+    /// 与链条上有几条 pass 无关。写反的症状是「天空在画面最下面」,
+    /// 而且 `cargo test` 变不红,只能靠这条 + 截图。
+    #[test]
+    fn fullscreen_uv_y_is_flipped_against_clip_y() {
+        let source: &str = SHADER_FULLSCREEN_VERTEX;
+        assert!(
+            source.contains("out.uv = vec2<f32>(p.x, 1.0 - p.y);"),
+            "vs_fullscreen 的 uv 必须按 (p.x, 1.0 - p.y) 生成:\
+             WebGPU 的纹理 v = 0 在**最上一行**,而 NDC 的 +y 朝上,\
+             两者相反。照抄 WebGL 那份的 `out.uv = p` 会让整幅画面上下颠倒\
+             (天空跑到画面最下面)。当前源码:\n{source}"
+        );
+        // `clip.y` 保持不取反 —— 这两条是独立约定,别一起翻。
+        assert!(
+            source.contains("out.clip = vec4<f32>(p * 2.0 - vec2<f32>(1.0, 1.0), 0.0, 1.0);"),
+            "vs_fullscreen 的 clip.y 不能取反:WebGPU 的 NDC +y 朝上,\
+             `p.y = 0` 已经落在屏幕下方。当前源码:\n{source}"
+        );
+        // 旧的 `out.uv = p` 必须已经不存在(它是这条 bug 的原始写法)。
+        assert!(
+            !source.contains("out.uv = p;"),
+            "`out.uv = p` 就是把画面上下颠倒的那一行,不能回来"
+        );
+    }
+
     /// bloom 三张目标必须正好是画布的**一半**分辨率。
     ///
     /// 这条钉住 [`bloom_target_size`] 的缩放系数:写成别的值(比如
