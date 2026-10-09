@@ -696,13 +696,14 @@ pub(crate) const UNIFORM_FRAME_BYTES: u32 = 64;
 /// 光源视投影矩阵 uniform buffer 的字节数。
 pub(crate) const UNIFORM_SHADOW_FRAME_BYTES: u32 = 64;
 
-/// 着色参数 uniform buffer 的字节数(14 × vec4 = 224 字节)。
+/// 着色参数 uniform buffer 的字节数(15 × vec4 = 240 字节)。
 ///
-/// ⚠️ 阴影那两块 vec4 加进来之后从 192 涨到 224。这个数**必须**跟着
+/// ⚠️ 阴影那两块 vec4 加进来之后从 192 涨到 224,接触 AO 的高度下界
+/// (`ao_band`)再加一块变成 240。这个数**必须**跟着
 /// [`crate::webgpu::r#struct::ShadingUniforms`] 的字段数一起改:
 /// 少分配的话 `writeBuffer` 会直接抛
 /// `writeBuffer size exceeds buffer size`,而不是静默截断。
-pub(crate) const UNIFORM_SHADING_BYTES: u32 = 14 * 16;
+pub(crate) const UNIFORM_SHADING_BYTES: u32 = 15 * 16;
 
 // ===========================================================================
 // 阴影偏置的 WebGPU 标定
@@ -790,13 +791,72 @@ struct Shading {
     emissive_gain : vec4<f32>,
     eye : vec4<f32>,
     fog : vec4<f32>,
+    // x = 接触 AO 的垂直上界(米),y = 最深压暗系数,
+    // z = 水平作用半径(米),w = 水平项平滑宽度(米)。
     ao_params : vec4<f32>,
     exposure_white : vec4<f32>,
+    // ⚠️ 下面这三块**必须声明**,哪怕顶点阶段一个都不读。
+    //
+    // WGSL 的 uniform 偏移是按**这份 struct 自己的声明顺序**算的,
+    // 不是按 Rust 侧上传的顺序。所以顶点这份一旦比 Rust 侧少两块,
+    // 后面所有字段的偏移就整体前移 32 字节 —— `ao_band` 会读到
+    // `shadow_params`(阴影强度 = 1.0)而不是高度下界 0.30。
+    // 后果不是编译报错:高度下界变成 1.0 m 之后,地面(y ≤ 0.16)的
+    // 接触带判据仍然成立,于是**整片地面又吃到最深压暗**,
+    // 正好退回本次要修的那个 bug。
+    //
+    // 实测踩过:第一版只给片元那份补 `ao_band`,顶点那份照抄了「不读
+    // 就不声明」的旧惯例,地面 luma 从 103.4 掉到 86.8,而 cargo 全绿。
+    // 判据见 `vertex_and_fragment_shading_structs_declare_the_same_fields`。
+    shadow_params : vec4<f32>,
+    shadow_misc : vec4<f32>,
+    // x = 接触 AO 的高度下界(米),其余为 pad。
+    ao_band : vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame : Frame;
 @group(0) @binding(1) var<uniform> shading : Shading;
 
+// ---- 顶点烘焙接触 AO:按「离自己的几何基座有多近」压暗 ----
+//
+// ⚠️ 这里曾经只有 `clamp(world.y / ao_params.x, 0, 1)` 一项,那是个
+// **世界高度**代理量:地面整体就在 y≈0 上,于是全城每一块地面都取到
+// clamp(0) = 0,统一吃到 `ao_params.y` 的最深压暗,与「附近有没有
+// 东西」完全无关。实测(2026-10-10,LOFT 样板楼南墙 z=35 外,WebGPU,
+// 正午):沿墙法向 0.55 → 6.85 m 的地面 luma 只有 103.024..104.433
+// (range 1.41,均值偏差 -0.22%),是一条平线 —— 墙根与开阔街道一样暗。
+//
+// 而「墙根的地面该压暗」这件事,顶点着色器**结构上做不到**:地面是
+// 一整张大网格,它的顶点只知道自己在世界里的位置,不知道自己旁边有
+// 没有一堵墙。这正是 SSAO 的职责,而 **WebGPU 路径目前没有 SSAO**。
+//
+// 所以这里的分工是:
+// - **地面 ↔ 墙**的接触暗部 = SSAO(WebGPU 端尚缺,见 impl.rs 的
+//   SSAO 段落);
+// - **模型 ↔ 自己基座**的接触暗部 = 本项,即楼身下段 / 树干根部的
+//   自遮蔽。判据必须是**水平距离**(离自己那栋东西的根有多近),
+//   不是世界高度。
+//
+// 两项相乘成一条曲线:离基座近且贴地 → 压到 `ao_params.y`;离得远
+// 或站得高 → 回到 1.0(完全不压)。model 矩阵的第 4 列(row3)就是
+// 世界平移(WGSL 的 `mat4x4<f32>(row0..row3)` 按**列**构造)。
+fn contact_ao(world : vec3<f32>, base : vec3<f32>) -> f32 {
+    let horizontal : f32 = length(world.xz - base.xz);
+    let reach : f32 = max(shading.ao_params.z, 0.001);
+    let feather : f32 = max(shading.ao_params.w, 0.001);
+    // 1 = 紧贴基座,0 = 已经走出作用半径。
+    let proximity : f32 = 1.0 - smoothstep(reach - feather, reach, horizontal);
+    // 只压「贴着自己基座、且高度在接触带内」的顶点。
+    // 下界 ao_band.x 高于地面网格的最高点(ROAD = 0.0、
+    // SIDEWALK = 0.14、地块 LOT_GROUND = 0.16),于是**地面永远不吃
+    // 这一项** —— 开阔地不会被无端压暗,而地面贴墙的暗部交给 SSAO。
+    // 上界 ao_params.x 让楼身高处完全放开。
+    let low : f32 = shading.ao_band.x;
+    let high : f32 = shading.ao_params.x;
+    let low_enough : f32 = smoothstep(low, low + 0.001, world.y)
+        * (1.0 - smoothstep(high - 0.001, high, world.y));
+    return 1.0 - (1.0 - shading.ao_params.y) * low_enough * proximity;
+}
 
 @vertex
 fn vs_main(
@@ -826,11 +886,7 @@ fn vs_main(
     out.tint = tint;
     out.world = world.xyz;
     out.eye_distance = length(world.xyz - shading.eye.xyz);
-    out.contact_ao = mix(
-        shading.ao_params.y,
-        1.0,
-        clamp(world.y / max(shading.ao_params.x, 0.001), 0.0, 1.0),
-    );
+    out.contact_ao = contact_ao(world.xyz, row3.xyz);
     // 让优化器保留 builtin 读取:写入一个恒等于 0 的分量不会影响画面。
     out.clip = out.clip + vec4<f32>(0.0, 0.0, 0.0, f32(index) * 0.0);
     return out;
@@ -900,6 +956,14 @@ struct Shading {
     shadow_params : vec4<f32>,
     // x = 一个纹素覆盖的世界尺寸(米), y = WebGPU 深度域跨度(米)。
     shadow_misc : vec4<f32>,
+    // x = 接触 AO 的**高度下界**(米),其余为 pad。
+    //
+    // ⚠️ 这一块放在**最后**是有意的:插在中间会把后面所有字段的
+    // 字节偏移平移 16 字节,而 `write_buffer` 那侧若忘了同步改,
+    // 读到的就是错位的值(阴影参数静默变成色调映射的曝光值)。
+    // 片元着色器不读它(`contact_ao` 只在顶点阶段跑),但 WGSL 的
+    // struct 是整块共享的声明,所以必须同时出现在这一份里。
+    ao_band : vec4<f32>,
 };
 
 // ---- 阴影(见 WebGL2 端 FRAGMENT_SHADER 的「---- 阴影 ----」一段)----

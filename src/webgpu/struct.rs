@@ -102,7 +102,13 @@ pub struct ShadingUniforms {
     pub eye: [f32; 4],
     /// `x` = `fog_start`,`y` = `fog_end`,其余为 pad。
     pub fog: [f32; 4],
-    /// `x` = `ao_height`,`y` = `ao_floor`,其余为 pad。
+    /// `x` = `ao_height`(垂直上界),`y` = `ao_floor`(最深压暗系数),
+    /// `z` = `ao_reach`(水平作用半径),`w` = `ao_feather`(水平平滑宽度)。
+    ///
+    /// ⚠️ **不再有「按 `world.y` 压暗」那一项。** 旧布局只有 xy,
+    /// WGSL 里写的是 `mix(y, 1.0, clamp(world.y / x, 0, 1))` —— 那是
+    /// 世界高度代理量,地面整片在 y≈0 上于是全城统一吃最深压暗。
+    /// 改判据见 [`SHADER_VERTEX`] 里的 `contact_ao()`。
     pub ao_params: [f32; 4],
     /// `x` = `exposure`,`y` = `tone_map_white`,其余为 pad。
     pub exposure_white: [f32; 4],
@@ -122,14 +128,25 @@ pub struct ShadingUniforms {
     /// 只改 [`crate::webgpu::r#const`] 一处,不必同时维护 GLSL 与
     /// WGSL 两份魔数。
     pub shadow_misc: [f32; 4],
+    /// `x` = 接触 AO 的**高度下界**(米),其余为 pad。
+    ///
+    /// 放在**整块的最后**而不是插在 `ao_params` 后面,是为了让本块
+    /// 里每一个既有字段的字节偏移都保持不变 —— WGSL 的 uniform 按
+    /// 声明顺序排布,中间插一个 vec4 会把后面全部字段平移 16 字节,
+    /// 而 `write_buffer` 那侧若忘了同步改,读到的是错位的值
+    /// (阴影参数静默变成色调映射的曝光值:画面偏亮且无影)。
+    ///
+    /// 单开一块而不是塞进 `ao_params` 的 zw,是因为 zw 已经被水平
+    /// 作用半径(6.0 m)与平滑宽度(2.0 m)占满了。
+    pub ao_band: [f32; 4],
 }
 
-/// 着色参数 uniform 的字节数(14 × vec4 = 224 字节)。
+/// 着色参数 uniform 的字节数(15 × vec4 = 240 字节)。
 ///
 /// ⚠️ 必须与 [`ShadingUniforms`] 的字段数**逐项一致**:少写一个
 /// `vec4` 不会编译报错,只会在 GPU 上读到**后面那个块的数据**当成本
 /// 字段 —— 阴影参数会静默变成色调映射的曝光值,画面偏亮且无影。
-pub(crate) const SHADING_VEC4_COUNT: usize = 14;
+pub(crate) const SHADING_VEC4_COUNT: usize = 15;
 
 /// bloom 参数 uniform 的字节布局(3 × vec4 = 48 字节)。
 ///
@@ -541,6 +558,312 @@ mod r#tests {
         let dx: f32 = m[12] + light[0] * along - focus[0];
         let dz: f32 = m[14] + light[2] * along - focus[2];
         dx * dx + dz * dz <= reach() * reach()
+    }
+
+    /// `smoothstep(a, b, x)` 的 Rust 写法,与 WGSL 的同名内建函数一致。
+    ///
+    /// # Arguments
+    ///
+    /// - `a` - 下界。
+    /// - `b` - 上界。
+    /// - `x` - 输入。
+    ///
+    /// # Returns
+    ///
+    /// 平滑后的 `0..=1`。
+    fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+        let t: f32 = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// 顶点接触 AO 的 Rust 镜像,与 [`SHADER_VERTEX`] 里那个
+    /// `contact_ao()` 逐字对应。
+    ///
+    /// 放在测试里而不只测 WGSL 字符串,是因为这个缺陷本质是**数值**
+    /// 的:字符串照样能通过「声明了 uniform」那类检查,只有把公式跑
+    /// 一遍才会发现开阔地是不是被无端压暗了。
+    ///
+    /// # Arguments
+    ///
+    /// - `world_y` - 顶点的世界高度(米)。
+    /// - `horizontal` - 顶点到本模型世界原点的 XZ 水平距离(米)。
+    ///
+    /// # Returns
+    ///
+    /// 亮度系数 `1.0`(不压暗)..=`CONTACT_SHADOW_FLOOR`(贴基座最暗)。
+    fn contact_ao_factor(world_y: f32, horizontal: f32) -> f32 {
+        let reach: f32 = CONTACT_SHADOW_REACH;
+        let feather: f32 = CONTACT_SHADOW_FEATHER;
+        let low: f32 = CONTACT_SHADOW_MIN_HEIGHT;
+        let high: f32 = BAKED_CONTACT_AO_HEIGHT;
+        let proximity: f32 = 1.0 - smoothstep(reach - feather, reach, horizontal);
+        let low_enough: f32 =
+            smoothstep(low, low + 0.001, world_y) * (1.0 - smoothstep(high - 0.001, high, world_y));
+        1.0 - (1.0 - CONTACT_SHADOW_FLOOR) * low_enough * proximity
+    }
+
+    /// 缺陷本体:接触 AO 拿**世界高度**当「离基座多近」的代理量。
+    ///
+    /// 旧 WGSL 表达式 `mix(ao_params.y, 1.0, clamp(world.y /
+    /// ao_params.x, 0, 1))` 对同一高度的两个顶点给出**完全相同**的
+    /// 压暗 —— 离基座 0.3 m 的和 40 m 外的都是 `CONTACT_SHADOW_FLOOR`。
+    /// 修好后应是前者更暗、后者回到 1.0。
+    ///
+    /// 实测(2026-10-10,LOFT 样板楼南墙 z=35 外,WebGPU,正午):沿墙法向
+    /// 0.55 → 6.85 m 的地面 luma 落在 103.024..104.433(range 1.41),
+    /// 墙根均值比开阔地还**低** 0.232 luma —— 一条平线,而且方向还反了。
+    #[test]
+    fn contact_ao_darkens_by_horizontal_proximity_not_world_height() {
+        // 楼身下段,同一高度,只改到基座的水平距离。
+        let y: f32 = 0.5;
+        let at_base: f32 = contact_ao_factor(y, 0.3);
+        let nearby: f32 = contact_ao_factor(y, 3.0);
+        let open: f32 = contact_ao_factor(y, 40.0);
+
+        assert!(
+            at_base < open - 0.05,
+            "同高度 y={y}:离基座 0.3 m 的 {at_base:.4} 必须明显比 40 m 外的 \
+             {open:.4} 更暗 —— 旧公式按 world.y 算,两者会完全相等"
+        );
+        assert!(
+            nearby < open,
+            "离基座 3.0 m 的 {nearby:.4} 应比 40 m 外的 {open:.4} 暗"
+        );
+        assert!(
+            (open - 1.0).abs() < 1e-5,
+            "离基座 40 m 已在 CONTACT_SHADOW_REACH={CONTACT_SHADOW_REACH} m 之外,\
+             接触 AO 必须完全回到 1.0,实测 {open:.5}"
+        );
+    }
+
+    /// **地面网格整片不吃顶点接触 AO。**
+    ///
+    /// 这是用户报「地面的光追效果不对」时最直接的成因:旧公式按
+    /// `world.y / ao_height` 压暗,而路面 `ROAD = 0.0`、人行道
+    /// `SIDEWALK = 0.14`、地块 `LOT_GROUND = 0.16`(取自 `game.rs` 的
+    /// `build_ground_near`)全都远低于 `BAKED_CONTACT_AO_HEIGHT = 1.2`,
+    /// 于是全城每一块地面都取到 `clamp(0) = 0` 吃满最深压暗 —— 墙根
+    /// 与开阔街道一样暗。
+    ///
+    /// 修法是加高度下界 `CONTACT_SHADOW_MIN_HEIGHT`(0.30 m,高于地面
+    /// 网格最高点),让这一项只负责「楼身下段 / 树干根部」的自遮蔽;
+    /// 地面贴墙的暗部交给 SSAO —— 顶点着色器结构上不知道墙在哪,而
+    /// **WebGPU 路径目前还没有 SSAO**。
+    #[test]
+    fn contact_ao_leaves_the_ground_mesh_untouched() {
+        for (name, y) in [("road", 0.0_f32), ("sidewalk", 0.14), ("lot", 0.16)] {
+            // 即便就站在一栋楼正下方(水平距离 0),也必须是 1.0。
+            let value: f32 = contact_ao_factor(y, 0.0);
+            assert!(
+                (value - 1.0).abs() < 1e-5,
+                "{name}(y={y})属于地面网格,不该吃顶点接触 AO —— 实测 {value:.5}; \
+                 CONTACT_SHADOW_MIN_HEIGHT={CONTACT_SHADOW_MIN_HEIGHT} 本该把它整个排除"
+            );
+        }
+        // 用 `const {}` 而不是普通 `assert!`:这个不变量完全由常量决定,
+        // 而 clippy 的 `assertions_on_constants` 会要求它放进 const 块 ——
+        // 那正好更强:const 块在**编译期**求值,常量被改坏时是编译失败,
+        // 而不是运行时一条断言。
+        const {
+            assert!(
+                CONTACT_SHADOW_MIN_HEIGHT > 0.16,
+                "高度下界必须高于地面网格最高点 0.16 (LOT_GROUND),否则路面仍会被无端压暗"
+            );
+        }
+    }
+
+    /// 高处顶点不吃「贴墙根」的压暗。
+    ///
+    /// 若垂直上界失效,一栋 40 m 高的楼会整条压暗,表现为
+    /// 「每栋楼都自带一圈黑边」。上界由 `BAKED_CONTACT_AO_HEIGHT` 封顶。
+    #[test]
+    fn contact_ao_skips_the_proximity_term_above_the_height_band() {
+        let y: f32 = BAKED_CONTACT_AO_HEIGHT * 4.0;
+        let value: f32 = contact_ao_factor(y, 0.0);
+        assert!(
+            (value - 1.0).abs() < 1e-5,
+            "y={y:.2}(远超 BAKED_CONTACT_AO_HEIGHT={BAKED_CONTACT_AO_HEIGHT})且贴着基座时\
+             接触 AO 必须是 1.0,实测 {value:.5}"
+        );
+    }
+
+    /// 顶点着色器读的那三个 uniform 分量必须真的被上传。
+    ///
+    /// `ao_params` 从「只有 xy」扩到「xyzw」:若 WGSL 里写的是
+    /// `ao_params.z` 而 Rust 侧忘了填,读到的是 0,于是
+    /// `max(reach, 0.001)` 退化成 0.001 m 的作用半径 —— **楼身下段
+    /// 一条接触暗带都消失**,而画面上不报任何错。
+    #[test]
+    fn contact_ao_reach_and_feather_reach_the_vertex_shader() {
+        let lighting: SceneLighting = SceneLighting::for_phase(crate::render::DayPhase::Noon);
+        let shading: ShadingUniforms = shading_from_lighting(&lighting, [0.0, 1.6, 12.0]);
+        assert_eq!(
+            shading.ao_params[2], CONTACT_SHADOW_REACH,
+            "ao_params.z(水平作用半径)必须等于 {CONTACT_SHADOW_REACH},实测 {} —— \
+             忘了填的话顶点着色器读到 0,整条水平项退化成 0.001 m",
+            shading.ao_params[2]
+        );
+        assert_eq!(shading.ao_params[3], CONTACT_SHADOW_FEATHER);
+        assert_eq!(
+            shading.ao_band[0], CONTACT_SHADOW_MIN_HEIGHT,
+            "ao_band.x(高度下界)必须等于 {CONTACT_SHADOW_MIN_HEIGHT},实测 {} —— \
+             忘了填的话读到 0,整城地面又回到「全亮」的老样子",
+            shading.ao_band[0]
+        );
+    }
+
+    /// ⚠️ uniform 布局的**字节偏移**不能被这一轮的改动挪动。
+    ///
+    /// WGSL 的 uniform struct 按声明顺序排布,少一个 vec4 不会编译
+    /// 报错,只会在 GPU 上读到**后面那个块的数据**当成本字段 —— 阴影
+    /// 参数静默变成色调映射的曝光值,症状是「画面偏亮且无影」。
+    /// `ao_band` 因此被放在**整块的最后**,而不是插在 `ao_params`
+    /// 后面。
+    #[test]
+    fn shading_uniform_layout_is_three_hundred_and_forty_six_bytes() {
+        assert_eq!(SHADING_VEC4_COUNT, 15);
+        assert_eq!(
+            UNIFORM_SHADING_BYTES,
+            (SHADING_VEC4_COUNT as u32) * 16,
+            "UNIFORM_SHADING_BYTES 与字段数脱节:少分配的 buffer 会让 \
+             writeBuffer 直接抛 writeBuffer size exceeds buffer size"
+        );
+        // 既有字段的偏移必须一字不动:`shadow_misc` 是第 14 块(下标 13),
+        // `ao_band` 只能是第 15 块(下标 14)。
+        let shading: ShadingUniforms = ShadingUniforms::default();
+        let flat: [f32; 60] = flatten_shading(shading);
+        assert_eq!(
+            &flat[52..56],
+            &shading.shadow_misc,
+            "shadow_misc 的偏移被挪动了 —— 它必须仍在下标 13(字节 208)"
+        );
+        assert_eq!(
+            &flat[56..60],
+            &shading.ao_band,
+            "ao_band 必须在最后一块(下标 14 / 字节 224)"
+        );
+    }
+
+    /// ⚠️ 顶点与片元两份 WGSL 里的 `Shading` struct 必须**逐项一致**。
+    ///
+    /// 两者是同一个 uniform buffer 的两个视图,少一块 vec4 不会编译
+    /// 报错,只会在 GPU 上读到后面那个块的数据当成本字段。更糟的是:
+    /// **顶点那份缺字段时 WGSL 直接编译失败**(`shading.ao_band` 不存在),
+    /// 整条管线作废,画面全黑 —— 而 `cargo test` / `cargo check` 全绿,
+    /// 因为它们根本不看 WGSL 字符串。
+    ///
+    /// 实测踩过:第一版只给片元那份加了 `ao_band`,顶点那份漏了,
+    /// 探针量到的地面 luma 是全 0.0。**教训:改这份字符串之后必须
+    /// 真的把画面截下来看**,不能只看编译与测试。
+    #[test]
+    fn vertex_and_fragment_shading_structs_declare_the_same_fields() {
+        // ⚠️ 两份必须**完全逐项相同**,包括顶点阶段一个都不读的那两块。
+        //
+        // WGSL 的 uniform 偏移是按**每份 struct 自己的声明顺序**算的,
+        // 所以「不读就不声明」在这里是个陷阱:顶点那份少两块,后面所有
+        // 字段的偏移就整体前移 32 字节,而 Rust 侧照旧上传 15 块。
+        // `ao_band` 于是读到 `shadow_params`(阴影强度 = 1.0)而不是
+        // 高度下界 0.30 —— 高度下界变成 1.0 m 之后,地面(y ≤ 0.16)
+        // 的接触带判据仍然成立,**整片地面又吃满最深压暗**,正好退回
+        // 本次要修的那个 bug。
+        //
+        // 实测踩过两轮:
+        //  (1) 第一版只给片元那份补 `ao_band`,顶点那份漏了 → WGSL
+        //      直接编译失败 → 整条管线作废 → 画面全黑(探针 luma 全 0)。
+        //  (2) 第二版给顶点那份补了 `ao_band`,却沿用了「不读就不声明」
+        //      的旧惯例没补阴影那两块 → 不编译报错,但地面 luma 从
+        //      103.4 掉到 86.8。cargo test / cargo check 全绿。
+        //
+        // **教训:改这份字符串之后必须真的把画面截下来量,不能只看
+        // 编译与测试。**
+        let expected: [&str; SHADING_VEC4_COUNT] = [
+            "light_dir",
+            "light_color",
+            "ambient",
+            "sky_color",
+            "sky_ambient",
+            "ground_ambient",
+            "ambient_hemi",
+            "emissive_gain",
+            "eye",
+            "fog",
+            "ao_params",
+            "exposure_white",
+            "shadow_params",
+            "shadow_misc",
+            "ao_band",
+        ];
+        // 收集 `struct Shading { ... }` 里的字段名(按声明顺序)。
+        //
+        // 写成普通循环而不是 `lines().map().filter().map()`:链上每一步的
+        // 入参类型都在 `&str` / `&&str` 之间跳,而本仓库的规则要求每个闭包
+        // 参数写明类型,于是类型标注比逻辑本身还长。
+        fn fields_of(shader: &str) -> Vec<String> {
+            let start: &str = match shader.split("struct Shading {").nth(1) {
+                Some(rest) => rest,
+                None => panic!("WGSL 里找不到 `struct Shading {{`"),
+            };
+            let body: &str = start.split('}').next().unwrap_or_default();
+            let mut out: Vec<String> = Vec::new();
+            for line in body.lines() {
+                let trimmed: &str = line.trim();
+                let decl: &str = trimmed.trim_end_matches(',');
+                if !decl.ends_with(": vec4<f32>") {
+                    continue;
+                }
+                let field: &str = decl.split(':').next().unwrap_or("");
+                out.push(field.trim().to_string());
+            }
+            out
+        }
+        let want: Vec<String> = expected
+            .iter()
+            .map(|s: &&str| -> String { (*s).to_string() })
+            .collect();
+
+        for (name, shader) in [
+            ("SHADER_VERTEX", SHADER_VERTEX),
+            ("SHADER_FRAGMENT", SHADER_FRAGMENT),
+        ] {
+            assert_eq!(
+                fields_of(shader),
+                want,
+                "{name} 的 `struct Shading` 与 Rust 侧的 SHADING_VEC4_COUNT \
+         ({SHADING_VEC4_COUNT} 块)不一致。\n\
+         ⚠️ uniform 偏移按**本 struct 的声明顺序**算,所以「顶点阶段不读的块\
+         就不声明」会让后面所有字段前移 —— 不会编译报错,只会在 GPU 上\
+         读到别人的字节(高度下界会变成阴影强度,地面于是又吃满压暗)。"
+            );
+        }
+    }
+
+    /// 顶点着色器必须真的按**水平距离**算接触 AO。
+    ///
+    /// 只钉数值不够:数值测试用的是 Rust 镜像,镜像与 WGSL 字符串可以
+    /// 各改各的而测试仍然全绿。这条断言把「WGSL 里读的是
+    /// `world.xz - base.xz` 的水平距离」这件事钉在字符串上,并钉住
+    /// 「旧的按世界高度 clamp 的写法已经不在了」。
+    #[test]
+    fn vertex_shader_keys_contact_ao_on_horizontal_distance() {
+        assert!(
+            SHADER_VERTEX.contains("length(world.xz - base.xz)"),
+            "顶点着色器必须用水平距离算接触 AO,而不是世界高度"
+        );
+        assert!(
+            !SHADER_VERTEX.contains("clamp(world.y / max(shading.ao_params.x"),
+            "按 world.y 压暗的老公式还在 —— 地面整片在 y≈0 上,会全城吃满最深压暗"
+        );
+        for uniform in [
+            "shading.ao_params.z",
+            "shading.ao_params.w",
+            "shading.ao_band.x",
+        ] {
+            assert!(
+                SHADER_VERTEX.contains(uniform),
+                "顶点着色器读了 `{uniform}`,但 WGSL 里读不到它 —— \
+         少了对应的 struct 字段就会**整条管线编译失败、画面全黑**"
+            );
+        }
     }
 }
 

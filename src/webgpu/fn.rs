@@ -330,7 +330,16 @@ pub fn shading_from_lighting(lighting: &SceneLighting, eye: Vec3) -> ShadingUnif
         emissive_gain: [lighting.emissive_gain, 0.0, 0.0, 0.0],
         eye: pad3(eye),
         fog: [lighting.fog_start, lighting.fog_end, 0.0, 0.0],
-        ao_params: [BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FLOOR, 0.0, 0.0],
+        // 接触 AO 的判据是「离自己几何基座有多近」,不是世界高度。
+        // 四个分量与 WebGL2 端的 `u_ao_*` 逐项同序,共用同一批常量 ——
+        // 两个后端必须是同一个数,否则同一个场景两边楼身下段的
+        // 明暗不同。
+        ao_params: [
+            BAKED_CONTACT_AO_HEIGHT,
+            CONTACT_SHADOW_FLOOR,
+            CONTACT_SHADOW_REACH,
+            CONTACT_SHADOW_FEATHER,
+        ],
         exposure_white: [lighting.exposure, lighting.tone_map_white, 0.0, 0.0],
         // 纹素尺寸与偏置倍数都从 `render.rs` 的那三个函数取,不在这里
         // 另立一套常量 —— 两个后端必须是同一个数,否则同一个场景两边
@@ -347,6 +356,9 @@ pub fn shading_from_lighting(lighting: &SceneLighting, eye: Vec3) -> ShadingUnif
             SHADOW_BIAS_SLOPE_GAIN,
             SHADOW_NORMAL_OFFSET_SLOPE_GAIN,
         ],
+        // 高度下界高于地面网格的最高点(0.16),所以地面整片不吃
+        // 顶点接触 AO —— 见 `contact_ao_factor` 的说明。
+        ao_band: [CONTACT_SHADOW_MIN_HEIGHT, 0.0, 0.0, 0.0],
     }
 }
 
@@ -484,7 +496,7 @@ pub fn canvas_context(canvas: &HtmlCanvasElement) -> Result<JsValue, GpuUnavaila
     }
 }
 
-/// 展平着色参数 uniform 成 56 个 f32。
+/// 展平着色参数 uniform 成 60 个 f32。
 ///
 /// # Arguments
 ///
@@ -492,8 +504,8 @@ pub fn canvas_context(canvas: &HtmlCanvasElement) -> Result<JsValue, GpuUnavaila
 ///
 /// # Returns
 ///
-/// - `[f32; 56]` - 可直接上传的字节序。
-pub fn flatten_shading(shading: ShadingUniforms) -> [f32; 56] {
+/// - `[f32; 60]` - 可直接上传的字节序。
+pub fn flatten_shading(shading: ShadingUniforms) -> [f32; 60] {
     let blocks: [[f32; 4]; SHADING_VEC4_COUNT] = [
         shading.light_dir,
         shading.light_color,
@@ -509,8 +521,9 @@ pub fn flatten_shading(shading: ShadingUniforms) -> [f32; 56] {
         shading.exposure_white,
         shading.shadow_params,
         shading.shadow_misc,
+        shading.ao_band,
     ];
-    let mut out: [f32; 56] = [0.0; 56];
+    let mut out: [f32; 60] = [0.0; 60];
     for (index, block) in blocks.iter().enumerate() {
         let base: usize = index * 4;
         out[base] = block[0];

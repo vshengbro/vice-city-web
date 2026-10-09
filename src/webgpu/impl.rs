@@ -1321,7 +1321,7 @@ impl WebGpuRenderer {
             0.0,
             f32_slice_to_bytes(&frame),
         )?;
-        let shading: [f32; 56] = flatten_shading(shading_from_lighting(lighting, eye));
+        let shading: [f32; 60] = flatten_shading(shading_from_lighting(lighting, eye));
         write_buffer(
             &device,
             &self.get_shading_buffer().clone(),
