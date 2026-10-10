@@ -1,9 +1,26 @@
-//! 交通 AI + 拾取物:车道循环行驶的车队、可上下的车辆、地面拾取物。
+//! 交通 AI + 拾取物:沿街道网格行驶的车队、可上下的车辆、地面拾取物。
 //!
-//! 车队**不是自由漫游**:每辆车被分配到一条固定车道(街道沿 Z 轴延伸,
-//! 车道是一条沿 Z 的直线段),车辆只沿车道 Z 方向前进,到端点 wrap 回起点,
-//! 因此永远不会拐进人行道、更不会穿楼。玩家上车后 WASD 直接驱动该车,
-//! 车速上限提到街道限速(8–15 m/s)。
+//! 车队**不是自由漫游**,但也不再是「一条固定 X 的直线」。每辆车被分配
+//! 到一条**城市街道上的车道**(车道中心 = 街道中轴线 ± [`LANE_OFFSET`]),
+//! 并沿着**路点(route)**行驶:走到下一个路口时按 [`ROUTE_PICK`] 的比例
+//! 概率决定直行还是转向,转向就换到横向街道的对应车道上继续开。
+//!
+//! 之前这里是「常量 `lane_x` + 起点 z + 方向」三元组,车永远沿一条
+//! 直线跑,到端点 wrap —— 结构上没有转向,也就没有路口。而车道的 X 是
+//! 写死的 `26.5 / 33.5 / -26.5 / -33.5`,**这四条线根本不在街道上**:
+//! 街道中轴线落在 `STREET_PITCH * k`(即 `0 / ±60 / ±120 ...`),
+//! 车道必须在 `轴线 ± 3.5` 处。实测(aff3e39):车道 x=26.5 的循环里有
+//! **8.1%** 的里程落在建筑 AABB 内(最深 2.03 m,`bldg_lilac_tower`),
+//! x=-33.5 有 **19.8%**(最深 4.96 m,`bldg_teal_loft`)。这就是用户报的
+//! 「NPC 开的汽车会穿越建筑」—— 不是碰撞失效,是车道画在了街上没有的
+//! 地方。
+//!
+//! 现在两件事同时成立:
+//!
+//! 1. **车道由街道网格派生**([`lane_axis`]),车永远在真实沥青面上。
+//! 2. **巡航真的走路网**([`TrafficCar::route_step`]),在路口转向,
+//!    并且每一步都用 `CollisionWorld::resolve_car_footprint`(真实
+//!    `4.566 × 1.851 m` 有向足迹)解一次碰撞 —— 挡住就停,不再穿模。
 //!
 //! 车灯:`car_*` 资产的 `frontlights` / `rearlights` part 带 `emissive`,
 //! 展开时已经逐三角形写进顶点缓冲的第四个 vec3(见 `render::build_gpu_mesh`),
@@ -11,7 +28,8 @@
 //! 是真的在发光,不是画一个假的亮点贴图。
 
 use crate::{
-    collision::CollisionWorld,
+    FRAC_PI_2, PI,
+    collision::{CAR_FOOTPRINT, CAR_STEP, CollisionWorld},
     r#const::*,
     player::{MAX_HEALTH, Player},
     r#type::{Vec2, Vec3},
@@ -21,6 +39,21 @@ use crate::{
 ///
 /// 由 [`crate::game::traffic_half`] 从城市半边长推导,车道两端到端点 wrap。
 pub const LOOP_HALF_LENGTH: f32 = 120.0;
+
+/// 相邻两条街道轴线之间的间距(米)—— 与 `game::STREET_PITCH` 同值。
+///
+/// 这里**重述一份而不是引用 `game.rs`**:模块依赖是单向的(`game` 依赖
+/// `traffic`,反过来就成环),而这个数字同时决定了「车走哪条街」,必须和
+/// `game::street_axis` 一致。两条常量各有一处单测把 `±3.5` 的车道坐标
+/// 与 `game::lane_x()` 对拍(见 `lane_axis_matches_the_city_grid`),网格
+/// 间距一旦在 `game.rs` 改了而这里没改,那些测试立刻变红。
+pub(crate) const STREET_PITCH: f32 = 60.0;
+/// 车道中心相对街道中轴线的横向偏移(米)—— 与 `game::LANE_OFFSET_X` 同值。
+///
+/// 路面半宽 7 m,双向车道各占一半,车道中心落在 ±3.5 m 处,正好压在
+/// 程序化地面画的车道虚线上。
+pub(crate) const LANE_OFFSET: f32 = 3.5;
+
 /// 车队巡航速度下限(米/秒)。
 pub const SPEED_MIN: f32 = 8.0;
 /// 车队巡航速度上限(米/秒)。
@@ -117,6 +150,112 @@ pub const CASH_STACK_AMOUNT: f32 = 250.0;
 /// 拾取物绕 Y 轴的自转角速度(弧度/秒)。
 pub const PICKUP_SPIN_RATE: f32 = 1.1;
 
+// ---- 车队路网:车怎么在街道网格上选路 -------------------------------
+//
+// 一辆车在网格上有一个**所在街道索引**(`street`)与**所在车道侧**
+// (`side` = −1 / +1,即街道中轴线两侧各一条车道),外加一个**行进轴**
+// (`axis`)。`axis = 0` 表示沿 Z 走(车位于一条南北向街道上),
+// `axis = 1` 表示沿 X 走(车位于一条东西向街道上)。
+//
+// 走法:沿当前车道开到下一个路口,然后要么直行(街道索引 +1,车道侧翻转,
+// 因为双向车道),要么转向(切到另一条街道上去,车道侧保持)。转向时按
+// [`ROUTE_PICK`] 抽签,让车流不会全城一个方向。
+
+/// 车队在路口选择「转向」而不是「直行」的概率(0..1)。
+///
+/// 0.62 让每个路口平均每 1.6 次就转一次弯,弯多到一眼看得出是路口,
+/// 又不至于整条街的车都挤进同一个街区。直行的那部分仍占 38%,于是
+/// 纵向街道上仍然有连续可见的车流。
+const ROUTE_PICK: f32 = 0.62;
+
+/// AI 车每步推进的子步长(米)—— 与 [`CAR_FOOTPRINT`] 配套。
+///
+/// 数值取自 [`CAR_STEP`]:车长 4.566 m,而世界里最薄的静态碰撞体只有
+/// 0.133 m(交通锥),一帧走 1.6 m 足以整个跳过它。子步保证任何单步
+/// 位移都短于最薄障碍 —— 那是「车不再穿楼」的最后一道保证。
+
+
+/// 「这一步其实没走成」的判定余量(米)。
+///
+/// 位移被碰撞吃掉时,判定为撞上障碍:车停下、速度归零、路网状态不推进。
+/// 余量必须小于单帧位移,否则正常行驶也会被误判成撞墙。
+const CAR_ROUTE_EPSILON: f32 = 0.001;
+
+/// 转向决策用的确定性伪随机流 —— 每辆车一份,推进步长固定。
+///
+/// 不引入 `rand` 依赖:城市其余部分(街道 / 楼 / 道具)全部用同一套
+/// `hash2` 风格的可重放哈希,车队保持一致才能让回归测试断言一个
+/// **具体**的行驶轨迹,而不是只能断言统计性质。
+///
+/// # Arguments
+///
+/// - `u32` - 上一轮的流状态。
+///
+/// # Returns
+///
+/// - `u32` - 本轮洗牌后的流状态。
+#[must_use]
+fn route_rand(seed: u32) -> u32 {
+    let mut h: u32 = seed.wrapping_mul(0x9E37_79B9);
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85EB_CA6B);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xC2B2_AE35);
+    h ^ (h >> 16)
+}
+/// 把 `u32` 流推进到 `[0, 1)` 浮点序列上。
+///
+/// # Arguments
+///
+/// - `u32` - 上一轮的流状态。
+///
+/// # Returns
+///
+/// - `f32` - 本轮 `[0, 1)` 的抽签结果。
+fn next_unit(seed: u32) -> f32 {
+    (route_rand(seed) & 0x00FF_FFFF) as f32 / (0x0100_0000 as f32)
+}
+
+/// 街道轴线的世界坐标 —— 与 `game::street_axis` 同一定义。
+///
+/// # Arguments
+///
+/// - `i32` - 街道索引(任意整数)。
+///
+/// # Returns
+///
+/// - `f32` - 该街道中轴线的世界 X 或 Z 坐标(米)。
+fn street_axis(index: i32) -> f32 {
+    STREET_PITCH * index as f32
+}
+
+/// 把一个世界坐标折回它所在街道的索引。
+///
+/// # Arguments
+///
+/// - `f32` - 世界 X 或 Z 坐标(米)。
+///
+/// # Returns
+///
+/// - `i32` - 最近的街道索引。
+fn street_index_at(along: f32) -> i32 {
+    (along / STREET_PITCH).round() as i32
+}
+
+/// 车道中心的世界坐标(街道中轴线 ± [`LANE_OFFSET`])。
+///
+/// # Arguments
+///
+/// - `i32` - 街道索引。
+/// - `f32` - 车道在街道哪一侧(`-1.0` / `+1.0`)。
+///
+/// # Returns
+///
+/// - `f32` - 车道中心坐标(米)。
+fn lane_axis(street: i32, side: f32) -> f32 {
+    street_axis(street) + side * LANE_OFFSET
+}
+
 /// 一辆参与交通仿真的车。
 #[derive(Clone, Debug)]
 pub struct TrafficCar {
@@ -128,7 +267,7 @@ pub struct TrafficCar {
     speed: f32,
     /// 巡航速度(米/秒)。
     cruise: f32,
-    /// 行车的固定 X 坐标(米)—— 车道中心,玩家驾驶时也会被强制拉回。
+    /// 行车的固定 X 坐标(米)—— 玩家驾驶时不再被强制拉回。
     lane_x: f32,
     /// 行驶方向:`1.0` = 沿 +Z,`-1.0` = 沿 -Z。
     ///
@@ -146,6 +285,18 @@ pub struct TrafficCar {
     wheel_spin: f32,
     /// 玩家是否正在驾驶这辆车。
     driven: bool,
+    /// 车当前所在街道的网格索引(`street_axis` 的参数)。
+    ///
+    /// AI 巡航的**路网坐标**:配合 [`Self::lane_side`] 与
+    /// [`Self::lane_axis_index`] 就能完全确定车在网格上的位置与朝向,
+    /// 不需要再存一条「世界坐标 + 直线方向」的退化车道。
+    route_street: i32,
+    /// 车道在街道中轴线的哪一侧(`-1.0` / `+1.0`)。
+    route_side: f32,
+    /// 行进轴:`0.0` = 沿 Z 走(南北向街道),`1.0` = 沿 X 走(东西向街道)。
+    route_axis: i32,
+    /// 转向抽签用的伪随机流状态(每辆车一份)。
+    route_seed: u32,
 }
 
 /// Inherent implementation of [`TrafficCar`].
@@ -206,11 +357,85 @@ impl TrafficCar {
 
     /// 行车的固定车道 X 坐标(米)。
     ///
+    /// AI 巡航时这个值**会随路网改变**(转向后车就换到另一条街道上,
+    /// 车道 X 自然不同),玩家驾驶时保留最后一次巡航写入的值。
+    ///
     /// # Returns
     ///
     /// - `f32` - 车道中心 X(米)。
     pub fn get_lane_x(&self) -> f32 {
         self.lane_x
+    }
+
+    /// 车道所在街道的网格索引。
+    ///
+    /// # Returns
+    ///
+    /// - `i32` - 当前街道索引(`street_axis` 的参数)。
+    pub fn get_lane_street(&self) -> i32 {
+        self.route_street
+    }
+
+    /// 车道在街道中轴线的哪一侧。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - `-1.0` 或 `+1.0`。
+    pub fn get_lane_side(&self) -> f32 {
+        self.route_side
+    }
+
+    /// 行进轴。
+    ///
+    /// # Returns
+    ///
+    /// - `i32` - `0` = 沿 Z 走(南北向街道),`1` = 沿 X 走(东西向街道)。
+    pub fn get_lane_axis(&self) -> i32 {
+        self.route_axis
+    }
+
+    /// 换到另一条平行街道,并把车道中轴线挪到新车道中心。
+    ///
+    /// 路口转弯 / 直行换街都走这里:三个路网状态必须**同时**更新,
+    /// 分开赋值会让下一帧按旧的 street/side 算出错误的目标点。
+    ///
+    /// # Arguments
+    ///
+    /// - `i32` - 新街道的网格索引。
+    /// - `f32` - 新车道在哪一侧(`-1.0` / `+1.0`)。
+    /// - `i32` - 新街道的行进轴。
+    pub fn set_lane(&mut self, street: i32, side: f32, axis: i32) {
+        self.route_street = street;
+        self.route_side = side;
+        self.route_axis = axis;
+        self.lane_x = lane_axis(street, side);
+    }
+
+    /// 推进一次伪随机流并抽出 `[0, 1)` 的结果。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 本轮抽签结果;推进后的流状态保证同一条轨迹可重放。
+    pub fn next_route_draw(&mut self) -> f32 {
+        let draw: f32 = next_unit(self.get_route_seed());
+        self.set_route_seed();
+        draw
+    }
+
+    /// 取当前流状态,并置零 —— 下一次 [`Self::set_route_seed`] 从这里续上。
+    ///
+    /// # Returns
+    ///
+    /// - `u32` - 本轮抽签使用的流状态。
+    fn get_route_seed(&mut self) -> u32 {
+        let seed: u32 = self.route_seed;
+        self.route_seed = 0;
+        seed
+    }
+
+    /// 把流状态洗牌后写回。
+    fn set_route_seed(&mut self) {
+        self.route_seed = route_rand(self.route_seed);
     }
 
     /// 玩家是否正在驾驶这辆车。
@@ -231,12 +456,41 @@ impl TrafficCar {
         self.driven = value;
     }
 
+    /// 把一组的「起始位置 + 朝向」折算成路网坐标。
+    ///
+    /// 街道索引与车道侧**不是**存下来的额外真值,而是每帧从位置重算的
+    /// 派生量(`realign_route`)。这样任何外部写位置 —— 包括游戏自己
+    /// `set_position`、下车、`resolve_dynamic_bodies` 的车车分离 ——
+    /// 都不会留下一条与实际位置矛盾的陈旧车道。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 起始 X 坐标(米)。
+    /// - `f32` - 起始 Z 坐标(米)。
+    /// - `f32` - 行驶方向(`1.0` = 沿 +Z,`-1.0` = 沿 -Z;只用于决定车道侧)。
+    ///
+    /// # Returns
+    ///
+    /// - `(i32, f32, i32, f32)` - `(街道索引, 车道侧, 行进轴, 车道中心)`,其中
+    ///   行进轴 `0` 表示沿 Z 行驶,车道中心就是 X 坐标。
+    fn route_from_xz(x: f32, z: f32, direction: f32) -> (i32, f32, i32, f32) {
+        let street: i32 = street_index_at(x);
+        // 沿 +Z 行驶靠街道**右侧**(东侧)的车道,沿 -Z 靠左侧 —— 双向
+        // 车道的惯例,也是右舵国家「靠右行驶」的那一侧。
+        let side: f32 = if direction >= 0.0 { 1.0 } else { -1.0 };
+        (street, side, 0, lane_axis(street, side))
+    }
+
     /// 在指定车道上放一辆车。
+    ///
+    /// `lane_x` / `start_z` / `direction` 是**世界坐标下的起点**,路网坐标
+    /// 由 [`Self::route_from_xz`] 从起点现算。旧版把 `lane_x` 当成一条
+    /// 永久不变的车道线,那正是「车开在街上没有的地方」的来源。
     ///
     /// # Arguments
     ///
     /// - `&'static str` - 资产 id。
-    /// - `f32` - 行车的固定 X 坐标(米)。
+    /// - `f32` - 起始车道中心的 X 坐标(米)。
     /// - `f32` - 起始 Z 坐标(米)。
     /// - `f32` - 巡航速度(米/秒)。
     /// - `f32` - 行驶方向(`1.0` 或 `-1.0`)。
@@ -251,19 +505,160 @@ impl TrafficCar {
         cruise: f32,
         direction: f32,
     ) -> Self {
-        let yaw: f32 = -direction * std::f32::consts::FRAC_PI_2;
+        let yaw: f32 = -direction * FRAC_PI_2;
+        let (street, side, axis, centre): (i32, f32, i32, f32) =
+            Self::route_from_xz(lane_x, start_z, direction);
         Self {
             asset,
-            position: [lane_x, 0.0, start_z],
+            position: [centre, 0.0, start_z],
             speed: cruise,
             cruise,
-            lane_x,
+            lane_x: centre,
             direction,
             yaw,
             lateral: 0.0,
             wheel_spin: 0.0,
             driven: false,
+            route_street: street,
+            route_side: side,
+            route_axis: axis,
+            route_seed: 0x7A11_u32 ^ street as u32 ^ (direction > 0.0) as u32 as u32,
         }
+    }
+
+    /// 按路网坐标放一辆车 —— 车队蓝图用的入口。
+    ///
+    /// 与 [`Self::new`] 的区别是它直接给**网格坐标**(街道索引 + 车道侧 +
+    /// 行进轴),不依赖「先想一个世界坐标」。位置由这三个量算出来,所以
+    /// 车队蓝图里**不可能再写出一条不在街道上的车道**。
+    ///
+    /// # Arguments
+    ///
+    /// - `&'static str` - 资产 id。
+    /// - `i32` - 所在街道索引。
+    /// - `f32` - 车道侧(`-1.0` / `+1.0`)。
+    /// - `i32` - 行进轴(`0` = 沿 Z,`1` = 沿 X)。
+    /// - `f32` - 起始沿街坐标(米);`axis = 0` 时是 Z,`axis = 1` 时是 X。
+    /// - `f32` - 巡航速度(米/秒)。
+    /// - `f32` - 行驶方向(`1.0` / `-1.0`,决定沿街坐标的增减)。
+    ///
+    /// # Returns
+    ///
+    /// - `Self` - 就绪的车辆状态。
+    pub fn new_on_lane(
+        asset: &'static str,
+        street: i32,
+        side: f32,
+        axis: i32,
+        start_along: f32,
+        cruise: f32,
+        direction: f32,
+    ) -> Self {
+        let cross: f32 = lane_axis(street, side);
+        let position: Vec3 = if axis == 0 {
+            [cross, 0.0, start_along]
+        } else {
+            [start_along, 0.0, cross]
+        };
+        // `yaw` 沿用本文件的约定 `fwd = [cos yaw, -sin yaw]`:沿 +Z 行驶
+        // 的车 yaw = -PI/2,沿 +X 行驶的车 yaw = 0。
+        let yaw: f32 = if axis == 0 {
+            -direction * FRAC_PI_2
+        } else {
+            direction * FRAC_PI_2
+        };
+        Self {
+            asset,
+            position,
+            speed: cruise,
+            cruise,
+            lane_x: cross,
+            direction,
+            yaw,
+            lateral: 0.0,
+            wheel_spin: 0.0,
+            driven: false,
+            route_street: street,
+            route_side: side,
+            route_axis: axis,
+            route_seed: 0x7A11_u32 ^ (street as u32).wrapping_mul(31) ^ side.to_bits(),
+        }
+    }
+
+    /// 把车在网格上的位置与朝向重新对齐到它**实际所在**的坐标。
+    ///
+    /// 每一步巡航之前都调一次。它是必需的而不是洁癖:外部(下车、
+    /// `resolve_dynamic_bodies` 的车车分离)会改 `set_position`,于是缓存的
+    /// `route_street` 就与真实位置差了半条街 —— 不重算的话车会朝一个
+    /// 方向开但**按另一个坐标积分**,几帧之内就开到马路对面去了。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 行驶方向(`1.0` / `-1.0`)。
+    fn realign_route(&mut self, direction: f32) {
+        let here: Vec3 = self.get_position();
+        // 沿哪根轴跑,取决于「横向」坐标离街道中轴线有多近:车在自己的
+        // 车道中心上,所以横向距离约等于 LANE_OFFSET,纵向则可以任意。
+        let to_x_street: f32 = (here[0] - street_axis(street_index_at(here[0]))).abs();
+        let to_z_street: f32 = (here[2] - street_axis(street_index_at(here[2]))).abs();
+        // 偏离自己的车道超过一个车宽(≈1.85 m)就认为被外力推歪了,
+        // 这时按**横向**重新落位;否则保持既有的行进轴。
+        let skewed: bool = if self.get_lane_axis() == 0 {
+            to_x_street - LANE_OFFSET
+        } else {
+            to_z_street - LANE_OFFSET
+        }
+        .abs()
+            > CAR_FOOTPRINT[1];
+        let axis: i32 = if skewed {
+            if to_x_street < to_z_street {
+                0
+            } else {
+                1
+            }
+        } else {
+            self.get_lane_axis()
+        };
+        let cross_here: f32 = if axis == 0 { here[0] } else { here[2] };
+        let street: i32 = street_index_at(cross_here);
+        // 车道侧:车在中轴线哪一侧就是哪一侧,`+0.0` / `-0.0` 一律算右侧。
+        let side: f32 = if cross_here >= street_axis(street) {
+            1.0
+        } else {
+            -1.0
+        };
+        self.set_lane(street, side, axis);
+        self.set_direction(direction);
+        self.set_yaw(Self::lane_yaw(axis, direction));
+    }
+
+    /// 由「行进轴 + 行驶方向」推出车身朝向。
+    ///
+    /// # Arguments
+    ///
+    /// - `i32` - 行进轴(`0` = 沿 Z,`1` = 沿 X)。
+    /// - `f32` - 行驶方向(`1.0` / `-1.0`)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 绕 Y 轴的车身朝向(弧度)。
+    fn lane_yaw(axis: i32, direction: f32) -> f32 {
+        // 本文件的 yaw 约定是 `fwd = [cos yaw, -sin yaw]`(见
+        // [`Self::get_yaw`]),所以沿 +Z 的车 yaw = -PI/2、沿 +X 的车 yaw = 0。
+        if axis == 0 {
+            -direction * FRAC_PI_2
+        } else {
+            direction * FRAC_PI_2
+        }
+    }
+
+    /// 写入行驶方向。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - `1.0` = 沿 +Z / +X,`-1.0` = 沿 -Z / -X。
+    pub fn set_direction(&mut self, value: f32) {
+        self.direction = if value >= 0.0 { 1.0 } else { -1.0 };
     }
 
     /// 车辆的朝向(绕 Y 轴弧度)。
@@ -335,16 +730,25 @@ impl TrafficCar {
         self.yaw = value;
     }
 
-    /// 车队模式下推进一个固定步长:沿车道前进 + 到端点 wrap。
+    /// 车队模式下推进一个固定步长:沿**路网**前进,在路口决定转向。
     ///
-    /// 速度被平滑逼近巡航速度,玩家驾驶模式由 [`Self::drive`] 接管,
-    /// 这里只做 wrap。
+    /// 这一步做三件事,顺序不能换:
+    ///
+    /// 1. 先按 [`Self::realign_route`] 把路网坐标对齐到真实位置 ——
+    ///    外部(下车、车车分离)随时可能挪动过车。
+    /// 2. 沿当前车道走,位置用
+    ///    `CollisionWorld::resolve_car_footprint` 解一次碰撞:被挡住就
+    ///    **停在障碍前面**,而不是像旧版那样只改 Z 坐标硬穿过去。
+    ///    这正是用户报的「NPC 开的汽车会穿越建筑」—— 旧版 `step` 里
+    ///    根本没有任何碰撞调用,车是被**直接赋值**放到新坐标的。
+    /// 3. 越过路口时抽签:转向就换到横向街道的对应车道继续开。
     ///
     /// # Arguments
     ///
     /// - `f32` - 固定步长(秒)。
     /// - `bool` - `true` 表示路边有玩家招手,这辆车减速停靠等客。
-    pub fn step(&mut self, dt: f32, hailer: bool) {
+    /// - `&CollisionWorld` - 静态碰撞世界,用来把车挡在障碍之外。
+    pub fn step(&mut self, dt: f32, hailer: bool, world: &CollisionWorld) {
         // 有行人在路边招手 → 当临时出租车站:松油门,直到停下等人。
         let target: f32 = if hailer { 0.0 } else { self.get_cruise() };
         let approach: f32 = if hailer {
@@ -355,21 +759,123 @@ impl TrafficCar {
         let cruise: f32 = target;
         let speed: f32 = self.get_speed();
         self.set_speed(speed + (cruise - speed) * approach);
-        let step_z: f32 = self.get_position()[2] + self.get_direction() * self.get_speed() * dt;
-        // wrap:出了 [−LOOP_HALF_LENGTH, +LOOP_HALF_LENGTH] 就折回另一头,
-        // 车道是一条闭合的环形轨道,车永远看不到尽头。停着的车不 wrap ——
-        // 停在原地等人,不然「招手停车」会把人甩到另一条街去。
-        let wrapped: f32 = if self.get_speed() < 0.05 {
-            step_z
-        } else if step_z > LOOP_HALF_LENGTH {
-            step_z - 2.0 * LOOP_HALF_LENGTH
-        } else if step_z < -LOOP_HALF_LENGTH {
-            step_z + 2.0 * LOOP_HALF_LENGTH
-        } else {
-            step_z
-        };
+        self.route_advance(dt, world);
+    }
+
+    /// 路网积分的一步:沿当前车道走,到路口按 [`ROUTE_PICK`] 抽签转向。
+    ///
+    /// 这是「车怎么走路网」的全部逻辑,[`Self::step`] 只是它外面套了一层
+    /// 速度逼近。拆出来是因为测试要在**不带招手逻辑**的前提下断言一辆
+    /// 车真的在路口转了 90°,而带套的那条路径会被 `HAUL_BRAKE` 干扰。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 固定步长(秒)。
+    /// - `&CollisionWorld` - 静态碰撞世界。
+    pub fn route_advance(&mut self, dt: f32, world: &CollisionWorld) {
+        let direction: f32 = self.get_direction();
+        self.realign_route(direction);
+        let axis: i32 = self.get_lane_axis();
+        let speed: f32 = self.get_speed();
+        let centre: f32 = lane_axis(self.get_lane_street(), self.get_lane_side());
         let here: Vec3 = self.get_position();
-        self.set_position([here[0], here[1], wrapped]);
+        // 沿街分量的步长(米)。停着的车不位移。
+        let travel: f32 = direction * speed * dt;
+        let delta: Vec2 = if axis == 0 {
+            [0.0, travel]
+        } else {
+            [travel, 0.0]
+        };
+        // 位置用**真实车身足迹**解碰撞:车宽 4.566 × 1.851 m 的有向盒,
+        // 位移按 `CAR_STEP` 切子步。被挡下时位移被吃掉,车就停在障碍
+        // 前面 —— 这条是「不再穿楼」的最后一道保证,即使路网或蓝图出错,
+        // 车也只会卡住而不会开进去。
+        let resolved: Vec2 =
+            world.resolve_car_footprint([here[0], here[2]], delta, self.get_yaw());
+        self.set_position([resolved[0], here[1], resolved[1]]);
+        if self.get_speed() > 0.0 {
+            let moved: f32 = (resolved[0] - here[0]).abs() + (resolved[1] - here[2]).abs();
+            let wanted: f32 = travel.abs();
+            if moved + CAR_ROUTE_EPSILON < wanted {
+                // 被完全挡住(或者一步都没走成):不推进路网状态,停在
+                // 障碍前。速度砍到零让它重新加速而不是顶着墙磨。
+                self.set_speed(0.0);
+                return;
+            }
+        }
+        // 沿街方向:路口判定只看自己这一根轴,横向坐标恒为车道中心。
+        let along: f32 = if axis == 0 { resolved[1] } else { resolved[0] };
+        self.set_position([
+            if axis == 0 { centre } else { resolved[0] },
+            here[1],
+            if axis == 0 { resolved[1] } else { centre },
+        ]);
+        // 走过路口了吗?取「前进方向上的下一个路口」。
+        let junction: f32 = if direction >= 0.0 {
+            street_axis(street_index_at(along) + 1)
+        } else {
+            street_axis(street_index_at(along) - 1)
+        };
+        let crossed: bool = if direction >= 0.0 {
+            along >= junction - CAR_ROUTE_EPSILON
+        } else {
+            along <= junction + CAR_ROUTE_EPSILON
+        };
+        if crossed && self.get_speed() > 0.0 {
+            self.choose_at_junction();
+        }
+    }
+
+    /// 在路口抽签:直行还是转向。
+    ///
+    /// 直行 = 落到下一条平行街道的**对侧车道**(双向车道,继续往前开就得
+    /// 换到马路对面去,否则会逆行)。转向 = 换到横向街道上去,车道侧不变
+    /// —— 右侧通行下右转进对侧车道、左转进同侧车道,两条合起来就是转 90°。
+    fn choose_at_junction(&mut self) {
+        let turn: bool = self.next_route_draw() < ROUTE_PICK;
+        let direction: f32 = self.get_direction();
+        let here: Vec3 = self.get_position();
+        let along: f32 = if self.get_lane_axis() == 0 {
+            here[2]
+        } else {
+            here[0]
+        };
+        // 转向:新的「沿街」坐标由**交叉轴**当前所在街道决定 —— 车开到
+        // 路口中心时,横向坐标仍在自己这条街上,所以新街道索引取横向的。
+        let cross_street: i32 = street_index_at(if self.get_lane_axis() == 0 {
+            here[0]
+        } else {
+            here[2]
+        });
+        if turn {
+            let next_axis: i32 = 1 - self.get_lane_axis();
+            self.set_lane(cross_street, self.get_lane_side(), next_axis);
+            self.set_direction(direction);
+            self.set_yaw(Self::lane_yaw(next_axis, direction));
+            // 转向后沿街坐标就是原来那条街的中轴线 —— 这正是路口中心。
+            let junction_centre: f32 = street_axis(cross_street);
+            let new_lane_x: f32 = self.get_lane_x();
+            self.set_position(if next_axis == 0 {
+                [new_lane_x, here[1], junction_centre]
+            } else {
+                [junction_centre, here[1], new_lane_x]
+            });
+        } else {
+            // 直行:跨到下一条平行街道,并翻到对侧车道。
+            let next_street: i32 = if direction >= 0.0 {
+                street_index_at(along) + 1
+            } else {
+                street_index_at(along) - 1
+            };
+            let next_side: f32 = -self.get_lane_side();
+            self.set_lane(next_street, next_side, self.get_lane_axis());
+            let centre: f32 = self.get_lane_x();
+            self.set_position(if self.get_lane_axis() == 0 {
+                [centre, here[1], along]
+            } else {
+                [along, here[1], centre]
+            });
+        }
     }
 
     /// 玩家驾驶输入:油门 / 转向 / 刹车,并把车挡在碰撞世界之外。
@@ -601,7 +1107,7 @@ impl Pickup {
     ///
     /// - `f32` - 固定步长(秒)。
     pub fn set_spin_advance(&mut self, dt: f32) {
-        let two_pi: f32 = 2.0 * std::f32::consts::PI;
+        let two_pi: f32 = 2.0 * PI;
         self.spin = (self.get_spin() + PICKUP_SPIN_RATE * dt) % two_pi;
     }
 }
@@ -725,7 +1231,8 @@ impl Traffic {
     ///
     /// - `f32` - 固定步长(秒)。
     /// - `Option<[f32; 2]>` - 正在路边招手的玩家 `[x, z]`;`None` 表示没人。
-    pub fn step(&mut self, dt: f32, hailer: Option<[f32; 2]>) {
+    /// - `&CollisionWorld` - 静态碰撞世界,用来把车挡在障碍之外。
+    pub fn step(&mut self, dt: f32, hailer: Option<[f32; 2]>, world: &CollisionWorld) {
         // 只有**离玩家最近的那一辆**会靠边等人,不是半径内所有车 ——
         // 否则 26 m 内整条街的车一起停,交通直接堵死。
         let hailer_car: Option<usize> = hailer.and_then(|who: [f32; 2]| {
@@ -753,7 +1260,7 @@ impl Traffic {
                 if car.get_driven() {
                     continue;
                 }
-                car.step(dt, Some(index) == hailer_car);
+                car.step(dt, Some(index) == hailer_car, world);
             }
         }
         for index in 0..self.get_pickups_ref().len() {
@@ -822,6 +1329,7 @@ mod tests {
         DRIFT_SLIP_RATIO, LATERAL_GRIP, REVERSE_SPEED_MAX, STEER_MIN_SPEED, STEER_RATE, TrafficCar,
         WHEEL_RADIUS,
     };
+    use super::{FRAC_PI_2, PI};
     use crate::r#type::Vec3;
 
     fn empty_world() -> crate::collision::CollisionWorld {
@@ -942,9 +1450,10 @@ mod tests {
     /// AI 巡航不受影响:不打舵的 AI 车仍然走直线、方向常量。
     #[test]
     fn ai_cruise_still_holds_its_lane() {
+        let world: crate::collision::CollisionWorld = empty_world();
         let mut c: TrafficCar = car();
         for _ in 0..120 {
-            c.step(1.0 / 60.0, false);
+            c.step(1.0 / 60.0, false, &world);
         }
         let pos: Vec3 = c.get_position();
         assert!(
@@ -954,7 +1463,7 @@ mod tests {
             c.get_lane_x()
         );
         assert!(
-            (c.get_yaw() - c.get_direction() * -std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            (c.get_yaw() - c.get_direction() * -FRAC_PI_2).abs() < 1e-5,
             "AI 巡航的朝向必须仍由行驶方向推出"
         );
     }

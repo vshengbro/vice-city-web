@@ -65,7 +65,7 @@ pub const CAR_FOOTPRINT: Vec2 = [2.283, 0.926];
 /// 任何一堵薄墙,`push_out_aabb` 那一帧根本看不到重叠,于是既不挡也不推,
 /// 车就过去了。取 0.05 m(与 [`SLIDE_STEP`] 同一档)后单步只有墙厚的
 /// 38%,再也跨不过去。
-const CAR_STEP: f32 = 0.05;
+pub(crate) const CAR_STEP: f32 = 0.05;
 
 /// 相机当作球体扫描时的半径(米)。
 ///

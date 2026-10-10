@@ -466,8 +466,7 @@ pub(crate) const T_SOLID_BOUNDS_DELETED_A_REAL_WALL: &str =
 
 /// 回归测试:实心足迹必须落在资产自己声明的包围盒之内。
 #[cfg(test)]
-pub(crate) const T_SOLID_BOUNDS_GREW_PAST_ASSET_BOUNDS: &str =
-    "实心足迹超出了资产自己声明的包围盒";
+pub(crate) const T_SOLID_BOUNDS_GREW_PAST_ASSET_BOUNDS: &str = "实心足迹超出了资产自己声明的包围盒";
 
 /// 回归测试:人行道上不得存在看不见的空气墙。
 #[cfg(test)]
@@ -479,7 +478,8 @@ pub(crate) const T_AIR_WALL_PROBE_FOUND_NO_SPOTS: &str = "空气墙探针一个�
 
 /// 单元测试夹具:路灯资产本体(真实 JSON,避免测试和资产脱节)。
 #[cfg(test)]
-pub(crate) const FIXTURE_PROP_STREETLIGHT_JSON: &str = include_str!("../assets/prop_streetlight.json");
+pub(crate) const FIXTURE_PROP_STREETLIGHT_JSON: &str =
+    include_str!("../assets/prop_streetlight.json");
 
 /// 单元测试夹具:交通信号灯资产本体。
 #[cfg(test)]
@@ -559,8 +559,7 @@ pub(crate) const KEY_STRAIGHT: &str = "straight";
 /// 上限约束并不等于合速度受约束:两轴分别顶到 `speed` 时合速度是
 /// `speed * sqrt(2)`(实测步行 6.5052 = 4.6√2,冲刺 11.8787 = 8.4√2)。
 /// 区间容差而非浮点等值。
-pub(crate) const T_DIAGONAL_MATCHES_STRAIGHT: &str =
-    "斜向移动不得比直线快:{mode} 实得 |{diagonal}| = {got:.4},|{straight}| = {want:.4}(比值 {ratio:.4})";
+pub(crate) const T_DIAGONAL_MATCHES_STRAIGHT: &str = "斜向移动不得比直线快:{mode} 实得 |{diagonal}| = {got:.4},|{straight}| = {want:.4}(比值 {ratio:.4})";
 #[cfg(test)]
 
 /// 回归测试:直线档位必须仍然是满速。
@@ -655,7 +654,8 @@ pub(crate) const STYLE_MAP_TITLE: &str =
     "font-size:20px;letter-spacing:2px;color:#7dfcff;text-shadow:0 0 12px rgba(125,252,255,.45)";
 
 /// 地图面板底部的坐标 / 提示行。
-pub(crate) const STYLE_MAP_HINT: &str = "margin-top:auto;font-size:13px;color:#9fb4d8;letter-spacing:1px";
+pub(crate) const STYLE_MAP_HINT: &str =
+    "margin-top:auto;font-size:13px;color:#9fb4d8;letter-spacing:1px";
 
 /// 地图面板打开时游戏画面上的遮罩(压暗,让地图读得清)。
 pub(crate) const STYLE_MAP_DIM: &str =
@@ -1956,7 +1956,8 @@ pub(crate) const T_JUMP_CLEARS_A_LEDGE: &str =
     "跳跃顶高 {peak:.3} m 必须 >= {want:.2} m(1.0-1.2 m 量级的台阶 / 矮墙),实跳初速 {v0} m/s";
 
 /// 回归测试:跳跃必须先升后落,不能一按就往下掉。
-pub(crate) const T_JUMP_RISES_BEFORE_FALLING: &str = "跳跃必须先升后落,顶点 {peak:.3} m,滞空 {air:.3} s";
+pub(crate) const T_JUMP_RISES_BEFORE_FALLING: &str =
+    "跳跃必须先升后落,顶点 {peak:.3} m,滞空 {air:.3} s";
 
 /// 回归测试:落地后必须回到「站稳」状态。
 pub(crate) const T_JUMP_LANDS_STANDING: &str =
@@ -2040,7 +2041,8 @@ pub(crate) const T_SHOWCASE_STAIR_RISE_SHALLOW: &str = "单级踏高必须小于
 pub(crate) const T_SHOWCASE_WALKER_REACHES_TOP: &str = "模拟沿楼梯行走必须抵达二层楼板面";
 
 /// 单元测试断言文案:两栋样板楼的门必须相向而开。
-pub(crate) const T_SHOWCASE_DOORS_FACE_EACH_OTHER: &str = "两栋样板楼的门洞必须相向,便于从中间走进去";
+pub(crate) const T_SHOWCASE_DOORS_FACE_EACH_OTHER: &str =
+    "两栋样板楼的门洞必须相向,便于从中间走进去";
 
 /// 单元测试断言文案:样板楼占地必须避开车行道与相邻的普通楼。
 pub(crate) const T_SHOWCASE_FOOTPRINT_CLEAR: &str = "样板楼占地不能和普通楼重叠";
@@ -2065,7 +2067,8 @@ pub(crate) const T_SHOWCASE_DOOR_NO_SLAB: &str = "门洞里没有首层楼板,su
 pub(crate) const T_SHOWCASE_DOOR_CENTER_BLOCKED: &str = "门洞中心被挡住了 after={after:?}";
 
 /// 单元测试断言文案:门垛必须挡住玩家。
-pub(crate) const T_SHOWCASE_PIER_LET_PLAYER_THROUGH: &str = "门垛没有挡住玩家 at={at:?} pushed={pushed:?}";
+pub(crate) const T_SHOWCASE_PIER_LET_PLAYER_THROUGH: &str =
+    "门垛没有挡住玩家 at={at:?} pushed={pushed:?}";
 
 /// 单元测试断言文案:两栋样板楼不得互相重叠。
 pub(crate) const T_SHOWCASE_TWO_OVERLAP: &str = "两栋楼重合了";
@@ -2091,20 +2094,19 @@ pub(crate) const T_SHOWCASE_TOLERANCE_TOO_BIG: &str = "容差 {STEP_UP_TOLERANCE
 pub(crate) const T_SHOWCASE_TOLERANCE_TWO_RISES: &str = "容差必须小于两级踏高 {}";
 
 /// 单元测试断言文案:模拟行走必须爬到二层。
-pub(crate) const T_SHOWCASE_WALKER_DIRECTION: &str = "走了 {frames} 帧,楼梯方向 (normal {:?}) 下的 y={y}";
+pub(crate) const T_SHOWCASE_WALKER_DIRECTION: &str =
+    "走了 {frames} 帧,楼梯方向 (normal {:?}) 下的 y={y}";
 
 /// 单元测试断言文案:二层楼板不得盖住梯段。landing 顶面恒为二层楼板面,
 /// 一旦盖住梯段,`support_height` 每帧都中选它,人就钉死在二层高度。
-pub(crate) const T_SHOWCASE_LANDING_COVERS_RUN: &str =
-    "二层楼板第 2 片盖住了梯段(楼 {index} 梯段本地 z[{run_lo:.3},{run_hi:.3}] vs 楼板 z[{slab_lo:.3},{slab_hi:.3}]),脚下踩到 {support:.3} 而非 {tread:.3}";
+pub(crate) const T_SHOWCASE_LANDING_COVERS_RUN: &str = "二层楼板第 2 片盖住了梯段(楼 {index} 梯段本地 z[{run_lo:.3},{run_hi:.3}] vs 楼板 z[{slab_lo:.3},{slab_hi:.3}]),脚下踩到 {support:.3} 而非 {tread:.3}";
 
 /// 单元测试断言文案:从二层 landing 下楼必须逐级降到首层。
 pub(crate) const T_SHOWCASE_DESCENT_REACHES_GROUND: &str =
     "从二层 landing 下楼必须逐级降到首层(楼 {index}),实得 y 序列 {seq:?}";
 
 /// 单元测试断言文案:下楼过程中不得出现抬升(那是往回上楼)。
-pub(crate) const T_SHOWCASE_DESCENT_NO_CLIMB: &str =
-    "下楼过程中不得出现抬升(楼 {index} 在第 {frame} 帧从 {from:.3} 升到 {to:.3}),实得 y 序列 {seq:?}";
+pub(crate) const T_SHOWCASE_DESCENT_NO_CLIMB: &str = "下楼过程中不得出现抬升(楼 {index} 在第 {frame} 帧从 {from:.3} 升到 {to:.3}),实得 y 序列 {seq:?}";
 
 /// 单元测试断言文案:头顶的楼板不得把玩家推开。
 pub(crate) const T_SHOWCASE_CEILING_PUSHED: &str = "楼 {index} 的头顶楼板把玩家推开了";
@@ -2121,7 +2123,8 @@ pub(crate) const T_SHOWCASE_PARTITION_LANE: &str =
 pub(crate) const T_SHOWCASE_LANE_BLOCKED: &str = "的过道被堵住了 lane={lane:?} through={through:?}";
 
 /// 单元测试断言文案:占地不得压上车行道。
-pub(crate) const T_SHOWCASE_AXIS_ON_ROAD: &str = "的轴 {axis} 压到了车行道:x={} 街={line} 半径={reach}";
+pub(crate) const T_SHOWCASE_AXIS_ON_ROAD: &str =
+    "的轴 {axis} 压到了车行道:x={} 街={line} 半径={reach}";
 
 /// 单元测试断言文案:棕榈不得种在车行道上。
 ///
@@ -2144,8 +2147,31 @@ pub(crate) const T_PALM_ROW_IS_UNIFORM: &str =
 /// 静态段长度 = 新生成中心周围真正用到的不同 mesh 数,实测会变(12 与 11
 /// 都出现过)。谁要是顺着「截断到旧的 `static_batch_count` 就行」把动态段
 /// 一起截掉,这条断言会先响:先说清楚长度本来就不是常量。
-pub(crate) const T_STATIC_LEN_ASSUMED_CONSTANT: &str =
-    "四个生成中心的静态段长度居然一样:{lengths} —— 「静态段长度恒定」的前提不成立,重建必须把动态段搬回去再把新长度写回";
+pub(crate) const T_STATIC_LEN_ASSUMED_CONSTANT: &str = "四个生成中心的静态段长度居然一样:{lengths} —— 「静态段长度恒定」的前提不成立,重建必须把动态段搬回去再把新长度写回";
+
+/// 单元测试断言文案:流式重建让玩家眼前的摆件凭空消失。
+///
+/// 这是用户报的「走着走着环境突然变了,像是穿越了」。重建前站在那儿的东西,
+/// 重建之后不在那儿了 —— 玩家眼前凭空少了一片。
+#[cfg(test)]
+pub(crate) const T_STREAM_CONTENT_MUST_NOT_VANISH: &str = "生成中心平移 ({step}) 后,{kind} 少了 {vanished}/{total} 个 —— 流式重建不许改掉玩家已经看见的世界";
+
+/// 单元测试断言文案:流式重建让同一坐标的摆件换了个模型。
+///
+/// 位置没变、资产变了 —— 楼在原地变身,视觉上就是「环境突然变了」。
+#[cfg(test)]
+pub(crate) const T_STREAM_CONTENT_MUST_NOT_SWAP: &str = "生成中心平移 ({step}) 后,{kind} 有 {swapped}/{total} 个在同一坐标换了资产 —— 种子必须由世界坐标定,不能由枚举顺序定";
+
+/// 单元测试断言文案:沿街站位没有钉在世界格点上。
+///
+/// 窗口整体平移一个街距之后,同一个站位号必须仍然指向同一个世界坐标。
+#[cfg(test)]
+pub(crate) const T_STREET_SLOT_WORLD_ANCHORED: &str = "间距 {step} 的站位 {slot} 平移前在 {at} m,平移后在 {again} m —— 站位必须按世界格点枚举,不能从区间端点起步";
+
+/// 单元测试断言文案:沿街站位坐标不是格点的整数倍。
+#[cfg(test)]
+pub(crate) const T_STREET_SLOT_ON_GRID: &str =
+    "间距 {step} 的站位 {slot} 落在 {at} m,不是 step * k 的整数倍";
 
 #[cfg(test)]
 /// 单元测试断言文案:一帧的位移必须被**扫掠**,不能只看帧末落点。
@@ -2347,7 +2373,8 @@ pub(crate) const T_WHEEL_ROLLS_FORWARD: &str =
     "车轮滚动方向反了:spin={spin} 时轮底沿车体后退了 {bottom:+.4} m,应当为负(车往 +X 前进)";
 
 /// 自转 90 度必须带动轮缘基向量(X / Y 之一)改变方向。
-pub(crate) const T_WHEEL_SPIN_MOVES_RIM: &str = "自转 90 度必须改变轮缘基向量:rest={axis} turned={turned}";
+pub(crate) const T_WHEEL_SPIN_MOVES_RIM: &str =
+    "自转 90 度必须改变轮缘基向量:rest={axis} turned={turned}";
 
 /// 绕轮轴(Z)自转时,轮轴基向量本身不得改变。
 pub(crate) const T_WHEEL_AXLE_STILL: &str = "绕 Z 自转不得转动 Z 轴本身,变化量 {delta}";
@@ -2375,7 +2402,8 @@ pub(crate) const T_INTERIOR_NORMAL_FRAME_UNCHANGED: &str =
     "正常帧率({dt:.4} s, 每帧 {stride:.3} m)下楼梯必须逐级抬升到二层楼板面,实得 {height}";
 
 /// 正常帧率下走下楼梯必须逐级下降,不得悬空或自由落体。
-pub(crate) const T_INTERIOR_NORMAL_FRAME_DESCENT: &str = "正常帧率下下楼必须逐级降到首层,实得 {height}";
+pub(crate) const T_INTERIOR_NORMAL_FRAME_DESCENT: &str =
+    "正常帧率下下楼必须逐级降到首层,实得 {height}";
 
 /// 修复前(单点采样)在同一 dt 下必须真的爬不上去 —— 否则这条回归测试
 /// 证明不了任何东西:它若在旧实现上也通过,就说明测的不是那个缺陷。
@@ -2502,16 +2530,14 @@ pub(crate) const KEY_BATCH: &str = "batch";
 ///
 /// 注意别把 `* 2.0` 一起删掉:落脚每 `pi` 相位一次,重心每步起伏一次,
 /// 所以起伏确实是两倍频;要改的只是相位(用 `cos` 而不是 `sin`)。
-pub(crate) const T_PED_BOB_OUT_OF_PHASE: &str =
-    "行人起伏与落脚错开:{deg:.1}° 处 bob = {bob:.5} m,但脚正落在这个相位上,身体应该到顶(cos(2·phi) = {cos:.5})";
+pub(crate) const T_PED_BOB_OUT_OF_PHASE: &str = "行人起伏与落脚错开:{deg:.1}° 处 bob = {bob:.5} m,但脚正落在这个相位上,身体应该到顶(cos(2·phi) = {cos:.5})";
 
 /// 单元测试断言文案:行人起伏的波峰个数不对。
 ///
 /// 起伏必须是**每步一次一个高峰**,所以一个完整步周期里恰好 2 个
 /// (左右脚各一次)。`cos(phi)` 只有 1 个,`sin(2·phi)` 虽有 2 个但位置
 /// 错开四分之一个周期 —— 两条都要挡住。
-pub(crate) const T_PED_BOB_DOUBLE_FREQUENCY: &str =
-    "行人起伏一个步周期里出现了 {peaks} 个波峰(应当恰好 2 个,左右脚各一次)—— 起伏必须与落脚同相、每步一次";
+pub(crate) const T_PED_BOB_DOUBLE_FREQUENCY: &str = "行人起伏一个步周期里出现了 {peaks} 个波峰(应当恰好 2 个,左右脚各一次)—— 起伏必须与落脚同相、每步一次";
 
 pub(crate) const WEBGPU: &str = "WebGPU";
 
