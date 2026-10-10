@@ -41,7 +41,7 @@ pub use euv::{js_sys, wasm_bindgen, wasm_bindgen_futures, web_sys};
 
 /// §6.1 同理:`std` 的常用常量在 crate 根**重新导出**一次,子模块就能
 /// `use super::*` 直接拿到 `FRAC_PI_2` / `PI`,不必在每个文件里写全路径。
-pub use std::f32::consts::{FRAC_PI_2, PI};
+pub use std::{f32::consts::{FRAC_PI_2, PI}, fs};
 
 /// 挂载静态视图树并启动游戏循环。
 ///

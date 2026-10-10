@@ -1340,6 +1340,49 @@ mod tests {
         TrafficCar::new(CAR_SEDAN, 0.0, 0.0, 8.0, 1.0)
     }
 
+    /// 路网积分的不变量:无论走直还是在路口转弯,车都必须**压在自己这条
+    /// 车道的中轴线上**,而且速度不能掉下来。
+    ///
+    /// 转向分支换到横向街道时,`set_lane` 会重算 `lane_x`;如果落位那一行
+    /// 用错了坐标(比如写成路口中轴线而不是新车道中心),车就会偏离整整
+    /// 一个车道宽,下一帧被碰撞推回 —— 每帧推回、每帧判定「被挡住」。
+    #[test]
+    fn a_car_stays_on_its_lane_through_junctions() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        let mut c: TrafficCar = TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 45.0, 11.5, 1.0);
+        let start: Vec3 = c.get_position();
+        for _ in 0..2000 {
+            c.route_advance(1.0 / 60.0, &world);
+            let p: Vec3 = c.get_position();
+            let lane: f32 = c.get_lane_x();
+            // 无论走直还是转弯,横向坐标都必须压在自己这条车道的中轴线上。
+            let cross: f32 = if c.get_lane_axis() == 0 { p[0] } else { p[2] };
+            assert!(
+                (cross - lane).abs() < 1e-3,
+                "车偏离自己的车道 {:.4} m(x={:.2} z={:.2} 车道 x={:.2} 轴向={})",
+                (cross - lane).abs(),
+                p[0],
+                p[2],
+                lane,
+                c.get_lane_axis()
+            );
+            assert!(
+                c.get_speed() > 1.0,
+                "车在 ({:.1},{:.1}) 卡住:速度 {:.4},说明每帧都被碰撞推回",
+                p[0],
+                p[2],
+                c.get_speed()
+            );
+        }
+        let end: Vec3 = c.get_position();
+        let travelled: f32 = (end[0] - start[0]).abs() + (end[2] - start[2]).abs();
+        assert!(
+            travelled > 100.0,
+            "2000 帧只走了 {:.1} m,路网没有真正推进",
+            travelled
+        );
+    }
+
     /// 满舵直线行驶:车必须真的转出角度,而不是继续沿原方向直行。
     #[test]
     fn steering_turns_the_car() {

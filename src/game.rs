@@ -3686,6 +3686,19 @@ fn build_collision_world(
     // 街区围合的**内圈**(`BLOCK_INNER` 半径),离最近车道 19.5 m,
     // 而车道是循环跑固定线路的,所以这条车道永远不会有车。
     for prop in build_city_props(cx, cz) {
+        // 车道缓冲带内的道具**不推进碰撞世界**。
+        //
+        // 街道家具是按人行道布置的,生成时并不参考交通车道:路口的
+        // 交通锥就摆在 (63.0, 0),而 63.5 正是街道 1 的车道中心线 ——
+        // 锥桶落在车身宽度里,车被它挡死。实测浏览器里有 4 辆车永久
+        // 停在 z≈-2.4 / -6.7(正好在 z=0 路口两侧),`speed` 却读出 11.5:
+        // 每帧位移都被碰撞吃掉,速度永远回不到巡航值。
+        //
+        // 棕榈树已经用同一条 `on_lane` 规则排除(见下面的循环);这里让
+        // 小道具也服从同一条规则,车道才是真的能开过去的。
+        if on_lane(prop.position[0]) {
+            continue;
+        }
         push_box(
             world,
             bounds_map,
@@ -11408,6 +11421,53 @@ mod tests {
             faces: Vec::new(),
             triangle_count: 0,
         }
+    }
+
+    #[test]
+    fn traffic_drives_through_a_junction_in_the_real_city() {
+        // 回归:用**真实城市道具**当碰撞世界,让一辆车从街道 1 的南向车道
+        // 一路开到路口再往前。实测浏览器里有 4 辆车永久停在 z≈-2.4 / -6.7
+        // (正好在 z=0 路口两侧),speed 却读出 11.5 —— 每帧位移都被碰撞吃掉。
+        // 这条测试把「车队能一直开下去」钉死。
+        // 必须走**生产路径** `build_collision_world`:手工拼 `push_box`
+        // 会绕过 `solid_bounds` 的高度带和 `on_lane` 的车道排除,测出来
+        // 的是测试自己造的空气墙,不是线上缺陷。
+        let raw: String = crate::fs::read_to_string("assets/prop_trafficlight.json")
+            .expect("交通灯资产必须在磁盘上");
+        let asset: MeshAsset = serde_json::from_str(&raw).expect("交通灯资产必须能解析");
+        let mut bounds: HashMap<String, crate::mesh::Bounds> = HashMap::new();
+        collider_bounds(&mut bounds, "prop_trafficlight", &asset);
+        collider_bounds(&mut bounds, "prop_traffic_cone", &asset);
+        let mut world: CollisionWorld = CollisionWorld::new();
+        build_collision_world(&mut world, &bounds, 0.0, 0.0);
+        let mut c: crate::traffic::TrafficCar =
+            crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 60.0, 11.5, -1.0);
+        let start: Vec3 = c.get_position();
+        let mut stuck_for: usize = 0;
+        for _ in 0..3000 {
+            c.step(1.0 / 60.0, false, &world);
+            let p: Vec3 = c.get_position();
+            if c.get_speed() < 1.0 {
+                stuck_for += 1;
+                assert!(
+                    stuck_for < 120,
+                    "车在 ({:.2}, {:.2}) 连续 {} 帧动不了(速度 {:.3})",
+                    p[0],
+                    p[2],
+                    stuck_for,
+                    c.get_speed()
+                );
+            } else {
+                stuck_for = 0;
+            }
+        }
+        let end: Vec3 = c.get_position();
+        let travelled: f32 = (end[0] - start[0]).abs() + (end[2] - start[2]).abs();
+        assert!(
+            travelled > 300.0,
+            "3000 帧(50 秒)只走了 {:.1} m,车队实际是停着的",
+            travelled
+        );
     }
 
     #[test]
