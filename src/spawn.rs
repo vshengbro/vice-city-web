@@ -208,11 +208,15 @@ pub fn mission_blueprints() -> Vec<(&'static str, u32, Vec3)> {
     out
 }
 
-/// 任务目标点所在的街道轴线(米):取自 `STREET_LINES` 的 ±30 / ±90,
+/// 任务目标点所在的街道轴线(米):取**街道网格的一格**,也就是
+/// [`STREET_PITCH`]。原先写死 ±30 —— 那是 30 m 街道间距时代的坐标,
+/// 而世界早就是 60 m 一格,于是三个目标全落在两个街区之间的空地里
+/// (实测离最近的街道轴线 21.8 m),既不是马路也不是人行道。
+///
 /// 目标落在街边的人行道上 —— 走路能到、开车也能到。
-const MISSION_ROAD_X: f32 = 30.0;
-/// 任务目标点的 Z 坐标(米)。
-const MISSION_ROAD_Z: f32 = 30.0;
+const MISSION_ROAD_X: f32 = crate::traffic::STREET_PITCH;
+/// 任务目标点的 Z 坐标(米):同样是街道网格的一格。
+const MISSION_ROAD_Z: f32 = crate::traffic::STREET_PITCH;
 /// 目标点往人行道方向的偏移(米):`STREET_HALF_WIDTH + 1.2`。
 const MISSION_SIDEWALK: f32 = 8.2;
 /// 任务蓝图表:`(标题, 阶段, 目标坐标)`。
@@ -324,4 +328,39 @@ pub fn is_hidden(hideouts: &[Vec2], player_at: Vec3) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mission_blueprints;
+    use crate::traffic::STREET_PITCH;
+
+    /// `game::STREET_HALF_WIDTH` —— 马路半宽(米)。那边是私有常量,
+    /// 这里按值复述一份;改那边的时候这个测试会先红,提醒同步。
+    const STREET_HALF_WIDTH: f32 = 7.0;
+    /// `game::SIDEWALK_WIDTH` —— 人行道宽(米),同上。
+    const SIDEWALK_WIDTH: f32 = 3.6;
+
+    /// 回归:任务目标必须真的落在**某条街道旁边的人行道**上。
+    ///
+    /// 原先 `MISSION_ROAD_X/Z` 写死 30 m —— 那是 30 m 街道间距时代的
+    /// 坐标。世界改成 60 m 一格之后,三个目标全都落在街区内部(离最近的
+    /// 街道轴线 21.8 m),既不是马路也不是人行道,玩家按蓝点走过去会撞楼。
+    #[test]
+    fn mission_targets_sit_next_to_a_real_street() {
+        for (title, _stage, at) in mission_blueprints() {
+            // 街道轴线都落在 STREET_PITCH 的整数倍上。
+            let nx: f32 = (at[0] / STREET_PITCH).round() * STREET_PITCH;
+            let nz: f32 = (at[2] / STREET_PITCH).round() * STREET_PITCH;
+            let dist: f32 = (at[0] - nx).abs().min((at[2] - nz).abs());
+            assert!(
+                dist <= STREET_HALF_WIDTH + SIDEWALK_WIDTH,
+                "任务「{title}」在 ({}, {}),离最近的街道轴线 {:.1} m —— 街道网格是 {} m 一格,它掉进街区里了",
+                at[0],
+                at[2],
+                dist,
+                STREET_PITCH
+            );
+        }
+    }
 }
