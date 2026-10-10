@@ -6113,8 +6113,11 @@ fn draw_minimap(handles: &GameHandles) {
     let scale: f64 = size / (2.0 * f64::from(MINIMAP_RANGE));
     // 街道:四条南北 + 四条东西,画成两条粗线。
     context.set_fill_style_str(COLOR_MINIMAP_ROAD);
-    for line in MAP_STREET_LINES {
-        let offset: f64 = f64::from(*line) - f64::from(center[1]);
+    // 街道轴线从**街道网格**现算,而不是写死一张表。写死的表曾经停在
+    // 30 m 间距上,而世界早就改成 60 m 一格 —— 结果小地图画的是一座
+    // 不存在的城市:玩家正踩着的这条街在图上根本没有,实测重合率 0%。
+    for line in map_street_lines(center) {
+        let offset: f64 = f64::from(line) - f64::from(center[1]);
         let pixel: f64 = size * 0.5 + offset * scale;
         context.fill_rect(
             0.0,
@@ -6122,7 +6125,7 @@ fn draw_minimap(handles: &GameHandles) {
             size,
             f64::from(MINIMAP_ROAD_W),
         );
-        let offset_x: f64 = f64::from(*line) - f64::from(center[0]);
+        let offset_x: f64 = f64::from(line) - f64::from(center[0]);
         let pixel_x: f64 = size * 0.5 + offset_x * scale;
         context.fill_rect(
             pixel_x - f64::from(MINIMAP_ROAD_W) * 0.5,
@@ -6248,8 +6251,30 @@ fn faction_code(faction: Faction) -> u8 {
     }
 }
 
-/// 小地图上画出来的街道轴线(米)。
-const MAP_STREET_LINES: &[f32] = &[-90.0, -30.0, 30.0, 90.0];
+/// 小地图视野内该画出来的街道轴线(米)。
+///
+/// 轴线从 [`street_indices_in`] 现算 —— 和交通车道一样,必须跟着
+/// [`STREET_PITCH`] 走。之前这里写死 `[-90, -30, 30, 90]`(30 m 间距),
+/// 而世界早已改成 60 m 一格,于是小地图画的街道和真实街道**零重合**。
+///
+/// # Arguments
+///
+/// - `Vec2` - 玩家所在的 XZ 坐标(米),小地图以它为中心。
+///
+/// # Returns
+///
+/// - `Vec<f32>` - 横向与纵向合并后的轴线位置(米)。
+fn map_street_lines(center: Vec2) -> Vec<f32> {
+    street_indices_in(center[0] - MINIMAP_RANGE, center[0] + MINIMAP_RANGE)
+        .iter()
+        .map(|index: &i32| street_axis(*index))
+        .chain(
+            street_indices_in(center[1] - MINIMAP_RANGE, center[1] + MINIMAP_RANGE)
+                .iter()
+                .map(|index: &i32| street_axis(*index)),
+        )
+        .collect()
+}
 
 /// 在 Rust 侧建出 HUD 的结构化 DOM(因为 `index.html` 不可改)。
 ///
@@ -9829,14 +9854,16 @@ mod tests {
 
     use crate::game::{
         BLOCK_VIEW_RADIUS, BlockLayout, BuildingPlacement, GROUND_SPAN, MeshAsset, MeshPart,
-        PALM_PITCH_MAX, PLAYER_RADIUS, Placement, PropPlacement, SHOWCASE_DOOR_HALF,
+        MINIMAP_RANGE, PALM_PITCH_MAX, PLAYER_RADIUS, Placement, PropPlacement,
+        SHOWCASE_DOOR_HALF,
         SHOWCASE_GROUND_TOP, SHOWCASE_STAIR_LEAD, SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN,
         SHOWCASE_STAIR_STEPS, SHOWCASE_STAIR_WIDTH, SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS,
         SIDEWALK_WIDTH, STREAM_REBUILD_STEP, STREAM_SNAPSHOT_PAD, STREET_HALF_WIDTH, STREET_PITCH,
         ShowcaseSpec, ShowcaseSpecs, WORLD_HALF, blocks_near, build_city_buildings,
         build_city_palms, build_city_peds, build_city_props, build_city_signs,
         build_collision_world, build_ground_near, build_showcase_interiors, build_water_near,
-        collider_bounds, on_roadway, push_box, showcase_placements, showcase_specs,
+        collider_bounds, map_street_lines, on_roadway, push_box, showcase_placements,
+        showcase_specs,
         stream_needs_rebuild, street_axis, street_indices_in, street_slots,
     };
     use crate::interior::{Floor, FloorWorld, STEP_UP_TOLERANCE};
@@ -11468,6 +11495,43 @@ mod tests {
             "3000 帧(50 秒)只走了 {:.1} m,车队实际是停着的",
             travelled
         );
+    }
+
+    #[test]
+    fn the_minimap_draws_the_streets_the_player_is_actually_on() {
+        // 回归:小地图的街道轴线原先写死成 `[-90, -30, 30, 90]`(30 m 间距),
+        // 而世界早就是 60 m 一格 —— 两者**零重合**。玩家踩在 60 m 那条街上,
+        // 小地图上却空空如也,画出来的全是并不存在的 ±30 / ±90。
+        //
+        // 断言:每一条真实街道轴线(街道网格的整数倍)只要落在小地图视野内,
+        // 就必须被画出来。
+        for center in [
+            [0.0f32, 0.0f32],
+            [63.5, 45.0],   // 出生点车道
+            [60.0, 60.0],   // 路口正中
+            [-123.5, 87.0],
+            [180.0, -240.0],
+        ] {
+            let drawn: Vec<f32> = map_street_lines(center);
+            let mut axis: i32 =
+                ((center[0].max(center[1]) - MINIMAP_RANGE) / STREET_PITCH).ceil() as i32
+                    - 1;
+            while axis as f32 * STREET_PITCH <= center[0].max(center[1]) + MINIMAP_RANGE {
+                for axis_pos in [center[0], center[1]] {
+                    let real: f32 = street_axis(axis);
+                    if (real - axis_pos).abs() <= MINIMAP_RANGE {
+                        assert!(
+                            drawn.contains(&real),
+                            "玩家在 {:?} 时,{} m 处有一条真实街道,小地图却没画出来(画了 {:?})",
+                            center,
+                            real,
+                            drawn
+                        );
+                    }
+                }
+                axis += 1;
+            }
+        }
     }
 
     #[test]
