@@ -1055,6 +1055,142 @@ _SEDAN_COMMON = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Distinct bodies for the police cruiser and the taxi.
+#
+# Previously both were `_SEDAN_COMMON` verbatim: identical 4.57 x 1.85 shell,
+# byte-identical side profile across all 14 sampled stations (measured mean
+# |delta| = 0.0000). On screen they were the same car in different paint --
+# a light bar and a roof sign do not change the read at street distance.
+#
+# A police cruiser wants a squared-off, upright, long-roofline body; a city
+# taxi wants a tall short-bonnet one-box profile. Both are built from the
+# same (z, sill_y, roof_y, half_width) station format as _SEDAN_SHELL.
+# ---------------------------------------------------------------------------
+
+# Upright three-box cruiser: flat hood, near-vertical windscreen, long flat
+# roof carried well past the B-pillar, abrupt drop at the tail.
+# The roof line is carried FLAT at 1.075 from the A-pillar all the way to
+# x=+1.30, then drops almost vertically to the short deck. That hard break is
+# what makes it read "box" rather than "long sedan": a render measured against
+# the sedan showed the cruiser's mid-roof sitting *lower* than the sedan's,
+# because a longer body with the same roof height just reads longer-and-lower.
+_POLICE_SHELL = [
+    (-2.240, 0.660, 0.760, 0.235),
+    (-2.120, 0.940, 0.830, 0.220),
+    (-1.980, 1.000, 0.905, 0.195),
+    (-1.760, 1.030, 0.960, 0.185),
+    (-1.520, 1.045, 1.005, 0.180),
+    (-1.240, 1.055, 1.030, 0.178),
+    (-0.980, 1.058, 1.075, 0.185),
+    (-0.560, 1.058, 1.075, 0.190),
+    (0.320, 1.058, 1.075, 0.190),
+    (0.940, 1.058, 1.075, 0.185),
+    (1.180, 1.055, 1.070, 0.180),
+    (1.330, 1.050, 1.030, 0.178),
+    (1.620, 1.045, 0.995, 0.180),
+    (1.940, 1.030, 0.955, 0.190),
+    (2.240, 0.860, 0.880, 0.235),
+]
+
+# Flat windscreen, tall roof, boxy tail -- the one-box city cab.
+_TAXI_SHELL = [
+    (-2.010, 0.660, 0.780, 0.235),
+    (-1.900, 0.900, 0.830, 0.220),
+    (-1.760, 0.960, 0.900, 0.195),
+    (-1.520, 0.985, 0.950, 0.185),
+    (-1.180, 0.990, 0.985, 0.180),
+    (-0.880, 0.992, 1.060, 0.190),
+    (-0.420, 0.994, 1.060, 0.195),
+    (0.240, 0.994, 1.060, 0.195),
+    (0.760, 0.992, 1.060, 0.190),
+    (1.020, 0.990, 1.010, 0.180),
+    (1.400, 0.988, 0.985, 0.180),
+    (1.720, 0.985, 0.960, 0.185),
+    (1.950, 0.975, 0.925, 0.200),
+]
+
+# Cruiser cabin: upright glasshouse, roof stays high all the way to the tail.
+_POLICE_CABIN = [
+    (-1.02, 0.980, 1.170, 0.050),
+    (-0.80, 0.972, 1.480, 0.088),
+    (-0.64, 0.966, 1.535, 0.105),
+    (0.86, 0.966, 1.535, 0.105),
+    (1.04, 0.972, 1.480, 0.088),
+    (1.20, 0.980, 1.170, 0.050),
+]
+
+# Cab cabin: tall, upright, short bonnet -- one continuous glasshouse.
+_TAXI_CABIN = [
+    (-0.92, 0.920, 1.130, 0.050),
+    (-0.70, 0.912, 1.470, 0.085),
+    (-0.54, 0.906, 1.520, 0.100),
+    (0.60, 0.906, 1.520, 0.100),
+    (0.80, 0.912, 1.470, 0.085),
+    (1.02, 0.920, 1.130, 0.050),
+]
+
+_POLICE_COMMON = {
+    "shell": _POLICE_SHELL,
+    "cabin": {"ctrl": _POLICE_CABIN, "z0": 0.84},
+    "sill": 0.28, "ends": ((-2.240, 0.46), (2.240, 0.50)), "end_span": 0.21,
+    "arch_top": 0.78, "arch_half": 0.43, "axles": (-1.360, 1.390),
+    "wheel": (0.35, 0.23, 0.783),
+    "glass": {
+        "windshield": (-1.02, 1.170, 0.780, -0.80, 1.480, 0.740),
+        "backlight": (0.86, 1.170, 0.780, 0.60, 1.490, 0.740),
+        "side": ((-0.58, -0.06, 1.190, 1.420),
+                 (0.02, 0.48, 1.190, 1.420)),
+        "side_hw": 0.880, "ref": (-0.12, 1.02),
+    },
+    "face": {
+        "front": {"lamp": (0.54, 0.94, 0.76, 0.078),
+                  "grille": (0.32, 0.62, 0.54, 0.06),
+                  "bumper": (0.20, 0.17, 0.055)},
+        "rear": {"lamp": (0.57, 0.94, 0.82, 0.078),
+                 "bumper": (0.20, 0.17, 0.055)},
+    },
+    "mirror": (-0.80, 1.130, (0.155, 0.090, 0.105), 0.062),
+    "doors": (-0.92, 0.04, 0.94),
+    "door_span": (0.46, 0.82),
+    "handles": ((-0.52, 0.880, 0.17), (0.38, 0.880, 0.17)),
+    "beltline": (-0.92, 1.02, 1.165),
+    "vents": (-1.02, 0.580, 3),
+    "fuel_cap": (1.99, 0.815),
+    "panels": ((-1.97, -1.16, 0.62), (1.04, 2.10, 0.62)),
+}
+
+_TAXI_COMMON = {
+    "shell": _TAXI_SHELL,
+    "cabin": {"ctrl": _TAXI_CABIN, "z0": 0.86},
+    "sill": 0.27, "ends": ((-2.010, 0.45), (1.950, 0.49)), "end_span": 0.20,
+    "arch_top": 0.77, "arch_half": 0.42, "axles": (-1.260, 1.230),
+    "wheel": (0.34, 0.22, 0.781),
+    "glass": {
+        "windshield": (-0.92, 1.130, 0.760, -0.70, 1.470, 0.720),
+        "backlight": (0.80, 1.130, 0.760, 0.56, 1.470, 0.720),
+        "side": ((-0.54, -0.04, 1.150, 1.390),
+                 (0.00, 0.44, 1.150, 1.390)),
+        "side_hw": 0.848, "ref": (-0.10, 1.00),
+    },
+    "face": {
+        "front": {"lamp": (0.50, 0.93, 0.75, 0.072),
+                  "grille": (0.31, 0.61, 0.53, 0.06),
+                  "bumper": (0.19, 0.16, 0.055)},
+        "rear": {"lamp": (0.56, 0.93, 0.81, 0.078),
+                 "bumper": (0.19, 0.16, 0.055)},
+    },
+    "mirror": (-0.76, 1.090, (0.150, 0.086, 0.100), 0.060),
+    "doors": (-0.80, 0.06, 0.86),
+    "door_span": (0.45, 0.81),
+    "handles": ((-0.46, 0.890, 0.17), (0.34, 0.890, 0.17)),
+    "beltline": (-0.86, 0.97, 1.125),
+    "vents": (-0.94, 0.600, 3),
+    "fuel_cap": (1.79, 0.855),
+    "panels": ((-1.78, -1.02, 0.62), (0.94, 1.82, 0.62)),
+}
+
+
 # ------------------------------------------------------------------ liveries
 
 def _police_livery(a, cfg):
@@ -1515,15 +1651,15 @@ def build_all():
         "extras": (_bed,),
     }))
 
-    # 4. police cruiser -- sedan shell, light-bar plinth and real lenses
-    out.append(_vehicle(dict(_SEDAN_COMMON,
+    # 4. police cruiser -- upright three-box shell (NOT the sedan), light bar
+    out.append(_vehicle(dict(_POLICE_COMMON,
                              id="car_police", paint=WHITE,
                              bumper_color=(0.20, 0.21, 0.24),
                              extras=(_police_livery, _lightbar_mount,
                                      _lightbar))))
 
-    # 5. taxi -- cab yellow, checker band, roof sign bracket and sign
-    out.append(_vehicle(dict(_SEDAN_COMMON,
+    # 5. taxi -- tall one-box cab shell (NOT the sedan), checker band + sign
+    out.append(_vehicle(dict(_TAXI_COMMON,
                              id="car_taxi", paint=TAXI_YELLOW,
                              trim=(0.45, 0.46, 0.48),
                              belt_color=(0.20, 0.21, 0.24),

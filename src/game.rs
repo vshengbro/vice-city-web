@@ -9794,7 +9794,9 @@ mod tests {
     use crate::r#const::{
         AXIS_STRAFE, BLDG_AQUA_ARCADE, BLDG_DECO_PINK, BLDG_LILAC_TOWER, CAR_SEDAN,
         E_FIXTURE_ASSET_JSON, E_FIXTURE_NO_DECLARED_BOUNDS, E_FIXTURE_SOLID_BOUNDS_UNREGISTERED,
-        FIXTURE_BLDG_AQUA_ARCADE_JSON, FIXTURE_PROP_STREETLIGHT_JSON,
+        FIXTURE_BLDG_AQUA_ARCADE_JSON, FIXTURE_CAR_POLICE_JSON, FIXTURE_CAR_SEDAN_JSON,
+        FIXTURE_CAR_TAXI_JSON, FIXTURE_PROP_STREETLIGHT_JSON, SLOT_SILHOUETTE_CAR,
+        SLOT_SILHOUETTE_DELTA, T_SILHOUETTE_TOO_SIMILAR,
         FIXTURE_PROP_TRAFFICLIGHT_JSON, GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY,
         KEY_BATCH, PED_SUIT, PED_TALK_SLOT_STEP, PISTOL_MAGAZINE, PLAYER_BODY_HEIGHT, PROP_BENCH,
         PROP_NEWSSTAND, PROP_PHONE_BOOTH, PROP_STREETLIGHT, PROP_TRAFFICLIGHT, RELOAD_TIME,
@@ -11500,6 +11502,83 @@ mod tests {
             "3000 帧(50 秒)只走了 {:.1} m,车队实际是停着的",
             travelled
         );
+    }
+
+    /// 车身侧影沿车长的采样(只看车身件,不算车顶灯牌之类附件)。
+    fn vehicle_side_profile(asset: &MeshAsset, bins: usize) -> Vec<f32> {
+        // 附件(车顶灯、涂装、货斗)不算车身 —— 正是它们让出租车和警车
+        // 在旧版本里「看起来一样」,而附件不参与剪影判定。
+        const ATTACHMENTS: [&str; 10] = [
+            "livery", "sign_mount", "taxi_sign", "lightbar_mount", "lightbar_red",
+            "lightbar_blue", "bed", "hvac", "doors", "markers",
+        ];
+        let mut xs: Vec<f32> = Vec::new();
+        let mut ys: Vec<f32> = Vec::new();
+        for part in &asset.parts {
+            if ATTACHMENTS.contains(&part.name.as_str()) {
+                continue;
+            }
+            let positions: &[Vec3] = &part.positions;
+            for v in positions {
+                xs.push(v[0]);
+                ys.push(v[1]);
+            }
+        }
+        let lo: f32 = xs.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi: f32 = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut top: Vec<f32> = vec![0.0; bins];
+        for (x, y) in xs.iter().zip(ys.iter()) {
+            let idx: usize = (((x - lo) / (hi - lo)) * bins as f32) as usize;
+            let idx: usize = idx.min(bins - 1);
+            if *y > top[idx] {
+                top[idx] = *y;
+            }
+        }
+        // 各自归一化到自己的车高:比的是**形状**,不是绝对尺寸。
+        let peak: f32 = top.iter().copied().fold(0.0, f32::max);
+        if peak > 0.0 {
+            for value in top.iter_mut() {
+                *value /= peak;
+            }
+        }
+        top
+    }
+
+    /// 回归:出租车和警车不能再是「换了漆的轿车」。
+    ///
+    /// 两辆车原先都直接复用 `_SEDAN_COMMON`,侧影在 14 个采样站上
+    /// **逐站相同**(实测平均 |Δ| = 0.0000)—— 只有车顶灯牌和涂装不同,
+    /// 街上远看就是同一辆车。灯牌不会改变轮廓读数。
+    #[test]
+    fn the_taxi_and_the_police_car_are_not_recoloured_sedans() {
+        const BINS: usize = 16;
+        let sedan: MeshAsset =
+            super::parse_asset(CAR_SEDAN, FIXTURE_CAR_SEDAN_JSON).expect(E_FIXTURE_ASSET_JSON);
+        let base: Vec<f32> = vehicle_side_profile(&sedan, BINS);
+        for (name, raw) in [
+            ("taxi", FIXTURE_CAR_TAXI_JSON),
+            ("police", FIXTURE_CAR_POLICE_JSON),
+        ] {
+            let asset: MeshAsset =
+                super::parse_asset(name, raw).expect(E_FIXTURE_ASSET_JSON);
+            let profile: Vec<f32> = vehicle_side_profile(&asset, BINS);
+            let mut total: f32 = 0.0;
+            for (a, b) in profile.iter().zip(base.iter()) {
+                total += (a - b).abs();
+            }
+            let delta: f32 = total / BINS as f32;
+            assert!(
+                delta > crate::r#const::SILHOUETTE_SAME_THRESHOLD,
+                "{}",
+                fill(
+                    T_SILHOUETTE_TOO_SIMILAR,
+                    &[
+                        (SLOT_SILHOUETTE_CAR, name),
+                        (SLOT_SILHOUETTE_DELTA, &format!("{delta:.4}")),
+                    ]
+                )
+            );
+        }
     }
 
     #[test]

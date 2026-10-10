@@ -502,6 +502,33 @@ pub(crate) const E_FIXTURE_SOLID_BOUNDS_UNREGISTERED: &str = "加载器没有登
 #[cfg(test)]
 pub(crate) const T_SOLID_BOUNDS_X_WIDTH: &str = "实心足迹 x 宽度";
 
+/// 单元测试夹具:轿车(作为「其它车」的剪影基准)。
+#[cfg(test)]
+pub(crate) const FIXTURE_CAR_SEDAN_JSON: &str = include_str!("../assets/car_sedan.json");
+
+/// 单元测试夹具:出租车(应读作高挑单厢车,不是换漆的轿车)。
+#[cfg(test)]
+pub(crate) const FIXTURE_CAR_TAXI_JSON: &str = include_str!("../assets/car_taxi.json");
+
+/// 单元测试夹具:警车(应读作方正三厢巡航车)。
+#[cfg(test)]
+pub(crate) const FIXTURE_CAR_POLICE_JSON: &str = include_str!("../assets/car_police.json");
+
+/// 单元测试断言文案:两辆车剪影几乎一样(只是换了漆)。
+pub(crate) const T_SILHOUETTE_TOO_SIMILAR: &str = "剪影与轿车几乎相同,只是换了漆";
+
+/// 单元测试断言文案:车型名。
+pub(crate) const SLOT_SILHOUETTE_CAR: &str = "车型";
+
+/// 单元测试断言文案:剪影差异度。
+pub(crate) const SLOT_SILHOUETTE_DELTA: &str = "剪影差异";
+
+/// 单元测试断言文案:判定为「剪影相同」的阈值。
+pub(crate) const SILHOUETTE_SAME_THRESHOLD: f32 = 0.01;
+
+/// 单元测试断言文案:车身尺寸标注。
+pub(crate) const SLOT_SILHOUETTE_DIMS: &str = "车身尺寸";
+
 /// 单元测试夹具:水城街机城(一面带内顶点为零的真墙)。
 #[cfg(test)]
 pub(crate) const FIXTURE_BLDG_AQUA_ARCADE_JSON: &str =

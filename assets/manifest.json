@@ -4,7 +4,7 @@
   "up_axis": "Y",
   "unit": "meter",
   "asset_count": 99,
-  "tri_count": 141529,
+  "tri_count": 141305,
   "categories": [
     "animal",
     "beach",
@@ -350,18 +350,18 @@
       "id": "car_police",
       "category": "vehicle",
       "file": "car_police.json",
-      "tri_count": 4756,
+      "tri_count": 4692,
       "part_count": 13,
       "bounds": {
         "min": [
-          -2.283,
+          -2.355,
           0.0,
-          -0.925581
+          -1.094
         ],
         "max": [
-          2.283,
-          1.589,
-          0.925581
+          2.355,
+          1.674,
+          1.094
         ]
       }
     },
@@ -369,18 +369,18 @@
       "id": "car_taxi",
       "category": "vehicle",
       "file": "car_taxi.json",
-      "tri_count": 4500,
+      "tri_count": 4340,
       "part_count": 12,
       "bounds": {
         "min": [
-          -2.283,
+          -2.115,
           0.0,
-          -0.927212
+          -1.031913
         ],
         "max": [
-          2.283,
-          1.599,
-          0.927212
+          2.055,
+          1.669,
+          1.031913
         ]
       }
     },
