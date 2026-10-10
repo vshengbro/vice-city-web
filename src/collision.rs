@@ -105,6 +105,7 @@ pub struct CollisionWorld {
     half_extent: Vec2,
 }
 
+/// Inherent implementation of [`CollisionWorld`].
 impl CollisionWorld {
     /// 新建一个空的碰撞世界。
     ///
@@ -997,6 +998,7 @@ fn ray_into_circle(origin: Vec2, dir: Vec2, center: Vec2, radius: f32) -> Option
     Some((t, [origin[0] + dir[0] * t, origin[1] + dir[1] * t]))
 }
 
+/// Default construction for [`CollisionWorld`].
 impl Default for CollisionWorld {
     /// 返回空碰撞世界,与 `CollisionWorld::new` 等价。
     fn default() -> Self {
@@ -1046,6 +1048,7 @@ pub struct DynamicBody {
     pub mass: f32,
 }
 
+/// Inherent implementation of [`DynamicBody`].
 impl DynamicBody {
     /// 构造一个**圆形**动态碰撞体。
     ///

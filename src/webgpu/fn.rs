@@ -579,6 +579,36 @@ pub fn bloom_target_size(width: u32, height: u32) -> (u32, u32) {
     (scaled(width, BLOOM_SCALE), scaled(height, BLOOM_SCALE))
 }
 
+/// 一块流式重建网格的缓冲该扩到多大。
+///
+/// **返回的容量永远 ≥ `needed`**,且在 `needed > current` 时严格变大 ——
+/// 调用方(`replace_mesh`)靠这个不变式来保证「`write_buffer` 的写入长度
+/// 永不超过 live 缓冲的尺寸」。
+///
+/// 纯函数而不是内联算式,因为它是「黑屏修复」那条不变式唯一能被
+/// 原生 `cargo test` 钉住的地方:黑屏本身在无头浏览器里极难复现,
+/// 但「扩容后一定装得下」可以逐条断言。
+///
+/// 扩到 `needed.next_power_of_two()` 而不是刚好 `needed`:地面网格每
+/// 跨一个街区都会重建,顶点数是台阶式跳的(实测 880992 → 901368)。
+/// 只按 `needed` 分配意味着每走一格就要换一次 `GPUBuffer`,而流式重建
+/// 的频率与玩家移动速度成正比 —— 每次都重建会把帧时间顶起来。
+///
+/// # Arguments
+///
+/// - `usize` - 现有容量字节数。
+/// - `usize` - 本次需要的字节数。
+///
+/// # Returns
+///
+/// - `usize` - 新容量字节数,至少 `needed`。
+pub fn grown_capacity(current: usize, needed: usize) -> usize {
+    if needed <= current {
+        return current;
+    }
+    needed.next_power_of_two().max(needed)
+}
+
 /// 全空的 bloom uniform buffer 句柄数组(建之前的状态)。
 ///
 /// # Returns

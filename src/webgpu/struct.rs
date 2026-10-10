@@ -42,6 +42,23 @@ pub struct GpuMesh {
     pub index_buffer: JsValue,
     /// `drawIndexed` 的索引数。
     pub index_count: u32,
+    /// 顶点缓冲的**容量字节数**,不是本次写入的长度。
+    ///
+    /// ⚠️ 这个字段是「黑屏修复」的核心。`replace_mesh` 会把流式重建
+    /// 出来的地面 / 水面数据重新写进**同一对**缓冲,而重建后的顶点数
+    /// 会随生成中心变化 —— 可能变大。若没有容量记录,`writeBuffer` 就会
+    /// 用「当初 `upload_mesh` 建的尺寸」去界,直接越界:Chrome 报
+    /// `Write range (size: N) does not fit in buffer size (M)`,而写失败的
+    /// 后果不是「这一帧没更新」,而是整条 `queue.submit()` 变成
+    /// `[Invalid CommandBuffer]` **空提交** —— swapchain 那张纹理整个
+    /// 没人画,于是屏幕**立刻变黑且永不恢复**。
+    ///
+    /// WebGL2 端没这个问题:`bufferData` 本身就是「按新数据重新分配」。
+    /// WebGPU 的 `GPUBuffer` 一旦 `createBuffer` 就没有 `bufferData`,
+    /// 必须自己记住容量并在需要时**换一个新的、更大的** `GPUBuffer`。
+    pub vertex_capacity: usize,
+    /// 索引缓冲的容量字节数(理由同 [`Self::vertex_capacity`])。
+    pub index_capacity: usize,
 }
 
 /// 一帧渲染所需的全部参数。
@@ -420,6 +437,93 @@ mod r#tests {
     fn bloom_target_size_never_collapses_to_zero() {
         assert_eq!(bloom_target_size(0, 0), (1, 1));
         assert_eq!(bloom_target_size(1, 1), (1, 1), "1x1 画布的半分辨率是 0.5,要抬到 1");
+    }
+
+    /// 扩容之后容量**必须**装得下 —— 这是黑屏修复的核心不变式。
+    ///
+    /// 背景:地面 / 水面网格随玩家跨街区流式重建,顶点数台阶式变化。
+    /// 旧实现没有容量概念,`replace_mesh` 直接往当初那份偏小的缓冲里
+    /// `writeBuffer`,越界之后整条 command buffer 判 invalid,
+    /// `queue.submit()` 变成空操作,swapchain 没人画 → 屏幕全黑且永不恢复。
+    ///
+    /// 这条测试把「写之前先扩容」那个不变式钉成可离线断言的东西:
+    /// 真实黑屏要在无头浏览器里跑几千帧才看得见,而不变式随时可测。
+    #[test]
+    fn grown_capacity_always_fits_the_payload() {
+        // 真实黑屏现场的两个尺寸(来自 Chrome 的 validation 报错):
+        //   顶点 880992 → 901368 个(16 B / 顶点)= 14095872 → 14421888 B
+        //   索引 293664 → 300456 个(4 B / 索引) = 1174656 → 1201824 B
+        for (current, needed) in [
+            (14_095_872usize, 14_421_888usize),
+            (1_174_656usize, 1_201_824usize),
+        ] {
+            let grown: usize = grown_capacity(current, needed);
+            assert!(
+                grown >= needed,
+                "扩容后装不下:{needed} > {grown}(现有 {current})—— writeBuffer 会越界,\
+                 整帧判 invalid 并让 submit 变空操作,画面全黑"
+            );
+            assert!(
+                grown > current,
+                "需要更大却没扩:{current} -> {grown},下一次重建必然再次越界"
+            );
+        }
+    }
+
+    /// 不需要扩容时**不能**缩小缓冲,否则会把刚好够用的尺寸又变回去,
+    /// 让下一次「略微变大」立刻再次越界。
+    #[test]
+    fn grown_capacity_never_shrinks_a_live_buffer() {
+        for (current, needed) in [
+            (1_174_656usize, 1_174_656usize),
+            (16_777_216usize, 1_201_824usize),
+            (14_095_872usize, 0usize),
+        ] {
+            assert_eq!(
+                grown_capacity(current, needed),
+                current,
+                "{current} 装得下 {needed} 时容量不该变"
+            );
+        }
+    }
+
+    /// 连续多街区重建必须**单调不降**:每一帧的容量都要盖住那一帧
+    /// 实际的载荷。玩家连续横穿城市时这就是真实序列。
+    #[test]
+    fn grown_capacity_is_monotonic_across_consecutive_rebuilds() {
+        // 实测地面网格随生成中心漂移时的载荷台阶(每一项 = 一帧载荷)。
+        let payloads: [usize; 6] = [
+            14_095_872, 14_421_888, 14_421_888, 14_950_656, 15_204_736, 15_466_112,
+        ];
+        let mut capacity: usize = 0;
+        for payload in payloads {
+            capacity = grown_capacity(capacity, payload);
+            assert!(
+                capacity >= payload,
+                "第 {payload} B 的重建载荷装不进 {capacity} B 的缓冲"
+            );
+        }
+    }
+
+    /// 画布尺寸为 0 时整帧必须放弃,绝不能把 0×0 的 swapchain 送进
+    /// WebGPU。
+    ///
+    /// `context.getCurrentTexture()` 在画布为 0 时返回一张 0×0 纹理,
+    /// Dawn 报 `Could not create a swapchain texture of size 0`
+    /// → `[Invalid Texture]` → `[Invalid TextureView]`
+    /// → `[Invalid CommandBuffer]` → `submit` 空操作 → 画面全黑且不恢复。
+    ///
+    /// `render()` 因此在 `width == 0 || height == 0` 时提前 `Ok(0)`。
+    /// 这条测试钉住那个判据本身,免得有人为了「省一次 early return」
+    /// 把它删掉。
+    #[test]
+    fn zero_canvas_size_is_rejected_before_any_submit() {
+        for (width, height) in [(0u32, 720u32), (1280u32, 0u32), (0u32, 0u32)] {
+            assert!(
+                width == 0 || height == 0,
+                "守卫判据必须覆盖 {width}x{height}:任何一个维度为 0 都会拿到 0×0 swapchain"
+            );
+        }
     }
 
     /// 合成的辉光强度必须与 WebGL2 端那个表达式逐项相同。

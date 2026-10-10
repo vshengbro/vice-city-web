@@ -794,9 +794,11 @@ impl WebGpuRenderer {
                 USAGE_UNIFORM_BUFFER,
             )?);
         }
-        self.set_bloom_buffers(buffers.try_into().map_err(|_| {
-            String::from("bloom uniform buffer count must match BLOOM_PASS_COUNT")
-        })?);
+        self.set_bloom_buffers(
+            buffers.try_into().map_err(|_| {
+                String::from("bloom uniform buffer count must match BLOOM_PASS_COUNT")
+            })?,
+        );
 
         // ---- 两条 bind group layout ----
         let group_layout: JsValue = self.build_bloom_group_layout()?;
@@ -873,7 +875,10 @@ impl WebGpuRenderer {
     /// # Returns
     ///
     /// - `Result<JsValue, String>` - 建好的 `GPUPipelineLayout`。
-    fn single_group_pipeline_layout(device: &JsValue, group_layout: &JsValue) -> Result<JsValue, String> {
+    fn single_group_pipeline_layout(
+        device: &JsValue,
+        group_layout: &JsValue,
+    ) -> Result<JsValue, String> {
         let layouts: JsValue = make_array();
         push_into(&layouts, 0usize, group_layout)?;
         let descriptor: Object = new_object();
@@ -920,7 +925,11 @@ impl WebGpuRenderer {
 
         let fragment_stage: Object = new_object();
         set(&fragment_stage, FIELD_MODULE, &fragment_module)?;
-        set(&fragment_stage, FIELD_ENTRY_POINT, &JsValue::from_str(entry))?;
+        set(
+            &fragment_stage,
+            FIELD_ENTRY_POINT,
+            &JsValue::from_str(entry),
+        )?;
         let targets: JsValue = make_array();
         let color_target: Object = new_object();
         set(&color_target, FIELD_FORMAT, &JsValue::from_str(format))?;
@@ -1071,7 +1080,11 @@ impl WebGpuRenderer {
                 FIELD_TYPE,
                 &JsValue::from_str(SAMPLER_TYPE_FILTERING),
             )?;
-            set(&blur_sampler_entry, FIELD_SAMPLER, blur_sampler_layout.as_ref())?;
+            set(
+                &blur_sampler_entry,
+                FIELD_SAMPLER,
+                blur_sampler_layout.as_ref(),
+            )?;
             push_into(&entries, 3usize, blur_sampler_entry.as_ref())?;
             let blur_texture_entry: Object = new_object();
             set(
@@ -1090,13 +1103,21 @@ impl WebGpuRenderer {
                 FIELD_SAMPLE_TYPE,
                 &JsValue::from_str(SAMPLE_TYPE_FLOAT),
             )?;
-            set(&blur_texture_entry, FIELD_TEXTURE, blur_texture_layout.as_ref())?;
+            set(
+                &blur_texture_entry,
+                FIELD_TEXTURE,
+                blur_texture_layout.as_ref(),
+            )?;
             push_into(&entries, 4usize, blur_texture_entry.as_ref())?;
         }
 
         let descriptor: Object = new_object();
         set(&descriptor, FIELD_ENTRIES, &entries)?;
-        call1(&device, METHOD_CREATE_BIND_GROUP_LAYOUT, descriptor.as_ref())
+        call1(
+            &device,
+            METHOD_CREATE_BIND_GROUP_LAYOUT,
+            descriptor.as_ref(),
+        )
     }
 
     /// 分配阴影深度纹理(`depth32float`,`SHADOW_MAP_SIZE` 见方)。
@@ -1198,6 +1219,9 @@ impl WebGpuRenderer {
             vertex_buffer,
             index_buffer,
             index_count,
+            // 容量 = 本次上传的字节数(下界),之后 `replace_mesh` 只会往上加。
+            vertex_capacity: vertex_bytes.len(),
+            index_capacity: index_bytes.len(),
         });
         self.set_gpu_mesh_count(self.get_meshes().len());
         Ok(self.get_meshes().len() - 1)
@@ -1233,6 +1257,37 @@ impl WebGpuRenderer {
                 self.get_meshes().len()
             ));
         };
+        // ⚠️⚠️⚠️ **写之前必须先保证容量足够。**
+        //
+        // 地面 / 水面是流式重建的:玩家每跨过一个街区,
+        // `rebuild_streamed_surface` 就用新的生成中心重建网格,而重建
+        // 出来的顶点数**会变**(这里是变大:880992 → 901368 个顶点)。
+        //
+        // 旧代码直接 `writeBuffer`,用的却是 `upload_mesh` 当初按
+        // **首次**数据建出来的缓冲尺寸 —— 于是写入 14,421,888 字节到
+        // 一个 14,095,872 字节的缓冲里。后果不是「这一帧地面没刷新」:
+        // 写入失败会让整条 command buffer 变成
+        // `[Invalid CommandBuffer]`,`queue.submit()` 变成**空操作**。
+        // 而 swapchain 那张 `getCurrentTexture()` 本帧**没有人画过**,
+        // 于是屏幕**立刻全黑,并且永远不会自己恢复** —— 三角形计数器
+        // 还在涨、画面却全黑,正是这条路径的签名。
+        //
+        // WebGL2 端同一个函数没有这个问题:`bufferData` 的语义本来就是
+        // 「按新数据重新分配」。WebGPU 没有 `bufferData`,所以必须自己
+        // 记住容量,并在需要时**换一个更大的** `GPUBuffer`
+        // (`GPUBuffer` 的大小在 `createBuffer` 之后不可更改)。
+        if vertex_bytes.len() > slot.vertex_capacity {
+            let capacity: usize = grown_capacity(slot.vertex_capacity, vertex_bytes.len());
+            let buffer: JsValue = create_buffer(&device, capacity, USAGE_VERTEX_BUFFER)?;
+            slot.vertex_buffer = buffer;
+            slot.vertex_capacity = capacity;
+        }
+        if index_bytes.len() > slot.index_capacity {
+            let capacity: usize = grown_capacity(slot.index_capacity, index_bytes.len());
+            let buffer: JsValue = create_buffer(&device, capacity, USAGE_INDEX_BUFFER)?;
+            slot.index_buffer = buffer;
+            slot.index_capacity = capacity;
+        }
         write_buffer(&device, &slot.vertex_buffer, 0.0, vertex_bytes)?;
         write_buffer(&device, &slot.index_buffer, 0.0, index_bytes)?;
         slot.index_count = (index_bytes.len() / 4) as u32;
@@ -1307,6 +1362,30 @@ impl WebGpuRenderer {
             near_cull_radius,
             shadow_focus,
         } = params;
+        // ⚠️⚠️ **画布尺寸为 0 时必须整帧放弃。**
+        //
+        // `canvas.width/height` 会在这些时刻变成 0:标签页被隐藏、
+        // 窗口被拖到最小、`display:none`、布局尚未完成。紧接着
+        // `context.getCurrentTexture()` 会拿到一个 **0×0** 的 swapchain
+        // 纹理,Dawn 直接报
+        //   `Could not create a swapchain texture of size 0`
+        //   → `[Invalid Texture]` → `[Invalid TextureView]`
+        //   → `[Invalid CommandBuffer]` → `queue.submit()` **空操作**
+        //
+        // 也就是说:**画面全黑,一帧不落,而且永远不会自己恢复** ——
+        // 与流式重建写越界是同一种黑屏、同一条致命链路。
+        //
+        // 实测这条会连续刷 100 次 `Invalid CommandBuffer` 才把 Chrome 的
+        // 警告配额耗尽,而配额耗尽之后 Chrome **不再报错** —— 于是
+        // 「后来不报错了」会被误读成「已经修好」。这正是本条守卫存在的
+        // 理由:不要让一张 0 像素的画布进入 WebGPU。
+        //
+        // 提前返回 `Ok(0)`:三角形数为 0 但**不提交任何命令**,所以 HUD
+        // 仍然活着(不会因为一次异常而整页白掉),下一帧尺寸一恢复就
+        // 立刻正常渲染。
+        if width == 0 || height == 0 {
+            return Ok(0);
+        }
         self.ensure_depth(width, height)?;
         let device: JsValue = self.get_device().clone();
         // 后处理目标跟着画布尺寸走 —— 与 `ensure_depth` 同一个时机。
@@ -1654,8 +1733,10 @@ impl WebGpuRenderer {
         }
 
         // 提取 / 两条模糊写进半分辨率目标,合成写进 swapchain。
-        let canvas_view: JsValue =
-            create_view(&call0(&self.get_context().clone(), METHOD_GET_CURRENT_TEXTURE)?)?;
+        let canvas_view: JsValue = create_view(&call0(
+            &self.get_context().clone(),
+            METHOD_GET_CURRENT_TEXTURE,
+        )?)?;
         let targets: [JsValue; BLOOM_PASS_COUNT] = [
             create_view(&self.get_bloom_bright().clone())?,
             create_view(&self.get_bloom_ping().clone())?,
@@ -1687,8 +1768,7 @@ impl WebGpuRenderer {
             // ⚠️ **不**带 `depthStencilAttachment`:后处理三条半分辨率
             // pass 与合成那条都只碰颜色,挂一条深度附件会强制它们
             // 共享主 pass 的深度纹理尺寸 —— 而主 pass 那张是全分辨率。
-            let pass: JsValue =
-                call1(encoder, METHOD_BEGIN_RENDER_PASS, descriptor.as_ref())?;
+            let pass: JsValue = call1(encoder, METHOD_BEGIN_RENDER_PASS, descriptor.as_ref())?;
             call1(&pass, METHOD_SET_PIPELINE, &passes[index].pipeline)?;
             set_bind_group(&pass, BINDING_GROUP, &passes[index].bind_group)?;
             // 全屏三角形:`draw(3)` 而不是 `drawIndexed` —— 整条
@@ -1929,17 +2009,11 @@ impl WebGpuRenderer {
             // ---- 全分辨率主场景目标 ----
             // 格式必须与画布 preferred format **逐项相同**,否则合成
             // 那条 pipeline 的 target 与附件不匹配,整帧被判 invalid。
-            let scene: JsValue = self.create_postprocess_texture(
-                canvas_size.0,
-                canvas_size.1,
-                self.get_format(),
-            )?;
+            let scene: JsValue =
+                self.create_postprocess_texture(canvas_size.0, canvas_size.1, self.get_format())?;
             // ---- 三张半分辨率 bloom 目标 ----
-            let bright: JsValue = self.create_postprocess_texture(
-                half.0,
-                half.1,
-                BLOOM_TARGET_FORMAT,
-            )?;
+            let bright: JsValue =
+                self.create_postprocess_texture(half.0, half.1, BLOOM_TARGET_FORMAT)?;
             let ping: JsValue =
                 self.create_postprocess_texture(half.0, half.1, BLOOM_TARGET_FORMAT)?;
             let pong: JsValue =
@@ -2073,10 +2147,8 @@ impl WebGpuRenderer {
             let descriptor: Object = new_object();
             set(&descriptor, FIELD_LAYOUT, &layout)?;
             set(&descriptor, FIELD_ENTRIES, &entries)?;
-            let group: JsValue =
-                call1(&device, METHOD_CREATE_BIND_GROUP, descriptor.as_ref()).map_err(
-                    |error: String| format!("bloom pass {index} createBindGroup: {error}"),
-                )?;
+            let group: JsValue = call1(&device, METHOD_CREATE_BIND_GROUP, descriptor.as_ref())
+                .map_err(|error: String| format!("bloom pass {index} createBindGroup: {error}"))?;
             passes[index].bind_group = group;
         }
         self.set_bloom_passes(passes);

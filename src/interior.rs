@@ -82,6 +82,7 @@ pub struct FloorWorld {
     floors: Vec<Floor>,
 }
 
+/// Inherent implementation of [`FloorWorld`].
 impl FloorWorld {
     /// 新建一个空的室内碰撞世界。
     ///
@@ -725,6 +726,7 @@ impl FloorWorld {
     }
 }
 
+/// Default construction for [`FloorWorld`].
 impl Default for FloorWorld {
     /// 返回空室内碰撞世界,与 `FloorWorld::new` 等价。
     fn default() -> Self {
@@ -822,15 +824,13 @@ fn push_out_aabb(center: Vec2, half: Vec2, point: Vec2, radius: f32) -> Option<(
 mod tests {
     use crate::r#const::{
         T_INTERIOR_BASELINE_AGREES, T_INTERIOR_BASELINE_STILL_FAILS, T_INTERIOR_BASELINE_TOKEN,
-        T_INTERIOR_CEILING_INSIDE, T_INTERIOR_DOORWAY_BLOCKS, T_INTERIOR_DOORWAY_THROUGH,
-        T_INTERIOR_DESCENT_NO_CLIMB,
-        T_INTERIOR_DESCENT_REACHES_GROUND, T_INTERIOR_DT_TOKEN, T_INTERIOR_HEIGHT_TOKEN,
-        T_INTERIOR_LONG_FRAME_HEIGHT,
-        T_INTERIOR_LONG_FRAME_LADDER, T_INTERIOR_NO_DOWNWARD_SNAP, T_INTERIOR_NO_SLAB_UNDER,
-        T_INTERIOR_NORMAL_FRAME_DESCENT, T_INTERIOR_NORMAL_FRAME_UNCHANGED, T_INTERIOR_PEAK_TOKEN,
-        T_INTERIOR_SPRINT_BASELINE_FAILS, T_INTERIOR_SPRINT_FRAME_CLIMBS, T_INTERIOR_SPRINT_NO_OP,
-        T_INTERIOR_STAIR_CLIMBS, T_INTERIOR_STAIR_MONOTONIC, T_INTERIOR_STAIR_PAIR,
-        T_INTERIOR_STAIRWELL_IS_OPEN,
+        T_INTERIOR_CEILING_INSIDE, T_INTERIOR_DESCENT_NO_CLIMB, T_INTERIOR_DESCENT_REACHES_GROUND,
+        T_INTERIOR_DOORWAY_BLOCKS, T_INTERIOR_DOORWAY_THROUGH, T_INTERIOR_DT_TOKEN,
+        T_INTERIOR_HEIGHT_TOKEN, T_INTERIOR_LONG_FRAME_HEIGHT, T_INTERIOR_LONG_FRAME_LADDER,
+        T_INTERIOR_NO_DOWNWARD_SNAP, T_INTERIOR_NO_SLAB_UNDER, T_INTERIOR_NORMAL_FRAME_DESCENT,
+        T_INTERIOR_NORMAL_FRAME_UNCHANGED, T_INTERIOR_PEAK_TOKEN, T_INTERIOR_SPRINT_BASELINE_FAILS,
+        T_INTERIOR_SPRINT_FRAME_CLIMBS, T_INTERIOR_SPRINT_NO_OP, T_INTERIOR_STAIR_CLIMBS,
+        T_INTERIOR_STAIR_MONOTONIC, T_INTERIOR_STAIR_PAIR, T_INTERIOR_STAIRWELL_IS_OPEN,
         T_INTERIOR_STRIDE_TOKEN, T_INTERIOR_UPPER_FLOOR_ABOVE, T_INTERIOR_WALL_BLOCKS,
         T_INTERIOR_WALL_PASSES,
     };
@@ -1509,8 +1509,7 @@ mod tests {
             let to: Vec2 = [x, 0.0];
             // 旧行为:先逐级抬升,再让整帧下楼补查无条件覆盖。
             let mut raised: f32 = y;
-            let substeps: usize =
-                ((stride / SUPPORT_SUBSTEP_DISTANCE).ceil() as usize).max(1);
+            let substeps: usize = ((stride / SUPPORT_SUBSTEP_DISTANCE).ceil() as usize).max(1);
             let mut cursor: Vec2 = from;
             for index in 0..substeps {
                 let t: f32 = (index + 1) as f32 / substeps as f32;
@@ -1541,7 +1540,11 @@ mod tests {
         let stride: f32 = WALK_SPEED_60 / 60.0;
         for (from, to, y0) in [
             ([5.1f32, -4.55f32 + 0.5 * STAIR_RUN], 0.0f32, GROUND_TOP),
-            ([5.1, -4.55 + 8.0 * STAIR_RUN], 0.0, GROUND_TOP + 9.0 * STAIR_RISE),
+            (
+                [5.1, -4.55 + 8.0 * STAIR_RUN],
+                0.0,
+                GROUND_TOP + 9.0 * STAIR_RISE,
+            ),
         ] {
             let from: Vec2 = [from[0], from[1] + to];
             let mut new_y: f32 = y0;
@@ -1553,8 +1556,7 @@ mod tests {
                 new_y = stepped;
                 // 旧实现:同样的抬升,补查无条件执行。
                 let mut raised: f32 = old_y;
-                let substeps: usize =
-                    ((stride / SUPPORT_SUBSTEP_DISTANCE).ceil() as usize).max(1);
+                let substeps: usize = ((stride / SUPPORT_SUBSTEP_DISTANCE).ceil() as usize).max(1);
                 let mut cursor: Vec2 = a;
                 for index in 0..substeps {
                     let t: f32 = (index + 1) as f32 / substeps as f32;

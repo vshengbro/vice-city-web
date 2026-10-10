@@ -148,6 +148,7 @@ pub struct TrafficCar {
     driven: bool,
 }
 
+/// Inherent implementation of [`TrafficCar`].
 impl TrafficCar {
     /// 当前世界坐标。
     ///
@@ -526,6 +527,7 @@ pub struct Pickup {
     spin: f32,
 }
 
+/// Inherent implementation of [`Pickup`].
 impl Pickup {
     /// 在指定位置放一个拾取物。
     ///
@@ -613,6 +615,7 @@ pub struct Traffic {
     pickups: Vec<Pickup>,
 }
 
+/// Inherent implementation of [`Traffic`].
 impl Traffic {
     /// 新建一个空的交通世界。
     ///
