@@ -11471,6 +11471,60 @@ mod tests {
     }
 
     #[test]
+    fn the_ground_does_not_flip_when_it_re_anchors() {
+        // 回归:地面的棋盘格着色原先用**格子下标** `(i + j) % 2` / `i % 4`
+        // 决定,而不是世界坐标。地面每跨一个流式格子重新落位时 origin 平移
+        // 一格,所有下标整体 +1,于是整块地面的沥青 / 人行道配色在原地
+        // 翻面 —— 这就是用户报的「走着走着突然环境变了,像是穿越了」。
+        //
+        // 断言:同一个世界点,在重建前后必须拿到**同一个颜色**。
+        let probe: Vec<[f32; 3]> = vec![
+            [63.5, 0.0, 45.0],   // 车道内
+            [66.0, 0.0, 45.0],   // 人行道
+            [80.0, 0.0, 45.0],   // 地块
+            [63.5, 0.0, 105.0],
+            [80.0, 0.0, 105.0],
+        ];
+        let colour_at: fn([f32; 2], [f32; 3]) -> Option<[f32; 3]> =
+            |centre: [f32; 2], at: [f32; 3]| -> Option<[f32; 3]> {
+            let ground: MeshAsset = build_ground_near(centre[0], centre[1]);
+            let cell: f32 = GROUND_SPAN / super::GROUND_SUBDIV as f32;
+            let ox: f32 =
+                street_axis((centre[0] / super::GROUND_CELL_ALIGN).round() as i32)
+                    - GROUND_SPAN * 0.5;
+            let oz: f32 =
+                street_axis((centre[1] / super::GROUND_CELL_ALIGN).round() as i32)
+                    - GROUND_SPAN * 0.5;
+            let i: usize = (((at[2] - oz) / cell).floor().max(0.0) as usize)
+                .min(super::GROUND_SUBDIV - 1);
+            let j: usize = (((at[0] - ox) / cell).floor().max(0.0) as usize)
+                .min(super::GROUND_SUBDIV - 1);
+            // 每个 cell 两个三角面,面序与 faces 一样按 (i, j) 行优先。
+            let index: usize = (i * super::GROUND_SUBDIV + j) * 2;
+            ground
+                .parts
+                .first()
+                .and_then(|part: &crate::mesh::MeshPart| {
+                    part.face_colors.as_ref().and_then(|c: &Vec<[f32; 3]>| {
+                        c.get(index).map(|v: &[f32; 3]| {
+                            [v[0] as f32, v[1] as f32, v[2] as f32]
+                        })
+                    })
+                })
+        };
+        for at in probe {
+            let before: Option<[f32; 3]> = colour_at([63.5, 45.0], at);
+            let after: Option<[f32; 3]> = colour_at([123.5, 105.0], at);
+            assert_eq!(
+                before, after,
+                "地面重新落位后,世界点 ({}, {}) 的颜色从 {:?} 变成 {:?} —— \
+                 棋盘格用的是格子下标而不是世界坐标,整块地会原地翻面",
+                at[0], at[2], before, after
+            );
+        }
+    }
+
+    #[test]
     fn lane_axis_matches_the_city_grid() {
         // traffic.rs 不能依赖 game(单向依赖,否则成环),所以街道网格的
         // 两个数字各存了一份。这条测试就是那份重复的**唯一担保**:任何一边
