@@ -2034,6 +2034,19 @@ impl QualityTier {
         *self == QualityTier::High
     }
 
+    /// 档位名(给调试探针用)。
+    ///
+    /// # Returns
+    ///
+    /// - `&'static str` - `High` / `Medium` / `Low`。
+    pub fn tier_name(&self) -> &'static str {
+        match self {
+            QualityTier::High => QUALITY_NAME_HIGH,
+            QualityTier::Medium => QUALITY_NAME_MEDIUM,
+            QualityTier::Low => QUALITY_NAME_LOW,
+        }
+    }
+
     /// 该档位下是否跑 SSAO。
     ///
     /// # Returns
@@ -5306,6 +5319,55 @@ impl Renderer {
 
 #[cfg(test)]
 mod tests {
+    use super::{AdaptiveQuality, QualityTier};
+    use crate::r#const::{
+        FAST_FRAME_THRESHOLD, QUALITY_DOWN_FPS, SLOW_FRAME_THRESHOLD,
+    };
+
+    /// 回归:降档是**单向**的 —— 代码里刻意不执行升档。
+    ///
+    /// 这条以前只有一句注释守着(`单向降级:这里刻意不执行升档`),没有断言。
+    /// 它很重要:SSR 只在 `High` 档跑(`wants_ssr`),所以一旦在慢机器上掉到
+    /// `Medium`,整条湿地面反射管线会**静默消失**,而画面看起来仍然正常。
+    /// 本测试把这个语义钉死,顺手确认 `Low` 不会自己爬回去。
+    #[test]
+    fn quality_only_ever_drops_and_never_climbs_back() {
+        let mut quality: AdaptiveQuality = AdaptiveQuality::new();
+        assert_eq!(
+            quality.get_tier(),
+            QualityTier::High,
+            "初始档位必须是 High —— 否则第一帧就没有 SSR"
+        );
+        // 连续喂慢帧:High -> Medium -> Low,然后钉死在 Low。
+        for _ in 0..(SLOW_FRAME_THRESHOLD * 4) {
+            quality.sample(QUALITY_DOWN_FPS * 0.5);
+        }
+        let dropped: QualityTier = quality.get_tier();
+        assert!(
+            dropped == QualityTier::Medium || dropped == QualityTier::Low,
+            "喂了 {} 个慢帧之后档位应该已经降过,实际是 {:?}",
+            SLOW_FRAME_THRESHOLD * 4,
+            dropped.tier_name()
+        );
+        // 再喂一堆**快**帧 —— 档位不许涨回去(这是刻意的设计)。
+        let after_fast: QualityTier = {
+            for _ in 0..(FAST_FRAME_THRESHOLD * 4) {
+                quality.sample(240.0);
+            }
+            quality.get_tier()
+        };
+        assert_eq!(
+            after_fast,
+            dropped,
+            "单向降档:快帧不能让档位自己涨回 {:?}(实际 {:?})",
+            dropped.tier_name(),
+            after_fast.tier_name()
+        );
+        assert!(
+            !dropped.wants_ssr() || dropped == QualityTier::High,
+            "只有 High 档才跑 SSR"
+        );
+    }
     use crate::r#const::{
         PHASE_FIELD_VALUE, PHASE_QUERY_DUSK, PHASE_QUERY_NIGHT, PHASE_QUERY_NOON,
         SHADOW_CULL_MARGIN, SHADOW_GROUNDED_EPS, SHADOW_HALF_EXTENT, T_PHASE_QUERY_MAPS,

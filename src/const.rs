@@ -1836,6 +1836,12 @@ pub(crate) const FAST_FRAME_THRESHOLD: u32 = 180;
 
 /// 建管线后前多少帧不参与降级判定。
 pub(crate) const QUALITY_WARMUP_FRAMES: u32 = 20;
+/// 档位名,给调试探针输出用。
+pub(crate) const QUALITY_NAME_HIGH: &str = "High";
+/// 中档名。
+pub(crate) const QUALITY_NAME_MEDIUM: &str = "Medium";
+/// 低档名。
+pub(crate) const QUALITY_NAME_LOW: &str = "Low";
 
 /// 跳过 SSAO 时 AO 贴图的中性值(1.0 = 完全不遮蔽)。
 pub(crate) const NEUTRAL_AO: f32 = 1.0;
