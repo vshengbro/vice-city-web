@@ -120,6 +120,52 @@ def _annulus(m, y, x0, x1, z0, z1, ow, oh, color, flip):
             m.quad(pts[0], pts[1], pts[2], pts[3], color)
 
 
+def _annulus_side(m, x, z0, z1, y0, y1, ow, oh, color, flip):
+    """`_annulus` for a wall lying in the Z/Y plane at constant ``x``.
+
+    The front facade ring is built in X/Z at a fixed Y; a gable or end wall
+    needs the same border in Z/Y at a fixed X.  Same four quads, other axes.
+    """
+    outer = ((z0 - ow, y0 - oh), (z1 + ow, y0 - oh),
+             (z1 + ow, y1 + oh), (z0 - ow, y1 + oh))
+    inner = ((z0, y0), (z1, y0), (z1, y1), (z0, y1))
+    for j in range(4):
+        a = outer[j]
+        b = outer[(j + 1) % 4]
+        c = inner[(j + 1) % 4]
+        d = inner[j]
+        pts = ((x, a[0], a[1]), (x, b[0], b[1]),
+               (x, c[0], c[1]), (x, d[0], d[1]))
+        if flip:
+            m.quad(pts[0], pts[3], pts[2], pts[1], color)
+        else:
+            m.quad(pts[0], pts[1], pts[2], pts[3], color)
+
+
+def _reveal_side(m, z, y0, y1, x_a, x_b, color, up):
+    """End-wall sill/lintel: a horizontal band at height ``z`` spanning the
+    window width in Y, running the reveal depth in X.
+
+    Mirrors `_reveal` (one constant height plane, one axis swept) so the sill
+    really is a sill and not a vertical jamb band.
+
+    Both ends share a single Part, so the depth span is normalised to a
+    positive X extent first.  The east end's depth runs toward -X and the west
+    end's toward +X, which would emit opposite windings and hence disagreeing
+    normals that one ``outward`` cannot express.  ``up`` picks the facing:
+    sills up, lintels down.
+    """
+    x_lo, x_hi = (x_a, x_b) if x_b >= x_a else (x_b, x_a)
+    a = (x_lo, y0, z)
+    b = (x_hi, y0, z)
+    c = (x_hi, y1, z)
+    d = (x_lo, y1, z)
+    if up:
+        m.quad(a, b, c, d, color)
+    else:
+        m.quad(a, d, c, b, color)
+
+
 def _reveal(m, x0, x1, z, y_a, y_b, color, up):
     """One window reveal: the jamb face between the frame ring and the glass.
 
@@ -433,6 +479,18 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
     windows_side = C.Part("windows_side", base_color=GLASS, roughness=0.25)
     window_side_lit = C.Part("window_side_lit", base_color=GLASS_LIT,
                              roughness=0.25, emissive=(0.90, 0.74, 0.40))
+    # 东/西两端面此前只有一块裸玻璃:正面有框、窗台、过梁,侧面什么都没有,
+    # 于是侧立面在街上读成一块空板。侧框朝 +X/-X,故单列一组。
+    # 两个端面朝向相反,而一个 Part 只允许一个 outward 方向,所以东西两面
+    # 各要一组框;东西两端共用窗台/过梁方向(都朝上/下)。
+    frames_side_e = C.Part("window_side_frames_e", base_color=trim_c,
+                           outward=("dir", (1.0, 0.0, 0.0)))
+    frames_side_w = C.Part("window_side_frames_w", base_color=trim_c,
+                           outward=("dir", (-1.0, 0.0, 0.0)))
+    sills_side = C.Part("window_side_sills", base_color=trim_c,
+                        outward=("dir", (0.0, 0.0, 1.0)))
+    lintels_side = C.Part("window_side_lintels", base_color=_shrub(trim_c, 0.86),
+                          outward=("dir", (0.0, 0.0, -1.0)))
 
     ww, wh = 1.10, 1.62
     fw = 0.13                                    # frame border width
@@ -484,16 +542,45 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
                         y_f, y_g, trim_c, up=True)
                 _reveal(lintels.mesh, x - ww * 0.5, x + ww * 0.5,
                         z + wh * 0.5, y_f, y_g, _shrub(trim_c, 0.86), up=False)
-            # east/west ends -- one recessed light per storey per end
+            # east/west ends -- one recessed light per storey per end, now
+            # framed like the front: a 20 mm rebate, a surround ring, a sill
+            # and a lintel.  `_annulus` and `_reveal` are written for the
+            # X/Z plane facing +Y, so pass the end-wall axes swapped and the
+            # face inset already resolved by the caller.
+            # 端面此前每层只有一扇固定位置的窗,无论楼有多深 —— 沿街看过去
+            # 侧面就是一大片只开一个小洞的墙。现在按深度排一整排,间距与
+            # 正面一致,侧立面才有和正面相同的节奏。
             for fi2, sx in enumerate((-1, 1)):
-                lit = _lit_at(f, 3 + fi2, sx, lit_mod, lit_thresh)
-                sp = window_side_lit if lit else windows_side
-                sc = GLASS_LIT if lit else GLASS
-                C.box(sp.mesh, (0.12, 0.90, 1.42),
-                      center=(sx * (w2 * 0.5 - 0.02), 0.0, z), color=sc)
+                ring_m = frames_side_e if sx > 0 else frames_side_w
+                side_cols: int = max(1, int(round(d2 * 0.82 / win_pitch)))
+                for sidx in range(side_cols):
+                    lit = _lit_at(f, 3 + fi2, sx, lit_mod, lit_thresh)
+                    sp = window_side_lit if lit else windows_side
+                    sc = GLASS_LIT if lit else GLASS
+                    sw, sh = 0.90, 1.42
+                    y_end: float = ((sidx + 0.5) / side_cols - 0.5) * d2 * 0.82
+                    x_wall: float = sx * (w2 * 0.5 - 0.02)
+                    C.box(sp.mesh, (0.12, sw, sh),
+                          center=(x_wall, y_end, z), color=sc)
+                    # ring sits just outboard of the glass, facing +/-X
+                    _annulus_side(ring_m.mesh, x_wall + sx * 0.06,
+                                  z - sh * 0.5, z + sh * 0.5,
+                                  y_end - sw * 0.5, y_end + sw * 0.5,
+                                  fw, fw, trim_c, flip=(sx < 0))
+                    # sill below and lintel above, spanning the reveal depth
+                    depth_a: float = x_wall
+                    depth_b: float = x_wall - sx * 0.12
+                    _reveal_side(sills_side.mesh, z - sh * 0.5,
+                                 y_end - sw * 0.5, y_end + sw * 0.5,
+                                 depth_a, depth_b, trim_c, up=True)
+                    _reveal_side(lintels_side.mesh, z + sh * 0.5,
+                                 y_end - sw * 0.5, y_end + sw * 0.5,
+                                 depth_a, depth_b,
+                                 _shrub(trim_c, 0.86), up=False)
 
     for p in (windows, window_lit, frames, frames_rear, sills, lintels,
-              windows_side, window_side_lit):
+              windows_side, window_side_lit,
+              frames_side_e, frames_side_w, sills_side, lintels_side):
         if p.mesh.faces:
             a.add(p)
 
