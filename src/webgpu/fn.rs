@@ -618,12 +618,31 @@ pub fn empty_bloom_buffers() -> [JsValue; BLOOM_PASS_COUNT] {
     [JsValue::NULL; BLOOM_PASS_COUNT]
 }
 
-/// 全空的 bloom pipeline / bind group 配对数组(建之前的状态)。
+/// 全空的 AO pipeline / bind group 配对数组(建之前的状态)。
 ///
-/// ⚠️ `array::from_fn` 从 [`crate::webgpu`] 的 `mod.rs` 统一 import
-/// (§6.4 要求 import 集中在那里,§1.3 又不写 `std::` 限定路径,所以走
-/// crate 根的 `::core`)。这里能直接写 `array::from_fn` 是因为
-/// [`super::mod`] 已经把它 re-export 出来了。
+/// 同 [`empty_bloom_passes`]:`JsValue` 不是 `Copy`,必须用 `from_fn`
+/// 而不是 `[expr; N]` 重复式。
+///
+/// # Returns
+///
+/// - `[GpuAoPass; AO_PASS_COUNT]` - 每条的 pipeline 与 bind group 都是 `JsValue::NULL`。
+pub fn empty_ao_passes() -> [GpuAoPass; AO_PASS_COUNT] {
+    array::from_fn(|_index: usize| GpuAoPass {
+        pipeline: JsValue::NULL,
+        group: JsValue::NULL,
+    })
+}
+
+/// 三条 AO pass 各自的 uniform buffer,建之前都是空的。
+///
+/// # Returns
+///
+/// - `[JsValue; AO_PASS_COUNT]` - 每条一个尚未创建的 buffer 句柄。
+pub fn empty_ao_buffers() -> [JsValue; AO_PASS_COUNT] {
+    [JsValue::NULL; AO_PASS_COUNT]
+}
+
+/// 全空的 bloom pipeline / bind group 配对数组(建之前的状态)。
 ///
 /// # Returns
 ///
@@ -1087,4 +1106,40 @@ pub fn draw_indexed(
         .apply(pass, &arguments)
         .map(|_: JsValue| ())
         .map_err(|error: JsValue| format!("drawIndexed threw: {}", describe(&error)))
+}
+
+/// AO 模糊 pass 的 WGSL。
+///
+/// 深度感知(双边)的可分离模糊:只在深度差小于 `DEPTH_SIGMA` 的像素之间
+/// 混合。普通高斯模糊会把前景的暗角糊到背景上,在街沿和墙角表现为脏边。
+///
+/// 采样数固定 9(5 抽 + 4 双边权重),分离成 H/V 两趟。
+///
+/// # Returns
+///
+/// - `String` - 填好深度 sigma 与哨兵值的 WGSL。
+pub(crate) fn shader_ao_blur() -> String {
+    SSAO_BLUR_BODY
+        .replace(WGSL_SLOT_DEPTH_SIGMA, &SSAO_DEPTH_SIGMA.to_string())
+        .replace(WGSL_SLOT_NO_GEOMETRY, &SSAO_NO_GEOMETRY.to_string())
+}
+/// SSAO pass 的 WGSL。
+///
+/// 在**视空间**半球里采样:每个样本算出一个期望深度,与实际深度比较,
+/// 差得越远说明被遮挡得越厉害。用半球而不是整球 —— 背后的几何体
+/// 不构成遮挡。
+///
+/// 法线与深度都必须来自城市 pass 的 MRT 且是**视空间**的,和 `frame`
+/// 里的 `view` 约定配套。世界法线直接拿来算会让方向整体错开。
+///
+/// # Returns
+///
+/// - `String` - 填好哨兵值与采样数的 WGSL。
+pub(crate) fn shader_ssao() -> String {
+    // 哨兵与采样数从 Rust 常量注入:WGSL 看不到 Rust 的 `const`,
+    // 硬编码一份必然和清屏值、`SSAO_SAMPLES` 走散。
+    let body: String = SSAO_BODY
+        .replace(WGSL_SLOT_NO_GEOMETRY, &SSAO_NO_GEOMETRY.to_string())
+        .replace(WGSL_SLOT_SAMPLES, &SSAO_SAMPLES.to_string());
+    body
 }

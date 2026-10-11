@@ -207,6 +207,8 @@ pub(crate) const COMPARE_LESS: &str = "less";
 /// 硬件在 2×2 邻域内插值出来的。给 `"nearest"` 的话 3×3 核会退化成
 /// 9 个方块状硬边,半影全丢。
 pub(crate) const FILTER_LINEAR: &str = "linear";
+/// AO 专用:必须逐 texel 取。见 `FILTER_NEAREST` 的调用处。
+pub(crate) const FILTER_NEAREST: &str = "nearest";
 
 /// `GPUSamplerDescriptor` 的 `magFilter` 键。
 pub(crate) const FIELD_MAG_FILTER: &str = "magFilter";
@@ -474,6 +476,11 @@ pub(crate) const FIELD_COUNT: &str = "count";
 /// `depth`):声明错采样类型时,绑 `rgba8unorm` 会被判 invalid,
 /// 而且错误是**异步**报上来的 —— 画面直接黑,console 里一个字都没有。
 pub(crate) const SAMPLE_TYPE_FLOAT: &str = "float";
+/// `r32float` 只配这个采样类型:WebGPU 规定 32 位浮点不可线性过滤。
+/// 绑这类纹理时 layout 写 `float` 会报
+/// `None of the supported sample types (UnfilterableFloat) ... match
+/// the expected sample types (Float)`,整组 bind group 作废。
+pub(crate) const SAMPLE_TYPE_UNFILTERABLE_FLOAT: &str = "unfilterable-float";
 
 /// `GPUSamplerBindingLayout.type` = `"filtering"`。
 ///
@@ -481,6 +488,10 @@ pub(crate) const SAMPLE_TYPE_FLOAT: &str = "float";
 /// 颜色纹理只能配 `sampler`(filtering / non-filtering),配
 /// `sampler_comparison` 会被 WebGPU 判 invalid。
 pub(crate) const SAMPLER_TYPE_FILTERING: &str = "filtering";
+
+/// 非插值采样器(逐 texel 取)。与 `SAMPLE_TYPE_UNFILTERABLE_FLOAT`
+/// 配对:32 位浮点纹理只能配它。
+pub(crate) const SAMPLER_TYPE_NON_FILTERING: &str = "non-filtering";
 
 /// bloom 全屏三角形顶点着色器的入口点名。
 ///
@@ -520,6 +531,274 @@ pub(crate) const BINDING_BLOOM_BLUR_SAMPLER: u32 = 3;
 /// bloom 模糊图在**合成** layout 里的第二个纹理槽位。
 pub(crate) const BINDING_BLOOM_BLUR_MAP: u32 = 4;
 
+/// SSAO 采样器在**合成** layout 里的槽位。
+pub(crate) const BINDING_BLOOM_AO_SAMPLER: u32 = 5;
+
+/// SSAO 图在**合成** layout 里的槽位。
+pub(crate) const BINDING_BLOOM_AO_MAP: u32 = 6;
+
+pub(crate) const SSAO_BLUR_BODY: &str = r#"
+struct BlurUniform {
+    // xy = 1/分辨率, z = 方向 x, w = 方向 y
+    direction : vec4<f32>,
+};
+
+@group(0) @binding(0) var blur_sampler : sampler;
+@group(0) @binding(1) var blur_source : texture_2d<f32>;
+@group(0) @binding(2) var blur_depth : texture_2d<f32>;
+@group(0) @binding(3) var<uniform> blur : BlurUniform;
+
+struct VsOut {
+    @builtin(position) position : vec4<f32>,
+    @location(0) uv : vec2<f32>,
+};
+
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
+    var x : f32 = -1.0;
+    var y : f32 = -1.0;
+    if (index == 1u) {
+        x = 3.0;
+    } else if (index == 2u) {
+        y = 3.0;
+    }
+    var out : VsOut;
+    out.position = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_blur(in : VsOut) -> @location(0) vec4<f32> {
+    let centre_depth : f32 = textureSampleLevel(blur_depth, blur_sampler, in.uv, 0.0).r;
+    if (centre_depth >= {NO_GEOMETRY}) {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    }
+    let step_uv : vec2<f32> = blur.direction.xy * blur.direction.zw;
+    var total : f32 = 0.0;
+    var weight_sum : f32 = 0.0;
+    // 高斯权重 [1 4 6 4 1] / 16,双边权重再乘深度相似度。
+    for (var i : i32 = -4; i <= 4; i = i + 1) {
+        let offset : f32 = f32(i);
+        let weight : f32 = exp(-offset * offset / 8.0);
+        let uv : vec2<f32> = in.uv + step_uv * offset;
+        // ⚠️ `textureSampleLevel` 而非 `textureSample`:循环里的 `continue`
+        // 让控制流变成非 uniform,`textureSample` 在那里非法。
+        let d : f32 = textureSampleLevel(blur_depth, blur_sampler, uv, 0.0).r;
+        if (d >= {NO_GEOMETRY}) {
+            continue;
+        }
+        let depth_weight : f32 = exp(
+            -abs(d - centre_depth) / max({DEPTH_SIGMA}, 0.0001));
+        let w : f32 = weight * depth_weight;
+        total = total
+            + textureSampleLevel(blur_source, blur_sampler, uv, 0.0).r * w;
+        weight_sum = weight_sum + w;
+    }
+    if (weight_sum <= 0.0) {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    }
+    return vec4<f32>(total / weight_sum, 0.0, 0.0, 1.0);
+}
+"#;
+
+
+/// 全屏三角形:所有离屏 pass 共用,UV 在这里翻一次。
+/// SSAO / AO 模糊模板里的占位符名。
+///
+/// WGSL 看不见 Rust 的 `const`,所以模板先留名字、拼 shader 时再替换成
+/// 真实数值。名字本身也是常量 —— 硬编码在 `fn.rs` 的替换调用里会让
+/// 「模板里写了 `{X}`、替换时找的是 `Y`」这种错配无从发现(§1.3c)。
+pub(crate) const WGSL_SLOT_NO_GEOMETRY: &str = "{NO_GEOMETRY}";
+
+/// 见 [`WGSL_SLOT_NO_GEOMETRY`]:深度哨兵的占位符名。
+pub(crate) const WGSL_SLOT_DEPTH_SIGMA: &str = "{DEPTH_SIGMA}";
+
+/// 见 [`WGSL_SLOT_NO_GEOMETRY`]:采样数的占位符名。
+pub(crate) const WGSL_SLOT_SAMPLES: &str = "{SAMPLES}";
+
+pub(crate) const SSAO_BODY: &str = r#"
+struct AoUniform {
+    // x = 1/宽度, y = 1/高度, z = 抖动种子, w = 强度下限
+    misc : vec4<f32>,
+    // x = 采样半径(米), y = 强度(0 = 关闭), z/w = 预留
+    params : vec4<f32>,
+};
+
+@group(0) @binding(0) var ao_sampler : sampler;
+@group(0) @binding(1) var ao_normal : texture_2d<f32>;
+@group(0) @binding(2) var ao_depth : texture_2d<f32>;
+@group(0) @binding(3) var<uniform> ao : AoUniform;
+
+struct VsOut {
+    @builtin(position) position : vec4<f32>,
+    @location(0) uv : vec2<f32>,
+};
+
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
+    var x : f32 = -1.0;
+    var y : f32 = -1.0;
+    if (index == 1u) {
+        x = 3.0;
+    } else if (index == 2u) {
+        y = 3.0;
+    }
+    var out : VsOut;
+    out.position = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+    return out;
+}
+
+/// 采样点是否还落在屏幕里。
+///
+/// 逐分量比较而不是四条 `||`:`sample_uv` 越界时整圈样本都得跳过,
+/// 提前返回的代价低于继续采样。
+fn inside_unit(value : vec2<f32>) -> bool {
+    return all(value >= vec2<f32>(0.0)) && all(value <= vec2<f32>(1.0));
+}
+
+/// 哈希到 [0,1),每像素抖动以打散采样噪声。
+fn hash(value : vec2<f32>) -> f32 {
+    return fract(sin(dot(value, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+}
+
+@fragment
+fn fs_ssao(in : VsOut) -> @location(0) vec4<f32> {
+    let centre_depth : f32 = textureSampleLevel(ao_depth, ao_sampler, in.uv, 0.0).r;
+    let strength : f32 = ao.params.y;
+    if (centre_depth >= {NO_GEOMETRY} || strength <= 0.0) {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    }
+    // 解回 [-1,1]:写的时候做了 `* 0.5 + 0.5` 的编码,这里必须对称地
+    // 解码,否则 `normalize` 之前法线就整体偏了。
+    let n : vec3<f32> = normalize(
+        textureSampleLevel(ao_normal, ao_sampler, in.uv, 0.0).xyz * 2.0
+        - vec3<f32>(1.0));
+
+    let radius : f32 = ao.params.x;
+
+    let angle_offset : f32 = hash(in.uv * ao.misc.zw) * 6.2831853;
+    let tangent : vec3<f32> = normalize(
+        select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0),
+               abs(n.z) < 0.9));
+    let bitangent : vec3<f32> = cross(n, tangent);
+
+    let count : f32 = f32({SAMPLES});
+    var occlusion : f32 = 0.0;
+    var tested : f32 = 0.0;
+    for (var i : i32 = 0; i < {SAMPLES}; i = i + 1) {
+        let fi : f32 = f32(i) + 0.5;
+        let theta : f32 = angle_offset + fi * 2.39996323;
+        // sqrt 均匀化半球面积,否则样本全挤在极点上。
+        let cos_z : f32 = sqrt(1.0 - fi / count);
+        let sin_z : f32 = sqrt(fi / count);
+        let dir : vec3<f32> = tangent * (cos(theta) * sin_z)
+            + bitangent * (sin(theta) * sin_z) + n * cos_z;
+        // ⚠️ **深度增量取法线的点积,不是 `dir.z`。**
+        //
+        // `dir` 是单位半球方向,`dir.z` 是它在**某个世界/视空间轴**上的
+        // 分量 —— 与「样本沿视线方向偏了多远」毫无关系。切平面上的样本
+        // `dir.z ≈ 0`,于是 `sample_depth ≈ centre_depth`,`delta` 恒在
+        // 半径以内、`falloff` 恒为 1,但真正该被算作遮挡的样本
+        // (样本深度比场景**更远**)又因为 `step(sample_depth,
+        // scene_depth)` 恰好取 1 而全部命中 —— 两个错误互相抵消,最后
+        // 表现为一张几乎全白、只有零星黑点的 AO 图。
+        //
+        // 视空间里 z 轴指向相机,所以「沿视线往外走」就是沿法线抬起来
+        // 的那一段:深度增量 = `dot(dir, n) * radius`。
+        let along_normal : f32 = dot(dir, n);
+        let sample_depth : f32 = centre_depth + along_normal * radius;
+        if (sample_depth <= 0.0) {
+            continue;
+        }
+        // 视空间 xy 偏移投到 UV。
+        //
+        // ⚠️ **不能简单乘 `centre_depth`。** 那假设正交投影,而实际是透视:
+        // 屏幕空间偏移与深度成反比,直接相乘会让远处几何的采样点飞到
+        // 屏幕外(被下面的 `sample_uv` 边界检查全部 `continue` 掉),于是
+        // 越远的物体越没有 AO —— 表现为近处有、远处一片白。
+        //
+        // 透视下屏幕偏移与深度成反比,所以除以眼距做归一化;`misc.xy`
+        // 是半分辨率的 texel 尺寸,乘进去把米换算成 uv。
+        //
+        // ⚠️ `max(centre_depth, 0.05)` 是必需的:贴到相机上的面眼距趋近
+        // 0,那一项会发散到把 `sample_uv` 顶出边界,整圈样本被跳过。
+        let sample_uv : vec2<f32> = in.uv
+            + dir.xy * radius * ao.misc.xy / max(centre_depth, 0.05);
+        if (!inside_unit(sample_uv)) {
+            continue;
+        }
+        // ⚠️ 必须是 `textureSampleLevel`,不能是 `textureSample`:
+        // 循环里带 `continue`,控制流依赖 `sample_depth`(来自纹理),
+        // **不是 uniform**。`textureSample` 只允许在 uniform 控制流里
+        // 调用,否则编译报
+        // `textureSample must only be called from uniform control flow`。
+        // 显式给 mip 层级(=0)在全屏离屏 pass 上完全等价。
+        tested = tested + 1.0;
+        let scene_depth : f32 =
+            textureSampleLevel(ao_depth, ao_sampler, sample_uv, 0.0).r;
+        if (scene_depth >= {NO_GEOMETRY}) {
+            continue;
+        }
+        // ⚠️ **遮挡的方向曾经写反了。**
+        //
+        // `step(edge, x)` 在 `x >= edge` 时返回 1,所以原来的
+        // `step(sample_depth, scene_depth)` 命中的是「场景比样本点**更远**」
+        // —— 而遮挡的定义恰恰相反:样本点所在的前方如果有东西,那个东西的
+        // 深度会比 `sample_depth` **更近**。
+        //
+        // 两者一旦同时被另一个错误(`dir.z` 当深度增量)掩盖,结果就是
+        // 整张 AO 图恒为 1.0 —— 99.8% 的样本都跑完了深度比较,却一个
+        // 都没判成遮挡。
+        let delta : f32 = scene_depth - sample_depth;
+        // 只统计 `delta` 为负(场景更近)且在半径之内的那部分。
+        let within : f32 = step(delta, 0.0);
+        let falloff : f32 = smoothstep(0.0, 1.0,
+                                      radius / max(abs(delta), 0.0001));
+        occlusion = occlusion + within * falloff;
+    }
+    let shade : f32 = 1.0 - (occlusion / count) * strength;
+    return vec4<f32>(clamp(shade, ao.misc.w, 1.0), 0.0, 0.0, 1.0);
+}
+"#;
+
+// ---------------------------------------------------------------------------
+// SSAO
+// ---------------------------------------------------------------------------
+
+/// SSAO 的 G-buffer 采样器槽位。
+pub(crate) const BINDING_SSAO_SAMPLER: u32 = 0;
+
+/// slot 1 的语义随 pass 变:采样那条是视空间法线图,模糊那两条是上一
+/// 趟的 AO 结果。两条着色器的 `@binding(1)` 共用同一个 layout 槽位。
+pub(crate) const BINDING_SSAO_SOURCE: u32 = 1;
+
+/// SSAO 的**线性深度**图槽位(城市 pass 的 MRT 附件 2)。
+pub(crate) const BINDING_SSAO_DEPTH: u32 = 2;
+
+/// SSAO 的 uniform 槽位。
+pub(crate) const BINDING_SSAO_UNIFORM: u32 = 3;
+
+/// 每个像素的半球采样数。
+///
+/// 12 是「夜景看不出噪声」的最小值;再低就会在墙根出现明显的噪点带。
+pub(crate) const SSAO_SAMPLES: i32 = 12;
+
+/// 「没有几何体」的线性深度哨兵。
+///
+/// ⚠️ 必须和 G-buffer 深度附件的**清屏值**配对(1.0)。曾经清屏写 0.0
+/// 而这里沿用 WebGL2 的 0.999,天空像素就被当成贴在 z=0 的面,整个 AO
+/// 在第一步就取到错的深度。
+pub(crate) const SSAO_NO_GEOMETRY: f32 = 0.999;
+
+/// AO 模糊的深度不敏感阈值(米):跨更大的深度差就不互相贡献,
+/// 否则前景会把背景的暗角糊过来。
+pub(crate) const SSAO_DEPTH_SIGMA: f32 = 0.06;
+
+/// SSAO 强度的下限,保证最暗处也不会压成纯黑。
+pub(crate) const SSAO_MIN_AO: f32 = 0.22;
+
 /// bloom 离屏颜色目标:`RENDER_ATTACHMENT | TEXTURE_BINDING`。
 ///
 /// 四张(scene / bright / ping / pong)都要读写两遍:被上一个 pass 写
@@ -540,6 +819,42 @@ pub(crate) const BLOOM_TARGET_FORMAT: &str = "rgba8unorm";
 /// `build_bloom_layout` 的形状选择:提取 / 两条模糊(3 槽)。
 pub(crate) const BLOOM_LAYOUT_SHAPE_PLAIN: bool = false;
 
+/// SSAO 采样 pass 的片元入口。
+pub(crate) const ENTRY_SSAO_FRAGMENT: &str = "fs_ssao";
+
+/// 双边模糊 pass 的片元入口(H / V 两趟共用)。
+pub(crate) const ENTRY_AO_BLUR_FRAGMENT: &str = "fs_blur";
+
+/// AO 半分辨率目标的格式。
+pub(crate) const AO_TARGET_FORMAT: &str = "r8unorm";
+
+/// AO uniform 的大小(字节):两条 `vec4<f32>`。
+pub(crate) const UNIFORM_AO_BYTES: u32 = 32;
+
+/// G-buffer 视空间法线的格式。
+pub(crate) const G_BUFFER_NORMAL_FORMAT: &str = "rgba8unorm";
+
+/// G-buffer 线性深度的格式。
+///
+/// `r32float` 而不是 `r16float`:深度要线性,16bit 在 100 m 外每
+/// 厘米就量化没了,双边模糊的权重会整片塌掉。
+pub(crate) const G_BUFFER_DEPTH_FORMAT: &str = "r32float";
+
+/// SSAO 三条 pass 的槽位下标。
+pub(crate) const AO_PASS_SAMPLE: usize = 0;
+
+/// SSAO 采样半径(米)。
+///
+
+/// AO 双边模糊的步长(纹素)。
+///
+
+/// 模糊的**水平**那一趟。
+pub(crate) const AO_PASS_BLUR_H: usize = 1;
+
+/// 模糊的**竖直**那一趟(最终读出)。
+pub(crate) const AO_PASS_BLUR_V: usize = 2;
+
 /// `build_bloom_layout` 的形状选择:合成(5 槽)。
 pub(crate) const BLOOM_LAYOUT_SHAPE_COMPOSITE: bool = true;
 
@@ -551,8 +866,7 @@ pub(crate) const BLOOM_LAYOUT_SHAPE_COMPOSITE: bool = true;
 /// [`crate::webgpu::r#struct::BLOOM_VEC4_COUNT`] 一起改:少分配的话
 /// `writeBuffer` 会直接抛 `writeBuffer size exceeds buffer size`,
 /// 而不是静默截断。
-pub(crate) const UNIFORM_BLOOM_BYTES: u32 =
-    crate::webgpu::r#struct::BLOOM_VEC4_COUNT as u32 * 16;
+pub(crate) const UNIFORM_BLOOM_BYTES: u32 = crate::webgpu::r#struct::BLOOM_VEC4_COUNT as u32 * 16;
 
 /// bloom 高斯核的 5 个权重(中心 + 4 个对称抽头)。
 ///
@@ -1079,6 +1393,21 @@ fn sample_shadow(world : vec3<f32>, n_dot_l : f32) -> f32 {
     return select(lit, 1.0, shading.shadow_params.x <= 0.0);
 }
 
+/// 城市主 pass 的 MRT 输出。
+///
+/// 0 = 场景色(canvas 格式),1 = **视空间**法线,2 = 线性深度。
+/// 1/2 是 SSAO 的输入:只靠 canvas 颜色无法重建几何,AO 只能做成
+/// 「贴在物体上的假阴影」。
+///
+/// ⚠️ 每个 `@fragment` 常量编译成**独立的** `GPUShaderModule`,彼此
+/// 看不见对方的类型。所以这个 `struct` 必须完整写在**城市**的片元
+/// 模块里,不能只声明在顶点模块 —— 否则报 `unresolved type 'FragOut'`。
+struct FragOut {
+    @location(0) color : vec4<f32>,
+    @location(1) normal : vec4<f32>,
+    @location(2) depth : vec4<f32>,
+}
+
 @fragment
 fn fs_main(
     @location(0) normal : vec3<f32>,
@@ -1088,7 +1417,7 @@ fn fs_main(
     @location(4) world : vec3<f32>,
     @location(5) eye_distance : f32,
     @location(6) contact_ao : f32,
-) -> @location(0) vec4<f32> {
+) -> FragOut {
     let n : vec3<f32> = normalize(normal);
     let n_dot_l : f32 = max(dot(n, shading.light_dir.xyz), 0.0);
     let hemi_weight : f32 = n.y * 0.5 + 0.5;
@@ -1121,7 +1450,30 @@ fn fs_main(
         mapped = mapped + shading.sky_color.xyz * min(fog * 0.72, 0.72);
     }
     mapped = mix(mapped, shading.sky_color.xyz, fog);
-    return vec4<f32>(linear_to_srgb(mapped), 1.0);
+
+    var out : FragOut;
+    out.color = vec4<f32>(linear_to_srgb(mapped), 1.0);
+    // 视空间基。⚠️ **`Shading` 里没有 `view` 成员** —— uniform 只有
+    // `view_proj`,所以不能写 `shading.view[2]`(那会得到
+    // `struct member view not found`)。这里改用眼睛到该片元的向量当场
+    // 构造,与顶点着色器算 `eye_distance` 用的是同一个 `eye`。
+    //   forward = 指向场景内,right = forward x up,up = right x forward
+    // ⚠️ 法线**必须**转到视空间:SSAO 的半球采样完全在视空间里进行,
+    // 拿世界法线去算,采样方向会整体错开,表现为 AO 贴在错误的一侧。
+    let forward : vec3<f32> = normalize(world - shading.eye.xyz);
+    let right : vec3<f32> = normalize(cross(forward, vec3<f32>(0.0, 1.0, 0.0)));
+    let up : vec3<f32> = normalize(cross(right, forward));
+    // ⚠️ **视空间法线必须先从 [-1,1] 搬到 [0,1]。**
+    //
+    // G-buffer 法线是 `rgba8unorm` —— unorm 目标会把负分量**钳到 0**。
+    // 直接写 `dot(n, right)` 之类的话,凡是背向相机的分量都被压成 0,
+    // SSAO 那边 `normalize()` 拿到的法线长度不对、方向也偏,半球采样
+    // 整个歪掉。表现为 AO 图几乎全白、只在极少数角度上冒出零星黑点。
+    let view_normal : vec3<f32> = normalize(vec3<f32>(dot(n, right), dot(n, up),
+                                                     dot(n, forward)));
+    out.normal = vec4<f32>(view_normal * 0.5 + vec3<f32>(0.5), 1.0);
+    out.depth = vec4<f32>(eye_distance, 0.0, 0.0, 1.0);
+    return out;
 }
 "#;
 
@@ -1218,6 +1570,9 @@ struct BloomParams {
 // 只有合成那一个入口用得到这一对。
 @group(0) @binding(3) var blur_sampler : sampler;
 @group(0) @binding(4) var blur_map : texture_2d<f32>;
+// 槽 5 / 6:SSAO 的采样器 + 半分辨率 AO 图。
+@group(0) @binding(5) var ao_sampler : sampler;
+@group(0) @binding(6) var ao_map : texture_2d<f32>;
 
 // 取第 index 个核权重(index ∈ 0..4)。第 5 个(w4)放在 texel.x,
 // 所以这里单独分流而不是直接索引 kernel。
@@ -1282,7 +1637,17 @@ fn fs_blur_v(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
 fn fs_composite(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     let color : vec3<f32> = textureSample(source_color, source_sampler, uv).rgb;
     let glow : vec3<f32> = textureSample(blur_map, blur_sampler, uv).rgb;
-    return vec4<f32>(color + glow * bloom.params.y, 1.0);
+    // SSAO 当**乘性**项作用在场景色上,而不是加一层黑 —— 加法会在本来
+    // 该暗的地方变成「深灰叠深灰」,而乘法正是环境光被遮挡后应有的行为。
+    //
+    // AO 是**半分辨率**的,这里线性采样即可:深度感知双边模糊已经保证
+    // 边缘不跨物体渗色,不需要额外的双边上采样。
+    //
+    // ⚠️ 强度走 `bloom.texel.w` —— uniform 里唯一空着的槽位(`params.zw`
+    // 是模糊方向,`kernel` 是高斯核权重)。
+    let ao : f32 = textureSample(ao_map, ao_sampler, uv).r;
+    let shaded : vec3<f32> = color * mix(1.0, ao, bloom.texel.w);
+    return vec4<f32>(shaded + glow * bloom.params.y, 1.0);
 }
 "#;
 
@@ -1297,3 +1662,115 @@ pub(crate) const GPU_ERR_NO_DEVICE: &str = "requestDevice() failed";
 pub(crate) const GPU_ERR_NO_CONTEXT: &str = "getContext(webgpu) returned null";
 
 pub(crate) const GPU_ERR_CONFIGURE_FAILED: &str = "context.configure failed";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AO 采样器必须是 `non-filtering`,深度纹理必须是
+    /// `unfilterable-float`。
+    ///
+    /// 这两个都错过:G-buffer 深度是 `r32float`,WebGPU 视其为
+    /// `UnfilterableFloat`,配 filtering 采样器或声明成 `float` 的
+    /// sampleType,整条 pass 的 bind group 当场作废 —— 而画面上只表现为
+    /// 「AO 没有效果」,没有任何报错指向它。
+    #[test]
+    fn the_ao_bind_layout_matches_the_unfilterable_depth_texture() {
+        assert_eq!(SAMPLE_TYPE_UNFILTERABLE_FLOAT, "unfilterable-float");
+        assert_eq!(SAMPLER_TYPE_NON_FILTERING, "non-filtering");
+        // 合成的 AO 图是 `r8unorm`,那边仍必须是 filtering —— 两个 bind
+        // group 的采样器要求相反,别互相照抄。
+        assert_eq!(AO_TARGET_FORMAT, "r8unorm");
+    }
+
+    /// SSAO 的视空间法线必须先编码到 [0,1] 再写 unorm 目标,读回来对称解码。
+    ///
+    /// 直接写 `dot(n, right)` 会被 unorm 钳到 0(背向相机的分量全是负),
+    /// `normalize()` 拿到的是被削过的法线,半球采样整个歪掉。
+    #[test]
+    fn the_view_normal_is_encoded_for_the_unorm_gbuffer() {
+        let source: &str = SHADER_FRAGMENT;
+        assert!(
+            source.contains("view_normal * 0.5 + vec3<f32>(0.5)"),
+            "fs_main must encode the view normal from [-1,1] to [0,1]"
+        );
+        let ssao: &str = SSAO_BODY;
+        assert!(
+            ssao.contains("* 2.0") && ssao.contains("vec3<f32>(1.0)"),
+            "fs_ssao must decode the view normal symmetrically"
+        );
+    }
+
+    /// 遮挡的判定方向:样本深度比场景**更近**才算遮挡。
+    ///
+    /// `step(sample_depth, scene_depth)` 命中的是相反的方向(场景更远)。
+    /// 写反时整张 AO 图恒为 1.0,而 99.8% 的样本都正常跑完了深度比较,
+    /// 看上去「管线在工作」,只是从来没判成过遮挡。
+    #[test]
+    fn occlusion_requires_the_scene_to_be_nearer_than_the_sample() {
+        let ssao: &str = SSAO_BODY;
+        assert!(
+            ssao.contains("let within : f32 = step(delta, 0.0);"),
+            "the occlusion test must reject samples whose scene depth is farther"
+        );
+        assert!(
+            ssao.contains("let delta : f32 = scene_depth - sample_depth;")
+                && ssao.contains("within * falloff"),
+            "occlusion must be scored from scene_depth - sample_depth"
+        );
+        // 只看代码行 —— 注释里为了讲清楚曾经写反过什么,正要把这段字符串
+        // 引用出来,按整段文本搜会自己撞上自己。
+        let code: Vec<&str> = ssao
+            .lines()
+            .filter(|line: &&str| {
+                let trimmed: &str = line.trim_start();
+                !trimmed.is_empty() && !trimmed.starts_with("//")
+            })
+            .collect();
+        assert!(
+            !code
+                .iter()
+                .any(|line: &&str| line.contains("step(sample_depth, scene_depth)")),
+            "step(sample_depth, scene_depth) is the inverted test -- it counts \
+             occlusion when the scene is FARTHER, which is backwards"
+        );
+    }
+
+    /// AO pass 里不能出现裸的 `textureSample`。
+    ///
+    /// 循环里带 `continue`,控制流依赖纹理值,**不是 uniform**,
+    /// WGSL 只允许在 uniform 控制流里调 `textureSample`。
+    #[test]
+    fn the_ao_passes_only_sample_from_uniform_control_flow() {
+        for body in [SSAO_BODY, SSAO_BLUR_BODY] {
+            for line in body.lines() {
+                let trimmed: &str = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !trimmed.contains("textureSample("),
+                    "bare textureSample in a non-uniform path: {trimmed}"
+                );
+            }
+        }
+    }
+
+    /// 合成那条要把 AO 当**乘性**项作用在场景色上。
+    ///
+    /// 写成 `vec3<f32>(ao)` 会让 AO 取代整个场景 —— AO 接近 1.0 时画面
+    /// 是一片近乎纯白的象牙色,而调试信息、HUD、三角数全部照常,只有
+    /// 世界不见了。
+    #[test]
+    fn the_composite_multiplies_the_scene_by_ao() {
+        let source: &str = SHADER_BLOOM_FRAGMENT;
+        assert!(
+            source.contains("color * mix(1.0, ao, bloom.texel.w)"),
+            "the composite must multiply scene colour by AO"
+        );
+        assert!(
+            !source.contains("vec3<f32>(ao)"),
+            "vec3<f32>(ao) replaces the scene with the AO map"
+        );
+    }
+}

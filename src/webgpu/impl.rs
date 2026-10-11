@@ -39,6 +39,7 @@ impl WebGpuRenderer {
             format!("[vcw] WebGPU unavailable: {}", reason.reason)
         })?;
         let mut renderer: WebGpuRenderer = WebGpuRenderer {
+            frame_index: 0,
             context: acquired.context,
             device: acquired.device,
             format: acquired.format,
@@ -74,9 +75,25 @@ impl WebGpuRenderer {
             bloom_group_layout: JsValue::NULL,
             bloom_composite_group_layout: JsValue::NULL,
             bloom_passes: empty_bloom_passes(),
+            ao_normal: JsValue::NULL,
+            ao_depth: JsValue::NULL,
+            ao_ping: JsValue::NULL,
+            ao_pong: JsValue::NULL,
+            ao_size: (0, 0),
+            ao_buffers: empty_ao_buffers(),
+            ao_sampler: JsValue::NULL,
+            ao_group_layout: JsValue::NULL,
+            ao_passes: empty_ao_passes(),
+            // ⚠️ 必须在**建 pipeline 之前**就定下来:`create_pipeline`
+            // 读这个值决定要不要声明 MRT 附件 1 / 2。它如果还是 1,
+            // 管线就少了两个 target,而 render pass 有三个 attachment,
+            // WebGPU 判整帧 invalid(画面黑,console 只有一行
+            // `Fragment state attachments ... don't match`)。
+            gbuffer_slots: 3,
         };
         renderer.create_pipeline()?;
         renderer.create_shadow_pipeline()?;
+        renderer.create_ao_pipelines()?;
         renderer.create_uniform_buffers()?;
         // bloom 的顺序与依赖:
         //   采样器 / uniform buffer / 两条 bind group layout → 四条 pipeline
@@ -84,6 +101,7 @@ impl WebGpuRenderer {
         // 所以 pipeline 先建(它们只要 layout),目标与 bind group 留给
         // [`WebGpuRenderer::ensure_bloom_targets`] 在拿到画布尺寸时建。
         renderer.create_bloom_resources()?;
+        renderer.create_ao_resources()?;
         renderer.reserve_instances(INSTANCE_PREALLOC)?;
         Ok(renderer)
     }
@@ -157,6 +175,29 @@ impl WebGpuRenderer {
             &JsValue::from_str(&color_format),
         )?;
         push_into(&targets, 0usize, color_target.as_ref())?;
+        // ⚠️ MRT:管线必须声明与 render pass **同样数量**的目标。
+        // 少一个,WebGPU 报 `Fragment state attachments, depthStencil
+        // and format don't match` —— 异步,画面直接黑。
+        // 附件 1 / 2 只在 SSAO 开着时才有输出 —— 两者必须一致:
+        // 声明了目标却没有对应的 `@location(n)` 输出时,WebGPU 报
+        // `Color target has no corresponding fragment stage output but
+        // writeMask is not zero`,整条 pipeline 无效,画面直接黑。
+        if self.get_gbuffer_slots() > 1 {
+            let normal_target: Object = new_object();
+            set(
+                &normal_target,
+                FIELD_FORMAT,
+                &JsValue::from_str(G_BUFFER_NORMAL_FORMAT),
+            )?;
+            push_into(&targets, 1usize, normal_target.as_ref())?;
+            let linear_target: Object = new_object();
+            set(
+                &linear_target,
+                FIELD_FORMAT,
+                &JsValue::from_str(G_BUFFER_DEPTH_FORMAT),
+            )?;
+            push_into(&targets, 2usize, linear_target.as_ref())?;
+        }
         // ⚠️ `targets` 是 `GPUFragmentState` 的**成员**。少这一行,
         // WebGPU 会报 `Required member is undefined`,而且是异步的 ——
         // 画布直接黑给你看。
@@ -745,6 +786,63 @@ impl WebGpuRenderer {
     /// # Returns
     ///
     /// - `Result<(), String>` - 创建失败时的可读原因。
+    /// 建 SSAO 的采样器与三条 uniform buffer。
+    ///
+    /// 必须在 [`WebGpuRenderer::ensure_ao_targets`] **之前**跑:建目标
+    /// 时要顺手建 bind group,而 bind group 需要这里造出来的 sampler
+    /// 和 buffer 不是 `NULL`。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时的错误文本。
+    pub fn create_ao_resources(&mut self) -> Result<(), String> {
+        let device: JsValue = self.get_device().clone();
+        // ⚠️ **必须 `nearest`,不能 `linear`。**
+        //
+        // 这组绑的槽 2 是 G-buffer 的 `r32float`,WebGPU 视其为
+        // `UnfilterableFloat`,配 filtering 采样器会让 pipeline 作废。
+        // 而且这本来就是想要的:SSAO 的深度比较与双边模糊的权重判断都
+        // 必须逐 texel 取,插值出来的深度差会直接毁掉遮挡判断。
+        let sampler_descriptor: Object = new_object();
+        set(
+            &sampler_descriptor,
+            FIELD_MAG_FILTER,
+            &JsValue::from_str(FILTER_NEAREST),
+        )?;
+        set(
+            &sampler_descriptor,
+            FIELD_MIN_FILTER,
+            &JsValue::from_str(FILTER_NEAREST),
+        )?;
+        let sampler: JsValue = call1(&device, METHOD_CREATE_SAMPLER, sampler_descriptor.as_ref())?;
+        self.set_ao_sampler(sampler);
+
+        // ⚠️ **三条各一个 buffer。** 同帧往同一个 buffer 写三次,
+        // 队列时间线上只有最后一次生效 —— 而采样那条要半径/强度,
+        // 模糊两条要的**方向**还不一样(H 一个 vec2、V 另一个)。
+        // 共用的话竖直模糊会退化成第二次水平模糊,表现为 AO 沿一个
+        // 方向拉出条纹。
+        let mut buffers: Vec<JsValue> = Vec::with_capacity(AO_PASS_COUNT);
+        for _slot in 0..AO_PASS_COUNT {
+            buffers.push(create_buffer(
+                &device,
+                UNIFORM_AO_BYTES as usize,
+                USAGE_UNIFORM_BUFFER,
+            )?);
+        }
+        self.set_ao_buffers(
+            buffers
+                .try_into()
+                .map_err(|_| String::from("ao uniform buffer count must match AO_PASS_COUNT"))?,
+        );
+        Ok(())
+    }
+
+    /// 建 bloom 的离屏纹理、采样器与 bind group。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时把 validation 原因交给上层。
     pub fn create_bloom_resources(&mut self) -> Result<(), String> {
         let device: JsValue = self.get_device().clone();
         push_error_scope(&device, VALIDATION_SCOPE);
@@ -886,6 +984,274 @@ impl WebGpuRenderer {
         call1(device, METHOD_CREATE_PIPELINE_LAYOUT, descriptor.as_ref())
     }
 
+    /// 建 SSAO 的三条 pipeline:采样 → 模糊 H → 模糊 V。
+    ///
+    /// 三条共用同一个 4 槽 bind group layout,只是换了片元着色器和
+    /// uniform(半径/强度 vs 模糊方向)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时把 validation 原因交给上层。
+    pub fn create_ao_pipelines(&mut self) -> Result<(), String> {
+        // ⚠️ 必须包 error scope:管线与绑定不匹配都是**异步**报上来的。
+        // 不包的话 console 里只剩一句 `Invalid RenderPipeline ... due to
+        // a previous error`,真正的原因被吞掉,只能靠猜。
+        let device: JsValue = self.get_device().clone();
+        push_error_scope(&device, VALIDATION_SCOPE);
+        let built: Result<(), String> = self.create_ao_pipelines_inner();
+        pop_error_scope(&device, VALIDATION_SCOPE);
+        built
+    }
+
+    /// 真正建 SSAO 三条 pipeline 的那几步(外层负责 error scope)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时的错误文本。
+    fn create_ao_pipelines_inner(&mut self) -> Result<(), String> {
+        let layout: JsValue = self.build_ao_group_layout()?;
+        self.set_ao_group_layout(layout.clone());
+
+        let device: JsValue = self.get_device().clone();
+        let vertex_module: JsValue = create_shader_module(&device, SHADER_FULLSCREEN_VERTEX)?;
+        let ao_module: JsValue = create_shader_module(&device, &shader_ssao())?;
+        let blur_module: JsValue = create_shader_module(&device, &shader_ao_blur())?;
+
+        let pipeline_layout: JsValue = self.build_pipeline_layout_single(&layout)?;
+        let mut built: [GpuAoPass; AO_PASS_COUNT] = empty_ao_passes();
+        built[AO_PASS_SAMPLE] = GpuAoPass {
+            pipeline: self.build_fullscreen_pipeline(
+                &vertex_module,
+                &ao_module,
+                ENTRY_SSAO_FRAGMENT,
+                AO_TARGET_FORMAT,
+                &pipeline_layout,
+            )?,
+            group: JsValue::NULL,
+        };
+        built[AO_PASS_BLUR_H] = GpuAoPass {
+            pipeline: self.build_fullscreen_pipeline(
+                &vertex_module,
+                &blur_module,
+                ENTRY_AO_BLUR_FRAGMENT,
+                AO_TARGET_FORMAT,
+                &pipeline_layout,
+            )?,
+            group: JsValue::NULL,
+        };
+        built[AO_PASS_BLUR_V] = GpuAoPass {
+            pipeline: built[AO_PASS_BLUR_H].pipeline.clone(),
+            group: JsValue::NULL,
+        };
+        self.set_ao_passes(built);
+        Ok(())
+    }
+
+    /// SSAO 三条 pass 共用的 bind group layout(4 槽)。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<JsValue, String>` - `GPUBindGroupLayout`。
+    fn build_ao_group_layout(&self) -> Result<JsValue, String> {
+        let device: JsValue = self.get_device().clone();
+        let entries: JsValue = make_array();
+
+        // ⚠️ binding 0 的采样器类型必须是 **`non-filtering`**。
+        //
+        // 槽 2 绑的是 G-buffer 的 `r32float`,WebGPU 把这种格式标成
+        // `UnfilterableFloat`,它不能与 filtering 采样器同处一条 pipeline:
+        // `Texture binding (group:0, binding:2) is
+        // TextureSampleType::UnfilterableFloat but used statically with a
+        // sampler that's SamplerBindingType::Filtering`。
+        //
+        // 只把 `createSampler` 换成 nearest 是不够的 —— layout 声明的
+        // `SamplerBindingType` 也要跟着改,否则 pipeline 照样作废。
+        let sampler_entry: Object = new_object();
+        set(
+            &sampler_entry,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_SSAO_SAMPLER as f64),
+        )?;
+        set(
+            &sampler_entry,
+            FIELD_VISIBILITY,
+            &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+        )?;
+        let sampler_layout: Object = new_object();
+        set(
+            &sampler_layout,
+            FIELD_TYPE,
+            &JsValue::from_str(SAMPLER_TYPE_NON_FILTERING),
+        )?;
+        set(&sampler_entry, FIELD_SAMPLER, sampler_layout.as_ref())?;
+        push_into(&entries, 0usize, sampler_entry.as_ref())?;
+
+        // ⚠️ 槽 2(深度图)的 sampleType 必须是 `unfilterable-float`,
+        // **不是** `float`。
+        //
+        // G-buffer 深度是 `r32float`,WebGPU 规定 32 位浮点纹理只配
+        // `UnfilterableFloat` —— 声明成 `float` 时:
+        // `None of the supported sample types (UnfilterableFloat) of
+        // [Texture R32Float] match the expected sample types (Float)`,
+        // 整条 pass 的 bind group 无效,画面上什么也不画。
+        //
+        // 槽 1 是 `rgba8unorm`,那个确实配 `float`。
+        for (slot, binding, sample_type) in [
+            (1usize, BINDING_SSAO_SOURCE, SAMPLE_TYPE_FLOAT),
+            (2usize, BINDING_SSAO_DEPTH, SAMPLE_TYPE_UNFILTERABLE_FLOAT),
+        ] {
+            let texture_entry: Object = new_object();
+            set(
+                &texture_entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(binding as f64),
+            )?;
+            set(
+                &texture_entry,
+                FIELD_VISIBILITY,
+                &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+            )?;
+            let texture_layout: Object = new_object();
+            set(
+                &texture_layout,
+                FIELD_SAMPLE_TYPE,
+                &JsValue::from_str(sample_type),
+            )?;
+            set(&texture_entry, FIELD_TEXTURE, texture_layout.as_ref())?;
+            push_into(&entries, slot, texture_entry.as_ref())?;
+        }
+
+        // binding 3:uniform。
+        let params_entry: Object = new_object();
+        set(
+            &params_entry,
+            FIELD_BINDING,
+            &JsValue::from_f64(BINDING_SSAO_UNIFORM as f64),
+        )?;
+        set(
+            &params_entry,
+            FIELD_VISIBILITY,
+            &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+        )?;
+        let params_layout: Object = new_object();
+        set(
+            &params_layout,
+            FIELD_TYPE,
+            &JsValue::from_str(BUFFER_TYPE_UNIFORM),
+        )?;
+        set(&params_entry, FIELD_BUFFER, params_layout.as_ref())?;
+        push_into(&entries, 3usize, params_entry.as_ref())?;
+
+        let layout_desc: Object = new_object();
+        set(&layout_desc, FIELD_ENTRIES, &entries)?;
+        call1(
+            &device,
+            METHOD_CREATE_BIND_GROUP_LAYOUT,
+            layout_desc.as_ref(),
+        )
+    }
+
+    /// 建一条「全屏三角形 + 单颜色目标」的后处理 pipeline。
+    ///
+    /// bloom 与 SSAO 的六条 pass 形状完全一致,抽出来共用 —— 复制
+    /// 六份必然会有某一份忘掉「不剔除」或「没有 depthStencil」,
+    /// 而那正是全屏三角形最常见的失效方式。
+    ///
+    /// # Arguments
+    ///
+    /// - `&JsValue` - 顶点着色器模块。
+    /// - `&JsValue` - 片元着色器模块。
+    /// - `&str` - 片元入口点名。
+    /// - `&str` - 颜色目标格式。
+    /// - `&JsValue` - pipeline layout。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<JsValue, String>` - `GPURenderPipeline`。
+    fn build_fullscreen_pipeline(
+        &self,
+        vertex_module: &JsValue,
+        fragment_module: &JsValue,
+        entry: &str,
+        format: &str,
+        pipeline_layout: &JsValue,
+    ) -> Result<JsValue, String> {
+        let device: JsValue = self.get_device().clone();
+        let vertex_stage: Object = new_object();
+        set(&vertex_stage, FIELD_MODULE, vertex_module)?;
+        set(
+            &vertex_stage,
+            FIELD_ENTRY_POINT,
+            &JsValue::from_str(ENTRY_FULLSCREEN_VERTEX),
+        )?;
+        // ⚠️ **没有 `buffers`**。全屏三角形靠 `vertex_index` 算位置,
+        // 一条顶点缓冲都不绑;声明空数组(省略会被读成 `undefined`)。
+        let empty_buffers: JsValue = make_array();
+        set(&vertex_stage, FIELD_BUFFERS, &empty_buffers)?;
+
+        let fragment_stage: Object = new_object();
+        set(&fragment_stage, FIELD_MODULE, fragment_module)?;
+        set(
+            &fragment_stage,
+            FIELD_ENTRY_POINT,
+            &JsValue::from_str(entry),
+        )?;
+        let targets: JsValue = make_array();
+        let color_target: Object = new_object();
+        set(&color_target, FIELD_FORMAT, &JsValue::from_str(format))?;
+        push_into(&targets, 0usize, color_target.as_ref())?;
+        set(&fragment_stage, FIELD_TARGETS, &targets)?;
+
+        let primitive: Object = new_object();
+        set(
+            &primitive,
+            FIELD_TOPOLOGY,
+            &JsValue::from_str(TOPOLOGY_TRIANGLE_LIST),
+        )?;
+        // ⚠️ 不剔除:全屏三角形只有一面,剔背面会在某些平台上把
+        // 整个 pass 剔没。
+        set(
+            &primitive,
+            FIELD_CULL_MODE,
+            &JsValue::from_str(CULL_MODE_NONE),
+        )?;
+        set(
+            &primitive,
+            FIELD_FRONT_FACE,
+            &JsValue::from_str(FRONT_FACE_CCW),
+        )?;
+
+        let descriptor: Object = new_object();
+        set(&descriptor, FIELD_LAYOUT, pipeline_layout)?;
+        set(&descriptor, FIELD_VERTEX, &vertex_stage)?;
+        set(&descriptor, FIELD_FRAGMENT, &fragment_stage)?;
+        set(&descriptor, FIELD_PRIMITIVE, &primitive)?;
+        // ⚠️ **没有 `depthStencil`**:后处理 pass 不带深度附件。
+        let multisample: Object = new_object();
+        set(&multisample, FIELD_COUNT, &JsValue::from_f64(1.0))?;
+        set(&descriptor, FIELD_MULTISAMPLE, multisample.as_ref())?;
+
+        call1(&device, METHOD_CREATE_RENDER_PIPELINE, descriptor.as_ref())
+    }
+
+    /// 建一条只含单个 bind group layout 的 pipeline layout。
+    ///
+    /// # Arguments
+    ///
+    /// - `&JsValue` - `GPUBindGroupLayout`。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<JsValue, String>` - `GPUPipelineLayout`。
+    fn build_pipeline_layout_single(&self, layout: &JsValue) -> Result<JsValue, String> {
+        let device: JsValue = self.get_device().clone();
+        let layouts: JsValue = make_array();
+        push_into(&layouts, 0usize, layout)?;
+        let descriptor: Object = new_object();
+        set(&descriptor, FIELD_BIND_GROUP_LAYOUTS, &layouts)?;
+        call1(&device, METHOD_CREATE_PIPELINE_LAYOUT, descriptor.as_ref())
+    }
+
     /// 建 bloom 提取 / 模糊 / 合成三条 pipeline 中的一条。
     ///
     /// # Arguments
@@ -897,6 +1263,11 @@ impl WebGpuRenderer {
     /// # Returns
     ///
     /// - `Result<JsValue, String>` - 建好的 `GPURenderPipeline`。
+    ///
+    /// # Errors
+    ///
+    /// 建 pipeline 失败时返回原因;调用方已包好 error scope,所以这里
+    /// 拿到的一定是根因,而不是 `due to a previous error`。
     fn build_bloom_pipeline(
         &self,
         entry: &str,
@@ -1109,6 +1480,49 @@ impl WebGpuRenderer {
                 blur_texture_layout.as_ref(),
             )?;
             push_into(&entries, 4usize, blur_texture_entry.as_ref())?;
+            // 槽 5 / 6:SSAO 的采样器 + AO 图。
+            //
+            // ⚠️ 采样器类型是 `filtering`,与 AO 自己那套
+            // `non-filtering` 不同:这里是 `r8unorm`,可以线性插值,而
+            // AO 组槽 2 绑的是 `r32float`,被 WebGPU 强制成不可过滤。
+            let ao_sampler_entry: Object = new_object();
+            set(
+                &ao_sampler_entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_BLOOM_AO_SAMPLER as f64),
+            )?;
+            set(
+                &ao_sampler_entry,
+                FIELD_VISIBILITY,
+                &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+            )?;
+            let ao_sampler_layout: Object = new_object();
+            set(
+                &ao_sampler_layout,
+                FIELD_TYPE,
+                &JsValue::from_str(SAMPLER_TYPE_FILTERING),
+            )?;
+            set(&ao_sampler_entry, FIELD_SAMPLER, ao_sampler_layout.as_ref())?;
+            push_into(&entries, 5usize, ao_sampler_entry.as_ref())?;
+            let ao_texture_entry: Object = new_object();
+            set(
+                &ao_texture_entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_BLOOM_AO_MAP as f64),
+            )?;
+            set(
+                &ao_texture_entry,
+                FIELD_VISIBILITY,
+                &JsValue::from_f64(f64::from(VISIBILITY_FRAGMENT)),
+            )?;
+            let ao_texture_layout: Object = new_object();
+            set(
+                &ao_texture_layout,
+                FIELD_SAMPLE_TYPE,
+                &JsValue::from_str(SAMPLE_TYPE_FLOAT),
+            )?;
+            set(&ao_texture_entry, FIELD_TEXTURE, ao_texture_layout.as_ref())?;
+            push_into(&entries, 6usize, ao_texture_entry.as_ref())?;
         }
 
         let descriptor: Object = new_object();
@@ -1390,6 +1804,13 @@ impl WebGpuRenderer {
         let device: JsValue = self.get_device().clone();
         // 后处理目标跟着画布尺寸走 —— 与 `ensure_depth` 同一个时机。
         self.ensure_bloom_targets(width, height)?;
+        // G-buffer / AO 目标同样跟着画布尺寸:城市 pass 的 MRT 附件必须
+        // 和主 pass 同尺寸,否则 attachment 与 pipeline target 不匹配,
+        // 整帧被判 invalid(症状是画面停在 clear 的天空色)。
+        self.ensure_ao_targets(width, height)?;
+        // 两组后处理目标都齐了,这时再建 bind group —— 顺序反了会在第一帧
+        // 就因为 AO 纹理还没建而抛错(见 `ensure_postprocess_bind_groups`)。
+        self.ensure_postprocess_bind_groups()?;
 
         // ---- uniform ----
 
@@ -1532,6 +1953,52 @@ impl WebGpuRenderer {
         let pass_descriptor: Object = new_object();
         let color_list: JsValue = make_array();
         push_into(&color_list, 0usize, color_attachment.as_ref())?;
+        // ---- G-buffer 的两个额外附件(SSAO 的输入)----
+        // ⚠️ 清屏值必须和 `SSAO_NO_GEOMETRY` **配对**:深度清 1.0。
+        // 清 0.0 会让每一块天空都被 SSAO 当成「贴在 z=0 的面」,
+        // 整个 AO 第一步就取到错的深度,而且画面看不出报错。
+        let normal_view: JsValue = create_view(&self.get_ao_normal().clone())?;
+        let normal_attachment: Object = new_object();
+        set(&normal_attachment, FIELD_VIEW, &normal_view)?;
+        set(
+            &normal_attachment,
+            FIELD_CLEAR_VALUE,
+            &make_rgba(0.0, 0.0, 0.0),
+        )?;
+        set(
+            &normal_attachment,
+            FIELD_LOAD_OP,
+            &JsValue::from_str(LOAD_OP_CLEAR),
+        )?;
+        set(
+            &normal_attachment,
+            FIELD_STORE_OP,
+            &JsValue::from_str(STORE_OP_STORE),
+        )?;
+        push_into(&color_list, 1usize, normal_attachment.as_ref())?;
+
+        let gbuffer_depth_view: JsValue = create_view(&self.get_ao_depth().clone())?;
+        let linear_depth_attachment: Object = new_object();
+        set(&linear_depth_attachment, FIELD_VIEW, &gbuffer_depth_view)?;
+        // ⚠️ 1.0 = 「没有几何体」,见 [`SSAO_NO_GEOMETRY`]。
+        set(
+            &linear_depth_attachment,
+            FIELD_CLEAR_VALUE,
+            &make_rgba(1.0, 1.0, 1.0),
+        )?;
+        set(
+            &linear_depth_attachment,
+            FIELD_LOAD_OP,
+            &JsValue::from_str(LOAD_OP_CLEAR),
+        )?;
+        set(
+            &linear_depth_attachment,
+            FIELD_STORE_OP,
+            &JsValue::from_str(STORE_OP_STORE),
+        )?;
+        push_into(&color_list, 2usize, linear_depth_attachment.as_ref())?;
+        self.set_gbuffer_slots(3);
+
         set(&pass_descriptor, FIELD_COLOR_ATTACHMENTS, &color_list)?;
         set(
             &pass_descriptor,
@@ -1611,6 +2078,9 @@ impl WebGpuRenderer {
             // 唯一一步(把那帧天空色拷到屏幕上)。提前返回的话画布这一
             // 帧完全不写,于是停留在上一帧的内容,表现为「切到空场景后
             // 画面冻住」。
+            // SSAO 排在主 pass 之后、bloom 之前:
+            // 读主 pass 写出的 G-buffer,结果给合成那条采样。
+            self.draw_ao_chain(&device, &encoder, lighting)?;
             self.draw_bloom_chain(&device, &encoder, lighting)?;
             return self.finish_frame(&device, &encoder, shadow_triangles);
         }
@@ -1999,6 +2469,51 @@ impl WebGpuRenderer {
     /// # Returns
     ///
     /// - `Result<(), String>` - 创建失败时的错误文本。
+    /// 按需建 SSAO 的四个 G-buffer / AO 目标。
+    ///
+    /// 尺寸变了或第一次才建。G-buffer 两张是**全分辨率**(城市 pass 的
+    /// MRT 附件,必须和主 pass 同尺寸),AO 两张是**半分辨率**(AO 是
+    /// 低频信号,半分辨率看不出差别,却省掉 3/4 的填充率)。
+    ///
+    /// # Arguments
+    ///
+    /// - `u32` - 画布宽度。
+    /// - `u32` - 画布高度。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时把原因交给上层。
+    pub fn ensure_ao_targets(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let canvas_size: (u32, u32) = (width.max(1), height.max(1));
+        let first_time: bool = self.get_ao_passes()[AO_PASS_SAMPLE].group.is_null();
+        if canvas_size == self.get_ao_size() && !first_time {
+            return Ok(());
+        }
+        let half: (u32, u32) = bloom_target_size(canvas_size.0, canvas_size.1);
+        let normal: JsValue =
+            self.create_postprocess_texture(canvas_size.0, canvas_size.1, G_BUFFER_NORMAL_FORMAT)?;
+        let depth: JsValue =
+            self.create_postprocess_texture(canvas_size.0, canvas_size.1, G_BUFFER_DEPTH_FORMAT)?;
+        let ping: JsValue = self.create_postprocess_texture(half.0, half.1, AO_TARGET_FORMAT)?;
+        let pong: JsValue = self.create_postprocess_texture(half.0, half.1, AO_TARGET_FORMAT)?;
+        self.set_ao_normal(normal);
+        self.set_ao_depth(depth);
+        self.set_ao_targets(ping, pong);
+        self.set_ao_size(canvas_size);
+        self.create_ao_bind_groups()?;
+        Ok(())
+    }
+
+    /// 按当前画布尺寸建 bloom 的离屏目标,尺寸变了就重建。
+    ///
+    /// # Arguments
+    ///
+    /// - `u32` - 画布宽。
+    /// - `u32` - 画布高。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时的错误文本。
     pub fn ensure_bloom_targets(&mut self, width: u32, height: u32) -> Result<(), String> {
         let canvas_size: (u32, u32) = (width.max(1), height.max(1));
         let first_time: bool = self.get_bloom_passes()[BLOOM_PASS_EXTRACT]
@@ -2023,7 +2538,18 @@ impl WebGpuRenderer {
             self.set_bloom_ping(ping);
             self.set_bloom_pong(pong);
             self.set_bloom_size(canvas_size);
-            self.create_bloom_bind_groups()?;
+            // ⚠️ **不要在这里建 bloom 的 bind group。**
+            //
+            // 合成的槽 6 要绑 AO 图,而 AO 目标是在 `ensure_ao_targets`
+            // 里建的 —— 那步排在 `ensure_bloom_targets` **之后**(见
+            // `WebGpuRenderer::render` 的调用顺序)。在这里建的话 AO 纹理
+            // 还是 `JsValue::UNDEFINED`,`create_view` 直接抛
+            // `WebGL render failed: createView`,而且它走 `?`,整帧渲染在
+            // **第一帧就 return Err** —— HUD 照常画、三角数照常报、
+            // validation 报 clean,只有世界不见了。
+            //
+            // 两组目标都就绪后再统一重建,见
+            // `WebGpuRenderer::ensure_postprocess_bind_groups`。
         }
         Ok(())
     }
@@ -2069,6 +2595,253 @@ impl WebGpuRenderer {
     /// # Returns
     ///
     /// - `Result<(), String>` - 创建失败时的错误文本。
+    /// 建三条 AO pass 的 bind group。
+    ///
+    /// 三条的形状完全一样:sampler + 法线图 + 深度图 + 各自的 uniform。
+    /// 区别只在**绑哪张图**:采样读 G-buffer,模糊 H 读 ping,模糊 V 读
+    /// pong —— 但深度图**三条都读同一张全分辨率 G-buffer**,模糊的
+    /// 双边权重正是拿它算的。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时把原因交给上层。
+    fn create_ao_bind_groups(&mut self) -> Result<(), String> {
+        let device: JsValue = self.get_device().clone();
+        let sampler: JsValue = self.get_ao_sampler().clone();
+        let buffers: [JsValue; AO_PASS_COUNT] = self.get_ao_buffers();
+        let layout: JsValue = self.get_ao_group_layout().clone();
+        let normal_view: JsValue = create_view(&self.get_ao_normal().clone())?;
+        let depth_view: JsValue = create_view(&self.get_ao_depth().clone())?;
+        let (ping, pong) = self.get_ao_targets();
+        let ping_view: JsValue = create_view(&ping)?;
+        let pong_view: JsValue = create_view(&pong)?;
+        // 采样那条没有「自己的输出」可读,槽 1 绑深度图占位即可 ——
+        // 着色器里采样 pass 不读它。
+        let sources: [JsValue; AO_PASS_COUNT] = [depth_view.clone(), ping_view, pong_view];
+
+        let mut passes: [GpuAoPass; AO_PASS_COUNT] = self.get_ao_passes().clone();
+        for index in 0..AO_PASS_COUNT {
+            let entries: JsValue = make_array();
+            let entry: Object = new_object();
+            set(
+                &entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_SSAO_SAMPLER as f64),
+            )?;
+            set(&entry, FIELD_RESOURCE, &sampler)?;
+            push_into(&entries, 0usize, entry.as_ref())?;
+
+            // ⚠️ **slot 1 在两条着色器里含义不同**:
+            //   采样 pass 读 `ao_normal`(G-buffer 法线),
+            //   模糊 pass 读 `blur_source`(上一趟的 AO 结果)。
+            // 共用同一个 layout 就必须在这里分岔 —— 两条着色器的
+            // `@binding(1)` 是同一个槽位,只是绑不同纹理。
+            let entry: Object = new_object();
+            set(
+                &entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_SSAO_SOURCE as f64),
+            )?;
+            let source: JsValue = if index == AO_PASS_SAMPLE {
+                normal_view.clone()
+            } else {
+                sources[index].clone()
+            };
+            // ⚠️ **裸 view**,不是 `{ view: … }`。写成对象会得到
+            // `not of type 'GPUTextureView'`。
+            set(&entry, FIELD_RESOURCE, &source)?;
+            push_into(&entries, 1usize, entry.as_ref())?;
+
+            // slot 2:深度图。⚠️ **三条都读同一张全分辨率 G-buffer** ——
+            // 模糊的双边权重正是拿它算的,换成半分辨率会让深度差
+            // 算在错误的尺度上。
+            let entry: Object = new_object();
+            set(
+                &entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_SSAO_DEPTH as f64),
+            )?;
+            set(&entry, FIELD_RESOURCE, &depth_view)?;
+            push_into(&entries, 2usize, entry.as_ref())?;
+
+            // slot 3:各自的 uniform。
+            let entry: Object = new_object();
+            set(
+                &entry,
+                FIELD_BINDING,
+                &JsValue::from_f64(BINDING_SSAO_UNIFORM as f64),
+            )?;
+            let resource: Object = new_object();
+            set(&resource, FIELD_BUFFER, &buffers[index])?;
+            set(&entry, FIELD_RESOURCE, resource.as_ref())?;
+            push_into(&entries, 3usize, entry.as_ref())?;
+
+            let descriptor: Object = new_object();
+            set(&descriptor, FIELD_LAYOUT, &layout)?;
+            set(&descriptor, FIELD_ENTRIES, &entries)?;
+            let group: JsValue = call1(&device, METHOD_CREATE_BIND_GROUP, descriptor.as_ref())
+                .map_err(|error: String| format!("ao pass {index} createBindGroup: {error}"))?;
+            passes[index].group = group;
+        }
+        self.set_ao_passes(passes);
+        Ok(())
+    }
+
+    /// 画 SSAO 三条 pass:采样 → 模糊 H → 模糊 V。
+    ///
+    /// 排在**主 pass 之后**:AO 读的是主 pass 写进 G-buffer 的视空间
+    /// 法线与线性深度,所以必须等那两条 attachment 存下来才能采。排在
+    /// bloom **之前**:合成那条要采样 AO 的结果。
+    ///
+    /// 目标在 ping / pong 之间来回:采样写 ping,模糊 H 读 ping 写 pong,
+    /// 模糊 V 读 pong **写回 ping** —— 模糊 V 的输出正好落在合成要采的
+    /// 那张上,所以 [`WebGpuRenderer::create_bloom_bind_groups`] 里槽 6
+    /// 绑的是 ping 而不是 pong。
+    ///
+    /// # Arguments
+    ///
+    /// - `&JsValue` - GPU 设备。
+    /// - `&JsValue` - 本帧的 command encoder。
+    /// - `&SceneLighting` - 本帧光照参数,`ao_strength` 为 0 时整段跳过。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时的错误文本。
+    fn draw_ao_chain(
+        &mut self,
+        device: &JsValue,
+        encoder: &JsValue,
+        lighting: &SceneLighting,
+    ) -> Result<(), String> {
+        let strength: f32 = lighting.ao_strength;
+        // 关闭时不写 uniform 也不开 pass —— 质量档位调到 Low 时整条
+        // SSAO 链不花一个 draw call。
+        if strength <= 0.0 {
+            return Ok(());
+        }
+        let half: (u32, u32) = bloom_target_size(self.get_ao_size().0, self.get_ao_size().1);
+        let (ping, pong) = self.get_ao_targets();
+        let ping_view: JsValue = create_view(&ping)?;
+        let pong_view: JsValue = create_view(&pong)?;
+        // ⚠️ **三条各写自己的 uniform buffer。** 同帧往同一个 buffer 写
+        // 三次,队列时间线上只有最后一次生效 —— 采样那条要半径/强度,
+        // 两条模糊要的**方向**还不一样(H 一个 vec2、V 另一个),共用的话
+        // 竖直模糊会退化成第二次水平模糊,表现为 AO 沿一个方向拉出条纹。
+        //
+        // 采样那条的布局是 `(misc, params)`(8 个 f32 = 32 字节),两条模糊
+        // 的是 `(direction)`(4 个 f32);buffer 一律按 `UNIFORM_AO_BYTES`
+        // 建,所以按各自的字节数写,未写的那半保持零。
+        // ⚠️ **采样那条的 texel 尺寸必须是全分辨率的。**
+        //
+        // `misc.xy` 在着色器里的用途是「把米换算成 uv」,而它读的
+        // `ao_depth` 是**全分辨率**的 G-buffer。用半分辨率的 texel 尺寸
+        // 会让屏幕偏移**小一半**,采样点挤在半径的一半以内 —— 够不到
+        // 真正产生遮挡的邻域,结果 AO 几乎为 0。
+        //
+        // 两条模糊读的是半分辨率的 AO 图 / 全分辨率的深度,但它们的
+        // `direction.xy` 走的是半分辨率尺寸,所以各自单独算。
+        let full: (u32, u32) = self.get_ao_size();
+        let texel: [f32; 2] = [1.0 / (full.0.max(1) as f32), 1.0 / (full.1.max(1) as f32)];
+        let texel_half: [f32; 2] = [1.0 / (half.0.max(1) as f32), 1.0 / (half.1.max(1) as f32)];
+        // ⚠️ **`misc.zw` 两个分量都必须非零。**
+        //
+        // 着色器拿 `hash(in.uv * ao.misc.zw)` 做逐像素的采样起始角。
+        // 只填 `z` 而把 `w` 留 0 的话,乘出来是 `(s * u, 0)`,hash 退化
+        // 成沿一条边的常量 —— 每个像素的起始角几乎相同,半分辨率 AO 放大
+        // 后是一层规则条纹,而且因为样本沿螺旋线分布,互相抵消后
+        // occlusion 恒接近 0,整张 AO 图就是白的。
+        //
+        // 用两个互质的小数(黄金比与其平方根的近似)把相邻像素、���邻帧
+        // 都错开。
+        let frame: f32 = self.get_frame_index() as f32;
+        let seed_x: f32 = (frame * 0.618_034).fract();
+        let seed_y: f32 = (frame * 0.754_877_7).fract() + 0.5;
+        let sample_bytes: [f32; 8] = [
+            // misc:1/宽, 1/高, 抖动种子 x, 抖动种子 y
+            texel[0],
+            texel[1],
+            seed_x,
+            seed_y,
+            // params:半径(米), 强度, 预留
+            SSAO_RADIUS,
+            strength,
+            0.0,
+            0.0,
+        ];
+        // 模糊 H 沿 u、模糊 V 沿 v —— 顺序不能换,换了 V 就成了第二次 H。
+        //
+        // `direction` 的 xy 是**一步**的 uv 偏移,不是半径本身;半径由
+        // `AO_BLUR_RADIUS`(纹素数)决定,着色器按它左右各取那么多 tap。
+        // 这里每步正好一个纹素。
+        // 模糊着色器是固定 5 tap(中心 + 前后各两个),所以 `direction.zw`
+        // 传 (1, 0) / (0, 1) —— 一步一个纹素,半径由着色器里的循环写死。
+        let blur_h: [f32; 8] = [texel_half[0], texel_half[1], 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let blur_v: [f32; 8] = [texel_half[0], texel_half[1], 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let uploads: [[f32; 8]; AO_PASS_COUNT] = [sample_bytes, blur_h, blur_v];
+        let buffers: [JsValue; AO_PASS_COUNT] = self.get_ao_buffers();
+        for index in 0..AO_PASS_COUNT {
+            write_buffer(
+                device,
+                &buffers[index],
+                0.0,
+                f32_slice_to_bytes(&uploads[index]),
+            )?;
+        }
+        // 附件一律 `clear` 覆盖。清 **1.0** 而不是 0:1.0 表示「完全不
+        // 遮挡」,清 0 会让没跑到的地方变成纯黑,模糊之后就是一团脏。
+        let targets: [JsValue; AO_PASS_COUNT] = [ping_view.clone(), pong_view, ping_view];
+        let passes: [GpuAoPass; AO_PASS_COUNT] = self.get_ao_passes().clone();
+        for index in 0..AO_PASS_COUNT {
+            let attachment: Object = new_object();
+            set(&attachment, FIELD_VIEW, &targets[index])?;
+            set(&attachment, FIELD_CLEAR_VALUE, &make_rgba(1.0, 1.0, 1.0))?;
+            set(
+                &attachment,
+                FIELD_LOAD_OP,
+                &JsValue::from_str(LOAD_OP_CLEAR),
+            )?;
+            set(
+                &attachment,
+                FIELD_STORE_OP,
+                &JsValue::from_str(STORE_OP_STORE),
+            )?;
+            let descriptor: Object = new_object();
+            let colors: JsValue = make_array();
+            push_into(&colors, 0usize, attachment.as_ref())?;
+            set(&descriptor, FIELD_COLOR_ATTACHMENTS, &colors)?;
+            // ⚠️ 不带 `depthStencilAttachment`,理由与 bloom 那三条相同:
+            // 挂上会被强制与主 pass 的全分辨率深度纹理同尺寸。
+            let pass: JsValue = call1(encoder, METHOD_BEGIN_RENDER_PASS, descriptor.as_ref())?;
+            call1(&pass, METHOD_SET_PIPELINE, &passes[index].pipeline)?;
+            set_bind_group(&pass, BINDING_GROUP, &passes[index].group)?;
+            // 全屏三角形,整条 pipeline 一个顶点缓冲都没绑。
+            call1(&pass, METHOD_DRAW, &JsValue::from_f64(3.0))?;
+            call0(&pass, METHOD_END)?;
+        }
+        Ok(())
+    }
+
+    /// AO 与 bloom 的 bind group **必须一起**重建。
+    ///
+    /// 合成的槽 6 要绑 AO 图,所以任何一边新建目标之后两边都得重来 ——
+    /// 只重建一边会留下一个引用着已销毁纹理的 bind group。
+    ///
+    /// 必须在 `ensure_bloom_targets` **与** `ensure_ao_targets` 都跑完之后
+    /// 才调:两者按顺序建目标,先建的一边此刻还拿不到后建的那张纹理。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时的错误文本。
+    fn ensure_postprocess_bind_groups(&mut self) -> Result<(), String> {
+        self.create_ao_bind_groups()?;
+        self.create_bloom_bind_groups()
+    }
+
+    /// 为四条 bloom pass 建各自的 bind group。
+    ///
+    /// # Returns
+    ///
+    /// - `Result<(), String>` - 失败时的错误文本。
     fn create_bloom_bind_groups(&mut self) -> Result<(), String> {
         let device: JsValue = self.get_device().clone();
         let sampler: JsValue = self.get_bloom_sampler().clone();
@@ -2143,6 +2916,35 @@ impl WebGpuRenderer {
                 )?;
                 set(&entry, FIELD_RESOURCE, &blur_map)?;
                 push_into(&entries, 4usize, entry.as_ref())?;
+                // 槽 5 / 6:SSAO 的采样器 + 模糊后的 AO 图,合成时把 AO 乘到
+                // 场景色上。
+                //
+                // ⚠️ 这里采样器是 **filtering**(不是 AO 那套
+                // non-filtering):AO 目标是 `r8unorm`,**可以**线性插值,
+                // 而且半分辨率直接采样需要插值才不至于出现块状台阶。
+                // AO 那套 nearest 是因为它的槽 2 绑了 `r32float`,被 WebGPU
+                // 强制成不可过滤 —— 两个 bind group 的要求不一样,别互相
+                // 照抄。
+                //
+                // 绑的是 **ping**:AO 的模糊 V 输出正好写回 ping
+                // (见 `WebGpuRenderer::record_ao_passes`)。
+                let entry: Object = new_object();
+                set(
+                    &entry,
+                    FIELD_BINDING,
+                    &JsValue::from_f64(BINDING_BLOOM_AO_SAMPLER as f64),
+                )?;
+                set(&entry, FIELD_RESOURCE, &sampler)?;
+                push_into(&entries, 5usize, entry.as_ref())?;
+                let entry: Object = new_object();
+                set(
+                    &entry,
+                    FIELD_BINDING,
+                    &JsValue::from_f64(BINDING_BLOOM_AO_MAP as f64),
+                )?;
+                let ao_map: JsValue = create_view(&self.get_ao_targets().0)?;
+                set(&entry, FIELD_RESOURCE, &ao_map)?;
+                push_into(&entries, 6usize, entry.as_ref())?;
             }
             let descriptor: Object = new_object();
             set(&descriptor, FIELD_LAYOUT, &layout)?;
@@ -2576,16 +3378,187 @@ impl WebGpuRenderer {
         self.shadow_sample_group_layout = layout;
     }
 
+    /// 本帧序号,供 SSAO 的逐帧抖动种子用。
+    ///
+    /// # Returns
+    ///
+    /// - `u64` - 帧计数。
+    pub fn get_frame_index(&self) -> u64 {
+        self.frame_index
+    }
+
+    /// 取三条 AO pass 的句柄。
+    ///
+    /// # Returns
+    ///
+    /// - `[GpuAoPass; AO_PASS_COUNT]` - pipeline + bind group 配对。
+    pub fn get_ao_passes(&self) -> [GpuAoPass; AO_PASS_COUNT] {
+        self.ao_passes.clone()
+    }
+
+    /// 设置三条 AO pass 的句柄。
+    ///
+    /// # Arguments
+    ///
+    /// - `[GpuAoPass; AO_PASS_COUNT]` - pipeline + bind group 配对。
+    pub fn set_ao_passes(&mut self, passes: [GpuAoPass; AO_PASS_COUNT]) {
+        self.ao_passes = passes;
+    }
+
+    /// SSAO 三条 pass 各自的 uniform buffer(只读副本)。
+    ///
+    /// # Returns
+    ///
+    /// - `[JsValue; AO_PASS_COUNT]` - uniform buffer 句柄。
+    pub fn get_ao_buffers(&self) -> [JsValue; AO_PASS_COUNT] {
+        self.ao_buffers.clone()
+    }
+
+    /// 设置三条 AO pass 的 uniform buffer。
+    ///
+    /// # Arguments
+    ///
+    /// - `[JsValue; AO_PASS_COUNT]` - uniform buffer 句柄。
+    pub fn set_ao_buffers(&mut self, buffers: [JsValue; AO_PASS_COUNT]) {
+        self.ao_buffers = buffers;
+    }
+
+    /// AO 的 bind group layout(只读副本)。
+    ///
+    /// # Returns
+    ///
+    /// - `JsValue` - `GPUBindGroupLayout`。
+    pub fn get_ao_group_layout(&self) -> JsValue {
+        self.ao_group_layout.clone()
+    }
+
+    /// 设置 AO 的 bind group layout。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUBindGroupLayout`。
+    pub fn set_ao_group_layout(&mut self, layout: JsValue) {
+        self.ao_group_layout = layout;
+    }
+
+    /// G-buffer 的视空间法线图。
+    ///
+    /// # Returns
+    ///
+    /// - `JsValue` - 纹理句柄。
+    pub fn get_ao_normal(&self) -> JsValue {
+        self.ao_normal.clone()
+    }
+
+    /// 设置 G-buffer 的视空间法线图。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - 纹理句柄。
+    pub fn set_ao_normal(&mut self, texture: JsValue) {
+        self.ao_normal = texture;
+    }
+
+    /// G-buffer 的线性深度图。
+    ///
+    /// # Returns
+    ///
+    /// - `JsValue` - 纹理句柄。
+    pub fn get_ao_depth(&self) -> JsValue {
+        self.ao_depth.clone()
+    }
+
+    /// 设置 G-buffer 的线性深度图。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - 纹理句柄。
+    pub fn set_ao_depth(&mut self, texture: JsValue) {
+        self.ao_depth = texture;
+    }
+
+    /// 半分辨率 AO 的 ping / pong 纹理。
+    ///
+    /// # Returns
+    ///
+    /// - `(JsValue, JsValue)` - ping 与 pong 句柄。
+    pub fn get_ao_targets(&self) -> (JsValue, JsValue) {
+        (self.ao_ping.clone(), self.ao_pong.clone())
+    }
+
+    /// 设置半分辨率 AO 的 ping / pong 纹理。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - ping 句柄。
+    /// - `JsValue` - pong 句柄。
+    pub fn set_ao_targets(&mut self, ping: JsValue, pong: JsValue) {
+        self.ao_ping = ping;
+        self.ao_pong = pong;
+    }
+
+    /// AO 四个目标当前的尺寸。
+    ///
+    /// # Returns
+    ///
+    /// - `(u32, u32)` - (0, 0) 表示还没建。
+    pub fn get_ao_size(&self) -> (u32, u32) {
+        self.ao_size
+    }
+
+    /// 设置 AO 四个目标的尺寸。
+    ///
+    /// # Arguments
+    ///
+    /// - `(u32, u32)` - 画布尺寸。
+    pub fn set_ao_size(&mut self, size: (u32, u32)) {
+        self.ao_size = size;
+    }
+
+    /// AO 用的采样器。
+    ///
+    /// # Returns
+    ///
+    /// - `JsValue` - `GPUSampler` 句柄。
+    pub fn get_ao_sampler(&self) -> JsValue {
+        self.ao_sampler.clone()
+    }
+
+    /// 设置 AO 用的采样器。
+    ///
+    /// # Arguments
+    ///
+    /// - `JsValue` - `GPUSampler` 句柄。
+    pub fn set_ao_sampler(&mut self, sampler: JsValue) {
+        self.ao_sampler = sampler;
+    }
+
+    /// 城市 pass 现在的 MRT 附件数。
+    ///
+    /// # Returns
+    ///
+    /// - `u32` - 1 = 只写场景色,3 = 场景色 + 法线 + 线性深度。
+    pub fn get_gbuffer_slots(&self) -> u32 {
+        self.gbuffer_slots
+    }
+
+    /// 设置城市 pass 的 MRT 附件数。
+    ///
+    /// # Arguments
+    ///
+    /// - `u32` - 附件数。
+    pub fn set_gbuffer_slots(&mut self, slots: u32) {
+        self.gbuffer_slots = slots;
+    }
+
     /// 四条 bloom pipeline 各自的句柄(按值克隆一份)。
+    ///
+    /// ⚠️ **按值返回副本**:`GpuBloomPass` 只 `Clone` 不 `Copy`(字段是
+    /// `JsValue`),而调用方往往在持有 `&mut self` 的同时要读这张表。
     ///
     /// # Returns
     ///
     /// - `[GpuBloomPass; BLOOM_PASS_COUNT]` - pipeline + bind group 配对。
-    ///
-    /// ⚠️ **按值返回副本**:`GpuBloomPass` 只 `Clone` 不 `Copy`
-    /// (字段是 `JsValue`),而调用方往往在持有 `&mut self` 的同时要
-    /// 读这张表 —— 例如 [`WebGpuRenderer::draw_bloom_chain`] 先克隆
-    /// 再去改别的字段。
     pub fn get_bloom_passes(&self) -> [GpuBloomPass; BLOOM_PASS_COUNT] {
         self.bloom_passes.clone()
     }

@@ -436,7 +436,11 @@ mod r#tests {
     #[test]
     fn bloom_target_size_never_collapses_to_zero() {
         assert_eq!(bloom_target_size(0, 0), (1, 1));
-        assert_eq!(bloom_target_size(1, 1), (1, 1), "1x1 画布的半分辨率是 0.5,要抬到 1");
+        assert_eq!(
+            bloom_target_size(1, 1),
+            (1, 1),
+            "1x1 画布的半分辨率是 0.5,要抬到 1"
+        );
     }
 
     /// 扩容之后容量**必须**装得下 —— 这是黑屏修复的核心不变式。
@@ -536,8 +540,7 @@ mod r#tests {
     #[test]
     fn bloom_composite_strength_matches_the_webgl2_formula() {
         // 正午:emissive_gain 低于下限,必须被兜住。
-        let mut lighting: SceneLighting =
-            SceneLighting::for_phase(crate::render::DayPhase::Noon);
+        let mut lighting: SceneLighting = SceneLighting::for_phase(crate::render::DayPhase::Noon);
         assert!(
             lighting.emissive_gain < BLOOM_MIN_GAIN,
             "前提不成立:noon 相位的 emissive_gain {} 不低于下限 {BLOOM_MIN_GAIN},\
@@ -1089,6 +1092,55 @@ pub struct WebGpuRenderer {
     /// WebGPU 只在真正 `setBindGroup` 那一刻才报 validation error,
     /// 症状是那一帧消失而前面几帧都正常。
     pub(crate) bloom_passes: [GpuBloomPass; BLOOM_PASS_COUNT],
+
+    // ---- SSAO -------------------------------------------------------------
+    /// G-buffer 的**视空间法线**图(城市 pass 的 MRT 附件 1)。
+    ///
+    /// `rgba8unorm`:法线分量会在 ±1,直接存 `rgba8unorm` 会在着色器
+    /// 里做钳位/编码往返,采样回来再解一次。
+    pub(crate) ao_normal: JsValue,
+    /// G-buffer 的**线性深度**图(城市 pass 的 MRT 附件 2)。
+    ///
+    /// `r32float`:深度要线性且不量化,8bit 会把整条马赛克化成
+    /// 台阶,双边模糊的权重全错。
+    pub(crate) ao_depth: JsValue,
+    /// 半分辨率的 AO 结果(ping)。
+    pub(crate) ao_ping: JsValue,
+    /// 半分辨率的 AO 结果(pong,也是模糊的最终读出)。
+    pub(crate) ao_pong: JsValue,
+    /// 四个 AO 目标当前的尺寸,(0, 0) = 还没建。
+    pub(crate) ao_size: (u32, u32),
+    /// 三条 AO pass(采样 / 模糊 H / 模糊 V)**各一个**的 uniform buffer。
+    ///
+    /// ⚠️ 和 bloom 同样受队列时间线约束:同帧写三次同一个 buffer,
+    /// 只有最后一次生效。方向参数因此必须分开。
+    /// 本帧序号,供 SSAO 的逐帧抖动种子用。
+    pub(crate) frame_index: u64,
+    pub(crate) ao_buffers: [JsValue; AO_PASS_COUNT],
+    /// AO 用的普通采样器(G-buffer 是颜色类纹理,不是比较采样器)。
+    pub(crate) ao_sampler: JsValue,
+    /// AO 采样 pass 的 bind group layout(4 槽:sampler + 法线 + 深度 +
+    /// uniform)。
+    pub(crate) ao_group_layout: JsValue,
+    /// 三条 AO pipeline 各自的 `(pipeline, bind group)` 配对。
+    pub(crate) ao_passes: [GpuAoPass; AO_PASS_COUNT],
+    /// 城市 pass 现在的 MRT 附件数(1 = 只写场景色,SSR/SSAO 关)。
+    pub(crate) gbuffer_slots: u32,
+}
+
+/// SSAO 这条链上有几条 pass:采样 → 模糊 H → 模糊 V。
+pub(crate) const AO_PASS_COUNT: usize = 3;
+
+/// 一条 AO pass 的 `(pipeline, bind group)`。
+///
+/// 收成数组而不是拆成六个字段,理由和 [`GpuBloomPass`] 一样:一一对应
+/// 的东西拆开就会出现「某条 pipeline 绑了别人的 group」这种静默错误。
+#[derive(Debug, Clone)]
+pub struct GpuAoPass {
+    /// 渲染 pipeline。
+    pub(crate) pipeline: JsValue,
+    /// 与之配套的 bind group。
+    pub(crate) group: JsValue,
 }
 
 /// 一条 bloom pass 要上传的那份 uniform 的**参数**
