@@ -727,8 +727,17 @@ def _animal_bird():
                  color=EYE_DK)
 
     beak = a.part("animal_bird_beak", base_color=BEAK_ORANGE, roughness=0.5)
+    # ⚠️ **`axis="Y"` 是必需的,原来漏了。**
+    #
+    # `cone` 默认沿 **Z** 立起来,可喙是朝前(-Y)长的。少了 axis,
+    # 喙就成了一根竖着的短锥:它的 y 只有 ±0.029 的厚度,z 却占了
+    # 0.058 —— 量出来 `y[-0.188,-0.159]` 整个埋在头里,只有 z 方向
+    # 露在头顶上方,远看就是「鸟头上顶了根竖刺」,喙根本不存在。
+    #
+    # 朝前之后尖端落在 y = -0.188 - 0.029 = -0.217,伸到头
+    # (y = -0.142 - 0.033 = -0.175)之外 0.042,喙才真的从脸前探出来。
     C.cone(beak.mesh, 0.016, 0.058, 5, center=(0.0, -0.188, 0.146),
-           radius_top=0.004, color=BEAK_ORANGE)
+           radius_top=0.004, color=BEAK_ORANGE, axis="Y")
 
     # OPEN SHEET 1 of 3.  A wing is a half-thickness membrane: a vertical
     # extrusion whose Z never falls, so every face still faces the sky.

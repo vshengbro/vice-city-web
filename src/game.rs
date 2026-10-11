@@ -11620,6 +11620,135 @@ mod tests {
         }
     }
 
+    /// 资产某一部分的轴向包围盒。
+    fn part_bounds(asset: &MeshAsset, part: &str) -> crate::mesh::Bounds {
+        let found: &crate::mesh::MeshPart = asset
+            .parts
+            .iter()
+            .find(|p: &&crate::mesh::MeshPart| p.name == part)
+            .unwrap_or_else(|| panic!("asset is missing the {part} part"));
+        assert!(
+            !found.positions.is_empty(),
+            "the {part} part carries no positions"
+        );
+        let mut lo: [f32; 3] = [f32::MAX; 3];
+        let mut hi: [f32; 3] = [f32::MIN; 3];
+        for v in &found.positions {
+            for (axis, value) in v.iter().enumerate() {
+                lo[axis] = lo[axis].min(*value);
+                hi[axis] = hi[axis].max(*value);
+            }
+        }
+        crate::mesh::Bounds { min: lo, max: hi }
+    }
+
+    #[test]
+    fn the_birds_beak_points_forward_out_of_its_head() {
+        // 回归:喙原来是**竖着**立的 —— `cone` 默认沿 Z 轴,可这只鸟朝前
+        // 是 -Y,少传一个 `axis="Y"`,喙就成了头顶上支棱的一根短刺。
+        //
+        // 导出成 Y-up 之后,朝前是 **+Z**,所以判据是「喙的前端必须比头
+        // 的前端更靠前」。原来两者都停在 z ≈ 0.203 / 0.174,喙只是搭在
+        // 头顶上,正前方看过去等于没有喙。
+        let raw: String =
+            crate::fs::read_to_string("assets/animal_bird.json").expect("鸟资产必须在磁盘上");
+        let asset: MeshAsset = serde_json::from_str(&raw).expect("鸟资产必须能解析");
+        let head: crate::mesh::Bounds = part_bounds(&asset, "animal_bird_head");
+        let beak: crate::mesh::Bounds = part_bounds(&asset, "animal_bird_beak");
+        // ⚠️ **不能用「探出多少」当判据。**
+        //
+        // 竖着立的喙,锥尖照样戳在头前面 0.029 m —— 比修好之后的
+        // 0.043 只短一截,两者都能过「探出 2 cm」的门槛。所以光量长度
+        // 根本分不出这两版。
+        //
+        // 真正的差别在**截面**:水平方向该是喙的长,竖直方向该是它的
+        // 薄厚。写反时 Y 长 0.058 而 Z 长 0.029 —— 一根竖刺。
+        let reach: f32 = beak.max[2] - head.max[2];
+        assert!(
+            reach >= 0.02,
+            "喙必须探出脸前至少 2 cm,实测只探出 {reach:.4} m"
+        );
+        let along: f32 = beak.max[2] - beak.min[2];
+        let across: f32 = beak.max[1] - beak.min[1];
+        assert!(
+            across < 0.5 * along,
+            "喙的水平跨度 {across:.4} 接近竖直跨度 {along:.4},说明它是竖着长的,不是朝前: 头 {head:?} 喙 {beak:?}"
+        );
+        // 喙也不能高过头顶太多,否则又变成竖刺。
+        assert!(
+            beak.max[1] <= head.max[1] + 0.01,
+            "喙尖不能高过头顶,头 {head:?} 喙 {beak:?}"
+        );
+        // 根部要真的插进头里,不能悬空。
+        assert!(
+            beak.min[2] < head.max[2],
+            "喙的根部必须落在头内部,否则是悬空的: 头 {head:?} 喙 {beak:?}"
+        );
+    }
+
+    #[test]
+    fn the_surfboard_fin_hangs_under_the_deck() {
+        // 回归:鳍原来有一截**穿出板面**。`_rbox` 第三个数是整段高度
+        // 0.16(半高 0.08),绕 Y 再转 -16°,最高角落到 z = +0.073,
+        // 而该处板底在 z ≈ -0.024 —— 于是板顶上凭空支棱出一片鳍。
+        //
+        // 判据:整片鳍必须落在甲板底下。
+        let raw: String =
+            crate::fs::read_to_string("assets/beach_surfboard.json").expect("冲浪板必须在磁盘上");
+        let asset: MeshAsset = serde_json::from_str(&raw).expect("冲浪板资产必须能解析");
+        let fin: crate::mesh::Bounds = part_bounds(&asset, "surfboard_fin");
+        let deck_part: &crate::mesh::MeshPart = asset
+            .parts
+            .iter()
+            .find(|p: &&crate::mesh::MeshPart| p.name == "surfboard_deck")
+            .expect("冲浪板必须有甲板");
+        // ⚠️ **必须按站位比,不能拿全板的最小 y 当板底。**
+        //
+        // 板身有 rocker(中部最薄)又整体翘起 6°,板底沿 x 是**升上去**
+        // 的:鳍所在的尾段板底在 0.199,而板头最薄处只有 0.184。用全局
+        // 最小值去判,任何位置都像是「鳍穿出板面」——板头比尾段更薄。
+        //
+        // 判据改成:鳍顶最多探进板底 2 cm(那是要粘住的部分),
+        // 但不得高过板**顶**面一丁点。
+        let span: f32 = fin.max[0] - fin.min[0];
+        let window: Vec<&crate::mesh::Vec3Json> = deck_part
+            .positions
+            .iter()
+            .filter(|v: &&crate::mesh::Vec3Json| {
+                v[0] >= fin.min[0] - 0.03 && v[0] <= fin.max[0] + 0.03
+            })
+            .collect();
+        assert!(
+            !window.is_empty(),
+            "鳍的位置(x {:.3}..{:.3}, 跨度 {span:.3})下面没有板,鳍悬空了",
+            fin.min[0],
+            fin.max[0]
+        );
+        let mut belly: f32 = f32::MAX;
+        let mut crown: f32 = f32::MIN;
+        for v in &window {
+            belly = belly.min(v[1]);
+            crown = crown.max(v[1]);
+        }
+        assert!(
+            fin.max[1] <= crown + 0.002,
+            "鳍不能高过板面: 鳍顶 {:.4},当地板面 {crown:.4}",
+            fin.max[1]
+        );
+        assert!(
+            fin.max[1] >= belly - 0.002,
+            "鳍要粘在板底,不能整片悬空: 鳍顶 {:.4},当地板底 {belly:.4}",
+            fin.max[1]
+        );
+        assert!(
+            fin.max[1] - belly <= 0.02,
+            "鳍吃进板里太多({:.4} m),读起来像穿模: 鳍顶 {:.4} 板底 {:.4}",
+            fin.max[1] - belly,
+            fin.max[1],
+            belly
+        );
+    }
+
     #[test]
     fn the_ground_does_not_flip_when_it_re_anchors() {
         // 回归:地面的棋盘格着色原先用**格子下标** `(i + j) % 2` / `i % 4`
