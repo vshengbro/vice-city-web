@@ -481,6 +481,14 @@ pub(crate) const T_AIR_WALL_PROBE_FOUND_NO_SPOTS: &str = "空气墙探针一个�
 pub(crate) const FIXTURE_PROP_STREETLIGHT_JSON: &str =
     include_str!("../assets/prop_streetlight.json");
 
+/// 单元测试夹具:紫罗兰塔(真实 JSON)。
+///
+/// 挑这栋是因为它**最高**(42.62 m),端面窗框一旦 Y/Z 写反就会掉到
+/// 地面以下几十米,`bounds` 跟着被撑大 —— 断言才抓得住。
+#[cfg(test)]
+pub(crate) const FIXTURE_BLDG_LILAC_TOWER_JSON: &str =
+    include_str!("../assets/bldg_lilac_tower.json");
+
 /// 单元测试夹具:交通信号灯资产本体。
 #[cfg(test)]
 pub(crate) const FIXTURE_PROP_TRAFFICLIGHT_JSON: &str =
@@ -501,6 +509,10 @@ pub(crate) const E_FIXTURE_SOLID_BOUNDS_UNREGISTERED: &str = "加载器没有登
 /// 单元测试断言文案:量纲(实测实心足迹 X 宽度)。
 #[cfg(test)]
 pub(crate) const T_SOLID_BOUNDS_X_WIDTH: &str = "实心足迹 x 宽度";
+pub(crate) const T_SIDE_FRAMES_MISSING: &str = "端面窗框缺失";
+pub(crate) const T_SIDE_FRAMES_UNDERGROUND: &str = "端面窗框掉到地面以下";
+pub(crate) const T_SIDE_FRAMES_ABOVE_ROOF: &str = "端面窗框高过楼顶";
+pub(crate) const T_SIDE_FRAMES_BOUNDS_BLOWN: &str = "端面窗框撑大了 bounds";
 
 /// 单元测试夹具:轿车(作为「其它车」的剪影基准)。
 #[cfg(test)]

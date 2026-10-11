@@ -126,6 +126,11 @@ def _annulus_side(m, x, z0, z1, y0, y1, ow, oh, color, flip):
     The front facade ring is built in X/Z at a fixed Y; a gable or end wall
     needs the same border in Z/Y at a fixed X.  Same four quads, other axes.
     """
+    # ⚠️ **坐标顺序:ring 的角点存成 (z, y),写出去必须还原成
+    # (x, y, z)。** 曾经直接写成 ``(x, a[0], a[1])``,把 z 塞进了 y
+    # 槽位 —— 于是 12 栋楼的 `window_side_frames_e/w` 整排掉到地面
+    # 以下(`bldg_lilac_tower` 是 z[-38.79,-0.81]),还顺带污染了每栋
+    # 资产的 `bounds`,让预览自动取景把这些楼框得极小。
     outer = ((z0 - ow, y0 - oh), (z1 + ow, y0 - oh),
              (z1 + ow, y1 + oh), (z0 - ow, y1 + oh))
     inner = ((z0, y0), (z1, y0), (z1, y1), (z0, y1))
@@ -134,8 +139,12 @@ def _annulus_side(m, x, z0, z1, y0, y1, ow, oh, color, flip):
         b = outer[(j + 1) % 4]
         c = inner[(j + 1) % 4]
         d = inner[j]
-        pts = ((x, a[0], a[1]), (x, b[0], b[1]),
-               (x, c[0], c[1]), (x, d[0], d[1]))
+        pts = ((x, a[1], a[0]), (x, b[1], b[0]),
+               (x, c[1], c[0]), (x, d[1], d[0]))
+        # ⚠️ **换轴会翻手性。** 角点原本按 (z, y) 逆时针排,直接写进
+        # (y, z) 就成了镜像,绕序反过来。导出器会当场报
+        # `N faces do not point along (1.0, 0.0, 0.0)`。
+        # 所以两支的 flip 是**相反**的:东墙(x > 0)要反转、西墙不用。
         if flip:
             m.quad(pts[0], pts[3], pts[2], pts[1], color)
         else:
@@ -566,7 +575,7 @@ def building(asset_id, key, width, depth, floors, floor_h=3.4,
                     _annulus_side(ring_m.mesh, x_wall + sx * 0.06,
                                   z - sh * 0.5, z + sh * 0.5,
                                   y_end - sw * 0.5, y_end + sw * 0.5,
-                                  fw, fw, trim_c, flip=(sx < 0))
+                                  fw, fw, trim_c, flip=(sx > 0))
                     # sill below and lintel above, spanning the reveal depth
                     depth_a: float = x_wall
                     depth_b: float = x_wall - sx * 0.12

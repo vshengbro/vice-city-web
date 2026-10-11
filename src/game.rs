@@ -9795,8 +9795,10 @@ mod tests {
         AXIS_STRAFE, BLDG_AQUA_ARCADE, BLDG_DECO_PINK, BLDG_LILAC_TOWER, CAR_SEDAN,
         E_FIXTURE_ASSET_JSON, E_FIXTURE_NO_DECLARED_BOUNDS, E_FIXTURE_SOLID_BOUNDS_UNREGISTERED,
         FIXTURE_BLDG_AQUA_ARCADE_JSON, FIXTURE_CAR_POLICE_JSON, FIXTURE_CAR_SEDAN_JSON,
-        FIXTURE_CAR_TAXI_JSON, FIXTURE_PROP_STREETLIGHT_JSON, SLOT_SILHOUETTE_CAR,
-        SLOT_SILHOUETTE_DELTA, T_SILHOUETTE_TOO_SIMILAR,
+        FIXTURE_BLDG_LILAC_TOWER_JSON, FIXTURE_CAR_TAXI_JSON, FIXTURE_PROP_STREETLIGHT_JSON,
+        SLOT_SILHOUETTE_CAR, SLOT_SILHOUETTE_DELTA, T_SIDE_FRAMES_ABOVE_ROOF,
+        T_SIDE_FRAMES_BOUNDS_BLOWN, T_SIDE_FRAMES_MISSING, T_SIDE_FRAMES_UNDERGROUND,
+        T_SILHOUETTE_TOO_SIMILAR,
         FIXTURE_PROP_TRAFFICLIGHT_JSON, GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY,
         KEY_BATCH, PED_SUIT, PED_TALK_SLOT_STEP, PISTOL_MAGAZINE, PLAYER_BODY_HEIGHT, PROP_BENCH,
         PROP_NEWSSTAND, PROP_PHONE_BOOTH, PROP_STREETLIGHT, PROP_TRAFFICLIGHT, RELOAD_TIME,
@@ -12168,6 +12170,69 @@ mod tests {
             T_SOLID_BOUNDS_DELETED_A_REAL_WALL,
             width
         );
+    }
+
+    /// 端面窗框必须真的爬在楼上,不能掉到地面以下。
+    ///
+    /// 这条钉住 `_annulus_side` 里的坐标顺序 bug:ring 的角点按
+    /// `(z, y)` 存,写出去时如果直接塞进 `(x, y, z)`,z 就落进了 y 槽
+    /// —— 12 栋楼的 `window_side_frames_e/w` 整排掉到地下,`bounds`
+    /// 被撑到 z[-38.79, …],预览取景因此把这些楼框得极小。
+    ///
+    /// 只断言几何,不比对视觉:窗框最高的点必须落在楼高之内,且整体
+    /// 高于 0(不是埋在地下)。
+    #[test]
+    fn side_window_frames_climb_the_building_instead_of_sinking_under_it() {
+        let asset: MeshAsset =
+            super::parse_asset(BLDG_LILAC_TOWER, FIXTURE_BLDG_LILAC_TOWER_JSON)
+                .expect(E_FIXTURE_ASSET_JSON);
+        let declared: Bounds = asset
+            .get_bounds()
+            .cloned()
+            .expect(E_FIXTURE_NO_DECLARED_BOUNDS);
+        let height: f32 = declared.get_max()[1] - declared.get_min()[1];
+        let mut frames: Vec<f32> = Vec::new();
+        collect_part_y_extent(&asset, "window_side_frames", &mut frames);
+        assert!(
+            !frames.is_empty(),
+            "{} {} side frames are missing",
+            T_SIDE_FRAMES_MISSING,
+            BLDG_LILAC_TOWER
+        );
+        let lowest: f32 = frames.iter().copied().fold(f32::MAX, f32::min);
+        let highest: f32 = frames.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            lowest >= -0.01,
+            "{} {} frames sink below ground at y={lowest}",
+            T_SIDE_FRAMES_UNDERGROUND,
+            BLDG_LILAC_TOWER
+        );
+        assert!(
+            highest <= height * 1.05,
+            "{} {} frames exceed the building height ({highest} > {height})",
+            T_SIDE_FRAMES_ABOVE_ROOF,
+            BLDG_LILAC_TOWER
+        );
+        // bounds 本身也不能被撑大 —— 这是这个 bug 最直观的副作用。
+        let depth: f32 = declared.get_max()[2] - declared.get_min()[2];
+        assert!(
+            depth < height * 0.5,
+            "{} {} bounds depth {depth} is implausible for a {height} m tower",
+            T_SIDE_FRAMES_BOUNDS_BLOWN,
+            BLDG_LILAC_TOWER
+        );
+    }
+
+    /// 收集名字带 `prefix` 的所有 Part 的 Y 极值。
+    fn collect_part_y_extent(asset: &MeshAsset, prefix: &str, out: &mut Vec<f32>) {
+        for part in &asset.parts {
+            if !part.name.starts_with(prefix) {
+                continue;
+            }
+            for vertex in &part.positions {
+                out.push(vertex[1]);
+            }
+        }
     }
 
     #[test]
