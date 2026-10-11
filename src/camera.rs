@@ -10,6 +10,7 @@
 //! 投影矩阵是标准 WebGL 深度范围 `[-1, 1]` 的右手透视矩阵。
 
 use crate::{
+    FRAC_PI_2, FRAC_PI_4,
     collision::{CAMERA_PROBE_RADIUS, CollisionWorld, ray_to_shapes},
     interior::FloorWorld,
     r#type::{Mat4Data, Vec2, Vec3, Vec4},
@@ -395,7 +396,7 @@ pub const ORBIT_MAX_DISTANCE: f32 = 620.0;
 /// 膨胀,玩家站到离墙 0.32 m 以内时射线起点就落在膨胀盒**内部**,求交
 /// 返回 `t = 0`,相机被一路压到下限。此时正确的行为是「贴着角色站住、
 /// 接受一点墙面穿帮」,而不是把镜头怼进模型里。
-pub const OCCLUSION_MIN_DISTANCE: f32 = 2.2;
+pub(crate) const OCCLUSION_MIN_DISTANCE: f32 = 2.2;
 
 /// 室内被墙贴脸时相机允许压到的**最近距离**(米)。
 ///
@@ -416,13 +417,13 @@ pub const OCCLUSION_MIN_DISTANCE: f32 = 2.2;
 /// 实测 yaw=180° 时眼点在 `x = 27.84`,而墙内表面在 `x = 27.75`;改成
 /// 0.30 后同一角度眼点落在 `x = 27.70`,回到墙内。0.30 < 0.35 - 0.05,
 /// 是唯一能**证明**眼点不出墙的取值。
-pub const PRESS_IN_DISTANCE: f32 = 0.30;
+pub(crate) const PRESS_IN_DISTANCE: f32 = 0.30;
 
 /// 遮挡回避命中后**额外**保留的贴墙余量(米)。
 ///
 /// 射线命中点正好在墙面上,眼点贴上去之后近平面仍然会啃掉半面墙。
 /// 往回退一点让眼点停在墙外,画面里才不会出现「一大片模型不展示」。
-pub const OCCLUSION_SKIN: f32 = 0.45;
+pub(crate) const OCCLUSION_SKIN: f32 = 0.45;
 
 /// 遮挡检测的「视锥宽度系数」—— 射线不只打中心一条,而是打
 /// **中心 + 左右各偏 `t · tan(FOV/2) · COVERAGE_WIDTH` 的三条**。
@@ -441,7 +442,7 @@ pub const OCCLUSION_COVERAGE_WIDTH: f32 = 0.62;
 ///
 /// 地面是一整张 `y = 0` 的网格,碰撞体里没有它,所以线段-地面求交要
 /// 单独算。不夹这一条,玩家从高处走向坡地时相机会先钻进地面。
-pub const CAMERA_MIN_HEIGHT: f32 = 0.45;
+pub(crate) const CAMERA_MIN_HEIGHT: f32 = 0.45;
 
 impl Camera {
     /// 创建一台默认相机:街区全景视角。
@@ -454,7 +455,7 @@ impl Camera {
             distance: 250.0,
             yaw: 0.0,
             pitch: 0.42,
-            fov_y: std::f32::consts::FRAC_PI_4,
+            fov_y: FRAC_PI_4,
             near: 0.1,
             far: 900.0,
             desired_distance: 250.0,
@@ -668,7 +669,7 @@ impl Camera {
     /// 连地面都被挤出取景框(截图里只剩一片蓝天)。距离的钳制是
     /// `clamp_distance` / `clamp_follow_distance` 的职责,谁改距离谁夹。
     pub fn clamp_pitch(&mut self) {
-        let limit: f32 = std::f32::consts::FRAC_PI_2 - 0.02;
+        let limit: f32 = FRAC_PI_2 - 0.02;
         let clamped: f32 = self.get_pitch().clamp(-limit, limit);
         self.set_pitch(clamped);
     }
@@ -1123,6 +1124,7 @@ pub fn is_back_facing(a: Vec3, b: Vec3, c: Vec3, eye: Vec3) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::PI;
     use crate::camera::{Camera, OCCLUSION_MIN_DISTANCE, OCCLUSION_SKIN};
     use crate::collision::{CollisionWorld, ray_to_shapes};
     use crate::r#const::{
@@ -1261,7 +1263,7 @@ mod tests {
         camera.set_target([0.0, 1.45, 0.0]);
         camera.set_pitch(0.0);
         // 眼点朝 +X(墙的另一侧),中间没有东西。
-        camera.set_yaw(std::f32::consts::PI);
+        camera.set_yaw(PI);
         camera.set_fov_y(FOLLOW_FOV);
         camera.set_distance(9.5);
         camera.set_desired_distance(9.5);

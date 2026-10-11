@@ -21,6 +21,7 @@
 //! [`ENEMY_SIGHT`] 一倍多的敌人连 AI 都不更新,自然也不会被上传。
 
 use crate::{
+    PI, TAU,
     camera::Mat4,
     collision::CollisionWorld,
     r#const::*,
@@ -945,7 +946,7 @@ impl Enemy {
         self.set_hurt_timer((self.get_hurt_timer() - dt).max(0.0));
         self.set_flee_timer((self.get_flee_timer() - dt).max(0.0));
         self.set_flash((self.get_flash() - dt).max(0.0));
-        self.set_wander((self.get_wander() + ENEMY_WANDER_RATE * dt) % std::f32::consts::TAU);
+        self.set_wander((self.get_wander() + ENEMY_WANDER_RATE * dt) % TAU);
         if self.get_patrol_timer() >= ENEMY_PATROL_RESELECT {
             self.set_patrol_timer(0.0);
         } else {
@@ -1815,10 +1816,7 @@ impl Pedestrian {
             self.set_gait_amount(
                 self.get_gait_amount() + (ratio - self.get_gait_amount()) * relaxed,
             );
-            self.set_gait_phase(
-                (self.get_gait_phase() + planar * PED_GAIT_RATE * dt)
-                    % (2.0 * std::f32::consts::PI),
-            );
+            self.set_gait_phase((self.get_gait_phase() + planar * PED_GAIT_RATE * dt) % (2.0 * PI));
         } else {
             let relaxed: f32 = (1.0 - (-PED_RELAX_RATE * dt).exp()).clamp(0.0, 1.0);
             self.set_gait_amount(self.get_gait_amount() - self.get_gait_amount() * relaxed);

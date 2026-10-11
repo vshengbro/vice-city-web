@@ -29,6 +29,7 @@ use euv::{
 };
 
 use crate::{
+    FRAC_PI_2, FRAC_PI_4, Ordering, PI, TAU,
     camera::{CAMERA_MIN_HEIGHT, Camera, Mat4, OCCLUSION_MIN_DISTANCE, PRESS_IN_DISTANCE},
     collision::{BodyKind, CAR_FOOTPRINT, CollisionWorld, DynamicBody, placement_box},
     combat::{
@@ -39,6 +40,7 @@ use crate::{
     enemy::{aim_with_spread, decide, is_active},
     interior::{FloorWorld, STEP_UP_TOLERANCE},
     mesh::{Bounds, GpuMesh, MeshAsset, MeshError, MeshPart, expand_asset},
+    once,
     player::{
         Player, RUN_SPEED, WALK_SPEED, joint_pivot, limb_chain_matrix, limb_parent, limb_swing,
     },
@@ -51,6 +53,7 @@ use crate::{
         advance_mission, build_hideouts, deploy_police, is_hidden, mission_blueprints, spawn_peds,
         spawn_thugs,
     },
+    take,
     traffic::{PICKUP_RADIUS, Pickup, Traffic, TrafficCar, apply_pickup, nearest_car},
     r#type::{Mat4Data, MeshExtent, PalmSpots, Placement, Vec2, Vec3},
 };
@@ -335,7 +338,7 @@ fn spawn_point() -> Vec3 {
 /// 玩家的前向是 `(cos yaw, -sin yaw)`。`yaw = PI/2` 时前向 = `(0, -1)`,
 /// 也就是朝北、顺着这条街往远处看 —— 相机落在角色南侧 7.4 m,同样在这
 /// 条街上,背后是同一条向远处延伸的马路,而不是楼面。
-const SPAWN_YAW: f32 = std::f32::consts::FRAC_PI_2;
+const SPAWN_YAW: f32 = FRAC_PI_2;
 
 // ===========================================================================
 // 场景蓝图:街区网格(多条平行街道 × 横向连接街道)
@@ -808,9 +811,9 @@ struct PropPlacement {
 const BLOCK_RING: &[(f32, f32, f32)] = &[
     // (相对街区中心的 dx, dz, 朝向街道的 yaw)
     (0.0, -1.0, 0.0),
-    (0.0, 1.0, std::f32::consts::PI),
-    (-1.0, 0.0, std::f32::consts::FRAC_PI_2),
-    (1.0, 0.0, -std::f32::consts::FRAC_PI_2),
+    (0.0, 1.0, PI),
+    (-1.0, 0.0, FRAC_PI_2),
+    (1.0, 0.0, -FRAC_PI_2),
 ];
 
 /// 可进入样板楼的世界摆放表。
@@ -834,9 +837,9 @@ const BLOCK_RING: &[(f32, f32, f32)] = &[
 /// - `SHOP_YAW = -π/2` → 门法线 `(−1, 0)`,门朝 −X,即朝西面的出生点。
 ///
 /// 两栋的门因此**相向而开**,从街区中间那条空地上就能同时看见两个开口。
-const SHOWCASE_YAW: f32 = std::f32::consts::FRAC_PI_2;
+const SHOWCASE_YAW: f32 = FRAC_PI_2;
 /// 样板楼 B 的朝向与 A 相反,让两栋的门相向。
-const SHOWCASE_YAW_FLIPPED: f32 = -std::f32::consts::FRAC_PI_2;
+const SHOWCASE_YAW_FLIPPED: f32 = -FRAC_PI_2;
 
 /// 样板楼 A(LOFT)所在街区的 X 索引 —— 街区中心在 `STREET_PITCH * k`。
 const SHOWCASE_LOFT_BLOCK_X: i32 = 0;
@@ -1590,7 +1593,7 @@ fn build_city_buildings_with(guard: f32, cx: f32, cz: f32) -> Vec<BuildingPlacem
             out.push(BuildingPlacement {
                 asset: BUILDING_POOL[hash2(seed, 8) as usize % BUILDING_POOL.len()],
                 position: [px, pz],
-                yaw: -std::f32::consts::FRAC_PI_4,
+                yaw: -FRAC_PI_4,
                 scale: 0.95 + hash_unit(seed, 9) * 0.3,
                 tint: [1.0, 0.96 + hash_unit(seed, 10) * 0.1, 1.0],
             });
@@ -1628,11 +1631,7 @@ fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
                 out.push(PropPlacement {
                     asset: PROP_TRAFFICLIGHT,
                     position: [line_x + sx * corner, 0.0, line_z + sz * corner],
-                    yaw: if sx * sz > 0.0 {
-                        0.0
-                    } else {
-                        std::f32::consts::PI
-                    },
+                    yaw: if sx * sz > 0.0 { 0.0 } else { PI },
                     tint: [1.0, 1.0, 1.0],
                 });
             }
@@ -1653,13 +1652,13 @@ fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
             out.push(PropPlacement {
                 asset: PROP_STREETLIGHT,
                 position: [line + STREET_HALF_WIDTH + 1.5, 0.0, step],
-                yaw: std::f32::consts::FRAC_PI_2,
+                yaw: FRAC_PI_2,
                 tint: [1.0, 1.0, 1.0],
             });
             out.push(PropPlacement {
                 asset: PROP_STREETLIGHT,
                 position: [step, 0.0, line - STREET_HALF_WIDTH - 1.5],
-                yaw: std::f32::consts::PI,
+                yaw: PI,
                 tint: [1.0, 1.0, 1.0],
             });
             // 沿线点缀:长椅 / 垃圾桶 / 消防栓 / 报摊 / 电话亭 / 锥桶。
@@ -1685,13 +1684,13 @@ fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
                 3 => out.push(PropPlacement {
                     asset: PROP_NEWSSTAND,
                     position: [step + 11.0, 0.0, line - STREET_HALF_WIDTH - 2.0],
-                    yaw: std::f32::consts::FRAC_PI_2,
+                    yaw: FRAC_PI_2,
                     tint: [1.0, 1.0, 1.0],
                 }),
                 4 => out.push(PropPlacement {
                     asset: PROP_PHONE_BOOTH,
                     position: [line + STREET_HALF_WIDTH + 2.0, 0.0, step + 13.0],
-                    yaw: -std::f32::consts::FRAC_PI_2,
+                    yaw: -FRAC_PI_2,
                     tint: [0.98, 1.0, 1.0],
                 }),
                 _ => out.push(PropPlacement {
@@ -1835,11 +1834,7 @@ fn build_city_vehicles(cx: f32, _cz: f32) -> Vec<Placement> {
             out.push((
                 VEHICLE_POOL[hash2(seed, 4) as usize % VEHICLE_POOL.len()],
                 position,
-                if along_x {
-                    0.0
-                } else {
-                    std::f32::consts::FRAC_PI_2
-                },
+                if along_x { 0.0 } else { FRAC_PI_2 },
             ));
         }
     }
@@ -1867,13 +1862,13 @@ fn build_city_signs(cx: f32, _cz: f32) -> Vec<Placement> {
                 out.push((
                     SIGN_POOL[hash2(seed, 2) as usize % SIGN_POOL.len()],
                     [line - face, 4.2, step],
-                    -std::f32::consts::FRAC_PI_2,
+                    -FRAC_PI_2,
                 ));
             } else {
                 out.push((
                     SIGN_POOL[hash2(seed, 2) as usize % SIGN_POOL.len()],
                     [step, 3.8, line + face],
-                    std::f32::consts::FRAC_PI_2,
+                    FRAC_PI_2,
                 ));
             }
         }
@@ -1904,7 +1899,7 @@ fn build_city_peds(cx: f32, _cz: f32) -> Vec<Placement> {
                     0.0,
                     step,
                 ],
-                hash_unit(seed, 3) * std::f32::consts::TAU,
+                hash_unit(seed, 3) * TAU,
             ));
         }
     }
@@ -2422,7 +2417,7 @@ pub fn build_water_near(cx: f32, cz: f32) -> MeshAsset {
         let start: f32 = if ri == 0 { 0.0 } else { rings[ri - 1].1 };
         let base: usize = positions.len();
         for s in 0..=spokes {
-            let angle: f32 = (s as f32 / spokes as f32) * std::f32::consts::TAU;
+            let angle: f32 = (s as f32 / spokes as f32) * TAU;
             let (sin_a, cos_a): (f32, f32) = angle.sin_cos();
             positions.push([cx + cos_a * start, SEA_LEVEL, cz + sin_a * start]);
             positions.push([cx + cos_a * outer, SEA_LEVEL, cz + sin_a * outer]);
@@ -2452,8 +2447,8 @@ pub fn build_water_near(cx: f32, cz: f32) -> MeshAsset {
     // ---- 内湖:一张带圆角的多边形水面,凹在城东南 ----
     let lake_center: Vec2 = LAKE_CENTER;
     for i in 0..LAKE_SEGMENTS {
-        let t0: f32 = (i as f32 / LAKE_SEGMENTS as f32) * std::f32::consts::TAU;
-        let t1: f32 = ((i + 1) as f32 / LAKE_SEGMENTS as f32) * std::f32::consts::TAU;
+        let t0: f32 = (i as f32 / LAKE_SEGMENTS as f32) * TAU;
+        let t1: f32 = ((i + 1) as f32 / LAKE_SEGMENTS as f32) * TAU;
         let p0: Vec2 = [
             lake_center[0] + t0.cos() * LAKE_RADIUS,
             lake_center[1] + t0.sin() * LAKE_RADIUS_X,
@@ -4492,7 +4487,7 @@ fn bind_pointer_events(handles: &GameHandles) {
             };
             let (x, y): (f64, f64) = (mouse.client_x() as f64, mouse.client_y() as f64);
             {
-                let game: std::cell::Ref<Game> = handles.game.borrow();
+                let game: Ref<Game> = handles.game.borrow();
                 if !game.input.dragging {
                     return;
                 }
@@ -4627,7 +4622,7 @@ fn bind_pointer_events(handles: &GameHandles) {
                         let mut game: RefMut<Game> = handles.game.borrow_mut();
                         let previous_pinch: f64 = game.input.last_pinch;
                         let previous_center: [f64; 2] = game.input.last_pointer;
-                        let camera: Camera = std::mem::take(&mut game.camera);
+                        let camera: Camera = take(&mut game.camera);
                         (camera, previous_pinch, previous_center)
                     };
                     if previous_pinch > 0.0 {
@@ -4964,7 +4959,7 @@ fn sync_phase_ui(handles: &GameHandles, phase: DayPhase) {
             slider.set_attribute(ATTR_VALUE, &format!("{}", phase.slider_value()));
     }
     let hud: String = {
-        let game: std::cell::Ref<Game> = handles.game.borrow();
+        let game: Ref<Game> = handles.game.borrow();
         format_hud(&game, 0)
     };
     if let Some(element) = &handles.hud {
@@ -5239,7 +5234,7 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
     // `web_sys::window()` / `js_sys::JSON::parse`,是 §borrow 的可重入调用,
     // 不能与活着的 guard 同处一个作用域。
     let (json, visibility): (String, String) = {
-        let game: std::cell::Ref<Game> = handles.game.borrow();
+        let game: Ref<Game> = handles.game.borrow();
         let position: Vec3 = game.player.get_position();
         let car_x: Vec<f64> = game
             .traffic
@@ -5676,7 +5671,7 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
             })
             .collect();
         scored.sort_by(|a: &(f32, String), b: &(f32, String)| {
-            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+            a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal)
         });
         let items: Vec<String> = scored
             .iter()
@@ -5979,7 +5974,7 @@ fn sync_hud(handles: &GameHandles, triangles: u32) {
         String,
         &str,
     ) = {
-        let game: std::cell::Ref<Game> = handles.game.borrow();
+        let game: Ref<Game> = handles.game.borrow();
         let health_pct: f64 = (f64::from(game.player.get_health()) / f64::from(PLAYER_MAX_HEALTH)
             * 100.0)
             .clamp(0.0, 100.0);
@@ -6111,7 +6106,7 @@ fn draw_minimap(handles: &GameHandles) {
     context.clear_rect(0.0, 0.0, size, size);
     context.set_fill_style_str(COLOR_MINIMAP_BG);
     context.fill_rect(0.0, 0.0, size, size);
-    let game: std::cell::Ref<Game> = handles.game.borrow();
+    let game: Ref<Game> = handles.game.borrow();
     let here: Vec3 = game.player.get_position();
     let center: Vec2 = [here[0], here[2]];
     // 世界 → 地图像素:以玩家为中心,固定比例(不随速度缩放)。
@@ -7755,12 +7750,7 @@ fn update_ped_social(peds: &mut [Pedestrian], dt: f32) {
         let span: f32 = PED_TALK_MAX_SECONDS - PED_TALK_MIN_SECONDS;
         let total: f32 = PED_TALK_MIN_SECONDS + span * crowd;
         // 序号 = 在这一堆人里的排位,保证一圈人各占不同方位。
-        for (slot, other) in neighbors
-            .iter()
-            .copied()
-            .chain(std::iter::once(index))
-            .enumerate()
-        {
+        for (slot, other) in neighbors.iter().copied().chain(once(index)).enumerate() {
             join_talk(peds, other, slot, center, total);
         }
     }
@@ -8329,7 +8319,7 @@ fn toggle_camera_mode(game: &mut Game) {
 /// - `&GameHandles` - 事件句柄。
 fn sync_map_visibility(handles: &GameHandles) {
     let (open, position, cash, stars): (bool, Vec3, f32, u32) = {
-        let game: std::cell::Ref<Game> = handles.game.borrow();
+        let game: Ref<Game> = handles.game.borrow();
         (
             game.map_open,
             game.player.get_position(),
@@ -8854,7 +8844,7 @@ fn start_loop(handles: GameHandles) {
         let width: u32 = handles.canvas.width();
         let height: u32 = handles.canvas.height();
         let mut accumulator: f32 = {
-            let game: std::cell::Ref<Game> = handles.game.borrow();
+            let game: Ref<Game> = handles.game.borrow();
             game.accumulator
         };
         let triangles: u32 = {
@@ -8865,7 +8855,7 @@ fn start_loop(handles: GameHandles) {
             triangles
         };
         let hud_text: String = {
-            let game: std::cell::Ref<Game> = handles.game.borrow();
+            let game: Ref<Game> = handles.game.borrow();
             format_hud(&game, triangles)
         };
         if let Some(hud) = &handles.hud {
@@ -9118,7 +9108,7 @@ pub fn boot() {
             };
             let parsed: f64 = value.parse().unwrap_or(0.0);
             let phase: DayPhase = DayPhase::from_slider(parsed);
-            let mut game: std::cell::RefMut<Game> = handles_for_input.game.borrow_mut();
+            let mut game: RefMut<Game> = handles_for_input.game.borrow_mut();
             game.input.phase = phase;
             drop(game);
             if let Some(label) = &handles_for_input.phase_label {
@@ -9742,6 +9732,7 @@ pub fn app_root() -> VirtualNode {
 
 #[cfg(test)]
 mod tests {
+    use crate::{FRAC_PI_2, Ordering};
     use std::collections::HashMap;
 
     use super::{
@@ -9794,41 +9785,39 @@ mod tests {
     use crate::r#const::{
         AXIS_STRAFE, BLDG_AQUA_ARCADE, BLDG_DECO_PINK, BLDG_LILAC_TOWER, CAR_SEDAN,
         E_FIXTURE_ASSET_JSON, E_FIXTURE_NO_DECLARED_BOUNDS, E_FIXTURE_SOLID_BOUNDS_UNREGISTERED,
-        FIXTURE_BLDG_AQUA_ARCADE_JSON, FIXTURE_CAR_POLICE_JSON, FIXTURE_CAR_SEDAN_JSON,
-        FIXTURE_BLDG_LILAC_TOWER_JSON, FIXTURE_CAR_TAXI_JSON, FIXTURE_PROP_STREETLIGHT_JSON,
-        SLOT_SILHOUETTE_CAR, SLOT_SILHOUETTE_DELTA, T_SIDE_FRAMES_ABOVE_ROOF,
-        T_SIDE_FRAMES_BOUNDS_BLOWN, T_SIDE_FRAMES_MISSING, T_SIDE_FRAMES_UNDERGROUND,
-        T_SILHOUETTE_TOO_SIMILAR,
+        FIXTURE_BLDG_AQUA_ARCADE_JSON, FIXTURE_BLDG_LILAC_TOWER_JSON, FIXTURE_CAR_POLICE_JSON,
+        FIXTURE_CAR_SEDAN_JSON, FIXTURE_CAR_TAXI_JSON, FIXTURE_PROP_STREETLIGHT_JSON,
         FIXTURE_PROP_TRAFFICLIGHT_JSON, GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY,
         KEY_BATCH, PED_SUIT, PED_TALK_SLOT_STEP, PISTOL_MAGAZINE, PLAYER_BODY_HEIGHT, PROP_BENCH,
         PROP_NEWSSTAND, PROP_PHONE_BOOTH, PROP_STREETLIGHT, PROP_TRAFFICLIGHT, RELOAD_TIME,
-        SLOT_FORMER_RELOAD_KEY, SLOT_RELOAD_KEY, T_AIR_WALL_ON_THE_SIDEWALK,
-        T_AIR_WALL_PROBE_FOUND_NO_SPOTS, T_C_NO_LONGER_RELOADS, T_CAR_BODY_BATCH_MISSING,
-        T_CAR_BODY_BATCH_NOT_TAIL, T_CAR_BODY_BATCH_SHARED, T_JUMP_CLEARS_A_LEDGE,
-        T_JUMP_LANDS_STANDING, T_JUMP_ONLY_FROM_GROUND, T_JUMP_RISES_BEFORE_FALLING,
-        T_PALM_ON_ROADWAY, T_PALM_ROW_IS_UNIFORM, T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT,
-        T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS, T_RELOAD_CONSUMES_RESERVE, T_RELOAD_KEY_IS_GTA_R,
-        T_RELOAD_NOT_REPEATABLE, T_RELOAD_R_REFILLS_MAGAZINE, T_RELOAD_R_STARTS_RELOAD,
-        T_ROUTE_LEG_DIAGONAL, T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED,
-        T_SHOWCASE_DESCENT_NO_CLIMB, T_SHOWCASE_DESCENT_REACHES_GROUND,
-        T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE, T_SHOWCASE_DOOR_NO_SLAB,
-        T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL, T_SHOWCASE_DOOR_OUTSIDE_BLOCKED,
-        T_SHOWCASE_DOORS_FACE_EACH_OTHER, T_SHOWCASE_DOORWAY_2D_BLOCKED,
-        T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING, T_SHOWCASE_LANDING_COVERS_RUN,
-        T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_NO_WALL_AHEAD, T_SHOWCASE_OVERLAPS_ORDINARY,
-        T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
+        SLOT_FORMER_RELOAD_KEY, SLOT_RELOAD_KEY, SLOT_SILHOUETTE_CAR, SLOT_SILHOUETTE_DELTA,
+        T_AIR_WALL_ON_THE_SIDEWALK, T_AIR_WALL_PROBE_FOUND_NO_SPOTS, T_C_NO_LONGER_RELOADS,
+        T_CAR_BODY_BATCH_MISSING, T_CAR_BODY_BATCH_NOT_TAIL, T_CAR_BODY_BATCH_SHARED,
+        T_JUMP_CLEARS_A_LEDGE, T_JUMP_LANDS_STANDING, T_JUMP_ONLY_FROM_GROUND,
+        T_JUMP_RISES_BEFORE_FALLING, T_PALM_ON_ROADWAY, T_PALM_ROW_IS_UNIFORM,
+        T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT, T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS,
+        T_RELOAD_CONSUMES_RESERVE, T_RELOAD_KEY_IS_GTA_R, T_RELOAD_NOT_REPEATABLE,
+        T_RELOAD_R_REFILLS_MAGAZINE, T_RELOAD_R_STARTS_RELOAD, T_ROUTE_LEG_DIAGONAL,
+        T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DESCENT_NO_CLIMB,
+        T_SHOWCASE_DESCENT_REACHES_GROUND, T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE,
+        T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL,
+        T_SHOWCASE_DOOR_OUTSIDE_BLOCKED, T_SHOWCASE_DOORS_FACE_EACH_OTHER,
+        T_SHOWCASE_DOORWAY_2D_BLOCKED, T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING,
+        T_SHOWCASE_LANDING_COVERS_RUN, T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_NO_WALL_AHEAD,
+        T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
         T_SHOWCASE_PIER_LET_PLAYER_THROUGH, T_SHOWCASE_PUSHED_INTO_WALL,
         T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE, T_SHOWCASE_SPRINT_PENETRATES_WALL,
         T_SHOWCASE_SPRINT_TUNNELS_WALL, T_SHOWCASE_STAIR_REACHES_TOP,
         T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_SUBSTEP_NOT_NO_OP,
         T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP,
         T_SHOWCASE_WALK_LOSES_SLIDE, T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP,
-        T_SOLID_BOUNDS_DELETED_A_REAL_WALL, T_SOLID_BOUNDS_FIXTURE_TOO_WEAK,
-        T_SOLID_BOUNDS_GREW_PAST_ASSET_BOUNDS, T_SOLID_BOUNDS_STILL_AN_AIR_WALL,
-        T_SOLID_BOUNDS_X_WIDTH, T_STATIC_LEN_ASSUMED_CONSTANT, T_STREAM_CONTENT_MUST_NOT_SWAP,
-        T_STREAM_CONTENT_MUST_NOT_VANISH, T_STREET_SLOT_ON_GRID, T_STREET_SLOT_WORLD_ANCHORED,
-        T_VERTICAL_REST_ON_FLOOR, T_WHEEL_AXLE_STILL, T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD,
-        T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
+        T_SIDE_FRAMES_ABOVE_ROOF, T_SIDE_FRAMES_BOUNDS_BLOWN, T_SIDE_FRAMES_MISSING,
+        T_SIDE_FRAMES_UNDERGROUND, T_SILHOUETTE_TOO_SIMILAR, T_SOLID_BOUNDS_DELETED_A_REAL_WALL,
+        T_SOLID_BOUNDS_FIXTURE_TOO_WEAK, T_SOLID_BOUNDS_GREW_PAST_ASSET_BOUNDS,
+        T_SOLID_BOUNDS_STILL_AN_AIR_WALL, T_SOLID_BOUNDS_X_WIDTH, T_STATIC_LEN_ASSUMED_CONSTANT,
+        T_STREAM_CONTENT_MUST_NOT_SWAP, T_STREAM_CONTENT_MUST_NOT_VANISH, T_STREET_SLOT_ON_GRID,
+        T_STREET_SLOT_WORLD_ANCHORED, T_VERTICAL_REST_ON_FLOOR, T_WHEEL_AXLE_STILL,
+        T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD, T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
     };
     use crate::player::Player;
     use crate::r#type::{Mat4Data, Vec3};
@@ -9862,9 +9851,8 @@ mod tests {
     }
 
     use crate::game::{
-        BLOCK_VIEW_RADIUS, BlockLayout, BuildingPlacement, GROUND_SPAN, MeshAsset, MeshPart,
-        MINIMAP_RANGE, PALM_PITCH_MAX, PLAYER_RADIUS, Placement, PropPlacement,
-        SHOWCASE_DOOR_HALF,
+        BLOCK_VIEW_RADIUS, BlockLayout, BuildingPlacement, GROUND_SPAN, MINIMAP_RANGE, MeshAsset,
+        MeshPart, PALM_PITCH_MAX, PLAYER_RADIUS, Placement, PropPlacement, SHOWCASE_DOOR_HALF,
         SHOWCASE_GROUND_TOP, SHOWCASE_STAIR_LEAD, SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN,
         SHOWCASE_STAIR_STEPS, SHOWCASE_STAIR_WIDTH, SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS,
         SIDEWALK_WIDTH, STREAM_REBUILD_STEP, STREAM_SNAPSHOT_PAD, STREET_HALF_WIDTH, STREET_PITCH,
@@ -9872,8 +9860,7 @@ mod tests {
         build_city_palms, build_city_peds, build_city_props, build_city_signs,
         build_collision_world, build_ground_near, build_showcase_interiors, build_water_near,
         collider_bounds, map_street_lines, on_roadway, push_box, showcase_placements,
-        showcase_specs,
-        stream_needs_rebuild, street_axis, street_indices_in, street_slots,
+        showcase_specs, stream_needs_rebuild, street_axis, street_indices_in, street_slots,
     };
     use crate::interior::{Floor, FloorWorld, STEP_UP_TOLERANCE};
     use crate::mesh::Bounds;
@@ -11118,7 +11105,9 @@ mod tests {
         let buildings: fn(f32, f32) -> Vec<(String, [f32; 3])> = |cx: f32, cz: f32| {
             build_city_buildings(cx, cz)
                 .iter()
-                .map(|b: &BuildingPlacement| (b.asset.to_string(), [b.position[0], 0.0, b.position[1]]))
+                .map(|b: &BuildingPlacement| {
+                    (b.asset.to_string(), [b.position[0], 0.0, b.position[1]])
+                })
                 .collect()
         };
         let props: fn(f32, f32) -> Vec<(String, [f32; 3])> = |cx: f32, cz: f32| {
@@ -11175,7 +11164,10 @@ mod tests {
                 let a: HashMap<(i32, i32), String> = snapshot(before, mid);
                 let b: HashMap<(i32, i32), String> = snapshot(after, mid);
                 // 重建**前**有的、重建**后**没了 = 玩家眼前的楼凭空消失。
-                let vanished: usize = a.keys().filter(|k: &&(i32, i32)| !b.contains_key(*k)).count();
+                let vanished: usize = a
+                    .keys()
+                    .filter(|k: &&(i32, i32)| !b.contains_key(*k))
+                    .count();
                 assert!(
                     vanished == 0,
                     "{}",
@@ -11229,8 +11221,10 @@ mod tests {
             // 因此少掉的那几个站位是合法的(它们真的走出了窗口),不在比对范围。
             let shifted: Vec<(i32, f32)> = street_slots(lo + STREET_PITCH, hi + STREET_PITCH, step);
             for (slot, at) in full.iter() {
-                let found: Option<(i32, f32)> =
-                    shifted.iter().find(|entry: &&(i32, f32)| entry.0 == *slot).copied();
+                let found: Option<(i32, f32)> = shifted
+                    .iter()
+                    .find(|entry: &&(i32, f32)| entry.0 == *slot)
+                    .copied();
                 let Some((_, again)) = found else {
                     continue;
                 };
@@ -11322,8 +11316,7 @@ mod tests {
     fn wheel_spin_rotates_the_axle() {
         let mount: [f32; 3] = crate::traffic::WHEEL_MOUNTS[0];
         let rest: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, 0.0);
-        let turned: Mat4Data =
-            car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, std::f32::consts::FRAC_PI_2);
+        let turned: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, FRAC_PI_2);
         // 绕本地 Z 自转:Z 基向量不动,X/Y 两个基向量在 XY 平面上转 90 度。
         // 列主序下第一列是 X 基向量(model[0..3]),所以要看 **第一、二列**。
         let x_rest: [f32; 3] = [rest[0], rest[1], rest[2]];
@@ -11370,8 +11363,7 @@ mod tests {
     fn wheel_follows_the_body_yaw() {
         let mount: [f32; 3] = crate::traffic::WHEEL_MOUNTS[0];
         let east: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, 0.0);
-        let north: Mat4Data =
-            car_wheel_model([0.0, 0.0, 0.0], -std::f32::consts::FRAC_PI_2, mount, 0.0);
+        let north: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], -FRAC_PI_2, mount, 0.0);
         assert!(
             (east[12] - north[14]).abs() < 1e-5,
             "车身转 90 度后安装位应从 +X 转到 +Z,实际 {} vs {}",
@@ -11511,8 +11503,16 @@ mod tests {
         // 附件(车顶灯、涂装、货斗)不算车身 —— 正是它们让出租车和警车
         // 在旧版本里「看起来一样」,而附件不参与剪影判定。
         const ATTACHMENTS: [&str; 10] = [
-            "livery", "sign_mount", "taxi_sign", "lightbar_mount", "lightbar_red",
-            "lightbar_blue", "bed", "hvac", "doors", "markers",
+            "livery",
+            "sign_mount",
+            "taxi_sign",
+            "lightbar_mount",
+            "lightbar_red",
+            "lightbar_blue",
+            "bed",
+            "hvac",
+            "doors",
+            "markers",
         ];
         let mut xs: Vec<f32> = Vec::new();
         let mut ys: Vec<f32> = Vec::new();
@@ -11561,8 +11561,7 @@ mod tests {
             ("taxi", FIXTURE_CAR_TAXI_JSON),
             ("police", FIXTURE_CAR_POLICE_JSON),
         ] {
-            let asset: MeshAsset =
-                super::parse_asset(name, raw).expect(E_FIXTURE_ASSET_JSON);
+            let asset: MeshAsset = super::parse_asset(name, raw).expect(E_FIXTURE_ASSET_JSON);
             let profile: Vec<f32> = vehicle_side_profile(&asset, BINS);
             let mut total: f32 = 0.0;
             for (a, b) in profile.iter().zip(base.iter()) {
@@ -11593,15 +11592,14 @@ mod tests {
         // 就必须被画出来。
         for center in [
             [0.0f32, 0.0f32],
-            [63.5, 45.0],   // 出生点车道
-            [60.0, 60.0],   // 路口正中
+            [63.5, 45.0], // 出生点车道
+            [60.0, 60.0], // 路口正中
             [-123.5, 87.0],
             [180.0, -240.0],
         ] {
             let drawn: Vec<f32> = map_street_lines(center);
             let mut axis: i32 =
-                ((center[0].max(center[1]) - MINIMAP_RANGE) / STREET_PITCH).ceil() as i32
-                    - 1;
+                ((center[0].max(center[1]) - MINIMAP_RANGE) / STREET_PITCH).ceil() as i32 - 1;
             while axis as f32 * STREET_PITCH <= center[0].max(center[1]) + MINIMAP_RANGE {
                 for axis_pos in [center[0], center[1]] {
                     let real: f32 = street_axis(axis);
@@ -11758,39 +11756,36 @@ mod tests {
         //
         // 断言:同一个世界点,在重建前后必须拿到**同一个颜色**。
         let probe: Vec<[f32; 3]> = vec![
-            [63.5, 0.0, 45.0],   // 车道内
-            [66.0, 0.0, 45.0],   // 人行道
-            [80.0, 0.0, 45.0],   // 地块
+            [63.5, 0.0, 45.0], // 车道内
+            [66.0, 0.0, 45.0], // 人行道
+            [80.0, 0.0, 45.0], // 地块
             [63.5, 0.0, 105.0],
             [80.0, 0.0, 105.0],
         ];
         let colour_at: fn([f32; 2], [f32; 3]) -> Option<[f32; 3]> =
             |centre: [f32; 2], at: [f32; 3]| -> Option<[f32; 3]> {
-            let ground: MeshAsset = build_ground_near(centre[0], centre[1]);
-            let cell: f32 = GROUND_SPAN / super::GROUND_SUBDIV as f32;
-            let ox: f32 =
-                street_axis((centre[0] / super::GROUND_CELL_ALIGN).round() as i32)
+                let ground: MeshAsset = build_ground_near(centre[0], centre[1]);
+                let cell: f32 = GROUND_SPAN / super::GROUND_SUBDIV as f32;
+                let ox: f32 = street_axis((centre[0] / super::GROUND_CELL_ALIGN).round() as i32)
                     - GROUND_SPAN * 0.5;
-            let oz: f32 =
-                street_axis((centre[1] / super::GROUND_CELL_ALIGN).round() as i32)
+                let oz: f32 = street_axis((centre[1] / super::GROUND_CELL_ALIGN).round() as i32)
                     - GROUND_SPAN * 0.5;
-            let i: usize = (((at[2] - oz) / cell).floor().max(0.0) as usize)
-                .min(super::GROUND_SUBDIV - 1);
-            let j: usize = (((at[0] - ox) / cell).floor().max(0.0) as usize)
-                .min(super::GROUND_SUBDIV - 1);
-            // 每个 cell 两个三角面,面序与 faces 一样按 (i, j) 行优先。
-            let index: usize = (i * super::GROUND_SUBDIV + j) * 2;
-            ground
-                .parts
-                .first()
-                .and_then(|part: &crate::mesh::MeshPart| {
-                    part.face_colors.as_ref().and_then(|c: &Vec<[f32; 3]>| {
-                        c.get(index).map(|v: &[f32; 3]| {
-                            [v[0] as f32, v[1] as f32, v[2] as f32]
+                let i: usize =
+                    (((at[2] - oz) / cell).floor().max(0.0) as usize).min(super::GROUND_SUBDIV - 1);
+                let j: usize =
+                    (((at[0] - ox) / cell).floor().max(0.0) as usize).min(super::GROUND_SUBDIV - 1);
+                // 每个 cell 两个三角面,面序与 faces 一样按 (i, j) 行优先。
+                let index: usize = (i * super::GROUND_SUBDIV + j) * 2;
+                ground
+                    .parts
+                    .first()
+                    .and_then(|part: &crate::mesh::MeshPart| {
+                        part.face_colors.as_ref().and_then(|c: &Vec<[f32; 3]>| {
+                            c.get(index)
+                                .map(|v: &[f32; 3]| [v[0] as f32, v[1] as f32, v[2] as f32])
                         })
                     })
-                })
-        };
+            };
         for at in probe {
             let before: Option<[f32; 3]> = colour_at([63.5, 45.0], at);
             let after: Option<[f32; 3]> = colour_at([123.5, 105.0], at);
@@ -12312,9 +12307,8 @@ mod tests {
     /// 高于 0(不是埋在地下)。
     #[test]
     fn side_window_frames_climb_the_building_instead_of_sinking_under_it() {
-        let asset: MeshAsset =
-            super::parse_asset(BLDG_LILAC_TOWER, FIXTURE_BLDG_LILAC_TOWER_JSON)
-                .expect(E_FIXTURE_ASSET_JSON);
+        let asset: MeshAsset = super::parse_asset(BLDG_LILAC_TOWER, FIXTURE_BLDG_LILAC_TOWER_JSON)
+            .expect(E_FIXTURE_ASSET_JSON);
         let declared: Bounds = asset
             .get_bounds()
             .cloned()
@@ -12564,7 +12558,7 @@ mod tests {
         ));
         update_ped_social_for_test(peds.as_mut_slice(), 0.016);
         let mut slots: Vec<f32> = peds.iter().map(Pedestrian::get_talk_slot).collect();
-        slots.sort_by(|a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        slots.sort_by(|a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(Ordering::Equal));
         for pair in slots.windows(2) {
             let gap: f32 = (pair[1] - pair[0]).abs();
             assert!(gap > 1.0e-3, "{}: slots={slots:?}", T_PEDS_DISTINCT_SLOTS);

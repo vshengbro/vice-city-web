@@ -22,6 +22,7 @@
 
 use crate::{
     r#const::SHOWCASE_STAIR_RUN,
+    swap,
     r#type::{Vec2, Vec3},
 };
 
@@ -54,7 +55,7 @@ const INTERIOR_SIGHT_EPSILON: f32 = 1e-6;
 /// 小于它,`substeps == 1`,整帧仍走一次 —— 正常帧率的手感逐帧不变。
 /// 取值一旦掉到 0.077 以下,那条 no-op 前提就没了,单测
 /// `the_interior_sweep_is_a_no_op_at_sixty_fps` 会立刻红。
-pub const INTERIOR_SLIDE_SUBSTEP: f32 = 0.10;
+pub(crate) const INTERIOR_SLIDE_SUBSTEP: f32 = 0.10;
 
 /// 室内垂直碰撞体:一块楼板或一段隔墙。
 #[derive(Clone, Copy, Debug)]
@@ -587,7 +588,7 @@ impl FloorWorld {
                 let mut t0: f32 = (low - origin) / delta;
                 let mut t1: f32 = (high - origin) / delta;
                 if t0 > t1 {
-                    std::mem::swap(&mut t0, &mut t1);
+                    swap(&mut t0, &mut t1);
                 }
                 enter = enter.max(t0);
                 exit = exit.min(t1);
@@ -738,7 +739,7 @@ impl Default for FloorWorld {
 ///
 /// 室内楼梯每级 0.305 m,这里留到 0.45 m:既高于单级台阶(走上去会被抬),
 /// 又远低于门洞 2.30 m 与层高 3.05 m(所以不会一步跨上二层楼板)。
-pub const STEP_UP_TOLERANCE: f32 = 0.45;
+pub(crate) const STEP_UP_TOLERANCE: f32 = 0.45;
 
 /// 「脚下的板」允许比脚底低多少仍然算支撑(米)。
 ///

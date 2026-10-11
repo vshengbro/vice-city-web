@@ -35,7 +35,7 @@
 //! 展开后索引缓冲退化为顺序索引,但仍然真实生成并上传,方便后续 worker
 //! 在需要时改成共享顶点 / 索引优化。
 
-use crate::r#type::Vec3;
+use crate::{Display, r#type::Vec3};
 use serde::Deserialize;
 
 /// 一个三维向量,来自 JSON 数组 `[x, y, z]`。
@@ -154,7 +154,7 @@ pub enum MeshError {
     Schema(String),
 }
 
-impl std::fmt::Display for MeshError {
+impl Display for MeshError {
     /// 把错误格式化成人类可读的一行。
     ///
     /// # Arguments

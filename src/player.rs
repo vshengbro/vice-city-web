@@ -11,6 +11,7 @@
 //! 换模型时只要 part 划分一致,骨架自动跟着长。
 
 use crate::{
+    PI,
     camera::Mat4,
     collision::CollisionWorld,
     r#const::*,
@@ -18,9 +19,9 @@ use crate::{
 };
 
 /// 步行速度(米/秒)。
-pub const WALK_SPEED: f32 = 4.6;
+pub(crate) const WALK_SPEED: f32 = 4.6;
 /// 奔跑速度(米/秒,按住 Shift)。
-pub const RUN_SPEED: f32 = 8.4;
+pub(crate) const RUN_SPEED: f32 = 8.4;
 /// 转身插值速度(1/秒):越小转身越「重」,不会瞬移式扭头。
 pub const TURN_RATE: f32 = 11.0;
 /// 行走相位推进速率(rad / 米):每走 1 米推进约 2.6 rad,约 2.4 步。
@@ -41,7 +42,7 @@ pub const SPEED_RAMP: f32 = 14.0;
 /// 低于这个平面速度(米/秒)就认为「站住了」:不转身、不推进相位。
 pub const PLANAR_EPSILON: f32 = 0.05;
 /// 玩家初始生命值。
-pub const MAX_HEALTH: f32 = 100.0;
+pub(crate) const MAX_HEALTH: f32 = 100.0;
 
 /// 玩家的全部**可动**骨架 part(与 `ped_suit` 的 part 划分一一对应)。
 ///
@@ -53,7 +54,7 @@ pub const MAX_HEALTH: f32 = 100.0;
 /// 躯干 / 头 / 鞋这类没有父关节的 part 用空串表示「就是链根」。
 ///
 /// 相位:左右反相(`GAIT_PHASE_R = π`),同一侧上下同相位,形成对角步态。
-pub const LIMB_PLAN: &[(&str, &str, f32, f32)] = &[
+pub(crate) const LIMB_PLAN: &[(&str, &str, f32, f32)] = &[
     (PART_UPPER_ARM_L, "", GAIT_PHASE_L, LIMB_SWING),
     (
         PART_LOWER_ARM_L,
@@ -141,7 +142,7 @@ pub fn limb_swing(part: &str, phase: f32, amount: f32) -> f32 {
 /// 左腿相位:0。
 pub const GAIT_PHASE_L: f32 = 0.0;
 /// 右腿相位:与左腿反相。
-pub const GAIT_PHASE_R: f32 = std::f32::consts::PI;
+pub const GAIT_PHASE_R: f32 = PI;
 
 /// 一个玩家的运行时状态。
 #[derive(Clone, Debug)]
@@ -627,8 +628,7 @@ impl Player {
             let scaled: f32 = self.get_gait_amount() + (ratio - self.get_gait_amount()) * relaxed;
             self.set_gait_amount(scaled);
             self.set_gait_phase(
-                (self.get_gait_phase() + planar * GAIT_RATE_PER_METER * dt)
-                    % (2.0 * std::f32::consts::PI),
+                (self.get_gait_phase() + planar * GAIT_RATE_PER_METER * dt) % (2.0 * PI),
             );
         } else {
             let shrunk: f32 = self.get_gait_amount() - self.get_gait_amount() * relaxed;
@@ -675,11 +675,11 @@ pub fn facing_yaw(velocity: Vec2) -> f32 {
 ///
 /// - `f32` - 折回后的角度差(弧度)。
 pub fn wrap_angle(angle: f32) -> f32 {
-    let two_pi: f32 = 2.0 * std::f32::consts::PI;
+    let two_pi: f32 = 2.0 * PI;
     let mut value: f32 = angle % two_pi;
-    if value > std::f32::consts::PI {
+    if value > PI {
         value -= two_pi;
-    } else if value < -std::f32::consts::PI {
+    } else if value < -PI {
         value += two_pi;
     }
     value
@@ -820,6 +820,7 @@ mod tests {
         facing_yaw, joint_pivot, limb_chain_matrix, limb_parent, limb_swing,
     };
     use crate::r#type::{Mat4Data, Vec2, Vec3};
+    use crate::{FRAC_PI_2, PI};
 
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值(与 `camera.rs` 同形)。
     fn fill(template: &str, args: &[(&str, &str)]) -> String {
@@ -845,9 +846,9 @@ mod tests {
     fn facing_yaw_points_the_model_along_the_velocity() {
         for (velocity, want) in [
             (Vec2::from([0.0, 1.0]), 0.0),
-            (Vec2::from([1.0, 0.0]), std::f32::consts::FRAC_PI_2),
-            (Vec2::from([0.0, -1.0]), std::f32::consts::PI),
-            (Vec2::from([-1.0, 0.0]), -std::f32::consts::FRAC_PI_2),
+            (Vec2::from([1.0, 0.0]), FRAC_PI_2),
+            (Vec2::from([0.0, -1.0]), PI),
+            (Vec2::from([-1.0, 0.0]), -FRAC_PI_2),
         ] {
             let yaw: f32 = facing_yaw(velocity);
             assert!(
@@ -868,11 +869,11 @@ mod tests {
 
     /// 把角度折到 (−π, π],避免断言时被 ±2π 干扰。
     fn wrap(angle: f32) -> f32 {
-        let two_pi: f32 = 2.0 * std::f32::consts::PI;
+        let two_pi: f32 = 2.0 * PI;
         let mut value: f32 = angle % two_pi;
-        if value > std::f32::consts::PI {
+        if value > PI {
             value -= two_pi;
-        } else if value < -std::f32::consts::PI {
+        } else if value < -PI {
             value += two_pi;
         }
         value
@@ -1003,7 +1004,7 @@ mod tests {
         );
         let phase_gap: f32 = (GAIT_PHASE_R - GAIT_PHASE_L).abs();
         assert!(
-            (phase_gap - std::f32::consts::PI).abs() < 1.0e-6,
+            (phase_gap - PI).abs() < 1.0e-6,
             "{T_LEGS_ANTIPHASE}: 左右相位必须差 π,实得 {phase_gap}"
         );
     }

@@ -55,7 +55,7 @@ const SLIDE_MIN_PROGRESS: f32 = 0.25;
 ///
 /// 外部读者:`game::resolve_dynamic_bodies` 用它给每辆车建有向盒碰撞体,
 /// 删掉或改成私有不符 §18。
-pub const CAR_FOOTPRINT: Vec2 = [2.283, 0.926];
+pub(crate) const CAR_FOOTPRINT: Vec2 = [2.283, 0.926];
 
 /// 车辆每步推进的子步长(米)。
 ///
@@ -73,7 +73,7 @@ pub(crate) const CAR_STEP: f32 = 0.05;
 /// yaw 的微小变化跳变。给探针一个实际尺寸(略大于一个肩宽)做球体推进,
 /// 抖动幅度被压到可以忽略。它只被 [`ray_to_shapes`] 读到,所以定义在
 /// 射线实现旁边而不是 `camera`。
-pub const CAMERA_PROBE_RADIUS: f32 = 0.32;
+pub(crate) const CAMERA_PROBE_RADIUS: f32 = 0.32;
 
 /// 一个静态碰撞体(投影到世界 XZ 平面)。
 #[derive(Clone, Copy, Debug)]

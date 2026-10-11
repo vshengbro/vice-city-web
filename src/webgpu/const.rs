@@ -602,7 +602,6 @@ fn fs_blur(in : VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-
 /// 全屏三角形:所有离屏 pass 共用,UV 在这里翻一次。
 /// SSAO / AO 模糊模板里的占位符名。
 ///

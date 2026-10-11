@@ -15,9 +15,11 @@ use euv::{
 };
 
 use crate::{
+    Ordering,
     camera::{Mat4, is_back_facing},
     r#const::*,
     mesh::{GpuMesh, f32_slice_to_bytes},
+    take,
     r#type::{Mat4Data, Rgb8, Vec3},
 };
 
@@ -811,7 +813,7 @@ pub fn tonemap(value: Vec3, exposure: f32, white: f32) -> Vec3 {
 ///
 /// # Returns
 ///
-/// - `[f32` - 计算结果。
+/// - `[f32; 3]` - 计算结果。
 pub fn shade_face(
     albedo: Vec3,
     emissive: Vec3,
@@ -4760,7 +4762,7 @@ impl WebGlRenderer {
                 {
                     // 整批都在近平面之外(常见情况:一排路灯 / 一排行道树),
                     // 就地过滤一次,避免为了剔一两个实例而重新分配。
-                    let mut kept: Vec<Instance> = std::mem::take(self.get_scratch_mut());
+                    let mut kept: Vec<Instance> = take(self.get_scratch_mut());
                     kept.clear();
                     kept.extend(
                         batch
@@ -4816,7 +4818,7 @@ impl WebGlRenderer {
                     .iter()
                     .any(|inst: &Instance| instance_distance(inst, eye) < near_cull_radius);
                 if any_near && batch.near_cull {
-                    let mut kept: Vec<Instance> = std::mem::take(self.get_scratch_mut());
+                    let mut kept: Vec<Instance> = take(self.get_scratch_mut());
                     kept.clear();
                     kept.extend(
                         batch
@@ -5188,9 +5190,7 @@ impl SoftwareRenderer {
 
         // 画家算法:远 → 近。
         queue.sort_by(|a: &ScreenTriangle, b: &ScreenTriangle| {
-            b.depth
-                .partial_cmp(&a.depth)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.depth.partial_cmp(&a.depth).unwrap_or(Ordering::Equal)
         });
         let count: u32 = queue.len() as u32;
         let mut previous: &str = "";
@@ -5320,9 +5320,7 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::{AdaptiveQuality, QualityTier};
-    use crate::r#const::{
-        FAST_FRAME_THRESHOLD, QUALITY_DOWN_FPS, SLOW_FRAME_THRESHOLD,
-    };
+    use crate::r#const::{FAST_FRAME_THRESHOLD, QUALITY_DOWN_FPS, SLOW_FRAME_THRESHOLD};
 
     /// 回归:降档是**单向**的 —— 代码里刻意不执行升档。
     ///
@@ -5369,15 +5367,15 @@ mod tests {
         );
     }
     use crate::r#const::{
+        BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FEATHER, CONTACT_SHADOW_FLOOR,
+        CONTACT_SHADOW_MIN_HEIGHT, CONTACT_SHADOW_REACH, SSAO_RADIUS, U_AO_FEATHER, U_AO_FLOOR,
+        U_AO_HEIGHT, U_AO_MIN_HEIGHT, U_AO_REACH, U_BLOOM_DIR, U_BLOOM_THRESHOLD,
+    };
+    use crate::r#const::{
         PHASE_FIELD_VALUE, PHASE_QUERY_DUSK, PHASE_QUERY_NIGHT, PHASE_QUERY_NOON,
         SHADOW_CULL_MARGIN, SHADOW_GROUNDED_EPS, SHADOW_HALF_EXTENT, T_PHASE_QUERY_MAPS,
         T_PHASE_QUERY_PROBE, T_PHASE_QUERY_UNKNOWN, T_SHADOW_CULLS_OUTSIDE, T_SHADOW_GROUNDED_SAFE,
         T_SHADOW_KEEPS_CENTRE, T_SHADOW_KEEPS_MARGIN, T_SHADOW_TALL_KEPT,
-    };
-    use crate::r#const::{
-        BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FEATHER, CONTACT_SHADOW_FLOOR,
-        CONTACT_SHADOW_MIN_HEIGHT, CONTACT_SHADOW_REACH, SSAO_RADIUS, U_AO_FEATHER, U_AO_FLOOR,
-        U_AO_HEIGHT, U_AO_MIN_HEIGHT, U_AO_REACH, U_BLOOM_DIR, U_BLOOM_THRESHOLD,
     };
     use crate::render::{
         BLOOM_BLUR_FRAGMENT_SHADER, BLOOM_EXTRACT_FRAGMENT_SHADER, COMPOSITE_FRAGMENT_SHADER,
@@ -5385,6 +5383,12 @@ mod tests {
         SHADOW_VERTEX_SHADER, SSAO_FRAGMENT_SHADER, SSR_FRAGMENT_SHADER, VERTEX_SHADER,
     };
     use crate::render::{DayPhase, Instance, instance_affects_shadow, normalize3};
+
+    /// `fill()` 断言文案里的字段名占位符(§1.3c:字面量集中在 const.rs)。
+    const L_DIST: &str = "dist";
+    const L_REACH: &str = "reach";
+    const L_LY: &str = "ly";
+
     use crate::r#type::Vec3;
 
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值。
@@ -5423,7 +5427,7 @@ mod tests {
             "{}",
             fill(
                 T_SHADOW_KEEPS_CENTRE,
-                &[("dist", "0.00"), ("reach", &format!("{:.2}", reach()))]
+                &[(L_DIST, "0.00"), (L_REACH, &format!("{:.2}", reach()))]
             )
         );
     }
@@ -5441,8 +5445,8 @@ mod tests {
             fill(
                 T_SHADOW_CULLS_OUTSIDE,
                 &[
-                    ("dist", &format!("{:.2}", reach() * 2.0)),
-                    ("reach", &format!("{:.2}", reach()))
+                    (L_DIST, &format!("{:.2}", reach() * 2.0)),
+                    (L_REACH, &format!("{:.2}", reach()))
                 ]
             )
         );
@@ -5461,8 +5465,11 @@ mod tests {
             fill(
                 T_SHADOW_KEEPS_MARGIN,
                 &[
-                    ("dist", &format!("{:.2}", SHADOW_HALF_EXTENT + SHADOW_CULL_MARGIN * 0.5)),
-                    ("reach", &format!("{:.2}", reach()))
+                    (
+                        L_DIST,
+                        &format!("{:.2}", SHADOW_HALF_EXTENT + SHADOW_CULL_MARGIN * 0.5)
+                    ),
+                    (L_REACH, &format!("{:.2}", reach()))
                 ]
             )
         );
@@ -5480,9 +5487,9 @@ mod tests {
             fill(
                 T_SHADOW_GROUNDED_SAFE,
                 &[
-                    ("ly", &format!("{:.6}", flat[1].abs())),
-                    ("dist", "1.00"),
-                    ("reach", &format!("{:.2}", reach()))
+                    (L_LY, &format!("{:.6}", flat[1].abs())),
+                    (L_DIST, "1.00"),
+                    (L_REACH, &format!("{:.2}", reach()))
                 ]
             )
         );
@@ -5513,8 +5520,8 @@ mod tests {
                 T_SHADOW_TALL_KEPT,
                 &[
                     ("height", &format!("{height:.0}")),
-                    ("dist", &format!("{dist:.2}")),
-                    ("reach", &format!("{:.2}", reach()))
+                    (L_DIST, &format!("{dist:.2}")),
+                    (L_REACH, &format!("{:.2}", reach()))
                 ]
             )
         );
@@ -5668,8 +5675,8 @@ mod tests {
         let low: f32 = CONTACT_SHADOW_MIN_HEIGHT;
         let high: f32 = BAKED_CONTACT_AO_HEIGHT;
         let proximity: f32 = 1.0 - smoothstep(reach - feather, reach, horizontal);
-        let low_enough: f32 = smoothstep(low, low + 0.001, world_y)
-            * (1.0 - smoothstep(high - 0.001, high, world_y));
+        let low_enough: f32 =
+            smoothstep(low, low + 0.001, world_y) * (1.0 - smoothstep(high - 0.001, high, world_y));
         1.0 - (1.0 - CONTACT_SHADOW_FLOOR) * low_enough * proximity
     }
 
@@ -5784,23 +5791,19 @@ mod tests {
                 let phi: f32 = fi * 2.39996323;
                 let cos_theta: f32 = (1.0 - fi / 8.0).sqrt();
                 let sin_theta: f32 = (fi / 8.0).sqrt();
-                let dir: [f32; 3] = [
-                    phi.cos() * sin_theta,
-                    phi.sin() * sin_theta,
-                    cos_theta,
-                ];
+                let dir: [f32; 3] = [phi.cos() * sin_theta, phi.sin() * sin_theta, cos_theta];
                 let sv: [f32; 3] = [
                     origin[0] + dir[0] * radius,
                     origin[1] + dir[1] * radius,
                     origin[2] + dir[2] * radius,
                 ];
                 // ⚠️ 这一步必须与 `view_position()` 的映射**互逆**:
-        // `view_position` 写的是 `view.xy = ndc.xy * u_proj_params * d`,
-        // 所以反投影要**除以** `u_proj_params`。原着色器漏了这个除法 ——
-        // 采样点被放大到 `u_proj_params`(≈ 2.05)倍,大量样本落到画面外
-        // 被 `continue` 丢掉。这是第三个独立缺陷:即使前两处单位都改对,
-        // 只活下来的样本依然不足以构成有意义的遮蔽。
-        let uv: [f32; 2] = [
+                // `view_position` 写的是 `view.xy = ndc.xy * u_proj_params * d`,
+                // 所以反投影要**除以** `u_proj_params`。原着色器漏了这个除法 ——
+                // 采样点被放大到 `u_proj_params`(≈ 2.05)倍,大量样本落到画面外
+                // 被 `continue` 丢掉。这是第三个独立缺陷:即使前两处单位都改对,
+                // 只活下来的样本依然不足以构成有意义的遮蔽。
+                let uv: [f32; 2] = [
                     sv[0] / (-sv[2]).max(1e-3) / proj_x * 0.5 + 0.5,
                     sv[1] / (-sv[2]).max(1e-3) / proj_y * 0.5 + 0.5,
                 ];

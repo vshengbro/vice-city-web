@@ -6,6 +6,7 @@
 //! 通缉 5 星会频繁增派,而 AI 判据很少动。
 
 use crate::{
+    FRAC_PI_4, TAU,
     combat::{Enemy, Faction, Mission, Pedestrian},
     r#const::*,
     r#type::{Vec2, Vec3},
@@ -103,7 +104,7 @@ pub fn deploy_police(
     let mut made: usize = 0;
     for slot in live..target {
         // 环形散布:每个增派点用不同相位,避免所有警察叠在同一个点。
-        let angle: f32 = phase * std::f32::consts::TAU + slot as f32 * 2.399_963;
+        let angle: f32 = phase * TAU + slot as f32 * 2.399_963;
         let radius: f32 = DEPLOY_RING_MIN
             + (DEPLOY_RING_MAX - DEPLOY_RING_MIN) * (0.5 + 0.5 * (angle * 1.7).sin());
         let at: Vec3 = [
@@ -135,7 +136,7 @@ pub fn deploy_police(
 pub fn spawn_thugs(player_at: Vec3, count: usize, phase: f32) -> Vec<Enemy> {
     let mut out: Vec<Enemy> = Vec::new();
     for slot in 0..count {
-        let angle: f32 = phase * std::f32::consts::TAU + slot as f32 * 1.618_034;
+        let angle: f32 = phase * TAU + slot as f32 * 1.618_034;
         let radius: f32 =
             THUG_SPAWN_MIN + (THUG_SPAWN_MAX - THUG_SPAWN_MIN) * (0.5 + 0.5 * (angle * 2.3).cos());
         let at: Vec3 = [
@@ -171,7 +172,7 @@ const THUG_SPAWN_MAX: f32 = 62.0;
 pub fn spawn_peds(player_at: Vec3, count: usize, phase: f32) -> Vec<Pedestrian> {
     let mut out: Vec<Pedestrian> = Vec::new();
     for slot in 0..count {
-        let angle: f32 = phase * std::f32::consts::TAU + slot as f32 * std::f32::consts::FRAC_PI_4;
+        let angle: f32 = phase * TAU + slot as f32 * FRAC_PI_4;
         let radius: f32 = 7.0 + (slot % 6) as f32 * 4.4;
         let at: Vec3 = [
             player_at[0] + angle.cos() * radius,
