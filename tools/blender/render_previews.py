@@ -38,18 +38,27 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from vcw.builders import (                                      # noqa: E402
+from vcw.builders import (
+    interior, military, nature, watercraft,                                      # noqa: E402
     buildings, markers, misc, palms, pedestrians, props, roads, signs,
     vehicles, weapons,
 )
 
+# ⚠️ **必须和 build_assets.py 的 BUILDER_MODULES 完全一致。**
+# 这里之前少了 interior / military / watercraft / nature 四个模块,
+# 于是 collect_assets() 只 build 出 82 个资产,而 manifest 记的是 99 个 ——
+# 预览会**静默漏掉** beach/animal/nature/pickup 这几类模型。
 BUILDER_MODULES = (
     ("buildings", buildings),
+    ("interior", interior),
     ("vehicles", vehicles),
+    ("military", military),
+    ("watercraft", watercraft),
     ("pedestrians", pedestrians),
     ("props", props),
     ("signs", signs),
     ("palms", palms),
+    ("nature", nature),
     ("roads", roads),
     ("misc", misc),
     ("weapons", weapons),

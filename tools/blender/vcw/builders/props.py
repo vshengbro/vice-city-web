@@ -1297,11 +1297,20 @@ def _construction_barrier():
     # 1.3 mm into the road.
     tilt = 7.0
     leg_len = leg_rise + 0.10
-    sink = 0.5 * leg_len * math.cos(math.radians(tilt)) \
-        - 0.5 * 0.080 * math.sin(math.radians(tilt)) - 0.048
+    # ⚠️ **`sink` 里那半个 `leg_len` 是重复扣减。**
+    #
+    # 这条注释原本说 `sink` 只是补偿 7 deg 倾斜让最低角下沉的那 0.86 mm,
+    # 但它自己减掉了 `0.5 * leg_len`(0.48 m)。再和中心的 `0.5 * leg_len`
+    # 一加,腿的底被顶到 z≈0.42 —— 而下走道轨的顶面在 z≈0.107。
+    # 中间空出 0.32 m,整条 A 架悬在底座上方,渲染里能直接看穿。
+    #
+    # 正确的中心:腿底落在轨面上,腿心 = 轨面 + 半长 + 倾斜补偿。
+    tilt_drop = 0.5 * 0.080 * math.sin(math.radians(tilt))
+    rail_top = 0.075 + 0.5 * 0.065
     for sx in (-1, 1):
         _chamfer_at(legs.mesh, (0.080, 0.080, leg_len),
-                    center=(sx * span * 0.5, 0.0, 0.5 * leg_len + sink),
+                    center=(sx * span * 0.5, 0.0,
+                            rail_top + 0.5 * leg_len - tilt_drop),
                     rot=(0.0, sx * tilt, 0.0), bevel=0.014,
                     color=BARRIER_WHITE)
     _chamfer_at(legs.mesh, (span * 0.92, 0.065, 0.065), center=(0.0, 0.0, 0.075),
