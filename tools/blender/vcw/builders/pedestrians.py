@@ -599,6 +599,15 @@ def _shoe(asset, name, x, y, w, d, h, collar, upper, sole, lace):
 # the figure assembly
 # --------------------------------------------------------------------------
 
+# How far the heel sits behind the ankle, as a fraction of the foot length.
+#
+# The ankle joint of a real foot is roughly a third of the way forward from
+# the heel. Putting the heel exactly on the leg centreline instead leaves the
+# entire shoe ahead of the leg with nothing under the heel -- at the 3/4
+# preview angle that reads as a gap of background under the back of the shoe.
+HEEL_SETBACK = 0.34
+
+
 def _figure(spec):
     """Assemble one pedestrian from its skeleton + palette table."""
     a = C.Asset(spec["id"], "pedestrian")
@@ -710,10 +719,26 @@ def _figure(spec):
     # batches about that ankle, so a shoe collar that stops short of it leaves
     # a visible 6 mm slit of daylight at the join in every walk frame.
     # ``h`` in the spec stays the VISIBLE shoe height; the extra is collar.
+    #
+    # The heel edge must land ON the leg's own centreline ``y = leg_y``, which
+    # is what ``_shoe`` takes its ``y`` for: it lofts the upper from the heel
+    # forward by ``d``, so passing ``-sd * 0.5`` instead slid every shoe half a
+    # foot-length AHEAD of the ankle it belongs to.  Measured on the built
+    # assets that put the heel 253-323 mm in front of the shin's front face with
+    # the toe only 107-146 mm back, i.e. the foot sat under nothing at all --
+    # in the preview renders that reads as both shoes floating below-and-forward
+    # of the leg stubs with background showing through the join.
     sw, sd, sh_, shoe_up, shoe_sole, shoe_lace = spec["shoe"]
     total_h = sh_ + max(0.0, an_z + 0.014 - sh_)
     for side, sx in (("L", 1), ("R", -1)):
-        _shoe(a, "shoe_%s" % side, sx * an_x, -sd * 0.5 + leg_y * 0.0,
+        # The heel must sit slightly BEHIND the ankle, not on it.
+        # `_shoe` lofts from the heel forward by `sd`, so putting the heel on
+        # the leg centreline (`leg_y`) leaves the whole shoe ahead of Z=0 and
+        # the leg's rear half standing on nothing -- visible as a wedge of
+        # background under the heel at the 3/4 camera angle. A real foot has
+        # the ankle joint about a third of the foot length forward of the
+        # heel, so the heel goes back by that much.
+        _shoe(a, "shoe_%s" % side, sx * an_x, leg_y + sd * HEEL_SETBACK,
               sw, sd, total_h, sh_, shoe_up, shoe_sole, shoe_lace)
 
     return a

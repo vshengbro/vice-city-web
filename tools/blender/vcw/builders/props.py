@@ -1097,16 +1097,41 @@ def _fire_hydrant():
     BARREL = C.shade(RED, 0.88)
     body = a.part("hydrant_body", base_color=RED, roughness=0.55)
     C.cylinder(body.mesh, 0.215, 0.07, 12, center=(0, 0, 0.035), color=METAL_DK)
-    C.cylinder(body.mesh, 0.135, 0.58, 12, center=(0, 0, 0.36), color=BARREL)
-    C.cylinder(body.mesh, 0.30, 0.05, 12, center=(0, 0, 0.60), color=BARREL)
-    C.cone(body.mesh, 0.205, 0.16, 12, center=(0, 0, 0.73), radius_top=0.105,
-           color=CREAM)                                    # pale shoulder
+    C.cylinder(body.mesh, 0.135, 0.72, 12, center=(0, 0, 0.43), color=BARREL)
+    # The collar under the bonnet is the piece that decides the silhouette.
+    # A render after the bonnet was narrowed STILL read as a turret, and the
+    # measurement says why: at 0.205 this collar is 1.5x the 0.135 barrel and
+    # is the widest band anywhere on the crown, so it draws a hard flange ring
+    # around the top -- exactly the profile of a gun mount. Keeping it only a
+    # little proud of the barrel gives the stepped shoulder a real hydrant has
+    # without the turret rim.
+    C.cylinder(body.mesh, 0.152, 0.05, 12, center=(0, 0, 0.745), color=BARREL)
+    # Dome, not a roof. The old 0.16-tall cone with a 0.095 top radius read
+    # as a tapered tower roof rather than a hydrant bonnet, so it is now
+    # shorter and more strongly domed -- radius_top back near the base
+    # radius makes it a shoulder, not a spire.
+    C.cone(body.mesh, 0.150, 0.125, 12, center=(0, 0, 0.8575),
+           radius_top=0.125, color=CREAM)                 # pale shoulder
     # Chamfered bonnet block replaces a 12x6 UV sphere (120 tris -> 28) and
     # gives the crown four lit facets and four shaded ones.
-    _chamfer_at(body.mesh, (0.30, 0.30, 0.14), center=(0, 0, 0.80), bevel=0.048,
-                color=CREAM)
-    _chamfer_at(body.mesh, (0.20, 0.20, 0.05), center=(0, 0, 0.885), bevel=0.016,
-                color=C.shade(CREAM, 0.86))
+    #
+    # The bonnet is the ONLY part that decides whether this reads as a hydrant
+    # or as a turret, and it was spending 38% of the total height above the
+    # barrel shoulder (a real hydrant spends 20-25%) on a 0.30 block over a
+    # 0.135 barrel -- 2.2x the barrel width -- finished with a cone.  That
+    # stack, wide block then spike, is exactly the silhouette of a castle
+    # turret.  So the barrel now runs to 0.79 and everything above it is a
+    # third shorter, the block is narrowed to 1.4x the barrel, and the spike is
+    # gone in favour of the flat operating nut a real hydrant actually has.
+    #
+    # The red collar under the bonnet was the same 0.30 saucer, so narrowing
+    # only the block still left a 2.4x-barrel plate to sit under it -- a
+    # render after the first pass still read as a turret with a flat cap, and
+    # the saucer, not the cap, was what was left carrying that read.
+    _chamfer_at(body.mesh, (0.175, 0.175, 0.085), center=(0, 0, 0.900),
+                bevel=0.028, color=CREAM)
+    _chamfer_at(body.mesh, (0.145, 0.145, 0.035), center=(0, 0, 0.950),
+                bevel=0.012, color=C.shade(CREAM, 0.86))
 
     caps = a.part("hydrant_caps", base_color=CREAM, roughness=0.6)
     for sx in (-1, 1):                     # side hose outlets, axis X
@@ -1118,9 +1143,20 @@ def _fire_hydrant():
                color=CREAM)
     C.cone(caps.mesh, 0.074, 0.07, 10, center=(0, -0.27, 0.47), axis="Y",
            color=CREAM)
-    C.cylinder(caps.mesh, 0.038, 0.09, 6, center=(0, 0, 0.95), color=METAL)
-    C.cone(caps.mesh, 0.055, 0.07, 8, center=(0, 0, 1.02), color=METAL)
-    _rbox(caps.mesh, (0.15, 0.035, 0.02), center=(0, 0, 0.965),
+    # Squat flat operating nut.  This used to be a stem plus a 0.055 cone --
+    # a 70 mm spire standing 8x its own radius over the crown, which is the
+    # single feature that tipped the whole asset from hydrant to turret.  A
+    # real one is a short square-headed bolt barely proud of the bonnet, so
+    # that is what it is now: a low stem and a wide flat cap, no apex.
+    # The nut has to be DARKER than the bonnet or it vanishes. A render with
+    # the old near-white metal put the bonnet and the nut at almost the same
+    # value against the same background, and the eye merged them into one
+    # "small pale bump" -- vision could not pick the nut out at all, which is
+    # the single feature that most says "hydrant". So this is the dark
+    # `METAL_DK` the bolts already use, and it stands proud on a stem.
+    C.cylinder(caps.mesh, 0.030, 0.055, 8, center=(0, 0, 0.985), color=METAL_DK)
+    C.cylinder(caps.mesh, 0.058, 0.030, 8, center=(0, 0, 1.022), color=METAL_DK)
+    _rbox(caps.mesh, (0.13, 0.032, 0.020), center=(0, 0, 1.000),
           color=C.shade(METAL, 0.82))                      # operating nut bar
 
     bolts = a.part("hydrant_bolts", base_color=METAL_DK, metallic=0.4,
@@ -1135,10 +1171,14 @@ def _fire_hydrant():
     # axis="Y" branch maps (x, y, z) -> (x, z, y), determinant -1, which mirrors
     # the shell inside out (every face inverted, negative signed volume).  tube()
     # builds its frame from the tangent and is correct on every path.
+    #
+    # The top link hangs off the shoulder cone, whose bottom moved up with the
+    # taller barrel, so it is re-anchored to the new shoulder rather than left
+    # floating in mid-air below the bonnet.
     chain = a.part("hydrant_chain", base_color=METAL_DK, metallic=0.5,
                    roughness=0.45)
-    links = [(0.02, -0.10, 0.66), (0.10, -0.14, 0.56), (0.17, -0.15, 0.49),
-             (0.19, -0.16, 0.46)]
+    links = [(0.02, -0.10, 0.81), (0.10, -0.14, 0.62), (0.17, -0.15, 0.51),
+             (0.19, -0.16, 0.47)]
     for i in range(3):
         C.tube(chain.mesh, [links[i], links[i + 1]], 0.016, 6, color=METAL_DK)
     C.cylinder(chain.mesh, 0.028, 0.05, 6, center=links[0], color=METAL_DK)
