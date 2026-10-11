@@ -233,6 +233,20 @@ const PED_RADIUS: f32 = 0.35;
 const ENEMY_RADIUS: f32 = 0.35;
 /// 玩家质量(单位:一个「人」)。
 const PLAYER_MASS: f32 = 1.0;
+
+/// 动态层把玩家推开所需的最低自身速度(米/秒)。
+///
+/// 低于这个速度就认为玩家「站着不动」:人群的互相让位是在解算**扰动**,
+/// 不是解算墙 —— 静止时接受它会让每一帧都重复推出同一份分离向量
+/// (实测零输入时恒定 +0.094 m/帧,合 5.66 m/s,人站着不动一路漂走)。
+/// 静态层的推离不受此限制,那是真的解算结果。
+const PLAYER_PUSH_MIN_SPEED: f32 = 0.05;
+
+/// 低于这个长度的动态层位移直接丢弃(米)。
+///
+/// 与速度判据互补:贴着人群站着时 `resolve_all` 仍会给出亚毫米级的
+/// 数值噪声,阈值以下一律当作「没被推」。
+const PLAYER_PUSH_DEADZONE: f32 = 1e-3;
 /// 行人质量(单位:一个「人」)。
 const PED_MASS: f32 = 1.0;
 /// 敌人质量(单位:一个「人」)。
@@ -7581,6 +7595,21 @@ fn resolve_dynamic_bodies(game: &mut Game) {
         return;
     }
     let resolved: Vec<Vec2> = game.world.resolve_all(&bodies);
+    // 本帧真正「自己在动」的实体:位置相对**本帧起点**发生了变化。
+    //
+    // 分开的静态层修正(把人从墙里推出来)必须无条件保留 —— 那是解算
+    // 结果,不是扰动。但**动态层**的互相让位只有在实体本来就在移动时
+    // 才该施加:站着不动的人被人群「挤」走,人群下一帧又以同样的相对
+    // 位置重建体,于是每帧重复推出同一份向量,净位移累加成单向棘轮 ——
+    // 实测玩家零输入时恒定沿 +Z 漂 0.094 m/帧(5.66 m/s),X 精确不动。
+    //
+    // 判据用 `driven` 分支之外的「本帧输入速度」:玩家有速度就接受让位,
+    // 没有速度就不接受(静态层已经处理了墙,行人自己会走开)。
+    let player_speed: f32 = {
+        let v: Vec2 = game.player.get_velocity();
+        (v[0] * v[0] + v[1] * v[1]).sqrt()
+    };
+    let player_accepts_push: bool = driven.is_some() || player_speed > PLAYER_PUSH_MIN_SPEED;
 
     // 回写:与收集严格对称地按槽位消费。槽位 0 已被上面处理,
     // 所以 `cursor` 直接从 1 起(不回写的话从 0 起会错开一位)。
@@ -7591,7 +7620,16 @@ fn resolve_dynamic_bodies(game: &mut Game) {
             car.set_position([slot[0], at[1], slot[1]]);
         }
     } else if let Some(slot) = resolved.first() {
-        game.player.set_position([slot[0], player_at[1], slot[1]]);
+        // 只有自己在动的时候才接受人群让位;静止时只保留静态层的推离
+        // (那部分仍然来自 `resolve_all`,已经在 `slot` 里)。
+        let pushed: Vec2 = [slot[0] - player_at[0], slot[1] - player_at[2]];
+        let push_len: f32 = (pushed[0] * pushed[0] + pushed[1] * pushed[1]).sqrt();
+        let keep: Vec2 = if player_accepts_push || push_len <= PLAYER_PUSH_DEADZONE {
+            [slot[0], slot[1]]
+        } else {
+            [player_at[0], player_at[2]]
+        };
+        game.player.set_position([keep[0], player_at[1], keep[1]]);
     }
     for (index, car) in game.traffic.get_cars_mut().iter_mut().enumerate() {
         if driven == Some(index) {
@@ -9732,6 +9770,66 @@ pub fn app_root() -> VirtualNode {
 
 #[cfg(test)]
 mod tests {
+    use super::{PED_MASS, PLAYER_MASS, PLAYER_PUSH_DEADZONE, PLAYER_PUSH_MIN_SPEED};
+
+    /// 零输入时玩家必须原地不动 —— 动态层的人群让位不构成位移。
+    ///
+    /// 回归(2026-10-12 浏览器实测):不按任何键,玩家以恒定
+    /// 0.094 m/帧 沿 +Z 漂走(合 5.66 m/s),X 精确不动,
+    /// 60 帧走了 5.7 m 还远继续。`vel` 全程 `[0, 0]`。
+    ///
+    /// 机制:动态层的互相让位是对**扰动**的解算,而每帧都重新求解,
+    /// 且行人按自己的世界位置建体 —— 相对几何每帧相同,于是推出
+    /// 的分离向量也每帧相同,逐帧累加成单向棘轮。静态层的推离(把
+    /// 人从墙里救出来)是解算结果,必须保留;被门槛掉的只是人群让位。
+    #[test]
+    fn t_stationary_player_is_not_pushed_by_the_crowd() {
+        let world: CollisionWorld = CollisionWorld::new();
+        let radius: f32 = PLAYER_RADIUS;
+        // 四个行人紧贴玩家,重现街角人群的接触半径。
+        // 行人有**自己的**世界坐标,每帧按它建体(照 `resolve_dynamic_bodies`)。
+        let peds: Vec<Vec2> = vec![
+            [63.5, 120.60],
+            [63.5, 119.40],
+            [63.90, 120.0],
+            [63.10, 120.0],
+        ];
+        // 照 `resolve_dynamic_bodies` 的回写逻辑跑若干帧。
+        let mut at: Vec2 = [63.5, 120.0];
+        for _ in 0..8 {
+            let mut bodies: Vec<crate::r#collision::DynamicBody> =
+                vec![crate::r#collision::DynamicBody::new(
+                    crate::r#collision::BodyKind::Player,
+                    at,
+                    radius,
+                    PLAYER_MASS,
+                )];
+            for ped in peds.iter() {
+                bodies.push(crate::r#collision::DynamicBody::new(
+                    crate::r#collision::BodyKind::Pedestrian,
+                    *ped,
+                    radius,
+                    PED_MASS,
+                ));
+            }
+            let slot: Vec2 = world.resolve_all(&bodies)[0];
+            let speed: f32 = 0.0; // 零输入
+            let accepts: bool = speed > PLAYER_PUSH_MIN_SPEED;
+            let pushed: Vec2 = [slot[0] - at[0], slot[1] - at[1]];
+            let len: f32 = (pushed[0] * pushed[0] + pushed[1] * pushed[1]).sqrt();
+            let keep: Vec2 = if accepts || len <= PLAYER_PUSH_DEADZONE {
+                [slot[0], slot[1]]
+            } else {
+                at
+            };
+            at = keep;
+        }
+        let drift: f32 = (at[1] - 120.0).abs();
+        assert!(
+            drift <= PLAYER_PUSH_DEADZONE,
+            "stationary player drifted {drift:.6} m over 8 frames"
+        );
+    }
     use crate::{FRAC_PI_2, Ordering};
     use std::collections::HashMap;
 
