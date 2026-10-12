@@ -479,7 +479,7 @@ pub(crate) const T_AIR_WALL_PROBE_FOUND_NO_SPOTS: &str = "空气墙探针一个�
 /// 单元测试夹具:路灯资产本体(真实 JSON,避免测试和资产脱节)。
 #[cfg(test)]
 pub(crate) const FIXTURE_PROP_STREETLIGHT_JSON: &str =
-    include_str!("../assets/prop_streetlight.json");
+    include_str!("../../assets/prop_streetlight.json");
 
 /// 单元测试夹具:紫罗兰塔(真实 JSON)。
 ///
@@ -487,12 +487,12 @@ pub(crate) const FIXTURE_PROP_STREETLIGHT_JSON: &str =
 /// 地面以下几十米,`bounds` 跟着被撑大 —— 断言才抓得住。
 #[cfg(test)]
 pub(crate) const FIXTURE_BLDG_LILAC_TOWER_JSON: &str =
-    include_str!("../assets/bldg_lilac_tower.json");
+    include_str!("../../assets/bldg_lilac_tower.json");
 
 /// 单元测试夹具:交通信号灯资产本体。
 #[cfg(test)]
 pub(crate) const FIXTURE_PROP_TRAFFICLIGHT_JSON: &str =
-    include_str!("../assets/prop_trafficlight.json");
+    include_str!("../../assets/prop_trafficlight.json");
 
 /// 单元测试断言文案:夹具资产 JSON 解析失败。
 #[cfg(test)]
@@ -516,15 +516,15 @@ pub(crate) const T_SIDE_FRAMES_BOUNDS_BLOWN: &str = "端面窗框撑大了 bound
 
 /// 单元测试夹具:轿车(作为「其它车」的剪影基准)。
 #[cfg(test)]
-pub(crate) const FIXTURE_CAR_SEDAN_JSON: &str = include_str!("../assets/car_sedan.json");
+pub(crate) const FIXTURE_CAR_SEDAN_JSON: &str = include_str!("../../assets/car_sedan.json");
 
 /// 单元测试夹具:出租车(应读作高挑单厢车,不是换漆的轿车)。
 #[cfg(test)]
-pub(crate) const FIXTURE_CAR_TAXI_JSON: &str = include_str!("../assets/car_taxi.json");
+pub(crate) const FIXTURE_CAR_TAXI_JSON: &str = include_str!("../../assets/car_taxi.json");
 
 /// 单元测试夹具:警车(应读作方正三厢巡航车)。
 #[cfg(test)]
-pub(crate) const FIXTURE_CAR_POLICE_JSON: &str = include_str!("../assets/car_police.json");
+pub(crate) const FIXTURE_CAR_POLICE_JSON: &str = include_str!("../../assets/car_police.json");
 
 /// 单元测试断言文案:两辆车剪影几乎一样(只是换了漆)。
 pub(crate) const T_SILHOUETTE_TOO_SIMILAR: &str = "剪影与轿车几乎相同,只是换了漆";
@@ -544,7 +544,7 @@ pub(crate) const SLOT_SILHOUETTE_DIMS: &str = "车身尺寸";
 /// 单元测试夹具:水城街机城(一面带内顶点为零的真墙)。
 #[cfg(test)]
 pub(crate) const FIXTURE_BLDG_AQUA_ARCADE_JSON: &str =
-    include_str!("../assets/bldg_aqua_arcade.json");
+    include_str!("../../assets/bldg_aqua_arcade.json");
 
 /// 回归测试:动态层也必须把实体从静态形状里推出来。
 pub(crate) const T_DYNAMIC_STATIC_TOO: &str = "动态体也必须被推出静态形状";

@@ -6,7 +6,7 @@
 //! WebGL2 / Canvas2D 渲染后端 + `wasm-bindgen` → GitHub Pages。
 //!
 //! 模块划分:
-//! - [`const`] —— 全项目字符串常量的单一来源(§1.3c)。
+//! - [`config`] —— 全项目字符串常量的单一来源(§1.3c)。
 //! - [`mesh`] —— 资产 JSON schema 解析 → GPU 顶点布局。
 //! - [`camera`] —— 轨道相机、投影矩阵、背面剔除。
 //! - [`collision`] —— 二维圆形 vs AABB / 圆分离与世界边界。
@@ -20,7 +20,7 @@
 mod r#camera;
 mod r#collision;
 mod r#combat;
-mod r#const;
+mod r#config;
 mod r#enemy;
 mod r#game;
 mod r#interior;
@@ -60,6 +60,6 @@ pub use std::{
 #[wasm_bindgen]
 pub fn main() {
     console_error_panic_hook::set_once();
-    App::mount(r#const::APP_SELECTOR, r#game::app_root);
+    App::mount(r#config::APP_SELECTOR, r#game::app_root);
     r#game::boot();
 }

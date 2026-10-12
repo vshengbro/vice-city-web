@@ -24,7 +24,7 @@ use crate::{
     PI, TAU,
     camera::Mat4,
     collision::CollisionWorld,
-    r#const::*,
+    r#config::*,
     player::{Player, wrap_angle},
     r#type::{Vec2, Vec3},
 };
@@ -2288,7 +2288,7 @@ pub fn body_matrix(at: Vec3, yaw: f32, scale: f32) -> Mat4 {
 #[cfg(test)]
 mod tests {
     use crate::combat::{Arsenal, Weapon};
-    use crate::r#const::{
+    use crate::r#config::{
         GRENADE_TUBES, PICKUP_AMMO_BOX, PICKUP_ARMOR_VEST, PICKUP_HEALTH_PACK, SMG_MAGAZINE,
         T_GRENADE_COUNT_DOWN, T_GRENADE_NONE_LEFT, T_UNARMED_CANNOT_FIRE, T_UNARMED_HAS_NO_MESH,
         T_UNARMED_NO_RELOAD, T_UNARMED_NOT_A_PICKUP, WEP_BAT, WEP_GRENADE, WEP_PISTOL, WEP_SMG,

@@ -14,7 +14,7 @@ use crate::{
     PI,
     camera::Mat4,
     collision::CollisionWorld,
-    r#const::*,
+    r#config::*,
     r#type::{Vec2, Vec3},
 };
 
@@ -805,7 +805,7 @@ pub fn limb_matrix(origin: Vec3, yaw: f32, pivot: Vec3, swing: f32) -> Mat4 {
 mod tests {
     use crate::camera::Mat4;
     use crate::collision::CollisionWorld;
-    use crate::r#const::{
+    use crate::r#config::{
         DIAGONAL_SPEED_TOLERANCE, KEY_DIAGONAL, KEY_MODE, KEY_PART, KEY_STRAIGHT, MODE_SPRINT,
         MODE_WALK, PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_SHOE_R, PART_UPPER_ARM_L,
         PART_UPPER_LEG_L, PED_BOB_HEIGHT, T_DIAGONAL_MATCHES_STRAIGHT,
@@ -993,7 +993,7 @@ mod tests {
     fn left_and_right_legs_swing_in_opposite_phase() {
         let phase: f32 = 1.1;
         let left: f32 = limb_swing(PART_UPPER_LEG_L, phase, 1.0);
-        let right: f32 = limb_swing(crate::r#const::PART_UPPER_LEG_R, phase, 1.0);
+        let right: f32 = limb_swing(crate::r#config::PART_UPPER_LEG_R, phase, 1.0);
         assert!(
             left * right < 0.0,
             "{T_LEGS_ANTIPHASE}: 左={left} 右={right}"
@@ -1171,7 +1171,7 @@ mod tests {
         );
         assert_eq!(
             limb_parent(PART_SHOE_R),
-            crate::r#const::PART_LOWER_LEG_R,
+            crate::r#config::PART_LOWER_LEG_R,
             "{T_SHOE_FOLLOWS_SHIN}: 右鞋必须挂在右小腿上,实得父 {}",
             limb_parent(PART_SHOE_R)
         );
@@ -1264,7 +1264,7 @@ mod tests {
         // 每只鞋的相位必须**等于它那条腿**的相位 —— 挂错腿时两者会分叉。
         for (shoe, leg) in [
             (PART_SHOE_L, PART_UPPER_LEG_L),
-            (PART_SHOE_R, crate::r#const::PART_UPPER_LEG_R),
+            (PART_SHOE_R, crate::r#config::PART_UPPER_LEG_R),
         ] {
             let mut shoe_phase: Option<f32> = None;
             let mut leg_phase: Option<f32> = None;
@@ -1276,7 +1276,7 @@ mod tests {
                         if shoe == PART_SHOE_L {
                             PART_LOWER_LEG_L
                         } else {
-                            crate::r#const::PART_LOWER_LEG_R
+                            crate::r#config::PART_LOWER_LEG_R
                         },
                         "{T_SHOE_FOLLOWS_SHIN}: {shoe} 必须挂在对应的小腿上"
                     );

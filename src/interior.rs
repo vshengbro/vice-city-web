@@ -21,7 +21,7 @@
 //! 3. 分��是纯水平(XZ)的,垂直方向交给重力 —— 不会把玩家「吸」到墙上。
 
 use crate::{
-    r#const::SHOWCASE_STAIR_RUN,
+    r#config::SHOWCASE_STAIR_RUN,
     swap,
     r#type::{Vec2, Vec3},
 };
@@ -768,7 +768,7 @@ pub const SUPPORT_CATCH_EPSILON: f32 = 0.001;
 ///
 /// 上界仍然是 `STEP_UP_TOLERANCE`,两者一起构成一个以脚底为心的窗口
 /// `[y - 0.355, y + 0.45]`。
-pub const STEP_DOWN_TOLERANCE: f32 = crate::r#const::SHOWCASE_STAIR_RISE + 0.05;
+pub const STEP_DOWN_TOLERANCE: f32 = crate::r#config::SHOWCASE_STAIR_RISE + 0.05;
 
 /// 竖直解算把一帧切分成多小的水平小步(米)。
 ///
@@ -823,7 +823,7 @@ fn push_out_aabb(center: Vec2, half: Vec2, point: Vec2, radius: f32) -> Option<(
 
 #[cfg(test)]
 mod tests {
-    use crate::r#const::{
+    use crate::r#config::{
         T_INTERIOR_BASELINE_AGREES, T_INTERIOR_BASELINE_STILL_FAILS, T_INTERIOR_BASELINE_TOKEN,
         T_INTERIOR_CEILING_INSIDE, T_INTERIOR_DESCENT_NO_CLIMB, T_INTERIOR_DESCENT_REACHES_GROUND,
         T_INTERIOR_DOORWAY_BLOCKS, T_INTERIOR_DOORWAY_THROUGH, T_INTERIOR_DT_TOKEN,
@@ -854,7 +854,7 @@ mod tests {
 
     /// 把断言模板里的占位符换成实际数值。
     ///
-    /// 占位符本身来自 `crate::r#const` 的 `T_INTERIOR_*_TOKEN` 常量,
+    /// 占位符本身来自 `crate::r#config` 的 `T_INTERIOR_*_TOKEN` 常量,
     /// 与仓库既有做法一致(见 [`long_frame_height_message`])。
     fn fill(template: &str, args: &[(&str, &str)]) -> String {
         let mut out: String = template.to_string();

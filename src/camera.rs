@@ -1127,7 +1127,7 @@ mod tests {
     use crate::PI;
     use crate::camera::{Camera, OCCLUSION_MIN_DISTANCE, OCCLUSION_SKIN};
     use crate::collision::{CollisionWorld, ray_to_shapes};
-    use crate::r#const::{
+    use crate::r#config::{
         T_CENTRE_MISSES, T_FLOOR_HELD, T_NO_OCCLUSION, T_OCCLUSION_POSITIVE, T_OCCLUSION_REPORTED,
         T_OCCLUSION_SHORTER, T_PULL_IN, T_PULL_IN_SMOOTH, T_RAY_DISTANCE, T_RAY_MUST_HIT,
         T_RECOVERS, T_SIDE_HITS, T_SKIN_BOUNDED, T_SKIN_POSITIVE,

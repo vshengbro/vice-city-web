@@ -11,7 +11,7 @@
 //! AABB 角上时单次迭代可能残留一点重叠,所以固定迭代若干轮直到稳定。
 
 use crate::{
-    r#const::PEDESTRIAN_PERSONAL_SPACE,
+    r#config::PEDESTRIAN_PERSONAL_SPACE,
     r#type::{Vec2, Vec3},
 };
 
@@ -1395,7 +1395,7 @@ pub fn placement_box(min: Vec3, max: Vec3, yaw: f32, scale: f32, position: Vec3)
 #[cfg(test)]
 mod tests {
     use crate::collision::{BodyKind, CAR_FOOTPRINT, CollisionWorld, DynamicBody};
-    use crate::r#const::{
+    use crate::r#config::{
         T_COLLISION_SLIDE_KEEPS_TANGENT, T_COLLISION_SLIDE_OPEN_GROUND_X,
         T_COLLISION_SLIDE_OPEN_GROUND_Z, T_COLLISION_SLIDE_STOPS_AT_WALL, T_DYNAMIC_MASS_WEIGHTED,
         T_DYNAMIC_NO_MOVE_WHEN_CLEAR, T_DYNAMIC_SAME_KIND_SEPARATES, T_DYNAMIC_STATIC_TOO,

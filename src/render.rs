@@ -17,7 +17,7 @@ use euv::{
 use crate::{
     Ordering,
     camera::{Mat4, is_back_facing},
-    r#const::*,
+    r#config::*,
     mesh::{GpuMesh, f32_slice_to_bytes},
     take,
     r#type::{Mat4Data, Rgb8, Vec3},
@@ -3599,11 +3599,11 @@ impl WebGlRenderer {
         //   几何全部 z-fighting(第三人称贴着地面看只剩一片单色)。
         let attributes: JsValue = JsValue::from(js_sys::Object::new());
         for (name, value) in [
-            (crate::r#const::GL_ATTR_ALPHA, false),
-            (crate::r#const::GL_ATTR_DEPTH, true),
-            (crate::r#const::GL_ATTR_STENCIL, false),
-            (crate::r#const::GL_ATTR_ANTIALIAS, false),
-            (crate::r#const::GL_ATTR_PRESERVE_DRAWING_BUFFER, true),
+            (crate::r#config::GL_ATTR_ALPHA, false),
+            (crate::r#config::GL_ATTR_DEPTH, true),
+            (crate::r#config::GL_ATTR_STENCIL, false),
+            (crate::r#config::GL_ATTR_ANTIALIAS, false),
+            (crate::r#config::GL_ATTR_PRESERVE_DRAWING_BUFFER, true),
         ] {
             let _: Result<bool, JsValue> = js_sys::Reflect::set(
                 &attributes,
@@ -5320,7 +5320,7 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::{AdaptiveQuality, QualityTier};
-    use crate::r#const::{FAST_FRAME_THRESHOLD, QUALITY_DOWN_FPS, SLOW_FRAME_THRESHOLD};
+    use crate::r#config::{FAST_FRAME_THRESHOLD, QUALITY_DOWN_FPS, SLOW_FRAME_THRESHOLD};
 
     /// 回归:降档是**单向**的 —— 代码里刻意不执行升档。
     ///
@@ -5366,12 +5366,12 @@ mod tests {
             "只有 High 档才跑 SSR"
         );
     }
-    use crate::r#const::{
+    use crate::r#config::{
         BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FEATHER, CONTACT_SHADOW_FLOOR,
         CONTACT_SHADOW_MIN_HEIGHT, CONTACT_SHADOW_REACH, SSAO_RADIUS, U_AO_FEATHER, U_AO_FLOOR,
         U_AO_HEIGHT, U_AO_MIN_HEIGHT, U_AO_REACH, U_BLOOM_DIR, U_BLOOM_THRESHOLD,
     };
-    use crate::r#const::{
+    use crate::r#config::{
         PHASE_FIELD_VALUE, PHASE_QUERY_DUSK, PHASE_QUERY_NIGHT, PHASE_QUERY_NOON,
         SHADOW_CULL_MARGIN, SHADOW_GROUNDED_EPS, SHADOW_HALF_EXTENT, T_PHASE_QUERY_MAPS,
         T_PHASE_QUERY_PROBE, T_PHASE_QUERY_UNKNOWN, T_SHADOW_CULLS_OUTSIDE, T_SHADOW_GROUNDED_SAFE,

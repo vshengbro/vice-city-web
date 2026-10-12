@@ -30,7 +30,7 @@
 use crate::{
     FRAC_PI_2, PI,
     collision::{CAR_FOOTPRINT, CAR_STEP, CollisionWorld},
-    r#const::*,
+    r#config::*,
     player::{MAX_HEALTH, Player},
     r#type::{Vec2, Vec3},
 };
@@ -1319,7 +1319,7 @@ pub fn apply_pickup(player: &mut Player, pickup: &mut Pickup) {
 #[cfg(test)]
 mod tests {
     use super::{FRAC_PI_2, PI};
-    use crate::r#const::*;
+    use crate::r#config::*;
     use crate::traffic::{
         DRIFT_SLIP_RATIO, LATERAL_GRIP, REVERSE_SPEED_MAX, STEER_MIN_SPEED, STEER_RATE, TrafficCar,
         WHEEL_RADIUS,

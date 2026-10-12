@@ -36,7 +36,7 @@ use crate::{
         AiState, Arsenal, Enemy, Faction, HurtState, Mission, Pedestrian, Wanted, Weapon,
         apply_damage, body_matrix, falloff, flat_distance, has_line_of_sight, regen_armor,
     },
-    r#const::*,
+    r#config::*,
     enemy::{aim_with_spread, decide, is_active},
     interior::{FloorWorld, STEP_UP_TOLERANCE},
     mesh::{Bounds, GpuMesh, MeshAsset, MeshError, MeshPart, expand_asset},
@@ -61,7 +61,7 @@ use crate::{
 // ===========================================================================
 // 常量
 //
-// 字符串常量统一放在 `crate::r#const`(上面已 glob 引入),
+// 字符串常量统一放在 `crate::r#config`(上面已 glob 引入),
 // 这里只保留数值常量。
 // ===========================================================================
 
@@ -5315,7 +5315,7 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
                     .map(|i: &Instance| i.get_model_ref()),
                 batch.instances.len()
             ),
-            None => String::from(crate::r#const::NO_BATCHES),
+            None => String::from(crate::r#config::NO_BATCHES),
         };
         let bn: usize = game.scene.batches.len();
         // 流式地面的当前生成中心:验收脚本用它证明地面跟着玩家走。
@@ -10080,7 +10080,7 @@ mod tests {
     use super::FIXED_DT;
     use crate::collision::CollisionWorld;
     use crate::combat::Pedestrian;
-    use crate::r#const::{
+    use crate::r#config::{
         AXIS_STRAFE, BLDG_AQUA_ARCADE, BLDG_DECO_PINK, BLDG_LILAC_TOWER, CAR_SEDAN,
         E_FIXTURE_ASSET_JSON, E_FIXTURE_NO_DECLARED_BOUNDS, E_FIXTURE_SOLID_BOUNDS_UNREGISTERED,
         FIXTURE_BLDG_AQUA_ARCADE_JSON, FIXTURE_BLDG_LILAC_TOWER_JSON, FIXTURE_CAR_POLICE_JSON,
@@ -10625,7 +10625,7 @@ mod tests {
     ///
     /// 刻意去 `build_showcase_interiors` 铺出来的真实世界里量,而不是抄
     /// 一个字面量:门垛厚度在 `game.rs` 与 `const.rs` 各有一份(`0.20` 与
-    /// `0.25`,见 `push_showcase_interior` 与 [`crate::r#const::
+    /// `0.25`,见 `push_showcase_interior` 与 [`crate::r#config::
     /// SHOWCASE_WALL_THICKNESS`]),抄错就等于测了另一个几何。
     ///
     /// 判据与 [`crate::interior::FloorWorld::separate_interior`] 对齐:
@@ -11013,7 +11013,7 @@ mod tests {
             // 把路点放在端头上,加上玩家半径就正好卡在墙面上(实测停在
             // local z=2.83 动弹不得)。中点离两面墙都有 0.85 m 余量。
             let gap_end: f32 = span[0] * 0.5 - SHOWCASE_STAIR_WIDTH;
-            let _gap_x: f32 = gap_end - crate::r#const::SHOWCASE_PARTITION_GAP * 0.5;
+            let _gap_x: f32 = gap_end - crate::r#config::SHOWCASE_PARTITION_GAP * 0.5;
             // 路线(资产本地坐标)。每段的必要性都来自实测:
             //  · 隔墙横在 z = PARTITION_Y,右端止于「楼梯左边缘往回 GAP」,
             //    所以要先横移到**缺口中点**再回到梯中线 —— 路点放在缺口
@@ -11021,16 +11021,16 @@ mod tests {
             //  · 楼梯第一级贴 z = sz_last 一侧,顶面最低;越往 z **小**的
             //    方向级数越高,最后一级顶面正好 3.20 与二层楼板齐平。
             //  · 梯顶那一侧(z >= stair_end)本来就有二层板,不用跨井口。
-            let gap_x: f32 = sx0 - crate::r#const::SHOWCASE_PARTITION_GAP * 0.5;
+            let gap_x: f32 = sx0 - crate::r#config::SHOWCASE_PARTITION_GAP * 0.5;
             let route: [Vec2; 7] = [
                 // 门外
                 [front[0] + normal[0] * 1.5, front[1] + normal[1] * 1.5],
                 // 门洞
                 front,
                 // 绕到隔墙的过道缺口
-                to_world(index, [gap_x, crate::r#const::SHOWCASE_PARTITION_Y]),
+                to_world(index, [gap_x, crate::r#config::SHOWCASE_PARTITION_Y]),
                 // 穿过缺口,进到楼梯这一侧
-                to_world(index, [stair_x, crate::r#const::SHOWCASE_PARTITION_Y]),
+                to_world(index, [stair_x, crate::r#config::SHOWCASE_PARTITION_Y]),
                 // 踏上第一级
                 to_world(index, [stair_x, sz_last - SHOWCASE_STAIR_RUN * 0.5]),
                 // 沿梯中线一路上行
@@ -11747,9 +11747,9 @@ mod tests {
             let side: Vec2 = local_side(index);
             // 隔墙止于「楼梯左边缘再往回 1.70 m」,过道就在这两者之间。
             let partition_end: f32 =
-                span[0] * 0.5 - SHOWCASE_STAIR_WIDTH - crate::r#const::SHOWCASE_PARTITION_GAP;
+                span[0] * 0.5 - SHOWCASE_STAIR_WIDTH - crate::r#config::SHOWCASE_PARTITION_GAP;
             let gap_end: f32 = span[0] * 0.5 - SHOWCASE_STAIR_WIDTH;
-            let partition_y: f32 = crate::r#const::SHOWCASE_PARTITION_Y;
+            let partition_y: f32 = crate::r#config::SHOWCASE_PARTITION_Y;
             // 隔墙中段:挡住。
             let mid: Vec2 = to_world(index, [0.0, partition_y]);
             let pushed: Vec2 = w.resolve_interior(
@@ -11918,7 +11918,7 @@ mod tests {
             }
             let delta: f32 = total / BINS as f32;
             assert!(
-                delta > crate::r#const::SILHOUETTE_SAME_THRESHOLD,
+                delta > crate::r#config::SILHOUETTE_SAME_THRESHOLD,
                 "{}",
                 fill(
                     T_SILHOUETTE_TOO_SIMILAR,

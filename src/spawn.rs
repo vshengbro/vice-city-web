@@ -8,7 +8,7 @@
 use crate::{
     FRAC_PI_4, TAU,
     combat::{Enemy, Faction, Mission, Pedestrian},
-    r#const::*,
+    r#config::*,
     r#type::{Vec2, Vec3},
 };
 

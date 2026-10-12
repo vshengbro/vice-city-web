@@ -1537,7 +1537,7 @@ impl WebGpuRenderer {
     /// 分配阴影深度纹理(`depth32float`,`SHADOW_MAP_SIZE` 见方)。
     ///
     /// 尺寸**固定**,不随画布变:阴影 frustum 的半宽由
-    /// [`crate::r#const::SHADOW_HALF_EXTENT`] 决定,贴图边长直接决定
+    /// [`crate::r#config::SHADOW_HALF_EXTENT`] 决定,贴图边长直接决定
     /// 一个纹素覆盖多少米(`2 * 45 / 2048 ≈ 4.4 cm`)。跟着画布尺寸
     /// 走会让同一个场景在两个分辨率下影子形状不同。
     ///
