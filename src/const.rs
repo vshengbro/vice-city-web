@@ -1651,6 +1651,18 @@ pub(crate) const AIM_PITCH_LIMIT: f32 = 0.9;
 
 /// 敌人被 hitscan 命中的判定半径(米)。
 pub(crate) const ENEMY_HIT_RADIUS: f32 = 0.75;
+/// 撞到敌人时判定为「碾压」的相对速度下限(米/秒)。
+///
+/// 跟 [`PED_RUNOVER_MIN_SPEED`] 一样只看**速度**,不看来不来得及躲 ——
+/// 命中的判定交给扫掠线段,速度只负责区分「慢慢蹭过去」和「真的撞上」。
+pub(crate) const ENEMY_RUNOVER_MIN_SPEED: f32 = 3.2;
+/// 碾压一个敌人造成的伤害。
+///
+/// 混混 70 血(`THUG_HEALTH`)两次碾压致死、警察 100 血(`ENEMY_HEALTH`)
+/// 三次 —— 有还手余地,不会一撞就秒。
+pub(crate) const ENEMY_RUNOVER_DAMAGE: f32 = 40.0;
+/// 碾压把敌人推开的速度(米/秒)。
+pub(crate) const ENEMY_RUNOVER_KNOCK: f32 = 9.0;
 /// 命中标记的显示时长(秒)。
 pub(crate) const HITMARKER_TIME: f32 = 0.16;
 

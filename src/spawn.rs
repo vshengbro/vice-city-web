@@ -258,6 +258,7 @@ const MISSION_TABLE: &[(&str, u32, Vec3)] = &[
 /// # Arguments
 ///
 /// - `&mut Mission` - 当前任务。
+/// - `&[Enemy]` - 敌人表(GOTO 段转 KILL 段时用它挑目标)。
 /// - `Vec3` - 玩家坐标。
 /// - `usize` - 目标敌人的索引(阶段推进时用来确认它已被击杀)。
 /// - `bool` - 目标敌人是否已死亡。
@@ -268,6 +269,7 @@ const MISSION_TABLE: &[(&str, u32, Vec3)] = &[
 /// - `f32` - 任务完成时返回报酬,否则返回 0。
 pub fn advance_mission(
     mission: &mut Mission,
+    enemies: &[Enemy],
     player_at: Vec3,
     target_index: usize,
     target_dead: bool,
@@ -299,12 +301,65 @@ pub fn advance_mission(
                 mission.complete();
                 return reward;
             }
-            mission.set_target_enemy(target_index);
+            // 目标索引:调用方传进来的 `target_index` 在进入 KILL 段之前
+            // 一直是 `usize::MAX`(GOTO 段还没有「要干掉谁」),直接存进去
+            // 就等于 KILL 段永远查不到人 —— `update_mission` 的
+            // `index != usize::MAX` 恒为 false,任务卡在
+            // `take out the target` 永远完不成。
+            // 正确做法:进 KILL 段时**指定一个真实目标**,由调用方按
+            // 「离任务点最近的活人」选出来。
+            let target_enemy: usize = if target_index == usize::MAX {
+                select_mission_target(enemies, target)
+            } else {
+                target_index
+            };
+            // 顺序要紧:`Mission::advance` 里带一句
+            // `set_target_enemy_opt(None)`(换段就清空目标),所以目标必须
+            // **在 advance 之后**写 —— 反过来写等于刚设上就被清掉,
+            // `get_target_enemy()` 永远返回 `None`,任务卡死在
+            // `take out the target`。
             mission.advance(MISSION_KILL, target);
+            mission.set_target_enemy(target_enemy);
             0.0
         }
         _ => 0.0,
     }
+}
+
+/// 给 KILL 段挑一个目标:离任务点最近、还活着的敌人。
+///
+/// GOTO 段转 KILL 段的时候调用方手里没有「要干掉谁」(`target_index` 是
+/// `usize::MAX`),必须在这里按位置选一个出来 —— 不选的话 KILL 段存的是
+/// 一个空索引,`update_mission` 永远判不出「目标已死」,任务卡在
+/// `take out the target`(浏览器实测:面板不变,钱不涨)。
+///
+/// 没有活人就返回 `usize::MAX`,让任务停在原地等人来 —— 场上没有敌人时
+/// 总会有下一批,不该把任务判成失败。
+///
+/// # Arguments
+///
+/// - `&[Enemy]` - 敌人表。
+/// - `Vec3` - 任务目标点。
+///
+/// # Returns
+///
+/// - `usize` - 选中的敌人索引,没有活人时为 `usize::MAX`。
+fn select_mission_target(enemies: &[Enemy], at: Vec3) -> usize {
+    let mut best: usize = usize::MAX;
+    let mut best_distance: f32 = f32::INFINITY;
+    for (index, enemy) in enemies.iter().enumerate() {
+        if !enemy.is_alive() {
+            continue;
+        }
+        let dx: f32 = enemy.get_position()[0] - at[0];
+        let dz: f32 = enemy.get_position()[2] - at[2];
+        let distance: f32 = (dx * dx + dz * dz).sqrt();
+        if distance < best_distance {
+            best_distance = distance;
+            best = index;
+        }
+    }
+    best
 }
 
 /// 一个任务串起来的段数。

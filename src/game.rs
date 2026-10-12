@@ -7036,16 +7036,18 @@ fn fire_weapon(game: &mut Game) {
                 let drop: f32 = ENEMY_CASH_DROP;
                 game.player.set_cash_add(drop);
                 game.player.set_notice(String::from(NOTICE_KILL));
+                game.mission.set_target_enemy(usize::MAX);
             } else {
                 game.player.set_notice(String::from(NOTICE_HIT));
             }
-            // 命中「干掉某人」的目标:标记任务完成。
-            if game.mission.get_stage() == MISSION_KILL
-                && game.mission.get_target_enemy() == Some(index)
-                && killed
-            {
-                game.mission.set_target_enemy(usize::MAX);
-            }
+            // 「干掉某人」的目标:**什么都不用做**。
+            // 目标是不是死了由敌人表回答(`mission_target_state` 查
+            // `enemies[index].is_alive()`),`update_mission` 每帧自己判。
+            //
+            // 之前这里写 `set_target_enemy(usize::MAX)` 想「标记完成」,结果
+            // 把索引清掉了 —— `update_mission` 的 `index != usize::MAX` 恒为
+            // false,击杀段永远判不出「已完成」。实测把目标打死,任务面板停在
+            // `take out the target`,现金也不涨。
         }
         None => {
             if weapon == Weapon::Bat {
@@ -7088,6 +7090,19 @@ fn ray_sphere_distance(origin: Vec3, direction: Vec3, center: Vec3, radius: f32)
     }
     (along - (radius * radius - perpendicular_sq).sqrt().max(0.0)).max(0.0)
 }
+/// 撞死一个敌人之后的结算:计数、掉钱、提示。
+///
+/// 跟子弹命中那条路径(`fire_weapon` 里 `if killed`)保持一致。
+/// 通缉**不**因为碾压而涨 —— 车撞行人本身已经由 `step_peds` 记过一次热。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+fn on_enemy_killed_by_car(game: &mut Game) {
+    game.kills += 1;
+    game.player.set_cash_add(ENEMY_CASH_DROP);
+    game.player.set_notice(String::from(NOTICE_KILL));
+}
 
 /// 敌人 AI 的一帧推进。
 ///
@@ -7111,6 +7126,20 @@ fn step_enemies(game: &mut Game, dt: f32) {
         ENEMY_WANTED_TOTAL,
         phase,
     );
+    // 玩家开的车这一帧扫过的线段(上一帧 → 本帧)。判定必须扫掠:24 m/s
+    // 一帧 0.4 m,只看帧末点会把擦身而过的敌人整个漏掉 —— 和行人那边
+    // (`step_peds`)同一个道理,同一个 `point_to_segment_distance`。
+    let (car_from, car_to, car_speed): (Vec2, Vec2, f32) = match game.player.get_vehicle() {
+        Some(vehicle) => match game.traffic.get_cars_ref().get(vehicle) {
+            Some(car) => (
+                game.previous_step_xz,
+                [car.get_position()[0], car.get_position()[2]],
+                car.get_speed(),
+            ),
+            None => ([0.0, 0.0], [0.0, 0.0], 0.0),
+        },
+        None => ([0.0, 0.0], [0.0, 0.0], 0.0),
+    };
     for index in 0..game.enemies.len() {
         // 尸体单独推进,不受激活圈影响(要等它自己消失)。
         if !game.enemies[index].is_alive() {
@@ -7118,6 +7147,29 @@ fn step_enemies(game: &mut Game, dt: f32) {
             continue;
         }
         let at: Vec3 = game.enemies[index].get_position();
+        // 碾压:车扫过敌人所在的位置。判定圈 = 车身 + 敌人身体。
+        //
+        // 之前**根本没有**车撞敌人的判定 —— `step_enemies` 从头到尾没提过
+        // 玩家的车。于是 24 m/s 可以直接穿过警察封锁,任务 KILL 段也永远
+        // 没法靠开车完成。伤害走 `Enemy::damage`,跟子弹命中同一套。
+        if car_speed > ENEMY_RUNOVER_MIN_SPEED {
+            let reach: f32 = point_to_segment_distance([at[0], at[2]], car_from, car_to);
+            if reach < CAR_HIT_RADIUS + ENEMY_HIT_RADIUS {
+                let dx: f32 = at[0] - car_to[0];
+                let dz: f32 = at[2] - car_to[1];
+                let length: f32 = (dx * dx + dz * dz).sqrt().max(f32::EPSILON);
+                let killed: bool = game.enemies[index].damage(ENEMY_RUNOVER_DAMAGE);
+                game.enemies[index].knock_back([
+                    dx / length * ENEMY_RUNOVER_KNOCK,
+                    dz / length * ENEMY_RUNOVER_KNOCK,
+                ]);
+                game.did_hit = true;
+                game.hitmarker = HITMARKER_TIME;
+                if killed {
+                    on_enemy_killed_by_car(game);
+                }
+            }
+        }
         if !is_active(at, player_at) {
             continue;
         }
@@ -7302,6 +7354,29 @@ fn update_wanted(game: &mut Game, dt: f32) {
     }
 }
 
+/// 当前任务目标的状态:索引,以及它是不是已经死了。
+///
+/// 单独拆出来是因为「击杀 → 任务完成」这条链跨了两个函数(命中处理写
+/// `mission`,`update_mission` 读 `mission`),测试必须能驱动读的那一半。
+///
+/// # Arguments
+///
+/// - `&Mission` - 当前任务。
+/// - `&[Enemy]` - 敌人表。
+///
+/// # Returns
+///
+/// - `(usize, bool)` - 目标索引(`usize::MAX` 表示没有目标),以及它是否已死。
+fn mission_target_state(mission: &Mission, enemies: &[Enemy]) -> (usize, bool) {
+    let index: usize = mission.get_target_enemy().unwrap_or(usize::MAX);
+    let dead: bool = index != usize::MAX
+        && enemies
+            .get(index)
+            .map(|enemy: &Enemy| !enemy.is_alive())
+            .unwrap_or(true);
+    (index, dead)
+}
+
 /// 任务的一帧推进。
 ///
 /// # Arguments
@@ -7309,19 +7384,10 @@ fn update_wanted(game: &mut Game, dt: f32) {
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧秒数。
 fn update_mission(game: &mut Game, _dt: f32) {
-    let player_at: Vec3 = game.player.get_position();
-    let target_index: usize = game.mission.get_target_enemy().unwrap_or(usize::MAX);
-    let target_dead: bool = target_index != usize::MAX
-        && game
-            .enemies
-            .get(target_index)
-            .map(|enemy: &Enemy| !enemy.is_alive())
-            .unwrap_or(true);
-    let reward: f32 = advance_mission(
+    let reward: f32 = advance_mission_for_player(
         &mut game.mission,
-        player_at,
-        target_index,
-        target_dead,
+        &game.enemies,
+        game.player.get_position(),
         game.missions_done,
     );
     if reward > 0.0 {
@@ -7330,6 +7396,39 @@ fn update_mission(game: &mut Game, _dt: f32) {
         let notice: String = format!("{NOTICE_MISSION_DONE}{CASH_SIGN}{reward}");
         game.player.set_notice(notice);
     }
+}
+
+/// [`Self::update_mission`] 里「读目标状态 + 推进状态机」那两步。
+///
+/// 单独拆出来是为了让测试能驱动**真实调用路径**:命中处理和这里隔着
+/// 一个 `Game`,测试没法构造,于是早先的测试只测了 `mission_target_state`
+/// 这个纯函数 —— 生产代码把索引清成 `usize::MAX` 之后测试照样绿。
+///
+/// # Arguments
+///
+/// - `&mut Mission` - 当前任务。
+/// - `&[Enemy]` - 敌人表。
+/// - `Vec3` - 玩家坐标。
+/// - `u32` - 已完成任务数。
+///
+/// # Returns
+///
+/// - `f32` - 任务完成时的报酬,否则 `0.0`。
+fn advance_mission_for_player(
+    mission: &mut Mission,
+    enemies: &[Enemy],
+    player_at: Vec3,
+    missions_done: u32,
+) -> f32 {
+    let (target_index, target_dead): (usize, bool) = mission_target_state(mission, enemies);
+    advance_mission(
+        mission,
+        enemies,
+        player_at,
+        target_index,
+        target_dead,
+        missions_done,
+    )
 }
 
 /// 接任务:靠近任务点时按 J 接受,或者完成后自动接下一个。
@@ -9932,14 +10031,16 @@ mod tests {
 
     use super::{
         ARROWDOWN, ARROWLEFT, ARROWRIGHT, ARROWUP, CAR_HIT_RADIUS, Camera, DIR_LEFT, DIR_RIGHT,
-        Enemy, FOLLOW_FOV, Instance, KEYA, KEYD, KEYS, KEYW, LOOK_YAW_SENSITIVITY, Mat4,
-        MeshAssetGpu, PED_ALERT_CAR_SCALE, PED_ALERT_RADIUS, PED_COUNT, PED_FLEE_SPEED, PED_RADIUS,
+        Enemy, FOLLOW_FOV, Faction, Instance, KEYA, KEYD, KEYS, KEYW, LOOK_YAW_SENSITIVITY,
+        MISSION_GOTO, MISSION_KILL, MISSION_TITLE_A, Mat4, MeshAssetGpu, Mission,
+        PED_ALERT_CAR_SCALE, PED_ALERT_RADIUS, PED_COUNT, PED_FLEE_SPEED, PED_RADIUS,
         RUN_OVER_WALK_MIN, Scene, SceneBatch, T_AD_AND_ARROW_DO_NOT_CANCEL,
         T_ARROW_DOES_NOT_MOVE_ON_FOOT, T_ARROW_STEER_SIGNS_OPPOSED, T_ARROW_STEERS_WHILE_DRIVING,
         T_FOOT_POSITION_UNCHANGED, T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK,
-        T_RUN_SPEED_PICK, T_WALK_SPEED_PICK, THUG_COUNT, apply_look_delta, car_wheel_model,
-        flat_distance, point_to_segment_distance, rebuild_static_batches, repopulate_combatants_at,
-        spawn_peds, spawn_thugs, traffic_lanes,
+        T_RUN_SPEED_PICK, T_WALK_SPEED_PICK, THUG_COUNT, advance_mission,
+        advance_mission_for_player, apply_look_delta, car_wheel_model, flat_distance,
+        mission_target_state, point_to_segment_distance, rebuild_static_batches,
+        repopulate_combatants_at, spawn_peds, spawn_thugs, traffic_lanes,
     };
 
     const SLOT_CONTENT_STEP: &str = "step";
@@ -12778,6 +12879,95 @@ mod tests {
         // 写清楚免得以后有人把 `+ PED_RADIUS` 当重复计数删掉。
         let graze: f32 = point_to_segment_distance([2.0, 0.2], from, to);
         assert!(graze < window, "{graze:.2} m 在车身判定圈内,应该算撞到");
+    }
+
+    /// GOTO 段转 KILL 段时必须**指定一个真实目标**。
+    ///
+    /// 回归(2026-10-12 浏览器实测):接下任务后一直停在
+    /// `take out the target`,撞死好几个敌人、现金一路涨到 $480,
+    /// 任务面板**从头到尾没变过**。
+    ///
+    /// 机制:GOTO 段结束时调 `set_target_enemy(target_index)`,而那一刻
+    /// 调用方的 `target_index` 是 `usize::MAX`(还没指定要干掉谁)。
+    /// 于是 KILL 段存了一个空索引,`update_mission` 的
+    /// `index != usize::MAX` 恒为 false —— 任务永远判不出「目标已死」。
+    #[test]
+    fn the_kill_stage_gets_a_real_target_when_it_starts() {
+        // 三个敌人,任务点在 (10, 0, 10);真正该被打的是最近的那个 (12, 0, 10)。
+        let enemies: Vec<Enemy> = vec![
+            Enemy::new(Faction::Thug, [40.0, 0.0, 10.0], 0.0, 0.0),
+            Enemy::new(Faction::Thug, [12.0, 0.0, 10.0], 0.0, 0.0),
+            Enemy::new(Faction::Thug, [25.0, 0.0, 10.0], 0.0, 0.0),
+        ];
+        let mut mission: Mission = Mission::new();
+        let at: Vec3 = [10.0, 0.0, 10.0];
+        mission.accept(MISSION_TITLE_A, MISSION_GOTO, at);
+        // 走到任务点,GOTO 段完成 → 应该转成 KILL 段并选中最近的目标。
+        // `target_index` 传 `usize::MAX`,复现调用方在那一刻的状态。
+        let reward: f32 = advance_mission(&mut mission, &enemies, at, usize::MAX, false, 0);
+        assert!(reward == 0.0, "GOTO 段走完不该当场发报酬,实测 {reward}");
+        let target: Option<usize> = mission.get_target_enemy();
+        assert!(
+            target.is_some() && target != Some(usize::MAX),
+            "进 KILL 段时必须选中一个真实敌人,实测 {target:?} —— 任务会永远卡住"
+        );
+        assert_eq!(target, Some(1), "应该选中最近的敌人(index 1)");
+        // 目标死了之后必须能推进完成。
+        let mut enemies: Vec<Enemy> = enemies;
+        assert!(enemies[1].damage(f32::MAX), "应当击杀目标");
+        let (index, dead): (usize, bool) = mission_target_state(&mission, &enemies);
+        assert!(dead, "目标已死必须判定为已完成");
+        let payout: f32 = advance_mission(&mut mission, &enemies, at, index, dead, 1);
+        assert!(payout > 0.0, "击杀目标必须发报酬,实测 {payout}");
+        assert!(!mission.is_active(), "任务应当结束");
+    }
+
+    /// 任务击杀段必须真的能走完:目标死了 → 判定为已完成 → 拿到报酬。
+    ///
+    /// 回归(2026-10-12 浏览器实测):按 J 接下任务后停在
+    /// `take out the target · goal 0 m`,把目标打到死,任务面板**始终不变**,
+    /// `$` 也没涨过 —— 击杀段永远完不成。
+    ///
+    /// 机制:命中处理里写的是 `mission.set_target_enemy(usize::MAX)`,
+    /// 想「标记任务完成」;而 `update_mission` 读的是
+    /// `get_target_enemy().unwrap_or(usize::MAX)` 再判
+    /// `index != usize::MAX && 敌人已死` —— 索引刚被清掉,`target_dead`
+    /// 恒为 `false`,KILL 分支永远进不去。
+    /// 正确做法是**什么都不做**:目标死没死由敌人表回答,`update_mission`
+    /// 每帧自己判。那句 `set_target_enemy` 已经删掉了。
+    #[test]
+    fn killing_the_target_completes_the_mission_stage() {
+        let mut enemies: Vec<Enemy> = vec![Enemy::new(Faction::Thug, [10.0, 0.0, 10.0], 0.0, 0.0)];
+        let mut mission: Mission = Mission::new();
+        mission.accept(MISSION_TITLE_A, MISSION_KILL, [10.0, 0.0, 10.0]);
+        mission.set_target_enemy(0);
+        // 目标还活着时推进,不能提前发报酬。
+        let early: f32 = advance_mission_for_player(&mut mission, &enemies, [10.0, 0.0, 10.0], 1);
+        assert!(early == 0.0, "目标还活着不该发放报酬,实测 {early}");
+        // 打死目标。索引**保持不变** —— 命中处理里那句
+        // `set_target_enemy(usize::MAX)` 已经删掉了:「目标死了没有」由
+        // 敌人表回答(`enemies[index].is_alive()`),不需要(也不能)在
+        // 命中处把索引清掉。
+        assert!(enemies[0].damage(f32::MAX), "足够伤害应当击杀目标");
+        // 回归本体:命中处理曾经在击杀之后写 `set_target_enemy(usize::MAX)`,
+        // 把「目标是谁」自己删了。命中处现在**什么都不做**,所以这里也不该
+        // 清 —— 清了就等于把旧 bug 引进测试里,测试会变成在测 bug。
+        assert_eq!(
+            mission.get_target_enemy(),
+            Some(0),
+            "击杀之后索引必须保留 —— 旧的命中处理会在这里清成 usize::MAX"
+        );
+        // 端到端:走**真实调用路径**(`update_mission` 内部用的那个函数)。
+        // 早先这版测试只调 `mission_target_state`,于是命中处理里那句
+        // `set_target_enemy(usize::MAX)` 把索引清掉之后,测试照样绿 ——
+        // 修好之后回头才发现自己测的不是生产路径。
+        let reward: f32 = advance_mission_for_player(&mut mission, &enemies, [10.0, 0.0, 10.0], 1);
+        assert!(
+            reward > 0.0,
+            "目标已死,击杀段必须发放报酬,实测 {reward} —— 任务永远完不成"
+        );
+
+        assert!(!mission.is_active(), "拿到报酬后任务应当结束");
     }
 
     /// 撞飞判定:行人必须在逃跑速度下**仍然能被车撞到**。
