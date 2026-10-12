@@ -97,6 +97,35 @@ def _averaged_normals(positions, faces) -> list[list[float]]:
     return out
 
 
+def _canonical_order(positions, faces):
+    """Renumber vertices into a build-order-independent sequence.
+
+    Blender does not promise a stable `loop_triangles` order between runs, so
+    two identical builds emit the same triangles in a different sequence. The
+    geometry is equal as a multiset, but every JSON file differs byte-wise and
+    `git diff` shows every asset as changed on each rebuild.
+
+    Sorting faces by their own vertex coordinates and then renumbering in
+    first-encounter order makes the output depend only on the geometry.
+    """
+    key = [tuple(round(c, 6) for c in p) for p in positions]
+    order = sorted(range(len(faces)), key=lambda i: sorted(key[v] for v in faces[i]))
+    remap: dict[int, int] = {}
+    out_positions: list[list[float]] = []
+    out_faces: list[list[int]] = []
+    for fi in order:
+        face = []
+        for v in faces[fi]:
+            nv = remap.get(v)
+            if nv is None:
+                nv = len(out_positions)
+                remap[v] = nv
+                out_positions.append(positions[v])
+            face.append(nv)
+        out_faces.append(face)
+    return out_positions, out_faces
+
+
 def _object_to_part(obj: bpy.types.Object, matrix: Vector | None = None) -> dict:
     """Convert one evaluated object into a MeshPart dict.
 
@@ -136,6 +165,8 @@ def _object_to_part(obj: bpy.types.Object, matrix: Vector | None = None) -> dict
                 ids.append(vertex_id(co))
             if len(set(ids)) == 3:
                 faces.append(ids)
+
+        positions, faces = _canonical_order(positions, faces)
 
         # `flat: true` makes the renderer derive normals per face, so a
         # smooth normal set is not needed here and would break the shell.
