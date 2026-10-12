@@ -124,5 +124,12 @@ def neon_tube(name: str, rgb, *, length: float, radius: float = 0.045,
         tube.rotation_euler = (0.0, math.radians(90.0), 0.0)
     elif axis == "y":
         tube.rotation_euler = (math.radians(90.0), 0.0, 0.0)
+    else:
+        # A cylinder is Z-up by default, so an unrecognised axis used to
+        # fall through both branches and quietly produce a **vertical**
+        # tube — a neon sign drawn as a row of pillars. Fail loudly instead.
+        raise ValueError(
+            f"neon_tube({name}): axis must be 'x' or 'y', got {axis!r}"
+        )
     K.transform_apply(tube)
     return tube

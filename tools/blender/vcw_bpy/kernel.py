@@ -524,11 +524,21 @@ def signed_volume(obj: bpy.types.Object) -> float:
     Positive = outward winding. This is the only automatic outwardness test
     that works: a closed mesh has an interior, so a negative volume means the
     shell is inside-out, which renders identically from one side.
+
+    ⚠️ The order below is load-bearing. ``recalc_face_normals`` **fixes** the
+    winding of any watertight shell to point outward, so calling it *before*
+    measuring makes this function incapable of returning a negative value —
+    the outwardness gate silently passes everything. Weld first (so split
+    vertices form one shell), measure as-authored, and only then hand the
+    mesh to Blender.
+
+    The asset verifier ([`verify3a.py`]) deliberately does NOT use this helper:
+    it re-derives the volume from exported `positions`/`faces` so the check
+    runs on what actually ships, not on the in-Blender authoring state.
     """
     bm = bmesh.new()
     bm.from_mesh(obj.data)
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
     vol = bm.calc_volume(signed=True)
     bm.free()
     return vol
