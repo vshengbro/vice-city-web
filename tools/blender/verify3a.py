@@ -109,7 +109,30 @@ def _edge_counts(points, faces) -> dict:
     return counts
 
 
-def verify_asset(asset: dict, *, ground_category: str | None = None) -> list[str]:
+# Watercraft float: a hull's waterline is not its lowest point. A motorboat's
+# outboard leg and a cruiser's keel both sit below the surface on purpose, and
+# the shipped library already floated veh_boat at y=0 with geometry above it.
+# These categories are checked against a declared waterline offset instead of
+# the hard y=0 rule that applies to ground assets.
+WATERCRAFT_CATEGORIES = {"watercraft"}
+WATERCRAFT_TOLERANCE = 0.60
+
+
+# Ground tiles are SURFACES, not props. A tiling road/ground tile is correct
+    # with its top face at y=0 and its thickness hanging below, because the
+    # renderer lays them on the map plane and samples the top surface. Applying
+    # the ground-prop rule to them flags nine correct tiles; applying the tile
+    # rule to a ground prop (a lamp post, a tree) would let it float. So the
+    # category decides which rule applies.
+GROUND_TILE_CATEGORIES = {"ground_tile"}
+
+
+def verify_asset(
+    asset: dict,
+    *,
+    ground_category: str | None = None,
+    waterline: float | None = None,
+) -> list[str]:
     """Return a list of violation strings; empty means the asset is valid."""
     errors: list[str] = []
     aid = asset.get("id", "<missing id>")
@@ -228,10 +251,43 @@ def verify_asset(asset: dict, *, ground_category: str | None = None) -> list[str
             if abs(b["max"][i] - hi[i]) > BOUNDS_TOLERANCE:
                 errors.append(f"{aid}: bounds.max[{axis}] {b['max'][i]} != actual {hi[i]}")
 
-    if grounded_here and all_points:
+    # Watercraft float, so they are checked against a declared waterline rather
+    # than the hard y=0 rule that ground assets obey.
+    floating = ground_category in WATERCRAFT_CATEGORIES
+    is_tile = ground_category in GROUND_TILE_CATEGORIES
+    if grounded_here and all_points and is_tile:
+        # a tile rests with its TOP surface on y=0; thickness hangs below
+        highest = max(p[1] for p in all_points)
+        lowest = min(p[1] for p in all_points)
+        if abs(highest) > GROUND_TOLERANCE:
+            errors.append(
+                f"{aid}: tile top y={highest:.6f}, ground tiles must have their "
+                f"top surface on y=0 (bottom is {lowest:.6f})")
+    elif grounded_here and all_points and not floating:
         lowest = min(p[1] for p in all_points)
         if abs(lowest) > GROUND_TOLERANCE:
             errors.append(f"{aid}: lowest point y={lowest:.6f}, ground assets must rest on y=0")
+    elif floating and all_points:
+        # `waterline` is the depth of the hull's lowest point below the
+        # surface, i.e. a POSITIVE number. `lowest` is a negative world y.
+        # Comparing `lowest < -limit` against a negative limit inverts the
+        # test — a boat with a 0.21 m outboard leg was reported as "more than
+        # -0.21 m below the waterline" and refused. Compare magnitudes.
+        # A hull's lowest point can sit either side of y=0: a boat with a
+        # submerged outboard leg is below it, a ship whose keel is modelled
+        # above the waterline is above it. Draft is therefore the MAGNITUDE of
+        # the lowest point. Using `-lowest` inverted the test for every asset
+        # whose lowest point was positive, which reported three ships as
+        # "waterline 0.1 != 0.1".
+        lowest = min(p[1] for p in all_points)
+        draft = abs(lowest)
+        limit = WATERCRAFT_TOLERANCE if waterline is None else abs(waterline)
+        if draft > limit + GROUND_TOLERANCE:
+            errors.append(
+                f"{aid}: draft {draft:.6f} m exceeds the {limit:.2f} m limit")
+        if waterline is not None and abs(draft - abs(waterline)) > GROUND_TOLERANCE:
+            errors.append(
+                f"{aid}: waterline y={lowest:.6f} != declared {waterline:.6f}")
 
     return errors
 

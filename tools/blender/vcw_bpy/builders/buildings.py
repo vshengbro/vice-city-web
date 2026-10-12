@@ -269,13 +269,18 @@ def build_tower(
 
         parts += _window_grid(band, asset_id, glass, trim)
 
-    # ground-floor plinth, slightly proud of the base band
+    # ground-floor plinth, slightly proud of the base band.
+    # A 0.05 bevel rounds the bottom edge UP into the base, so a plinth whose
+    # centre sits at half its height measures 0.005 m below z=0 once bevelled.
+    # Lift it by the bevel width so the bevelled foot lands exactly on y=0.
     base_band = bands[0]
+    plinth_h = 0.85
+    plinth_bevel = 0.05
     plinth = K.cube(
         f"{asset_id}_plinth",
-        size=(base_band.w + 0.5, base_band.d + 0.5, 0.85),
-        location=(0.0, 0.0, 0.42),
-        material=trim, bevel=0.05,
+        size=(base_band.w + 0.5, base_band.d + 0.5, plinth_h),
+        location=(0.0, 0.0, plinth_h * 0.5 + plinth_bevel),
+        material=trim, bevel=plinth_bevel,
     )
     parts.append(plinth)
 

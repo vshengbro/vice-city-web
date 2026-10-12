@@ -441,10 +441,64 @@ def set_origin_to_geometry(obj: bpy.types.Object) -> bpy.types.Object:
 
 
 def transform_apply(obj: bpy.types.Object, location=True, rotation=True, scale=True) -> None:
+    """Bake an object transform into its mesh data.
+
+    Note the asymmetry with `rotate_about`: applying a transform leaves the
+    object's origin at the world origin, so any rotation set afterwards turns
+    the part about (0,0,0) rather than about its own centre.
+    """
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.transform_apply(location=location, rotation=rotation, scale=scale)
+
+
+def rotate_about(
+    obj: bpy.types.Object,
+    euler: Sequence[float],
+    pivot: Sequence[float] | None = None,
+) -> bpy.types.Object:
+    """Rotate a part about an explicit pivot, baking the result into its mesh.
+
+    `cube()` bakes its location and leaves the origin at the world origin, so
+    setting `rotation_euler` afterwards rotates the geometry about (0,0,0), not
+    about the part. A rotor blade built at its hub and then "spun" this way ends
+    up metres away from the hub — an aircraft propeller measured 5.15 m below
+    the ground. Build at the origin, rotate, then translate; or pass `pivot`.
+
+    `pivot` defaults to the object's own world centre, which is what almost
+    every part wants.
+    """
+    if pivot is None:
+        pts = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+        pivot = tuple(
+            (min(p[i] for p in pts) + max(p[i] for p in pts)) * 0.5 for i in range(3)
+        )
+    pivot_vec = Vector(pivot)
+    offset = obj.matrix_world.translation - pivot_vec
+
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    # re-origin the part at the pivot so the rotation acts where intended
+    obj.location = obj.location + offset
+    bpy.ops.object.transform_apply(location=True, rotation=False, scale=True)
+    obj.rotation_euler = euler
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+    return obj
+
+
+def place(
+    obj: bpy.types.Object,
+    location: Sequence[float],
+) -> bpy.types.Object:
+    """Move an already-built part to a world location, baking the move in."""
+    obj.location = Vector(location) - obj.matrix_world.translation
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+    return obj
 
 
 def empty(name: str, location: Sequence[float] = (0.0, 0.0, 0.0)) -> bpy.types.Object:

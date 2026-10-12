@@ -18,6 +18,7 @@ Coordinate transform, from the shipped schema: authoring is Z-up, JSON is
 from __future__ import annotations
 
 import json
+import re
 import math
 import os
 from typing import Sequence
@@ -158,6 +159,49 @@ def _object_to_part(obj: bpy.types.Object, matrix: Vector | None = None) -> dict
         evaluated.to_mesh_clear()
 
 
+# Part names the RENDERER looks up by exact string. `src/game.rs` has tests
+# that panic with "asset is missing the <part> part" when a name does not
+# appear, so these are an API contract, not a label: a builder may name its
+# parts descriptively, but the exported document must expose these.
+#
+# Each entry maps (asset_id, contract name) -> the builder's part-name suffix.
+# The suffix match is exact-or-prefixed, so `<aid>_fin` serves `surfboard_fin`.
+# Keeping this in the exporter rather than in each builder means a builder can
+# be renamed freely without silently breaking the consumer.
+# The value is a REGEX matched against the whole part name, not a suffix:
+# a suffix test matches `stringer`/`leash_plug` for `board` and nothing at all
+# for `trim`, because the tower's strips are named `_trim0.._trim3`.
+PART_NAME_CONTRACT: dict[tuple[str, str], str] = {
+    ("beach_surfboard", "surfboard_deck"): r"^beach_surfboard_board$",
+    ("beach_surfboard", "surfboard_fin"): r"^beach_surfboard_fin$",
+    ("animal_bird", "animal_bird_beak"): r"^animal_bird_beak",
+    ("animal_bird", "animal_bird_head"): r"^animal_bird_head$",
+    # every per-window trim strip on a tower is a side frame
+    ("bldg_lilac_tower", "window_side_frames"): r"^bldg_lilac_tower_.*_trim\d+$",
+}
+
+
+def _contract_names(asset_id: str, obj_name: str, taken: set) -> None:
+    """Emit `contract` duplicates of a part the renderer looks up by name.
+
+    A contract name that matches several source parts (every trim strip on a
+    tower) is duplicated across all of them, so the consumer's extent scan sees
+    the whole group rather than one arbitrary strip.
+    """
+    for (aid, contract), suffix in PART_NAME_CONTRACT.items():
+        if aid != asset_id:
+            continue
+        if not re.match(suffix, obj_name):
+            continue
+        name = contract
+        n = 2
+        while name in taken:
+            name = f"{contract}_{n}"
+            n += 1
+        taken.add(name)
+        yield name
+
+
 def build_asset_dict(
     asset_id: str,
     category: str,
@@ -186,9 +230,18 @@ def build_asset_dict(
             names_seen.add(name)
 
         part = _object_to_part(obj)
+        # _object_to_part uses obj.name; the dedup above may have renamed the
+        # part, so carry the final name across explicitly.
+        part["name"] = name
         if not include_normals:
             part.pop("normals", None)
         parts.append(part)
+
+        # Duplicate this part under any contract name the renderer looks up.
+        # Same geometry, different key: the consumer's name lookups and its
+        # per-part iteration both keep working.
+        for alias in _contract_names(asset_id, name, names_seen):
+            parts.append({**part, "name": alias})
 
     tri_count = sum(len(p.get("faces", [])) for p in parts)
 
