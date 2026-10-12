@@ -675,6 +675,26 @@ impl WebGpuRenderer {
             )?;
             push_into(&vertex_attributes, index as usize, attribute.as_ref())?;
         }
+        // PBR:`uv` 在 float 12/13(byte 48/52),`tangent(xyz, w)` 在 float
+        // 14-17,`roughness|metallic` 在 float 18/19。切线拆成两个 f32x2
+        // (location 10/11),uv 是 9,表面参数是 12 —— 与 WebGL 侧的
+        // 9/10/11/12 一致,并避开 4-8(instance 属性)占用的 location。
+        for (index, offset, format) in [
+            (9u32, 48u64, VERTEX_FORMAT_F32X2),
+            (10, 56, VERTEX_FORMAT_F32X2),
+            (11, 64, VERTEX_FORMAT_F32X2),
+            (12, 72, VERTEX_FORMAT_F32X2),
+        ] {
+            let attribute: Object = new_object();
+            set(
+                &attribute,
+                FIELD_SHADER_LOCATION,
+                &JsValue::from_f64(index as f64),
+            )?;
+            set(&attribute, FIELD_OFFSET, &JsValue::from_f64(offset as f64))?;
+            set(&attribute, FIELD_FORMAT, &JsValue::from_str(format))?;
+            push_into(&vertex_attributes, index as usize, attribute.as_ref())?;
+        }
         // instance:model matrix 4 × vec4 在 0..64 B,tint 在 64 B。
         let instance_attributes: JsValue = make_array();
         for index in 0..5u32 {

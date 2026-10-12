@@ -2514,6 +2514,12 @@ pub fn build_water_near(cx: f32, cz: f32) -> MeshAsset {
             emissive: Some([0.0; 3]),
             positions,
             normals: None,
+            uv: None,
+            tangents: None,
+            // 水面是场景里唯一的近镜面:roughness 压到 0.04 才有反射感。
+            // 金属度保持 0 —— 水是介电质,反射来自 Fresnel 而不是金属响应。
+            roughness: Some(0.04),
+            metallic: Some(0.0),
             faces,
             face_colors: Some(face_colors),
             flat: true,
@@ -2805,6 +2811,11 @@ pub fn build_ground_near(centre_x: f32, centre_z: f32) -> MeshAsset {
             emissive: None,
             positions,
             normals: None,
+            uv: None,
+            tangents: None,
+            // 沥青路面:全哑光、非金属。
+            roughness: Some(0.92),
+            metallic: Some(0.0),
             faces,
             face_colors: Some(face_colors),
             flat: true,
@@ -4331,6 +4342,34 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
                     .map(|index: &usize| colors.get(*index).copied().unwrap_or([0.0; 3]))
                     .collect()
             });
+        // 顶点被重排过,所以 UV / 切线必须按同一映射搬运,不能整体丢弃 ——
+        // 丢弃会让裁剪后的资产突然退回程序化投影,贴图尺度凭空突变。
+        // 用具名函数而不是闭包:闭包捕获了 `new_faces`,无法声明成
+        // `fn(...)` 指针,而 §5.1 要求 let 绑定有显式类型注解。
+        /// 按新面表把逐顶点数组重排一遍,保持与顶点顺序一致。
+        ///
+        /// # Arguments
+        ///
+        /// - `&Vec<[usize; 3]>` - 重排后的三角面表。
+        /// - `&Vec<T>` - 原始逐顶点数据(UV 或切线)。
+        ///
+        /// # Returns
+        ///
+        /// - `Vec<T>` - 按面顺序展开的逐角数据。
+        fn remap_corners<T: Copy>(faces: &Vec<[usize; 3]>, values: &Vec<T>) -> Vec<T> {
+            faces
+                .iter()
+                .flat_map(|face: &[usize; 3]| face.iter().map(|i: &usize| values[*i]))
+                .collect()
+        }
+        let rebuilt_uv: Option<Vec<[f32; 2]>> = part
+            .uv
+            .as_ref()
+            .map(|values: &Vec<[f32; 2]>| remap_corners(&new_faces, values));
+        let rebuilt_tangents: Option<Vec<[f32; 4]>> = part
+            .tangents
+            .as_ref()
+            .map(|values: &Vec<[f32; 4]>| remap_corners(&new_faces, values));
         parts.push(MeshPart {
             name: name.to_string(),
             positions: new_positions,
@@ -4338,6 +4377,10 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
             faces: new_faces,
             base_color: part.base_color,
             emissive: part.emissive,
+            uv: rebuilt_uv,
+            tangents: rebuilt_tangents,
+            roughness: part.roughness,
+            metallic: part.metallic,
             face_colors,
             flat: part.flat,
         });

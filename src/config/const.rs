@@ -1817,6 +1817,9 @@ pub(crate) const WATER_ID: &str = "water_procedural";
 /// 水面资产的分类。
 pub(crate) const WATER_CATEGORY: &str = "terrain";
 
+/// 测试用资产的类别标签(§1.3c:字面量集中在 const.rs)。
+pub(crate) const TEST_CATEGORY: &str = "prop";
+
 /// 水面 part 名。
 pub(crate) const WATER_PART: &str = "surface";
 

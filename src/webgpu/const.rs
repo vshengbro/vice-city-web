@@ -302,6 +302,9 @@ pub(crate) const CULL_MODE_FRONT: &str = "front";
 /// 顶点属性格式:`float32x3`。
 pub(crate) const VERTEX_FORMAT_F32X3: &str = "float32x3";
 
+/// PBR 顶点属性用的两通道浮点格式(UV 与拆开的切线)。
+pub(crate) const VERTEX_FORMAT_F32X2: &str = "float32x2";
+
 /// 顶点属性格式:`float32x4`(model matrix 的 4 行)。
 pub(crate) const VERTEX_FORMAT_F32X4: &str = "float32x4";
 
