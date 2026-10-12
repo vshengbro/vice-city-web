@@ -3352,6 +3352,10 @@ fn build_scene(
 /// 完全一致,只有走到块外才必须重来。
 const STREAM_REBUILD_STEP: f32 = STREET_PITCH;
 
+/// NPC 换批的伪随机相位由街区坐标算出 —— 同一街区永远得到同一批行人,
+/// 不会因为换块抖动而每次都不一样。
+const NPC_PHASE_SCALE: f32 = 0.017;
+
 /// 流式窗口边界的预留余量(米):摆件钉在街道轴线旁边的最大偏移。
 ///
 /// 生成窗口的边界是**街道轴线**,而路灯、长椅、报摊、电话亭最多挂在轴线外
@@ -6623,12 +6627,66 @@ fn step_streamed_surface(game: &mut Game) {
     // 静态段长度随生成中心变化,不写回的话下一次重建会按旧长度切,把动态段
     // 的头几个批次误当成静态段丢掉 —— 同一个 bug 换个偏移再犯一次。
     game.static_batch_count = new_static_count;
+    // 街道流式换块时,NPC 也得跟着换一批。流式重建原本只换地面 / 水面,
+    // `populate_combatants` 一辈子只在初始化跑一次 —— 于是 NPC 永远留在
+    // 出生点半径 28 m 内:开车走到 z = 651(实测最近行人 563 m)整条街空无一人,
+    // 任务点、撞人、社会聚集也全都在另一个街区。触发条件跟地面重建共用
+    // 同一次换块(`STREAM_REBUILD_STEP` = 一格街道),不多花一次判定。
+    repopulate_streamed_combatants(game, next_x, next_z);
     // 地面 / 水面的顶点数据换了,GPU 缓冲必须跟着换 —— 否则玩家走出街区
     // 边界后看到的还是出生点那块地,而 CPU 侧探针报告的却是新数据。
     if let Some(renderer) = game.renderer.as_mut() {
         reupload_streamed_meshes(renderer, &game.scene, &rewritten);
     }
     game.streamed_center = [next_x, next_z];
+}
+
+/// 流式换块时把 NPC 搬到玩家周围的新街区。
+///
+/// 只换行人,不换敌人:警察靠 `wanted` 增派、混混是常驻敌对,两者都由
+/// 各自的生成逻辑管;而行人没有别的入口,留在旧街区就等于永远消失。
+///
+/// 用街道对齐后的格子中心 `next` 当生成原点,而不是玩家脚下 —— 否则
+/// 同一个街区里来回走几步就会换一批行人,看着像瞬移。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+/// - `f32` - 新街区中心的 X(米)。
+/// - `f32` - 新街区中心的 Z(米)。
+fn repopulate_streamed_combatants(game: &mut Game, next_x: f32, next_z: f32) {
+    let here: Vec3 = [next_x, 0.0, next_z];
+    let phase: f32 = next_x * NPC_PHASE_SCALE + next_z * NPC_PHASE_SCALE;
+    let mut peds: Vec<Pedestrian> = Vec::new();
+    let mut enemies: Vec<Enemy> = Vec::new();
+    repopulate_combatants_at(&mut peds, &mut enemies, here, phase);
+    game.peds = peds;
+    // 敌人无条件一起换:警察只是顺带被丢掉,`deploy_police` 每帧会按通缉星数
+    // 重新增派到玩家周围,混混则由这里补齐。之前这里挂着
+    // `if stars == 0` 的条件,于是只要玩家身上有星(打了一场就摘不掉),
+    // 混混就永远留在出生点 —— 实测开到 600 m 外最近敌人 565.8 m。
+    game.enemies = enemies;
+}
+
+/// [`Self::repopulate_streamed_combatants`] 真正的换批动作。
+///
+/// 单独拆出来是为了让测试能直接驱动这条路径,不必搭一个完整 `Game`
+/// (那需要整套场景 + 资产表)。
+///
+/// # Arguments
+///
+/// - `&mut Vec<Pedestrian>` - 行人表,整体替换。
+/// - `&mut Vec<Enemy>` - 敌人表,整体替换(警察由 `deploy_police` 重派)。
+/// - `Vec3` - 新街区中心。
+/// - `f32` - 伪随机相位。
+fn repopulate_combatants_at(
+    peds: &mut Vec<Pedestrian>,
+    enemies: &mut Vec<Enemy>,
+    at: Vec3,
+    phase: f32,
+) {
+    *peds = spawn_peds(at, PED_COUNT, phase);
+    *enemies = spawn_thugs(at, THUG_COUNT, phase);
 }
 
 /// 重力 + 楼板支撑 + 楼梯抬升 —— 玩家 Y 轴的一帧推进。
@@ -9834,13 +9892,14 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ARROWDOWN, ARROWLEFT, ARROWRIGHT, ARROWUP, Camera, DIR_LEFT, DIR_RIGHT, FOLLOW_FOV,
-        Instance, KEYA, KEYD, KEYS, KEYW, LOOK_YAW_SENSITIVITY, Mat4, MeshAssetGpu,
+        ARROWDOWN, ARROWLEFT, ARROWRIGHT, ARROWUP, Camera, DIR_LEFT, DIR_RIGHT, Enemy, FOLLOW_FOV,
+        Instance, KEYA, KEYD, KEYS, KEYW, LOOK_YAW_SENSITIVITY, Mat4, MeshAssetGpu, PED_COUNT,
         RUN_OVER_WALK_MIN, Scene, SceneBatch, T_AD_AND_ARROW_DO_NOT_CANCEL,
         T_ARROW_DOES_NOT_MOVE_ON_FOOT, T_ARROW_STEER_SIGNS_OPPOSED, T_ARROW_STEERS_WHILE_DRIVING,
         T_FOOT_POSITION_UNCHANGED, T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK,
-        T_RUN_SPEED_PICK, T_WALK_SPEED_PICK, apply_look_delta, car_wheel_model,
-        rebuild_static_batches, traffic_lanes,
+        T_RUN_SPEED_PICK, T_WALK_SPEED_PICK, THUG_COUNT, apply_look_delta, car_wheel_model,
+        flat_distance, rebuild_static_batches, repopulate_combatants_at, spawn_peds, spawn_thugs,
+        traffic_lanes,
     };
 
     const SLOT_CONTENT_STEP: &str = "step";
@@ -11127,6 +11186,57 @@ mod tests {
         // 路面判定在远处同样成立:3000 是街道轴线,所以那里是沥青。
         assert!(on_roadway(3000.0, 30.0), "远处街道上必须是沥青");
         assert!(!on_roadway(3015.0, 30.0), "远离街道的点不能是沥青");
+    }
+
+    /// NPC 跟着街道流式换块 —— 开到远处,街上仍然有人。
+    ///
+    /// 修复前:`populate_combatants` 一辈子只在初始化跑一次,行人永远留在
+    /// 出生点半径 28 m 内。实测把车开到 `z = 651`,最近行人 **563 m**,
+    /// 整条街空无一人。
+    #[test]
+    fn npcs_follow_the_streamed_blocks() {
+        let block: Vec3 = [0.0, 0.0, 600.0];
+        let mut peds: Vec<Pedestrian> = spawn_peds([0.0, 0.0, 0.0], PED_COUNT, 0.37);
+        let mut enemies: Vec<Enemy> = spawn_thugs([0.0, 0.0, 0.0], THUG_COUNT, 0.37);
+        // 换块前:出生点这批 NPC 离 600 m 外的街区中心非常远。
+        let far_before: f32 = peds
+            .iter()
+            .map(|ped: &Pedestrian| {
+                flat_distance([ped.get_position()[0], 0.0, ped.get_position()[2]], block)
+            })
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            far_before > 560.0,
+            "出生点的行人离 600 m 外应该很远,实测 {far_before:.1} m"
+        );
+        // 模拟 `repopulate_streamed_combatants` 的换批。
+        repopulate_combatants_at(&mut peds, &mut enemies, block, 0.0);
+        // 就算玩家身上有通缉星,混混也必须跟过来 —— 之前这里挂了
+        // `if stars == 0`,打过一场之后敌人就永远留在出生点。
+        // 换块后:新街区附近必须有人 —— 生成半径 28 m,留一倍余量。
+        let near_after: f32 = peds
+            .iter()
+            .map(|ped: &Pedestrian| {
+                flat_distance([ped.get_position()[0], 0.0, ped.get_position()[2]], block)
+            })
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            near_after < 56.0,
+            "换块后最近行人应在 56 m 内,实测 {near_after:.1} m —— NPC 没跟着流式换块"
+        );
+        let foe_near: f32 = enemies
+            .iter()
+            .map(|enemy: &Enemy| {
+                flat_distance(
+                    [enemy.get_position()[0], 0.0, enemy.get_position()[2]],
+                    block,
+                )
+            })
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            foe_near < 56.0,
+            "换块后最近敌人应在 56 m 内,实测 {foe_near:.1} m"
+        );
     }
 
     /// 流式判定:玩家走满一格街道才重建,原地站着不重建。
