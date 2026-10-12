@@ -1564,6 +1564,16 @@ pub(crate) const PED_RUNOVER_SPEED: f32 = 9.0;
 pub(crate) const PED_DOWN_TIME: f32 = 4.0;
 /// 行人察觉危险的距离(米):会跑开。
 pub(crate) const PED_ALERT_RADIUS: f32 = 11.0;
+/// 开车时行人警觉半径的放大系数。
+///
+/// **必须小于 1。** 放大它等于让行人更早起步,而行人跑得越早,车越追不上:
+/// 系数 1.8 时行人从 16.2 m 外就逃窜,24 m/s 的车要从 16.2 m 缩进
+/// `CAR_HIT_RADIUS` 的 2 m 判定圈要 0.87 s,这期间行人已经跑出 ~4.7 m ——
+/// 于是行人永远撞不到,也就永远攒不出通缉星(实测 12 s 满油门零次撞飞)。
+/// 取 0.85 表示「车逼近到比行人警觉距离更近时才开始躲」:保留一点提前量
+/// (车已经在压过来了才躲,看着仍然自然),同时保证 5.4 m/s 的行人跑不出
+/// `CAR_HIT_RADIUS` + `PED_RADIUS` = 2.35 m 的判定圈(实测能跑 2.13 m)。
+pub(crate) const PED_ALERT_CAR_SCALE: f32 = 0.85;
 /// 行人逃跑的持续时间(秒)。
 pub(crate) const PED_FLEE_TIME: f32 = 3.2;
 /// 行人的巡航速度(米/秒)。

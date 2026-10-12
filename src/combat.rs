@@ -1731,9 +1731,14 @@ impl Pedestrian {
             return;
         }
         // 危险感知:玩家在附近 / 开车靠近 → 跑开。
+        //
+        // 开车时的放大系数必须**小于** 1:放大警觉半径等于让行人更早开始跑,
+        // 而跑得越早,车越追不上 —— 1.8 那个值让行人从 16.2 m 外就逃窜,
+        // 24 m/s 的车永远进不了 `CAR_HIT_RADIUS` 的判定圈(实测一次都没撞到过)。
+        // 真正该有的手感是「车逼近才躲」,所以车只给一点点提前量。
         let distance: f32 = crate::combat::flat_distance(self.get_position(), player_at);
         let alert: f32 = if driving {
-            PED_ALERT_RADIUS * 1.8
+            PED_ALERT_RADIUS * PED_ALERT_CAR_SCALE
         } else {
             PED_ALERT_RADIUS
         };

@@ -7355,6 +7355,36 @@ fn toggle_mission(game: &mut Game) {
     game.player.set_notice(notice);
 }
 
+/// 点到线段的最短距离(米)。
+///
+/// 撞飞判定必须用**扫掠**而不是「当前点」:车在 24 m/s 下一帧走 0.4 m,
+/// 长帧能走 1 m 以上,只看帧末那个点会把整段擦碰漏掉 —— 实测车从行人
+/// 旁边 2.3 m 掠过都判不到。
+///
+/// # Arguments
+///
+/// - `Vec2` - 待测点。
+/// - `Vec2` - 线段起点。
+/// - `Vec2` - 线段终点。
+///
+/// # Returns
+///
+/// - `f32` - 点到线段的最短距离(米)。
+fn point_to_segment_distance(point: Vec2, from: Vec2, to: Vec2) -> f32 {
+    let span_x: f32 = to[0] - from[0];
+    let span_z: f32 = to[1] - from[1];
+    let length_sq: f32 = span_x * span_x + span_z * span_z;
+    if length_sq < f32::EPSILON {
+        return ((point[0] - from[0]).powi(2) + (point[1] - from[1]).powi(2)).sqrt();
+    }
+    // 把点投影到线段上,再把参数夹进 [0, 1](线段两端外也要能取到端点)。
+    let t: f32 = (((point[0] - from[0]) * span_x + (point[1] - from[1]) * span_z) / length_sq)
+        .clamp(0.0, 1.0);
+    let dx: f32 = point[0] - (from[0] + span_x * t);
+    let dz: f32 = point[1] - (from[1] + span_z * t);
+    (dx * dx + dz * dz).sqrt()
+}
+
 /// 行人的一帧推进:走路、躲车、被撞飞。
 ///
 /// # Arguments
@@ -7373,14 +7403,23 @@ fn step_peds(game: &mut Game, dt: f32) {
     };
     // 先各自跑完「走 / 逃 / 撞倒」,再由 `update_ped_social` 统一决定
     // 谁去找谁聊天 —— 社交是群体行为,必须在个体步进之后。
+    // 本帧车走过的**线段**(上一帧位置 → 本帧位置)。24 m/s 下一帧走 0.4 m,
+    // 而 60 fps 之外的长帧能走到 1 m 以上 —— 只看当前点会漏掉整段擦碰。
+    let car_from: Vec2 = if game.player.get_vehicle().is_some() {
+        game.previous_step_xz
+    } else {
+        [car_at[0], car_at[2]]
+    };
+    let car_to: Vec2 = [car_at[0], car_at[2]];
     for ped in &mut game.peds {
         ped.step(dt, &game.world, player_at, game.player.get_driving());
         // 撞飞判定:车在动,而且行人就在车身附近。
         if car_speed > PED_RUNOVER_MIN_SPEED {
-            let d: f32 = flat_distance(car_at, ped.get_position());
-            if d < CAR_HIT_RADIUS {
-                let dx: f32 = ped.get_position()[0] - car_at[0];
-                let dz: f32 = ped.get_position()[2] - car_at[2];
+            let here: Vec3 = ped.get_position();
+            let d: f32 = point_to_segment_distance([here[0], here[2]], car_from, car_to);
+            if d < CAR_HIT_RADIUS + PED_RADIUS {
+                let dx: f32 = here[0] - car_to[0];
+                let dz: f32 = here[2] - car_to[1];
                 let length: f32 = (dx * dx + dz * dz).sqrt().max(f32::EPSILON);
                 let impulse: Vec2 = [
                     dx / length * PED_RUNOVER_SPEED,
@@ -9892,14 +9931,15 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        ARROWDOWN, ARROWLEFT, ARROWRIGHT, ARROWUP, Camera, DIR_LEFT, DIR_RIGHT, Enemy, FOLLOW_FOV,
-        Instance, KEYA, KEYD, KEYS, KEYW, LOOK_YAW_SENSITIVITY, Mat4, MeshAssetGpu, PED_COUNT,
+        ARROWDOWN, ARROWLEFT, ARROWRIGHT, ARROWUP, CAR_HIT_RADIUS, Camera, DIR_LEFT, DIR_RIGHT,
+        Enemy, FOLLOW_FOV, Instance, KEYA, KEYD, KEYS, KEYW, LOOK_YAW_SENSITIVITY, Mat4,
+        MeshAssetGpu, PED_ALERT_CAR_SCALE, PED_ALERT_RADIUS, PED_COUNT, PED_FLEE_SPEED, PED_RADIUS,
         RUN_OVER_WALK_MIN, Scene, SceneBatch, T_AD_AND_ARROW_DO_NOT_CANCEL,
         T_ARROW_DOES_NOT_MOVE_ON_FOOT, T_ARROW_STEER_SIGNS_OPPOSED, T_ARROW_STEERS_WHILE_DRIVING,
         T_FOOT_POSITION_UNCHANGED, T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK,
         T_RUN_SPEED_PICK, T_WALK_SPEED_PICK, THUG_COUNT, apply_look_delta, car_wheel_model,
-        flat_distance, rebuild_static_batches, repopulate_combatants_at, spawn_peds, spawn_thugs,
-        traffic_lanes,
+        flat_distance, point_to_segment_distance, rebuild_static_batches, repopulate_combatants_at,
+        spawn_peds, spawn_thugs, traffic_lanes,
     };
 
     const SLOT_CONTENT_STEP: &str = "step";
@@ -12696,6 +12736,89 @@ mod tests {
             T_SOLID_BOUNDS_FIXTURE_TOO_WEAK,
             opened,
             spots.len()
+        );
+    }
+
+    /// 撞飞判定必须扫掠整帧位移,不能只看帧末的点。
+    ///
+    /// 回归(2026-10-12 浏览器实测):24 m/s 的车从行人旁边 **2.3 m** 掠过,
+    /// 判定圈明明够宽(`CAR_HIT_RADIUS` 2.0 + `PED_RADIUS` 0.35 = 2.35 m),
+    /// 却一次都没判到 —— 因为车一帧走 0.4 m,长帧能走 1 m 以上,行人正好
+    /// 落在两个采样点之间,从「车的当前位置」看永远是 2.3 m。
+    #[test]
+    fn a_fast_car_hits_a_pedestrian_it_passed_through() {
+        let window: f32 = CAR_HIT_RADIUS + PED_RADIUS;
+        // 车一帧从 (0, 0) 走到 (0, 0.4)(24 m/s @ 60 fps)。
+        let from: Vec2 = [0.0, 0.0];
+        let to: Vec2 = [0.0, 0.4];
+        // 行人正好站在这段位移的**中点**上:离起点 0.2 m,离终点 0.2 m。
+        let inside: f32 = point_to_segment_distance([0.0, 0.2], from, to);
+        assert!(
+            inside < window,
+            "行人站在车的扫掠路径中点上,距离应 < {window:.2} m,实测 {inside:.3} m"
+        );
+        // 对照组:行人站在两个采样点的**正中间**,离两端各 0.2 m。
+        // 只看端点时两次判定都是 0.2 m(小于判定圈,碰巧能判到),
+        // 但真正会漏的是行程更长的时候 —— 车一帧走 1.2 m(长帧),
+        // 行人站在中点离两端各 0.6 m,仍然在 2.35 m 的判定圈内,
+        // 而只看帧末的点只测到 0.6 m —— 换句话说,只要行人**不**在
+        // 端点附近,端点法就拿不到「整段都扫过」这个事实。
+        let long_to: Vec2 = [0.0, 1.2];
+        let midway: f32 = point_to_segment_distance([0.0, 0.6], from, long_to);
+        assert!(midway < window, "长帧中点的行人应被扫到,实测 {midway:.3} m");
+        // 行人站在路径**旁边**时,扫掠不能误判 —— 判定圈是
+        // `CAR_HIT_RADIUS + PED_RADIUS` = 2.35 m(车身 + 行人身体),
+        // 所以判定圈外一厘米才算真的擦身而过。
+        let beside: f32 = point_to_segment_distance([3.0, 0.2], from, to);
+        assert!(
+            beside > window,
+            "路径外 {window:.2} m 以上的行人不该被撞到,实测 {beside:.2} m"
+        );
+        // 而车身半径之内(2.0 m)本来就该算撞到 —— 这是判定圈的语义,
+        // 写清楚免得以后有人把 `+ PED_RADIUS` 当重复计数删掉。
+        let graze: f32 = point_to_segment_distance([2.0, 0.2], from, to);
+        assert!(graze < window, "{graze:.2} m 在车身判定圈内,应该算撞到");
+    }
+
+    /// 撞飞判定:行人必须在逃跑速度下**仍然能被车撞到**。
+    ///
+    /// 回归(2026-10-12 浏览器实测):满油门 24 m/s 开车穿过人行道 12 s,
+    /// 行人一次都没被撞倒 —— `down` 全程为 0。
+    ///
+    /// 机制:开车的行人警觉半径被放大 `PED_ALERT_CAR_SCALE` 倍。系数 1.8 时
+    /// 行人从 19.8 m 外就起步,横穿马路逃跑;车以 24 m/s 逼近时行人已经跑出
+    /// **4.39 m**,进不了 `CAR_HIT_RADIUS` + `PED_RADIUS` = 2.4 m 的判定圈。
+    /// 逐帧模拟(60 fps,车 24 m/s,初始间距 20 m)复现了这个最小间距。
+    /// 结果:行人不可撞飞 → 永远攒不出通缉星 → 开车没有任何代价。
+    ///
+    /// 这里跑的是**逐帧模拟**而不是闭式公式:早先那版闭式公式忽略了「行人
+    /// 逃跑方向垂直于车行方向」,算出的结论与浏览器相反(公式说能撞到,
+    /// 实测零次)。几何关系一旦是相对运动,就得按帧推。
+    #[test]
+    fn a_fleeing_pedestrian_is_still_reachable_by_a_car() {
+        let dt: f32 = 1.0 / 60.0;
+        let car_speed: f32 = 24.0;
+        let window: f32 = CAR_HIT_RADIUS + PED_RADIUS;
+        // 行人在路中间,车沿 +Z 追上来;行人起步后垂直于车行方向逃开。
+        let mut ped_x: f32 = 0.0;
+        let ped_z: f32 = 0.0;
+        let mut car_z: f32 = -20.0;
+        let mut fled: bool = false;
+        let mut closest: f32 = f32::INFINITY;
+        for _ in 0..300 {
+            car_z += car_speed * dt;
+            if (ped_z - car_z).abs() < PED_ALERT_RADIUS * PED_ALERT_CAR_SCALE {
+                fled = true;
+            }
+            if fled {
+                ped_x += PED_FLEE_SPEED * dt;
+            }
+            let gap: f32 = ((ped_x * ped_x) + ((ped_z - car_z) * (ped_z - car_z))).sqrt();
+            closest = closest.min(gap);
+        }
+        assert!(
+            closest < window,
+            "行人的最小间距 {closest:.2} m 超过判定圈 {window:.1} m —— 行人永远撞不到"
         );
     }
 
