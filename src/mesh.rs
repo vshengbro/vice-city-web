@@ -146,6 +146,16 @@ pub struct MeshPart {
     /// 金属度 0..1(缺省 [`DEFAULT_METALLIC`] = 0.0,介电质)。
     #[serde(default)]
     pub metallic: Option<f32>,
+    /// 运行时贴图图集路径(可缺省,缺省时该零件只有标量 PBR)。
+    ///
+    /// 只有写入了 `atlas/<id>.bin` 的资产才会有这个字段。运行时管线经
+    /// HTTP 读取 `assets/*.json`,不读 GLB,所以贴图必须在这里有一个入口,
+    /// 否则第三层(图像纹理)在游戏里完全不可见。
+    #[serde(default, rename = "texture_atlas")]
+    pub texture_atlas: Option<String>,
+    /// 表面族(`paint` / `metal` / `glass` ...),决定该零件用图集里的哪套贴图。
+    #[serde(default, rename = "surface_kind")]
+    pub surface_kind: Option<String>,
 }
 
 /// `flat` 缺省时按 true(与资产 schema 一致)。
@@ -851,6 +861,8 @@ pub fn cube_part(center: Vec3, half_size: f32, color: Vec3, name: &str) -> MeshP
         tangents: None,
         roughness: None,
         metallic: None,
+        texture_atlas: None,
+        surface_kind: None,
         faces,
         face_colors: None,
         flat: true,

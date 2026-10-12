@@ -2520,6 +2520,8 @@ pub fn build_water_near(cx: f32, cz: f32) -> MeshAsset {
             // 金属度保持 0 —— 水是介电质,反射来自 Fresnel 而不是金属响应。
             roughness: Some(0.04),
             metallic: Some(0.0),
+            texture_atlas: None,
+            surface_kind: None,
             faces,
             face_colors: Some(face_colors),
             flat: true,
@@ -2816,6 +2818,8 @@ pub fn build_ground_near(centre_x: f32, centre_z: f32) -> MeshAsset {
             // 沥青路面:全哑光、非金属。
             roughness: Some(0.92),
             metallic: Some(0.0),
+            texture_atlas: None,
+            surface_kind: None,
             faces,
             face_colors: Some(face_colors),
             flat: true,
@@ -2921,6 +2925,74 @@ async fn fetch_text(url: &str) -> Result<String, String> {
         .map_err(|err: JsValue| format!("{url} body read failed: {err:?}"))?;
     body.as_string()
         .ok_or_else(|| format!("{url} body is not a string"))
+}
+
+/// The atlas path shared by an asset's parts, if it has one.
+///
+/// Every textured part of an asset points at the same blob, so the loader only
+/// needs the first reference rather than a set.
+///
+/// # Arguments
+///
+/// - `&MeshAsset` - The parsed asset.
+///
+/// # Returns
+///
+/// - `Option<String>` - The path relative to `assets/`, or `None` when no part
+///   is textured — in which case the asset renders on scalar PBR alone.
+fn first_atlas_reference(asset: &MeshAsset) -> Option<String> {
+    asset
+        .parts
+        .iter()
+        .find_map(|part: &crate::mesh::MeshPart| part.texture_atlas.clone())
+}
+
+/// Fetch a binary body — the atlas blobs, which are raw bytes rather than text.
+///
+/// # Arguments
+///
+/// - `&str` - The URL to fetch.
+///
+/// # Returns
+///
+/// - `Result<Vec<u8>, String>` - The bytes, or an error describing the failure.
+async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let Some(window) = window() else {
+        return Err(ERR_NO_WINDOW.to_string());
+    };
+    let promise: Promise = window.fetch_with_str(url);
+    let value: JsValue = JsFuture::from(promise)
+        .await
+        .map_err(|err: JsValue| format!("fetch failed for {url}: {err:?}"))?;
+    let response: Response = value
+        .dyn_into::<Response>()
+        .map_err(|_| format!("{url} did not return a Response"))?;
+    if !response.ok() {
+        return Err(format!("{url} returned HTTP {}", response.status()));
+    }
+    let body_promise: Promise = response
+        .array_buffer()
+        .map_err(|err: JsValue| format!("{url} arrayBuffer() threw: {err:?}"))?;
+    let buffer: JsValue = JsFuture::from(body_promise)
+        .await
+        .map_err(|err: JsValue| format!("{url} body read failed: {err:?}"))?;
+    Ok(js_array_buffer_to_vec(&buffer))
+}
+
+/// Copy a JS `ArrayBuffer` into a `Vec<u8>`.
+///
+/// # Arguments
+///
+/// - `&JsValue` - The buffer, as returned by `arrayBuffer()`.
+///
+/// # Returns
+///
+/// - `Vec<u8>` - The bytes; empty when the value is not a buffer.
+fn js_array_buffer_to_vec(value: &JsValue) -> Vec<u8> {
+    let Some(buffer) = value.dyn_ref::<js_sys::ArrayBuffer>() else {
+        return Vec::new();
+    };
+    js_sys::Uint8Array::new(buffer).to_vec()
 }
 
 // ===========================================================================
@@ -4381,6 +4453,13 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
             tangents: rebuilt_tangents,
             roughness: part.roughness,
             metallic: part.metallic,
+            // Carry the texture reference across the clone. This path crops a
+            // part into sub-parts (wheels from bodies, limbs from torsos);
+            // nulling these here would drop the atlas link and silently render
+            // the clone with scalar PBR only, which is invisible in a test that
+            // only checks geometry.
+            texture_atlas: part.texture_atlas.clone(),
+            surface_kind: part.surface_kind.clone(),
             face_colors,
             flat: part.flat,
         });
@@ -9655,6 +9734,32 @@ async fn load_assets_and_build(handles: GameHandles) {
                 match parse_asset(id, &text) {
                     Ok(asset) => {
                         collider_bounds(&mut asset_bounds, id, &asset);
+                        // Runtime textures. The GLB masters carry maps too, but
+                        // the engine never reads them — without fetching the
+                        // atlas here the third layer stays invisible in game.
+                        // A failure is logged and ignored: an asset with no
+                        // atlas still renders correctly on scalar PBR.
+                        if let Some(atlas_rel) = first_atlas_reference(&asset) {
+                            let atlas_url: String = format!("{ASSETS_BASE}{atlas_rel}");
+                            match fetch_bytes(&atlas_url).await {
+                                Ok(bytes) => {
+                                    match crate::texture::parse_atlas(
+                                        &bytes,
+                                        crate::texture::ATLAS_TEX_SIZE,
+                                    ) {
+                                        Ok(set) => {
+                                            crate::texture::store_atlas((*id).to_string(), set);
+                                        }
+                                        Err(message) => console_log(&format!(
+                                            "[vcw] {id} atlas parse failed: {message}"
+                                        )),
+                                    }
+                                }
+                                Err(message) => console_log(&format!(
+                                    "[vcw] {id} atlas fetch failed: {message}"
+                                )),
+                            }
+                        }
                         if *id == PED_SUIT {
                             ped_suit = Some(asset.clone());
                         }

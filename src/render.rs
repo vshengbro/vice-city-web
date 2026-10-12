@@ -6027,6 +6027,8 @@ mod tests {
                 tangents: None,
                 roughness: None,
                 metallic: None,
+                texture_atlas: None,
+                surface_kind: None,
                 faces: vec![[0, 1, 2]],
                 face_colors: None,
                 flat: true,
@@ -6088,6 +6090,8 @@ mod tests {
                 // 车漆 / 铬件那一档:低粗糙度 + 高金属度。
                 roughness: Some(0.08),
                 metallic: Some(0.85),
+                texture_atlas: None,
+                surface_kind: None,
                 faces: vec![[0, 1, 2]],
                 face_colors: None,
                 flat: true,

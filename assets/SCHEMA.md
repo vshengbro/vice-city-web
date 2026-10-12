@@ -113,6 +113,8 @@ different colours via `face_colors`.
   "emissive":      [0.0, 0.0, 0.0],      // linear RGB, 0..1; all-zero = not glowing
   "roughness":     0.45,                 // 0 = mirror, 1 = matte
   "metallic":      0.0,                  // 0 = dielectric, 1 = metal
+  "texture_atlas": "atlas/car_sedan.bin", // optional; absent = scalar PBR only
+  "surface_kind":  "paint",               // optional; picks the maps in that atlas
   "positions":     [[x,y,z], ...],       // vertices, METRES, Y-up world space
   "normals":       [[x,y,z], ...],       // one per position, unit length
   "faces":         [[i0,i1,i2], ...],    // triangle indices into positions
@@ -231,9 +233,11 @@ color = linear_to_srgb(color)
 
 Three consequences for anyone authoring or reviewing assets here:
 
-* **No specular, no PBR, no texture lookup.** `roughness` and `metallic` are
-  exported and validated but are never read. The only sources of surface
-  variation are the surface **normal**, the **albedo**, and **emissive**.
+* **PBR is live: `roughness` and `metallic` are read.** They feed the GGX
+  direct-light term (`src/render.rs`), so a metal and a dielectric under the
+  same light no longer look the same. Surface variation comes from the
+  **normal**, the **albedo**, the scalar PBR terms, and — when a part carries
+  a `texture_atlas` — the atlas maps described below.
 * **`emissive` is what drives the night look.** The engine has a separate
   additive glow pass keyed on `emissive`, and `emissive_gain` scales from 0.18
   at noon to 1.85 at night. Give anything that should glow at night (signs,
@@ -246,6 +250,35 @@ Three consequences for anyone authoring or reviewing assets here:
   fall across.
 
 ---
+
+## 4c. Runtime texture atlases (`atlas/<id>.bin`)
+
+A part that carries `texture_atlas` + `surface_kind` also references a blob
+holding that part's **albedo / normal / ORM** maps. The engine fetches
+`assets/*.json` over HTTP and never reads the GLB masters, so without this a
+texture that only reached the GLB would be invisible at runtime.
+
+Raw RGBA8, not PNG: PNG means implementing inflate, colour types and filters
+in Rust, for bytes the GPU uploads verbatim anyway. At 128² a map is 64 KiB and
+needs no decode step at all.
+
+Layout, little-endian throughout:
+
+```
+count: u32                      how many maps follow
+per map:
+  key_len: u32
+  key:    bytes                 "<surface kind>/<map name>", e.g. "paint/orm"
+  byte_len: u32
+  pixels: byte_len bytes        RGBA8, row-major, always 128 x 128
+```
+
+Maps are deduplicated **per surface family**, not per part, so a 4 688-part
+tower ships three maps per family rather than one set per part.
+
+`emissive` parts and `glass` are deliberately left untextured: tinting a lit
+neon tube with an albedo map makes it go muddy, and glass has no relief to
+model. Those parts fall back to scalar PBR, which is correct for them.
 
 ## 5. Categories
 

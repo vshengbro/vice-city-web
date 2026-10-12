@@ -2616,3 +2616,22 @@ pub(crate) const BACKEND_WEBGPU: &str = "WebGPU";
 pub(crate) const BACKEND_PARAM: &str = "backend";
 
 pub(crate) const BACKEND_QUERY_WEBGL2: &str = "webgl2";
+
+// 运行时贴图图集(texture atlas)相关字面量。
+//
+// 贴图这一层的字符串有两类:一类是图集键的表面族名与贴图名,流水线按同一批
+// 名字写盘、运行时按同一批名字查表;另一类是测试用的资产 id。放在这里是为了
+// 让"写进去的名字"和"读出来的名字"只有一处定义,改一处不会只改一半。
+
+/// 表面族:车漆。
+pub(crate) const SURFACE_PAINT: &str = "paint";
+/// 表面族:金属。
+pub(crate) const SURFACE_METAL: &str = "metal";
+/// 图集键:表面族 + 贴图名。
+pub(crate) const ATLAS_PAINT_ALBEDO: &str = "paint/albedo";
+/// 测试用:往返读写用的资产 id。
+pub(crate) const ATLAS_TEST_ASSET: &str = "asset_round_trip";
+/// 测试用:从未加载过的资产 id,必须查不到。
+pub(crate) const ATLAS_TEST_MISSING_ASSET: &str = "asset_never_loaded";
+/// 测试断言消息:图集应当能解析。
+pub(crate) const ATLAS_PARSE_EXPECT: &str = "atlas should parse";

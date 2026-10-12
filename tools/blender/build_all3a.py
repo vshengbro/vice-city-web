@@ -86,6 +86,15 @@ def main() -> int:
                 continue
             json_path = X.write_asset_json(asset, OUT_DIR)
             glb_path = X.write_pbr_glb(aid, parts, PBR_DIR)
+            # Runtime textures. The engine fetches assets/*.json over HTTP and
+            # never reads the GLB, so textures that only reach the GLB are
+            # invisible at runtime — this writes the same maps as raw RGBA8
+            # plus a per-part reference the engine can upload directly.
+            from vcw_bpy import atlas as AT
+
+            atlas_count, atlas_bytes = AT.write_asset_textures(
+                aid, parts, json_path, os.path.join(OUT_DIR, "atlas")
+            )
         except Exception as exc:  # noqa: BLE001
             failures.append((aid, repr(exc)))
             traceback.print_exc()
@@ -105,8 +114,9 @@ def main() -> int:
         cat["count"] += 1
         cat["triangles"] += tri
         flag = "" if glb_path else "  NO_GLB"
+        tex = f"  atlas={atlas_count} ({atlas_bytes // 1024} KB)" if atlas_count else ""
         print(f"  {aid:34s} {category:11s} parts={asset['part_count']:3d} "
-              f"tris={tri:6d}{flag}")
+              f"tris={tri:6d}{flag}{tex}")
 
     manifest = {
         "asset_count": len(built),

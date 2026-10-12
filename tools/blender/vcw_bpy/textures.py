@@ -277,6 +277,77 @@ def _orm_from_height(
     return pixels
 
 
+# Per-surface-family albedo contrast and normal strength, hoisted out of
+# `apply_textures` so `maps_for` reuses the exact same tuning instead of
+# drifting from it — the runtime atlas exporter and the GLB exporter must not
+# disagree about what a painted surface looks like.
+_CONTRAST: dict[str, float] = {
+    "asphalt": 0.55,
+    "concrete": 0.40,
+    "fabric": 0.30,
+    "foliage": 0.35,
+    "skin": 0.18,
+    "metal": 0.22,
+    "rubber": 0.20,
+    "glass": 0.0,
+    "paint": 0.30,
+}
+_NORMAL_STRENGTH: dict[str, float] = {
+    "asphalt": 26.0,
+    "concrete": 16.0,
+    "fabric": 10.0,
+    "foliage": 12.0,
+    "skin": 6.0,
+    "metal": 7.0,
+    "rubber": 8.0,
+    "glass": 0.0,
+    "paint": 4.0,
+}
+
+
+def maps_for(
+    material: bpy.types.Material,
+    rgb: tuple[float, float, float],
+    roughness: float,
+    metallic: float,
+) -> list[tuple[str, list[float]]]:
+    """The three pixel buffers a material's maps are made of.
+
+    Split out of `apply_textures` so a consumer that needs the raw texels but
+    does **not** want shader nodes bound — the runtime atlas exporter, which
+    uploads straight to the GPU — reuses the same tuning rather than keeping
+    its own copy.
+
+    # Arguments
+
+    - `material` - The material the maps belong to.
+    - `rgb` - Its linear base colour.
+    - `roughness` - Its base roughness, the ORM centre.
+    - `metallic` - Its metalness, the ORM blue channel.
+
+    # Returns
+
+    - `list[tuple[str, list[float]]]` - `(name, pixels)` for albedo, normal and
+      orm, each `size * size * 4` floats in 0..1. Empty when the material must
+      not be textured: emissive surfaces, or no node tree to read.
+    """
+    if material is None or not material.use_nodes:
+        return []
+    kind: str = kind_of(material)
+    # An emissive surface must not be tinted by an albedo map: the emission
+    # socket already carries the colour and a lit sign would go muddy.
+    if kind == "glass" and material.get("vcw_emissive"):
+        return []
+    size: int = TEX_SIZE
+    octave: int = int(_hash01(kind, material.name) * _OCTAVES) % _OCTAVES
+    height: list[float] = _height_for_kind(kind, size, octave)
+    return [
+        ("albedo", _albedo_from_height(height, size, rgb, _CONTRAST.get(kind, 0.28))),
+        ("normal", _normal_from_height(height, size, _NORMAL_STRENGTH.get(kind, 10.0))),
+        ("orm", _orm_from_height(height, size, roughness, metallic)),
+    ]
+
+
 def _new_image(name: str, size: int, pixels: list[float]) -> bpy.types.Image:
     """Create a datablock and write the pixels straight into it.
 
@@ -446,28 +517,8 @@ def apply_textures(
     # earlier ones. The first pilot shipped 3 identical `paint_orm` images.
     prefix: str = f"vcw_tex_{kind}_{material.name}"
 
-    contrast: float = {
-        "asphalt": 0.55,
-        "concrete": 0.40,
-        "fabric": 0.30,
-        "foliage": 0.35,
-        "skin": 0.18,
-        "metal": 0.22,
-        "rubber": 0.20,
-        "glass": 0.0,
-        "paint": 0.30,
-    }.get(kind, 0.28)
-    normal_strength: float = {
-        "asphalt": 26.0,
-        "concrete": 16.0,
-        "fabric": 10.0,
-        "foliage": 12.0,
-        "skin": 6.0,
-        "metal": 7.0,
-        "rubber": 8.0,
-        "glass": 0.0,
-        "paint": 4.0,
-    }.get(kind, 10.0)
+    contrast: float = _CONTRAST.get(kind, 0.28)
+    normal_strength: float = _NORMAL_STRENGTH.get(kind, 10.0)
 
     albedo: bpy.types.Image = _new_image(
         f"{prefix}_albedo", size, _albedo_from_height(height, size, rgb, contrast)

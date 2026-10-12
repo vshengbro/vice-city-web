@@ -16,6 +16,7 @@
 //! - [`traffic`] —— 车队 AI、上下车、拾取物。
 //! - [`render`] —— WebGL2 / Canvas2D 两个渲染后端 + 共享光照参数。
 //! - [`game`] —— 场景蓝图、异步加载、固定步长循环、输入、昼夜循环。
+//! - [`texture`] —— 运行时贴图图集:二进制图集的解析与按资产/表面族取图。
 
 mod r#camera;
 mod r#collision;
@@ -28,6 +29,7 @@ mod r#mesh;
 mod r#player;
 mod r#render;
 mod r#spawn;
+mod r#texture;
 mod r#traffic;
 mod r#type;
 mod r#webgpu;
@@ -38,6 +40,14 @@ pub use euv::{App, wasm_bindgen::prelude::*};
 /// **重新导出**一次 —— `src/webgpu/mod.rs` 就能通过 `pub use super::…`
 /// 拿到它们,不必自己写 `use euv::…`。
 pub use euv::{js_sys, wasm_bindgen, wasm_bindgen_futures, web_sys};
+
+pub(crate) use std::{
+    collections::HashMap,
+    iter,
+    sync::{Mutex, MutexGuard, OnceLock},
+};
+
+pub(crate) use serde::Deserialize;
 
 /// §6.1 同理:`std` 的常用常量在 crate 根**重新导出**一次,子模块就能
 /// `use super::*` 直接拿到 `FRAC_PI_2` / `PI`,不必在每个文件里写全路径。
