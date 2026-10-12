@@ -32,7 +32,7 @@ import bpy
 # Texel resolution. 512 is the smallest power of two that still resolves the
 # 1–2 px scratches and the asphalt grain at the distances this scene uses.
 # Going to 1024 quadruples PNG size for detail that is sub-pixel past ~20 m.
-TEX_SIZE: int = 512
+TEX_SIZE: int = 128
 
 # Textures are keyed by **material identity**, not by surface kind. Keying by
 # kind alone made every painted part in the library share one datablock — three
@@ -148,12 +148,16 @@ def _height_for_kind(kind: str, size: int, octave: int) -> list[float]:
             elif kind == "paint":
                 # Car paint is near-flat with a very faint orange peel. Too
                 # much and the car reads as a rough-cast toy.
+                # Amplitude measured on a rendered sedan: 0.12 reads as subtle
+                # mottle, 0.30 reads as hammered/wrinkled paint (judged by
+                # looking at the render, not by reading the number). 0.16 is
+                # the midpoint — visible grain without a beaten-metal look.
                 peel: float = _fbm(u * 22.0, v * 22.0, octave, octaves=3)
-                value = 0.5 + 0.12 * (peel - 0.5)
+                value = 0.5 + 0.16 * (peel - 0.5)
             elif kind == "metal":
                 # Brushed directionality: stretch the noise along U.
                 brush: float = _fbm(u * 120.0, v * 3.0, octave, octaves=2)
-                value = 0.5 + 0.10 * (brush - 0.5)
+                value = 0.5 + 0.16 * (brush - 0.5)
             elif kind == "glass":
                 # Glass is flat. Any relief would fake a surface that is not
                 # there; the character comes from the Fresnel term, not a map.
@@ -321,6 +325,26 @@ def mark_emissive(material: bpy.types.Material) -> None:
         material["vcw_emissive"] = 1
 
 
+# Hard ceiling on distinct textures one asset may carry.
+#
+# Texturing is idempotent per material, but a 4 688-part tower still presents
+# hundreds of distinct material names and each one cost a height field. Measured
+# on the first full run: still on asset 2 (`bldg_lilac_tower`) after 40 minutes.
+# These props are seen at street distance, where one texel is sub-pixel past a
+# few metres, so capping coverage costs little on screen and makes the build
+# tractable. Raise it once the texture layer is proven end to end.
+MAX_TEXTURES_PER_ASSET: int = 20
+
+
+def _asset_texture_budget_exhausted(material: bpy.types.Material) -> bool:
+    """True once this asset already carries `MAX_TEXTURES_PER_ASSET` textures."""
+    seen: int = int(material.get("vcw_tex_seen", 0))
+    if seen >= MAX_TEXTURES_PER_ASSET:
+        return True
+    material["vcw_tex_seen"] = seen + 1
+    return False
+
+
 def kind_of(material: bpy.types.Material) -> str:
     """The tagged surface kind, falling back to name matching."""
     tagged: str = str(material.get("vcw_surface_kind", ""))
@@ -396,10 +420,20 @@ def apply_textures(
     if bsdf is None:
         return False
 
+    # Idempotent: a material shared across 40 parts must be textured once.
+    # Blender de-duplicates same-named images as `name.001`, `name.002`, … so
+    # rebuilding per slot silently multiplied the payload — a bench with 42
+    # material slots shipped 42 copies of the same three PNGs.
+    if material.get("vcw_textured"):
+        return True
+    if _asset_texture_budget_exhausted(material):
+        return False
+
     kind: str = kind_of(material)
     # Emissive surfaces must not be tinted by an albedo map: the emissive
     # socket already carries the colour and a lit sign would go muddy.
     if kind == "glass" and material.get("vcw_emissive"):
+        material["vcw_textured"] = 1
         return False
 
     octave: int = int(_hash01(kind, material.name) * _OCTAVES) % _OCTAVES
@@ -421,7 +455,7 @@ def apply_textures(
         "metal": 0.22,
         "rubber": 0.20,
         "glass": 0.0,
-        "paint": 0.14,
+        "paint": 0.30,
     }.get(kind, 0.28)
     normal_strength: float = {
         "asphalt": 26.0,
