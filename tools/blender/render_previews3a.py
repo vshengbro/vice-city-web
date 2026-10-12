@@ -61,6 +61,26 @@ def _world_bounds(parts):
 def render_one(asset_id, parts, out_dir):
     from mathutils import Vector
 
+    # Texture the materials before rendering, or the preview shows flat
+    # material colours and the texture layer is never actually looked at.
+    # `write_pbr_glb` is the single place that knows how a material's real
+    # base colour / roughness / metallic are read back out of Blender 4.
+    from vcw_bpy import export3a as X
+
+    for obj in parts:
+        if obj is None:
+            continue
+        for slot in getattr(obj.data, "materials", []):
+            if slot is None:
+                continue
+            rgb, rough, metal = X.material_response(slot)
+            try:
+                from vcw_bpy import textures as TX
+
+                TX.apply_textures(slot, rgb, rough, metal)
+            except Exception as exc:  # pragma: no cover - preview must not die
+                print(f"  texture skip {slot.name}: {exc!r}")
+
     bounds = _world_bounds(parts)
     if bounds is None or bounds[0] is None or bounds[1] is None:
         return {"id": asset_id, "ok": False, "why": "no geometry"}

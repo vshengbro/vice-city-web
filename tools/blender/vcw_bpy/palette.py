@@ -18,50 +18,83 @@ from . import kernel as K
 # Miami-neon / pastel-decade, the same art direction the shipped library used,
 # now as real Principled layers instead of baked vertex colours.
 
+def _emissive_tag(material):
+    """Tag an emissive material.
+
+    It needs two facts: its surface family (so texture code skips it) and the
+    fact that it emits at all. An emissive surface must not receive an albedo
+    map — the emission colour already carries the look and an albedo tint
+    makes a lit sign go muddy.
+    """
+    from .textures import mark_emissive
+
+    mark_emissive(material)
+    return _tag(material, "glass")
+
+
+def _tag(material, kind: str):
+    """Record the surface family on the material itself.
+
+    Texture selection needs to know whether a surface is paint, metal, glass,
+    rubber, foliage, fabric or skin. It cannot infer that from the material's
+    name because builders rename materials per part (`veh_sedan_tyre`), so the
+    family is written here, at the point where it is still known, and read back
+    by `textures.apply_textures`. Keeping this in one helper means adding a
+    palette entry without a kind is a visible omission rather than a silent
+    fall-through to a generic grey.
+    """
+    from .textures import mark_kind
+
+    mark_kind(material, kind)
+    return material
+
+
 def paint(name: str, rgb, metallic: float = 0.0, roughness: float = 0.7):
-    return K.pbr_material(name, rgb, roughness=roughness, metallic=metallic)
+    return _tag(K.pbr_material(name, rgb, roughness=roughness, metallic=metallic), "paint")
 
 
 def glass(name: str, tint=(0.62, 0.78, 0.86), rough: float = 0.05):
-    return K.pbr_material(name, tint, roughness=rough, metallic=0.0,
-                          alpha=0.25, transmission=0.90, ior=1.52)
+    """Transparent glazing for vehicles and props."""
+    return _tag(K.pbr_material(name, tint, roughness=0.05, metallic=0.0,
+                                alpha=0.25, transmission=0.90, ior=1.52), "glass")
 
 
 def window_glass(name: str, tint=(0.16, 0.28, 0.36)):
     """Facade glazing: darker and more reflective than vehicle glass, so a
     tower reads as a tower and not as a greenhouse."""
-    return K.pbr_material(name, tint, roughness=0.07, metallic=0.60)
+    return _tag(K.pbr_material(name, tint, roughness=0.07, metallic=0.60), "glass")
 
 
 def rubber(name: str):
-    return K.pbr_material(name, (0.035, 0.035, 0.04), roughness=0.88, metallic=0.0)
+    return _tag(K.pbr_material(name, (0.035, 0.035, 0.04), roughness=0.88, metallic=0.0), "rubber")
 
 
 def chrome(name: str):
-    return K.pbr_material(name, (0.86, 0.88, 0.92), roughness=0.08, metallic=1.0)
+    return _tag(K.pbr_material(name, (0.86, 0.88, 0.92), roughness=0.08, metallic=1.0), "metal")
 
 
 def metal(name: str, rgb=(0.62, 0.64, 0.68), rough: float = 0.35, metal: float = 0.9):
-    return K.pbr_material(name, rgb, roughness=rough, metallic=metal)
+    return _tag(K.pbr_material(name, rgb, roughness=rough, metallic=metal), "metal")
 
 
 def emissive(name: str, rgb, strength: float = 4.0):
-    return K.pbr_material(name, rgb, roughness=0.3, metallic=0.0,
-                          emission=rgb, emission_strength=strength)
+    return _emissive_tag(
+        K.pbr_material(name, rgb, roughness=0.3, metallic=0.0,
+                       emission=rgb, emission_strength=strength))
 
 
 def foliage(name: str, rgb=(0.18, 0.42, 0.20), rough: float = 0.72):
     """Leaves and foliage get a high roughness and two-sided shading — a leaf
     that reflects like plastic is the fastest way to make a tree look CG."""
-    return K.pbr_material(name, rgb, roughness=rough, metallic=0.0)
+    return _tag(K.pbr_material(name, rgb, roughness=rough, metallic=0.0), "foliage")
 
 
 def fabric(name: str, rgb, rough: float = 0.86):
-    return K.pbr_material(name, rgb, roughness=rough, metallic=0.0)
+    return _tag(K.pbr_material(name, rgb, roughness=rough, metallic=0.0), "fabric")
 
 
 def skin(name: str, rgb=(0.78, 0.60, 0.48)):
-    return K.pbr_material(name, rgb, roughness=0.55, metallic=0.0)
+    return _tag(K.pbr_material(name, rgb, roughness=0.55, metallic=0.0), "skin")
 
 
 def finish(parts):

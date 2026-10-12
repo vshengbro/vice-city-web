@@ -305,14 +305,62 @@ def write_asset_json(asset: dict, assets_dir: str) -> str:
     return path
 
 
+def material_response(material: bpy.types.Material | None) -> tuple[tuple[float, float, float], float, float]:
+    """Read (base colour, roughness, metallic) the way Blender 4 actually stores them.
+
+    ⚠️ `Material.metallic` and `Material.roughness` still exist in Blender 4.5
+    but are **dead legacy fields**: the Principled BSDF keeps the real values in
+    its node tree. Reading the legacy field returns 0.0 for every material made
+    through `palette.paint(..., metallic=0.35)` — which silently writes an ORM
+    image whose blue channel (metalness) is zero everywhere, i.e. every metal
+    ships as a dielectric. Probe-verified: the legacy field says 0.0 while the
+    BSDF socket says 0.35.
+
+    So the node tree is authoritative and the legacy field is only a fallback
+    for a material with no node tree at all.
+    """
+    if material is None:
+        return (0.8, 0.8, 0.8), 0.6, 0.0
+    base: list[float] = _material_base_color(material)
+    rough: float = 0.6
+    metal: float = 0.0
+    if material.use_nodes:
+        bsdf: bpy.types.Node | None = material.node_tree.nodes.get("Principled BSDF")
+        if bsdf is not None:
+            if "Roughness" in bsdf.inputs:
+                rough = float(bsdf.inputs["Roughness"].default_value)
+            if "Metallic" in bsdf.inputs:
+                metal = float(bsdf.inputs["Metallic"].default_value)
+            return (base[0], base[1], base[2]), rough, metal
+    rough = float(getattr(material, "roughness", 0.6) or 0.6)
+    metal = float(getattr(material, "metallic", 0.0) or 0.0)
+    return (base[0], base[1], base[2]), rough, metal
+
+
 def write_pbr_glb(asset_id: str, objects: Sequence[bpy.types.Object], pbr_dir: str) -> str | None:
     """Write the PBR master. Returns None when the export produced no file."""
     from .kernel import export_glb
+    from . import textures as TX
 
     os.makedirs(pbr_dir, exist_ok=True)
     path = os.path.join(pbr_dir, f"{asset_id}.glb")
-    if not export_glb(path, [o for o in objects if o is not None]):
+    live: Sequence[bpy.types.Object] = [o for o in objects if o is not None]
+    # Texture the materials *before* the export: the glTF exporter reads image
+    # datablocks live off each material, so anything applied afterwards would
+    # not make it into the file. Textures are keyed by surface kind rather
+    # than per part, so a 4 688-part tower still only builds ~10 images.
+    textured: int = 0
+    for obj in live:
+        for slot in getattr(obj.data, "materials", []):
+            if slot is None:
+                continue
+            rgb, rough, metal = material_response(slot)
+            if TX.apply_textures(slot, rgb, rough, metal):
+                textured += 1
+    if not export_glb(path, list(live)):
         return None
+    if textured:
+        print(f"  textured {textured} material(s) -> {os.path.basename(path)}")
     return path
 
 
