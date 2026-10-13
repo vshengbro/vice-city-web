@@ -11,7 +11,7 @@
 //! AABB 角上时单次迭代可能残留一点重叠,所以固定迭代若干轮直到稳定。
 
 use crate::{
-    r#const::PEDESTRIAN_PERSONAL_SPACE,
+    r#config::PEDESTRIAN_PERSONAL_SPACE,
     r#type::{Vec2, Vec3},
 };
 
@@ -55,7 +55,7 @@ const SLIDE_MIN_PROGRESS: f32 = 0.25;
 ///
 /// 外部读者:`game::resolve_dynamic_bodies` 用它给每辆车建有向盒碰撞体,
 /// 删掉或改成私有不符 §18。
-pub const CAR_FOOTPRINT: Vec2 = [2.283, 0.926];
+pub(crate) const CAR_FOOTPRINT: Vec2 = [2.283, 0.926];
 
 /// 车辆每步推进的子步长(米)。
 ///
@@ -73,7 +73,7 @@ pub(crate) const CAR_STEP: f32 = 0.05;
 /// yaw 的微小变化跳变。给探针一个实际尺寸(略大于一个肩宽)做球体推进,
 /// 抖动幅度被压到可以忽略。它只被 [`ray_to_shapes`] 读到,所以定义在
 /// 射线实现旁边而不是 `camera`。
-pub const CAMERA_PROBE_RADIUS: f32 = 0.32;
+pub(crate) const CAMERA_PROBE_RADIUS: f32 = 0.32;
 
 /// 一个静态碰撞体(投影到世界 XZ 平面)。
 #[derive(Clone, Copy, Debug)]
@@ -1395,7 +1395,7 @@ pub fn placement_box(min: Vec3, max: Vec3, yaw: f32, scale: f32, position: Vec3)
 #[cfg(test)]
 mod tests {
     use crate::collision::{BodyKind, CAR_FOOTPRINT, CollisionWorld, DynamicBody};
-    use crate::r#const::{
+    use crate::r#config::{
         T_COLLISION_SLIDE_KEEPS_TANGENT, T_COLLISION_SLIDE_OPEN_GROUND_X,
         T_COLLISION_SLIDE_OPEN_GROUND_Z, T_COLLISION_SLIDE_STOPS_AT_WALL, T_DYNAMIC_MASS_WEIGHTED,
         T_DYNAMIC_NO_MOVE_WHEN_CLEAR, T_DYNAMIC_SAME_KIND_SEPARATES, T_DYNAMIC_STATIC_TOO,

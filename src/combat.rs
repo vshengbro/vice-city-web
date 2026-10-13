@@ -21,9 +21,10 @@
 //! [`ENEMY_SIGHT`] 一倍多的敌人连 AI 都不更新,自然也不会被上传。
 
 use crate::{
+    PI, TAU,
     camera::Mat4,
     collision::CollisionWorld,
-    r#const::*,
+    r#config::*,
     player::{Player, wrap_angle},
     r#type::{Vec2, Vec3},
 };
@@ -945,7 +946,7 @@ impl Enemy {
         self.set_hurt_timer((self.get_hurt_timer() - dt).max(0.0));
         self.set_flee_timer((self.get_flee_timer() - dt).max(0.0));
         self.set_flash((self.get_flash() - dt).max(0.0));
-        self.set_wander((self.get_wander() + ENEMY_WANDER_RATE * dt) % std::f32::consts::TAU);
+        self.set_wander((self.get_wander() + ENEMY_WANDER_RATE * dt) % TAU);
         if self.get_patrol_timer() >= ENEMY_PATROL_RESELECT {
             self.set_patrol_timer(0.0);
         } else {
@@ -1730,9 +1731,14 @@ impl Pedestrian {
             return;
         }
         // 危险感知:玩家在附近 / 开车靠近 → 跑开。
+        //
+        // 开车时的放大系数必须**小于** 1:放大警觉半径等于让行人更早开始跑,
+        // 而跑得越早,车越追不上 —— 1.8 那个值让行人从 16.2 m 外就逃窜,
+        // 24 m/s 的车永远进不了 `CAR_HIT_RADIUS` 的判定圈(实测一次都没撞到过)。
+        // 真正该有的手感是「车逼近才躲」,所以车只给一点点提前量。
         let distance: f32 = crate::combat::flat_distance(self.get_position(), player_at);
         let alert: f32 = if driving {
-            PED_ALERT_RADIUS * 1.8
+            PED_ALERT_RADIUS * PED_ALERT_CAR_SCALE
         } else {
             PED_ALERT_RADIUS
         };
@@ -1815,10 +1821,7 @@ impl Pedestrian {
             self.set_gait_amount(
                 self.get_gait_amount() + (ratio - self.get_gait_amount()) * relaxed,
             );
-            self.set_gait_phase(
-                (self.get_gait_phase() + planar * PED_GAIT_RATE * dt)
-                    % (2.0 * std::f32::consts::PI),
-            );
+            self.set_gait_phase((self.get_gait_phase() + planar * PED_GAIT_RATE * dt) % (2.0 * PI));
         } else {
             let relaxed: f32 = (1.0 - (-PED_RELAX_RATE * dt).exp()).clamp(0.0, 1.0);
             self.set_gait_amount(self.get_gait_amount() - self.get_gait_amount() * relaxed);
@@ -2285,7 +2288,7 @@ pub fn body_matrix(at: Vec3, yaw: f32, scale: f32) -> Mat4 {
 #[cfg(test)]
 mod tests {
     use crate::combat::{Arsenal, Weapon};
-    use crate::r#const::{
+    use crate::r#config::{
         GRENADE_TUBES, PICKUP_AMMO_BOX, PICKUP_ARMOR_VEST, PICKUP_HEALTH_PACK, SMG_MAGAZINE,
         T_GRENADE_COUNT_DOWN, T_GRENADE_NONE_LEFT, T_UNARMED_CANNOT_FIRE, T_UNARMED_HAS_NO_MESH,
         T_UNARMED_NO_RELOAD, T_UNARMED_NOT_A_PICKUP, WEP_BAT, WEP_GRENADE, WEP_PISTOL, WEP_SMG,

@@ -17,7 +17,7 @@
 use crate::{
     collision::CollisionWorld,
     combat::{AiState, Enemy, Faction, face_towards, flat_distance, has_line_of_sight},
-    r#const::*,
+    r#config::*,
     r#type::{Vec2, Vec3},
 };
 

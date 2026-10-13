@@ -6,8 +6,9 @@
 //! 通缉 5 星会频繁增派,而 AI 判据很少动。
 
 use crate::{
+    FRAC_PI_4, TAU,
     combat::{Enemy, Faction, Mission, Pedestrian},
-    r#const::*,
+    r#config::*,
     r#type::{Vec2, Vec3},
 };
 
@@ -103,7 +104,7 @@ pub fn deploy_police(
     let mut made: usize = 0;
     for slot in live..target {
         // 环形散布:每个增派点用不同相位,避免所有警察叠在同一个点。
-        let angle: f32 = phase * std::f32::consts::TAU + slot as f32 * 2.399_963;
+        let angle: f32 = phase * TAU + slot as f32 * 2.399_963;
         let radius: f32 = DEPLOY_RING_MIN
             + (DEPLOY_RING_MAX - DEPLOY_RING_MIN) * (0.5 + 0.5 * (angle * 1.7).sin());
         let at: Vec3 = [
@@ -135,7 +136,7 @@ pub fn deploy_police(
 pub fn spawn_thugs(player_at: Vec3, count: usize, phase: f32) -> Vec<Enemy> {
     let mut out: Vec<Enemy> = Vec::new();
     for slot in 0..count {
-        let angle: f32 = phase * std::f32::consts::TAU + slot as f32 * 1.618_034;
+        let angle: f32 = phase * TAU + slot as f32 * 1.618_034;
         let radius: f32 =
             THUG_SPAWN_MIN + (THUG_SPAWN_MAX - THUG_SPAWN_MIN) * (0.5 + 0.5 * (angle * 2.3).cos());
         let at: Vec3 = [
@@ -171,7 +172,7 @@ const THUG_SPAWN_MAX: f32 = 62.0;
 pub fn spawn_peds(player_at: Vec3, count: usize, phase: f32) -> Vec<Pedestrian> {
     let mut out: Vec<Pedestrian> = Vec::new();
     for slot in 0..count {
-        let angle: f32 = phase * std::f32::consts::TAU + slot as f32 * std::f32::consts::FRAC_PI_4;
+        let angle: f32 = phase * TAU + slot as f32 * FRAC_PI_4;
         let radius: f32 = 7.0 + (slot % 6) as f32 * 4.4;
         let at: Vec3 = [
             player_at[0] + angle.cos() * radius,
@@ -257,6 +258,7 @@ const MISSION_TABLE: &[(&str, u32, Vec3)] = &[
 /// # Arguments
 ///
 /// - `&mut Mission` - 当前任务。
+/// - `&[Enemy]` - 敌人表(GOTO 段转 KILL 段时用它挑目标)。
 /// - `Vec3` - 玩家坐标。
 /// - `usize` - 目标敌人的索引(阶段推进时用来确认它已被击杀)。
 /// - `bool` - 目标敌人是否已死亡。
@@ -267,6 +269,7 @@ const MISSION_TABLE: &[(&str, u32, Vec3)] = &[
 /// - `f32` - 任务完成时返回报酬,否则返回 0。
 pub fn advance_mission(
     mission: &mut Mission,
+    enemies: &[Enemy],
     player_at: Vec3,
     target_index: usize,
     target_dead: bool,
@@ -298,12 +301,65 @@ pub fn advance_mission(
                 mission.complete();
                 return reward;
             }
-            mission.set_target_enemy(target_index);
+            // 目标索引:调用方传进来的 `target_index` 在进入 KILL 段之前
+            // 一直是 `usize::MAX`(GOTO 段还没有「要干掉谁」),直接存进去
+            // 就等于 KILL 段永远查不到人 —— `update_mission` 的
+            // `index != usize::MAX` 恒为 false,任务卡在
+            // `take out the target` 永远完不成。
+            // 正确做法:进 KILL 段时**指定一个真实目标**,由调用方按
+            // 「离任务点最近的活人」选出来。
+            let target_enemy: usize = if target_index == usize::MAX {
+                select_mission_target(enemies, target)
+            } else {
+                target_index
+            };
+            // 顺序要紧:`Mission::advance` 里带一句
+            // `set_target_enemy_opt(None)`(换段就清空目标),所以目标必须
+            // **在 advance 之后**写 —— 反过来写等于刚设上就被清掉,
+            // `get_target_enemy()` 永远返回 `None`,任务卡死在
+            // `take out the target`。
             mission.advance(MISSION_KILL, target);
+            mission.set_target_enemy(target_enemy);
             0.0
         }
         _ => 0.0,
     }
+}
+
+/// 给 KILL 段挑一个目标:离任务点最近、还活着的敌人。
+///
+/// GOTO 段转 KILL 段的时候调用方手里没有「要干掉谁」(`target_index` 是
+/// `usize::MAX`),必须在这里按位置选一个出来 —— 不选的话 KILL 段存的是
+/// 一个空索引,`update_mission` 永远判不出「目标已死」,任务卡在
+/// `take out the target`(浏览器实测:面板不变,钱不涨)。
+///
+/// 没有活人就返回 `usize::MAX`,让任务停在原地等人来 —— 场上没有敌人时
+/// 总会有下一批,不该把任务判成失败。
+///
+/// # Arguments
+///
+/// - `&[Enemy]` - 敌人表。
+/// - `Vec3` - 任务目标点。
+///
+/// # Returns
+///
+/// - `usize` - 选中的敌人索引,没有活人时为 `usize::MAX`。
+fn select_mission_target(enemies: &[Enemy], at: Vec3) -> usize {
+    let mut best: usize = usize::MAX;
+    let mut best_distance: f32 = f32::INFINITY;
+    for (index, enemy) in enemies.iter().enumerate() {
+        if !enemy.is_alive() {
+            continue;
+        }
+        let dx: f32 = enemy.get_position()[0] - at[0];
+        let dz: f32 = enemy.get_position()[2] - at[2];
+        let distance: f32 = (dx * dx + dz * dz).sqrt();
+        if distance < best_distance {
+            best_distance = distance;
+            best = index;
+        }
+    }
+    best
 }
 
 /// 一个任务串起来的段数。

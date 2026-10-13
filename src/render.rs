@@ -15,9 +15,11 @@ use euv::{
 };
 
 use crate::{
+    Ordering,
     camera::{Mat4, is_back_facing},
-    r#const::*,
+    r#config::*,
     mesh::{GpuMesh, f32_slice_to_bytes},
+    take,
     r#type::{Mat4Data, Rgb8, Vec3},
 };
 
@@ -26,7 +28,18 @@ use crate::{
 ///
 /// 资产 JSON 里 part 有 `emissive`,展开时追加第 4 个 vec3,这样霓虹招牌
 /// 可以在着色阶段直接按自发光强度叠加,不需要再查一次表。
-pub(crate) const STRIDE_FLOATS: usize = 12;
+///
+/// PBR 阶段又追加 `uv(2) | tangent(4)`:`MeshAssetGpu` 由
+/// [`crate::mesh::FLOATS_PER_VERTEX`]=9 的紧凑布局展开成 GPU 布局,
+/// 中间这一层是唯一的转换点,所以这里只增不减。`tangent` 用 vec4
+/// (w = 手性符号),法线贴图翻转绿通道时需要它。
+pub(crate) const STRIDE_FLOATS: usize = 20;
+
+/// [`GpuMesh::pbr`] 为空时 UV 的兜底步长(UV 单位 / 顶点)。
+///
+/// 只在 PBR 列缺失时生效,让退化资产仍能采样出渐变而不是单点;
+/// 正常路径由 [`crate::mesh::expand_asset`] 写出真实 UV。
+const DEFAULT_UV_FALLBACK_STEP: f32 = 0.01;
 
 /// 单个 instance 在 buffer 里的字节跨度,必须等于
 /// `FLOATS_PER_INSTANCE * 4`,并作为 instanced 属性的 `vertex_attrib_pointer`
@@ -259,6 +272,7 @@ pub fn build_gpu_mesh(mesh: &GpuMesh, part_emissive: &[Vec3]) -> MeshAssetGpu {
     let vertex_count: usize = mesh.vertex_count();
     for vertex in 0..vertex_count {
         let base: usize = vertex * 9;
+        let pbr_base: usize = vertex * crate::mesh::FLOATS_PER_PBR_VERTEX;
         let position: [f32; 3] = [
             mesh.vertices[base],
             mesh.vertices[base + 1],
@@ -277,6 +291,35 @@ pub fn build_gpu_mesh(mesh: &GpuMesh, part_emissive: &[Vec3]) -> MeshAssetGpu {
         // 三角形 = 第 `vertex / 3` 个三角形;顶点 0/1/2 属于同一个三角形。
         let triangle: usize = vertex / 3;
         let emissive: [f32; 3] = part_emissive.get(triangle).copied().unwrap_or([0.0; 3]);
+        let pbr_uv: f32 = mesh
+            .pbr
+            .get(pbr_base)
+            .copied()
+            .unwrap_or(vertex as f32 * DEFAULT_UV_FALLBACK_STEP);
+        let pbr_uv_next: f32 = mesh
+            .pbr
+            .get(pbr_base + 1)
+            .copied()
+            .unwrap_or(vertex as f32 * DEFAULT_UV_FALLBACK_STEP);
+        // 粗糙度下限 0.04 与着色器一致:0 会让 GGX 分母除零。
+        let pbr_rough: f32 = mesh
+            .pbr
+            .get(pbr_base + 6)
+            .copied()
+            .unwrap_or(0.6)
+            .clamp(0.04, 1.0);
+        let pbr_metal: f32 = mesh
+            .pbr
+            .get(pbr_base + 7)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let pbr_tangent: [f32; 4] = [
+            mesh.pbr.get(pbr_base + 2).copied().unwrap_or(1.0),
+            mesh.pbr.get(pbr_base + 3).copied().unwrap_or(0.0),
+            mesh.pbr.get(pbr_base + 4).copied().unwrap_or(0.0),
+            mesh.pbr.get(pbr_base + 5).copied().unwrap_or(1.0),
+        ];
         out.vertices.extend_from_slice(&[
             position[0],
             position[1],
@@ -289,7 +332,15 @@ pub fn build_gpu_mesh(mesh: &GpuMesh, part_emissive: &[Vec3]) -> MeshAssetGpu {
             color[2], //
             emissive[0],
             emissive[1],
-            emissive[2],
+            emissive[2], //
+            pbr_uv,
+            pbr_uv_next, //
+            pbr_tangent[0],
+            pbr_tangent[1],
+            pbr_tangent[2],
+            pbr_tangent[3],
+            pbr_rough,
+            pbr_metal,
         ]);
     }
     for triangle in 0..mesh.triangle_count {
@@ -811,7 +862,7 @@ pub fn tonemap(value: Vec3, exposure: f32, white: f32) -> Vec3 {
 ///
 /// # Returns
 ///
-/// - `[f32` - 计算结果。
+/// - `[f32; 3]` - 计算结果。
 pub fn shade_face(
     albedo: Vec3,
     emissive: Vec3,
@@ -1232,6 +1283,11 @@ layout(location = 0) in vec3 a_position;
 layout(location = 1) in vec3 a_normal;
 layout(location = 2) in vec3 a_color;
 layout(location = 3) in vec3 a_emissive;
+// PBR 顶点属性从 9 起:4-8 已被 instanced 的 model matrix + tint 占满。
+layout(location = 9) in vec2 a_uv;
+layout(location = 10) in vec2 a_tangent_xy;
+layout(location = 11) in vec2 a_tangent_zw;
+layout(location = 12) in vec2 a_rough_metal;
 
 // Instanced attributes.
 layout(location = 4) in vec4 i_row0;
@@ -1248,6 +1304,9 @@ out vec3 v_emissive;
 out vec3 v_tint;
 out float v_eye_distance;
 out vec3 v_world;
+// PBR 表面参数:切线空间法线贴图需要 TBN,粗糙度/金属度决定 BRDF 分支。
+out vec2 v_uv;
+out vec4 v_tangent;
 // 顶点烘焙的接触 AO:1.0 = 不压暗,< 1.0 = 贴近地面的顶点被压暗。
 //
 // 在顶点着色器里算而不是多占一个交错通道:顶点格式已经是
@@ -1277,6 +1336,14 @@ void main() {
     v_tint = i_tint;
     v_world = world.xyz;
     v_eye_distance = distance(world.xyz, u_eye);
+    // PBR 表面参数。切线按模型的 mat3 旋转到世界空间,和法线保持同一套
+    // 变换 —— 否则旋转过的实例上,法线贴图会贴在错误的轴向上。
+    v_uv = a_uv;
+    v_tangent = vec4(mat3(model) * vec3(a_tangent_xy, a_tangent_zw.x),
+                     a_tangent_zw.y);
+    // 粗糙度 / 金属度是逐面常量,三角内三个顶点取值相同,所以线性插值
+    // 回来还是原值 —— 不需要额外的插值器或展平(flat)限定。
+    v_surface = vec2(a_rough_metal.x, a_rough_metal.y);
 
     // ---- 顶点烘焙接触 AO:按「离自己的几何基座有多近」压暗 ----
     //
@@ -1332,6 +1399,9 @@ layout(location = 0) in vec3 a_position;
 layout(location = 1) in vec3 a_normal;
 layout(location = 2) in vec3 a_color;
 layout(location = 3) in vec3 a_emissive;
+layout(location = 4) in vec2 a_uv;
+layout(location = 5) in vec2 a_tangent_xy;
+layout(location = 6) in vec2 a_tangent_zw;
 
 layout(location = 4) in vec4 i_row0;
 layout(location = 5) in vec4 i_row1;
@@ -1799,6 +1869,12 @@ in float v_contact_ao;
 // 少这一行,链接期不报错、`gl.getError()` 也是 0,但整个片元着色器编译
 // 失败 → WebGL2 初始化回退 → 画面全黑、只有 HUD 还在跑。
 in vec3 v_world;
+// PBR:UV 供程序化细节层使用,切线供切线空间法线扰动。
+in vec2 v_uv;
+in vec4 v_tangent;
+// x = 粗糙度,y = 金属度。由顶点着色器从 `mesh::expand_asset` 写出的
+// 每顶点 PBR 列直接透传(常量插值即可,不需要插值器)。
+in vec2 v_surface;
 
 uniform vec3 u_light_dir;
 uniform vec3 u_light_color;
@@ -1905,6 +1981,61 @@ float sample_shadow(vec3 world, float n_dot_l) {
     return visibility / 9.0;
 }
 
+// ---- PBR ----
+//
+// 金属/介电质的分裂是这一段存在的唯一理由:两者对同一束光的响应完全不同。
+// 介电质(金属度 0)的高光来自表面菲涅尔反射,漫反射被保留,所以无论粗糙度
+// 多大都还有颜色;金属(金属度 1)没有漫反射,颜色全部来自镜面反射的染色,
+// 粗糙度低时是彩色镜面,高时趋近灰色。之前的着色器把两者当同一种漫反射材质,
+// 所以「金属度 0.85 的车漆」和「金属度 0 的车漆」画出来完全一样 —— GLB 里
+// 那 34 个 PBR 材质到了这一层就退化成了 base_color。
+
+// Schlick 菲涅nel,`f0` 是法线方向上的反射率。
+float fresnel_schlick(float cos_theta, vec3 f0) {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// GGX / Trowbridge-Reitz 的法线分布项,是整个 BRDF 里决定高光形状的那一项。
+float distribution_ggx(vec3 n, vec3 h, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float n_dot_h = max(dot(n, h), 0.0);
+    float denominator = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * denominator * denominator, 1e-6);
+}
+
+// Smith 几何项(GGX 高度相关版本),负责掠射角的自遮蔽。
+float geometry_smith(vec3 n, vec3 v, vec3 l, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    float n_dot_v = max(dot(n, v), 0.0);
+    float n_dot_l = max(dot(n, l), 0.0);
+    float g_v = n_dot_v / (n_dot_v * (1.0 - k) + k);
+    float g_l = n_dot_l / (n_dot_l * (1.0 - k) + k);
+    return g_v * g_l;
+}
+
+// 单向光的直接光照项。
+vec3 shade_direct(vec3 n, vec3 v, vec3 l, vec3 light_color, vec3 albedo,
+                  float roughness, float metallic) {
+    vec3 h = normalize(v + l);
+    float n_dot_l = max(dot(n, l), 0.0);
+    if (n_dot_l <= 0.0) {
+        return vec3(0.0);
+    }
+    // 介电质的 F0 恒为 0.04;金属的 F0 就是它的基色(彩色反射的来源)。
+    vec3 f0 = mix(vec3(0.04), albedo, metallic);
+    float n_dot_v = max(dot(n, v), 0.0);
+    vec3 f = fresnel_schlick(max(dot(h, v), 0.0), f0);
+    float d = distribution_ggx(n, h, roughness);
+    float g = geometry_smith(n, v, l, roughness);
+    vec3 specular = (d * g * f) / max(4.0 * n_dot_v * n_dot_l, 1e-4);
+    // 金属没有漫反射(能量全部走镜面),介电质的漫反射按 (1 - F) 衰减,
+    // 保证能量守恒:菲涅尔越强,漫反射越弱。
+    vec3 diffuse = (vec3(1.0) - f) * albedo * (1.0 - metallic) / PI;
+    return (diffuse + specular) * light_color * n_dot_l;
+}
+
 void main() {
     vec3 normal = normalize(v_normal);
     float n_dot_l = max(dot(normal, u_light_dir), 0.0);
@@ -1936,7 +2067,24 @@ void main() {
     // 淡淡的接触暗部,物体才不至于「漂起来」。
     shadow = mix(1.0, shadow, u_shadow_params.x);
 
-    vec3 lit = base * (ambient * ao_factor + u_light_color * n_dot_l * shadow)
+    // ---- PBR 直接光 ----
+    // 视线方向:片元 → 眼睛。BRDF 的镜面项要用这个方向(不是入射方向)。
+    vec3 to_eye = normalize(u_eye - v_world);
+
+    // 表面参数来自 `mesh::expand_asset` 写出的 PBR 列:没有 UV/切线的资产
+    // 在那里按面法线做三平面投影并推导切线,所以这一层总是有可用值。
+    // 粗糙度下限 0.04 是物理要求:0 会让 GGX 分母除零并炸出 NaN 白斑。
+    float roughness = clamp(v_surface.x, 0.04, 1.0);
+    float metallic = clamp(v_surface.y, 0.0, 1.0);
+
+    vec3 direct = shade_direct(normal, to_eye, u_light_dir,
+                               u_light_color * shadow, base,
+                               roughness, metallic);
+
+    // 环境项同样按金属度分裂:金属的环境反射带基色染色,介电质只取天光。
+    vec3 environment = ambient * ao_factor * mix(vec3(1.0), base, metallic);
+
+    vec3 lit = direct + environment * base
              + base * v_emissive * u_emissive_gain;
 
     // ---- 顶点烘焙接触 AO ----
@@ -3597,11 +3745,11 @@ impl WebGlRenderer {
         //   几何全部 z-fighting(第三人称贴着地面看只剩一片单色)。
         let attributes: JsValue = JsValue::from(js_sys::Object::new());
         for (name, value) in [
-            (crate::r#const::GL_ATTR_ALPHA, false),
-            (crate::r#const::GL_ATTR_DEPTH, true),
-            (crate::r#const::GL_ATTR_STENCIL, false),
-            (crate::r#const::GL_ATTR_ANTIALIAS, false),
-            (crate::r#const::GL_ATTR_PRESERVE_DRAWING_BUFFER, true),
+            (crate::r#config::GL_ATTR_ALPHA, false),
+            (crate::r#config::GL_ATTR_DEPTH, true),
+            (crate::r#config::GL_ATTR_STENCIL, false),
+            (crate::r#config::GL_ATTR_ANTIALIAS, false),
+            (crate::r#config::GL_ATTR_PRESERVE_DRAWING_BUFFER, true),
         ] {
             let _: Result<bool, JsValue> = js_sys::Reflect::set(
                 &attributes,
@@ -3954,6 +4102,21 @@ impl WebGlRenderer {
                 (attribute as i32) * 12,
             );
         }
+        // 顶点属性 9-11:`uv` 占 float 12/13,`tangent(xyz, w)` 占 float 14-17。
+        // 切线拆成两个 vec2(属性 10 = xy、属性 11 = zw),因为 vec4 单属性会
+        // 吃掉 4 个连续 slot,而 4-8 已经被 instanced 属性占用。
+        for (attribute, component_offset) in [(9u32, 12i32), (10u32, 14), (11u32, 16), (12u32, 18)]
+        {
+            context.enable_vertex_attrib_array(attribute);
+            context.vertex_attrib_pointer_with_i32(
+                attribute,
+                2,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                stride,
+                component_offset * 4,
+            );
+        }
 
         let index_buffer: WebGlBuffer = context
             .create_buffer()
@@ -4058,6 +4221,19 @@ impl WebGlRenderer {
                 false,
                 stride,
                 (attribute as i32) * 12,
+            );
+        }
+        // 与 `upload_mesh` 相同的 PBR 属性:uv = float 12/13,
+        // tangent(xyz, w) 拆成 float 14-15 与 16-17 两个 vec2。
+        for (attribute, component_offset) in [(9u32, 12i32), (10u32, 14), (11u32, 16), (12u32, 18)]
+        {
+            context.vertex_attrib_pointer_with_i32(
+                attribute,
+                2,
+                WebGl2RenderingContext::FLOAT,
+                false,
+                stride,
+                component_offset * 4,
             );
         }
         context.bind_buffer(
@@ -4760,7 +4936,7 @@ impl WebGlRenderer {
                 {
                     // 整批都在近平面之外(常见情况:一排路灯 / 一排行道树),
                     // 就地过滤一次,避免为了剔一两个实例而重新分配。
-                    let mut kept: Vec<Instance> = std::mem::take(self.get_scratch_mut());
+                    let mut kept: Vec<Instance> = take(self.get_scratch_mut());
                     kept.clear();
                     kept.extend(
                         batch
@@ -4816,7 +4992,7 @@ impl WebGlRenderer {
                     .iter()
                     .any(|inst: &Instance| instance_distance(inst, eye) < near_cull_radius);
                 if any_near && batch.near_cull {
-                    let mut kept: Vec<Instance> = std::mem::take(self.get_scratch_mut());
+                    let mut kept: Vec<Instance> = take(self.get_scratch_mut());
                     kept.clear();
                     kept.extend(
                         batch
@@ -5188,9 +5364,7 @@ impl SoftwareRenderer {
 
         // 画家算法:远 → 近。
         queue.sort_by(|a: &ScreenTriangle, b: &ScreenTriangle| {
-            b.depth
-                .partial_cmp(&a.depth)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            b.depth.partial_cmp(&a.depth).unwrap_or(Ordering::Equal)
         });
         let count: u32 = queue.len() as u32;
         let mut previous: &str = "";
@@ -5320,9 +5494,7 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::{AdaptiveQuality, QualityTier};
-    use crate::r#const::{
-        FAST_FRAME_THRESHOLD, QUALITY_DOWN_FPS, SLOW_FRAME_THRESHOLD,
-    };
+    use crate::r#config::{FAST_FRAME_THRESHOLD, QUALITY_DOWN_FPS, SLOW_FRAME_THRESHOLD};
 
     /// 回归:降档是**单向**的 —— 代码里刻意不执行升档。
     ///
@@ -5368,16 +5540,16 @@ mod tests {
             "只有 High 档才跑 SSR"
         );
     }
-    use crate::r#const::{
+    use crate::r#config::{
+        BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FEATHER, CONTACT_SHADOW_FLOOR,
+        CONTACT_SHADOW_MIN_HEIGHT, CONTACT_SHADOW_REACH, SSAO_RADIUS, U_AO_FEATHER, U_AO_FLOOR,
+        U_AO_HEIGHT, U_AO_MIN_HEIGHT, U_AO_REACH, U_BLOOM_DIR, U_BLOOM_THRESHOLD,
+    };
+    use crate::r#config::{
         PHASE_FIELD_VALUE, PHASE_QUERY_DUSK, PHASE_QUERY_NIGHT, PHASE_QUERY_NOON,
         SHADOW_CULL_MARGIN, SHADOW_GROUNDED_EPS, SHADOW_HALF_EXTENT, T_PHASE_QUERY_MAPS,
         T_PHASE_QUERY_PROBE, T_PHASE_QUERY_UNKNOWN, T_SHADOW_CULLS_OUTSIDE, T_SHADOW_GROUNDED_SAFE,
         T_SHADOW_KEEPS_CENTRE, T_SHADOW_KEEPS_MARGIN, T_SHADOW_TALL_KEPT,
-    };
-    use crate::r#const::{
-        BAKED_CONTACT_AO_HEIGHT, CONTACT_SHADOW_FEATHER, CONTACT_SHADOW_FLOOR,
-        CONTACT_SHADOW_MIN_HEIGHT, CONTACT_SHADOW_REACH, SSAO_RADIUS, U_AO_FEATHER, U_AO_FLOOR,
-        U_AO_HEIGHT, U_AO_MIN_HEIGHT, U_AO_REACH, U_BLOOM_DIR, U_BLOOM_THRESHOLD,
     };
     use crate::render::{
         BLOOM_BLUR_FRAGMENT_SHADER, BLOOM_EXTRACT_FRAGMENT_SHADER, COMPOSITE_FRAGMENT_SHADER,
@@ -5385,6 +5557,12 @@ mod tests {
         SHADOW_VERTEX_SHADER, SSAO_FRAGMENT_SHADER, SSR_FRAGMENT_SHADER, VERTEX_SHADER,
     };
     use crate::render::{DayPhase, Instance, instance_affects_shadow, normalize3};
+
+    /// `fill()` 断言文案里的字段名占位符(§1.3c:字面量集中在 const.rs)。
+    const L_DIST: &str = "dist";
+    const L_REACH: &str = "reach";
+    const L_LY: &str = "ly";
+
     use crate::r#type::Vec3;
 
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值。
@@ -5423,7 +5601,7 @@ mod tests {
             "{}",
             fill(
                 T_SHADOW_KEEPS_CENTRE,
-                &[("dist", "0.00"), ("reach", &format!("{:.2}", reach()))]
+                &[(L_DIST, "0.00"), (L_REACH, &format!("{:.2}", reach()))]
             )
         );
     }
@@ -5441,8 +5619,8 @@ mod tests {
             fill(
                 T_SHADOW_CULLS_OUTSIDE,
                 &[
-                    ("dist", &format!("{:.2}", reach() * 2.0)),
-                    ("reach", &format!("{:.2}", reach()))
+                    (L_DIST, &format!("{:.2}", reach() * 2.0)),
+                    (L_REACH, &format!("{:.2}", reach()))
                 ]
             )
         );
@@ -5461,8 +5639,11 @@ mod tests {
             fill(
                 T_SHADOW_KEEPS_MARGIN,
                 &[
-                    ("dist", &format!("{:.2}", SHADOW_HALF_EXTENT + SHADOW_CULL_MARGIN * 0.5)),
-                    ("reach", &format!("{:.2}", reach()))
+                    (
+                        L_DIST,
+                        &format!("{:.2}", SHADOW_HALF_EXTENT + SHADOW_CULL_MARGIN * 0.5)
+                    ),
+                    (L_REACH, &format!("{:.2}", reach()))
                 ]
             )
         );
@@ -5480,9 +5661,9 @@ mod tests {
             fill(
                 T_SHADOW_GROUNDED_SAFE,
                 &[
-                    ("ly", &format!("{:.6}", flat[1].abs())),
-                    ("dist", "1.00"),
-                    ("reach", &format!("{:.2}", reach()))
+                    (L_LY, &format!("{:.6}", flat[1].abs())),
+                    (L_DIST, "1.00"),
+                    (L_REACH, &format!("{:.2}", reach()))
                 ]
             )
         );
@@ -5513,8 +5694,8 @@ mod tests {
                 T_SHADOW_TALL_KEPT,
                 &[
                     ("height", &format!("{height:.0}")),
-                    ("dist", &format!("{dist:.2}")),
-                    ("reach", &format!("{:.2}", reach()))
+                    (L_DIST, &format!("{dist:.2}")),
+                    (L_REACH, &format!("{:.2}", reach()))
                 ]
             )
         );
@@ -5668,8 +5849,8 @@ mod tests {
         let low: f32 = CONTACT_SHADOW_MIN_HEIGHT;
         let high: f32 = BAKED_CONTACT_AO_HEIGHT;
         let proximity: f32 = 1.0 - smoothstep(reach - feather, reach, horizontal);
-        let low_enough: f32 = smoothstep(low, low + 0.001, world_y)
-            * (1.0 - smoothstep(high - 0.001, high, world_y));
+        let low_enough: f32 =
+            smoothstep(low, low + 0.001, world_y) * (1.0 - smoothstep(high - 0.001, high, world_y));
         1.0 - (1.0 - CONTACT_SHADOW_FLOOR) * low_enough * proximity
     }
 
@@ -5784,23 +5965,19 @@ mod tests {
                 let phi: f32 = fi * 2.39996323;
                 let cos_theta: f32 = (1.0 - fi / 8.0).sqrt();
                 let sin_theta: f32 = (fi / 8.0).sqrt();
-                let dir: [f32; 3] = [
-                    phi.cos() * sin_theta,
-                    phi.sin() * sin_theta,
-                    cos_theta,
-                ];
+                let dir: [f32; 3] = [phi.cos() * sin_theta, phi.sin() * sin_theta, cos_theta];
                 let sv: [f32; 3] = [
                     origin[0] + dir[0] * radius,
                     origin[1] + dir[1] * radius,
                     origin[2] + dir[2] * radius,
                 ];
                 // ⚠️ 这一步必须与 `view_position()` 的映射**互逆**:
-        // `view_position` 写的是 `view.xy = ndc.xy * u_proj_params * d`,
-        // 所以反投影要**除以** `u_proj_params`。原着色器漏了这个除法 ——
-        // 采样点被放大到 `u_proj_params`(≈ 2.05)倍,大量样本落到画面外
-        // 被 `continue` 丢掉。这是第三个独立缺陷:即使前两处单位都改对,
-        // 只活下来的样本依然不足以构成有意义的遮蔽。
-        let uv: [f32; 2] = [
+                // `view_position` 写的是 `view.xy = ndc.xy * u_proj_params * d`,
+                // 所以反投影要**除以** `u_proj_params`。原着色器漏了这个除法 ——
+                // 采样点被放大到 `u_proj_params`(≈ 2.05)倍,大量样本落到画面外
+                // 被 `continue` 丢掉。这是第三个独立缺陷:即使前两处单位都改对,
+                // 只活下来的样本依然不足以构成有意义的遮蔽。
+                let uv: [f32; 2] = [
                     sv[0] / (-sv[2]).max(1e-3) / proj_x * 0.5 + 0.5,
                     sv[1] / (-sv[2]).max(1e-3) / proj_y * 0.5 + 0.5,
                 ];
@@ -5814,5 +5991,115 @@ mod tests {
                  SSAO 又会退化成输出 1.0 的空转(SSAO_RADIUS={radius})"
             );
         }
+    }
+
+    /// 顶点布局:`build_gpu_mesh` 每个顶点必须正好写满 `STRIDE_FLOATS`。
+    ///
+    /// 这是 PBR 改造最容易静默破坏的地方:少写两个 f32 不会编译报错,
+    /// 只会在 VAO 读取 `roughness|metallic` 时越界取到邻居顶点的值 ——
+    /// 表现是随机几个面变镜面,和「GPU 崩了」完全不像,极难定位。
+    /// 最后一个 f32 必须是金属度,且缺省为介电质。
+    ///
+    /// # Arguments
+    ///
+    /// 无。
+    ///
+    /// # Returns
+    ///
+    /// - 无:断言失败即 panic。
+    #[test]
+    fn pbr_vertex_layout_is_exactly_stride_wide() {
+        use crate::mesh::expand_asset;
+        // 一个只含一个三角形的资产,uv/切线/粗糙度/金属度全部缺省,
+        // 逼 expand_asset 走程序化投影与推导切线的兜底分支。
+        let asset: crate::mesh::MeshAsset = crate::mesh::MeshAsset {
+            id: "pbr_probe".to_string(),
+            category: crate::r#config::TEST_CATEGORY.to_string(),
+            y_up: true,
+            bounds: None,
+            parts: vec![crate::mesh::MeshPart {
+                name: "probe".to_string(),
+                base_color: Some([0.5, 0.5, 0.5]),
+                emissive: None,
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                normals: None,
+                uv: None,
+                tangents: None,
+                roughness: None,
+                metallic: None,
+                texture_atlas: None,
+                surface_kind: None,
+                faces: vec![[0, 1, 2]],
+                face_colors: None,
+                flat: true,
+            }],
+        };
+        let mesh: crate::mesh::GpuMesh = expand_asset(&asset).expect("probe asset expands");
+
+        // 每个顶点 9 个紧凑 f32(位置/法线/颜色)。
+        assert_eq!(
+            mesh.get_vertices_ref().len(),
+            9 * 3,
+            "expand_asset 每顶点必须写 9 个 f32"
+        );
+        // 每个顶点 8 个 PBR f32(uv2|切线4|粗糙1|金属1)。
+        assert_eq!(
+            mesh.pbr.len(),
+            crate::mesh::FLOATS_PER_PBR_VERTEX * 3,
+            "expand_asset 每顶点必须写 8 个 PBR f32"
+        );
+
+        let gpu: super::MeshAssetGpu = super::build_gpu_mesh(&mesh, &[]);
+        assert_eq!(
+            gpu.vertices.len(),
+            super::STRIDE_FLOATS * 3,
+            "GPU 顶点缓冲必须是 STRIDE_FLOATS × 顶点,否则 VAO 会越界读"
+        );
+
+        // 最后两个 f32 必须是粗糙度 / 金属度,且落在缺省范围内。
+        let rough: f32 = gpu.vertices[super::STRIDE_FLOATS - 2];
+        let metal: f32 = gpu.vertices[super::STRIDE_FLOATS - 1];
+        assert!(
+            (crate::mesh::DEFAULT_ROUGHNESS..=1.0).contains(&rough),
+            "缺省粗糙度应回落到 DEFAULT_ROUGHNESS,实际 {rough}"
+        );
+        assert_eq!(metal, crate::mesh::DEFAULT_METALLIC, "缺省金属度应是介电质");
+    }
+
+    /// 金属度必须真的改变着色结果,否则 PBR 只是多算了几个没用的数。
+    ///
+    /// 断言放在数据侧:`expand_asset` 要把 `roughness` / `metallic`
+    /// 原样透传到 PBR 列。着色器分支本身要靠 GPU 采样验证,数据侧能
+    /// 保证「值确实到位」,不会被一次着色器改动悄悄架空。
+    #[test]
+    fn pbr_scalars_survive_expansion() {
+        use crate::mesh::expand_asset;
+        let asset: crate::mesh::MeshAsset = crate::mesh::MeshAsset {
+            id: "pbr_metal".to_string(),
+            category: crate::r#config::TEST_CATEGORY.to_string(),
+            y_up: true,
+            bounds: None,
+            parts: vec![crate::mesh::MeshPart {
+                name: "chrome".to_string(),
+                base_color: Some([0.8, 0.8, 0.9]),
+                emissive: None,
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: None,
+                uv: None,
+                tangents: None,
+                // 车漆 / 铬件那一档:低粗糙度 + 高金属度。
+                roughness: Some(0.08),
+                metallic: Some(0.85),
+                texture_atlas: None,
+                surface_kind: None,
+                faces: vec![[0, 1, 2]],
+                face_colors: None,
+                flat: true,
+            }],
+        };
+        let mesh: crate::mesh::GpuMesh = expand_asset(&asset).expect("metal expands");
+        let last: usize = mesh.pbr.len() - 1;
+        assert_eq!(mesh.pbr[last - 1], 0.08, "粗糙度必须原样透传");
+        assert_eq!(mesh.pbr[last], 0.85, "金属度必须原样透传");
     }
 }

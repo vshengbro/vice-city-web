@@ -21,7 +21,8 @@
 //! 3. 分��是纯水平(XZ)的,垂直方向交给重力 —— 不会把玩家「吸」到墙上。
 
 use crate::{
-    r#const::SHOWCASE_STAIR_RUN,
+    r#config::SHOWCASE_STAIR_RUN,
+    swap,
     r#type::{Vec2, Vec3},
 };
 
@@ -54,7 +55,7 @@ const INTERIOR_SIGHT_EPSILON: f32 = 1e-6;
 /// 小于它,`substeps == 1`,整帧仍走一次 —— 正常帧率的手感逐帧不变。
 /// 取值一旦掉到 0.077 以下,那条 no-op 前提就没了,单测
 /// `the_interior_sweep_is_a_no_op_at_sixty_fps` 会立刻红。
-pub const INTERIOR_SLIDE_SUBSTEP: f32 = 0.10;
+pub(crate) const INTERIOR_SLIDE_SUBSTEP: f32 = 0.10;
 
 /// 室内垂直碰撞体:一块楼板或一段隔墙。
 #[derive(Clone, Copy, Debug)]
@@ -587,7 +588,7 @@ impl FloorWorld {
                 let mut t0: f32 = (low - origin) / delta;
                 let mut t1: f32 = (high - origin) / delta;
                 if t0 > t1 {
-                    std::mem::swap(&mut t0, &mut t1);
+                    swap(&mut t0, &mut t1);
                 }
                 enter = enter.max(t0);
                 exit = exit.min(t1);
@@ -738,7 +739,7 @@ impl Default for FloorWorld {
 ///
 /// 室内楼梯每级 0.305 m,这里留到 0.45 m:既高于单级台阶(走上去会被抬),
 /// 又远低于门洞 2.30 m 与层高 3.05 m(所以不会一步跨上二层楼板)。
-pub const STEP_UP_TOLERANCE: f32 = 0.45;
+pub(crate) const STEP_UP_TOLERANCE: f32 = 0.45;
 
 /// 「脚下的板」允许比脚底低多少仍然算支撑(米)。
 ///
@@ -767,7 +768,7 @@ pub const SUPPORT_CATCH_EPSILON: f32 = 0.001;
 ///
 /// 上界仍然是 `STEP_UP_TOLERANCE`,两者一起构成一个以脚底为心的窗口
 /// `[y - 0.355, y + 0.45]`。
-pub const STEP_DOWN_TOLERANCE: f32 = crate::r#const::SHOWCASE_STAIR_RISE + 0.05;
+pub const STEP_DOWN_TOLERANCE: f32 = crate::r#config::SHOWCASE_STAIR_RISE + 0.05;
 
 /// 竖直解算把一帧切分成多小的水平小步(米)。
 ///
@@ -822,7 +823,7 @@ fn push_out_aabb(center: Vec2, half: Vec2, point: Vec2, radius: f32) -> Option<(
 
 #[cfg(test)]
 mod tests {
-    use crate::r#const::{
+    use crate::r#config::{
         T_INTERIOR_BASELINE_AGREES, T_INTERIOR_BASELINE_STILL_FAILS, T_INTERIOR_BASELINE_TOKEN,
         T_INTERIOR_CEILING_INSIDE, T_INTERIOR_DESCENT_NO_CLIMB, T_INTERIOR_DESCENT_REACHES_GROUND,
         T_INTERIOR_DOORWAY_BLOCKS, T_INTERIOR_DOORWAY_THROUGH, T_INTERIOR_DT_TOKEN,
@@ -853,7 +854,7 @@ mod tests {
 
     /// 把断言模板里的占位符换成实际数值。
     ///
-    /// 占位符本身来自 `crate::r#const` 的 `T_INTERIOR_*_TOKEN` 常量,
+    /// 占位符本身来自 `crate::r#config` 的 `T_INTERIOR_*_TOKEN` 常量,
     /// 与仓库既有做法一致(见 [`long_frame_height_message`])。
     fn fill(template: &str, args: &[(&str, &str)]) -> String {
         let mut out: String = template.to_string();

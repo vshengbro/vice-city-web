@@ -577,7 +577,7 @@ mod r#tests {
     /// 判据的有效半径:半宽 + 余量(`render.rs` 的 `SHADOW_HALF_EXTENT`
     /// 与 `SHADOW_CULL_MARGIN`)。
     fn reach() -> f32 {
-        crate::r#const::SHADOW_HALF_EXTENT + crate::r#const::SHADOW_CULL_MARGIN
+        crate::r#config::SHADOW_HALF_EXTENT + crate::r#config::SHADOW_CULL_MARGIN
     }
 
     /// ⚠️ **只测原点的判据会误剔高楼** —— 这条钉住那个坑。
@@ -1014,7 +1014,7 @@ pub struct WebGpuRenderer {
     /// 光源视投影矩阵 uniform buffer(主 pass 与阴影 pass 各绑一份
     /// 同一个 buffer 到不同的 binding 上)。
     pub(crate) shadow_frame_buffer: JsValue,
-    /// 阴影深度纹理(`depth32float`,边长 [`crate::r#const::SHADOW_MAP_SIZE`] 的正方形)。
+    /// 阴影深度纹理(`depth32float`,边长 [`crate::r#config::SHADOW_MAP_SIZE`] 的正方形)。
     pub(crate) shadow_texture: JsValue,
     /// 阴影 pass 专用的 instance buffer。
     ///

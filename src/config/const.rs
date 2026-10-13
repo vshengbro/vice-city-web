@@ -479,7 +479,7 @@ pub(crate) const T_AIR_WALL_PROBE_FOUND_NO_SPOTS: &str = "空气墙探针一个�
 /// 单元测试夹具:路灯资产本体(真实 JSON,避免测试和资产脱节)。
 #[cfg(test)]
 pub(crate) const FIXTURE_PROP_STREETLIGHT_JSON: &str =
-    include_str!("../assets/prop_streetlight.json");
+    include_str!("../../assets/prop_streetlight.json");
 
 /// 单元测试夹具:紫罗兰塔(真实 JSON)。
 ///
@@ -487,12 +487,12 @@ pub(crate) const FIXTURE_PROP_STREETLIGHT_JSON: &str =
 /// 地面以下几十米,`bounds` 跟着被撑大 —— 断言才抓得住。
 #[cfg(test)]
 pub(crate) const FIXTURE_BLDG_LILAC_TOWER_JSON: &str =
-    include_str!("../assets/bldg_lilac_tower.json");
+    include_str!("../../assets/bldg_lilac_tower.json");
 
 /// 单元测试夹具:交通信号灯资产本体。
 #[cfg(test)]
 pub(crate) const FIXTURE_PROP_TRAFFICLIGHT_JSON: &str =
-    include_str!("../assets/prop_trafficlight.json");
+    include_str!("../../assets/prop_trafficlight.json");
 
 /// 单元测试断言文案:夹具资产 JSON 解析失败。
 #[cfg(test)]
@@ -516,15 +516,15 @@ pub(crate) const T_SIDE_FRAMES_BOUNDS_BLOWN: &str = "端面窗框撑大了 bound
 
 /// 单元测试夹具:轿车(作为「其它车」的剪影基准)。
 #[cfg(test)]
-pub(crate) const FIXTURE_CAR_SEDAN_JSON: &str = include_str!("../assets/car_sedan.json");
+pub(crate) const FIXTURE_CAR_SEDAN_JSON: &str = include_str!("../../assets/car_sedan.json");
 
 /// 单元测试夹具:出租车(应读作高挑单厢车,不是换漆的轿车)。
 #[cfg(test)]
-pub(crate) const FIXTURE_CAR_TAXI_JSON: &str = include_str!("../assets/car_taxi.json");
+pub(crate) const FIXTURE_CAR_TAXI_JSON: &str = include_str!("../../assets/car_taxi.json");
 
 /// 单元测试夹具:警车(应读作方正三厢巡航车)。
 #[cfg(test)]
-pub(crate) const FIXTURE_CAR_POLICE_JSON: &str = include_str!("../assets/car_police.json");
+pub(crate) const FIXTURE_CAR_POLICE_JSON: &str = include_str!("../../assets/car_police.json");
 
 /// 单元测试断言文案:两辆车剪影几乎一样(只是换了漆)。
 pub(crate) const T_SILHOUETTE_TOO_SIMILAR: &str = "剪影与轿车几乎相同,只是换了漆";
@@ -544,7 +544,7 @@ pub(crate) const SLOT_SILHOUETTE_DIMS: &str = "车身尺寸";
 /// 单元测试夹具:水城街机城(一面带内顶点为零的真墙)。
 #[cfg(test)]
 pub(crate) const FIXTURE_BLDG_AQUA_ARCADE_JSON: &str =
-    include_str!("../assets/bldg_aqua_arcade.json");
+    include_str!("../../assets/bldg_aqua_arcade.json");
 
 /// 回归测试:动态层也必须把实体从静态形状里推出来。
 pub(crate) const T_DYNAMIC_STATIC_TOO: &str = "动态体也必须被推出静态形状";
@@ -1564,6 +1564,16 @@ pub(crate) const PED_RUNOVER_SPEED: f32 = 9.0;
 pub(crate) const PED_DOWN_TIME: f32 = 4.0;
 /// 行人察觉危险的距离(米):会跑开。
 pub(crate) const PED_ALERT_RADIUS: f32 = 11.0;
+/// 开车时行人警觉半径的放大系数。
+///
+/// **必须小于 1。** 放大它等于让行人更早起步,而行人跑得越早,车越追不上:
+/// 系数 1.8 时行人从 16.2 m 外就逃窜,24 m/s 的车要从 16.2 m 缩进
+/// `CAR_HIT_RADIUS` 的 2 m 判定圈要 0.87 s,这期间行人已经跑出 ~4.7 m ——
+/// 于是行人永远撞不到,也就永远攒不出通缉星(实测 12 s 满油门零次撞飞)。
+/// 取 0.85 表示「车逼近到比行人警觉距离更近时才开始躲」:保留一点提前量
+/// (车已经在压过来了才躲,看着仍然自然),同时保证 5.4 m/s 的行人跑不出
+/// `CAR_HIT_RADIUS` + `PED_RADIUS` = 2.35 m 的判定圈(实测能跑 2.13 m)。
+pub(crate) const PED_ALERT_CAR_SCALE: f32 = 0.85;
 /// 行人逃跑的持续时间(秒)。
 pub(crate) const PED_FLEE_TIME: f32 = 3.2;
 /// 行人的巡航速度(米/秒)。
@@ -1641,6 +1651,18 @@ pub(crate) const AIM_PITCH_LIMIT: f32 = 0.9;
 
 /// 敌人被 hitscan 命中的判定半径(米)。
 pub(crate) const ENEMY_HIT_RADIUS: f32 = 0.75;
+/// 撞到敌人时判定为「碾压」的相对速度下限(米/秒)。
+///
+/// 跟 [`PED_RUNOVER_MIN_SPEED`] 一样只看**速度**,不看来不来得及躲 ——
+/// 命中的判定交给扫掠线段,速度只负责区分「慢慢蹭过去」和「真的撞上」。
+pub(crate) const ENEMY_RUNOVER_MIN_SPEED: f32 = 3.2;
+/// 碾压一个敌人造成的伤害。
+///
+/// 混混 70 血(`THUG_HEALTH`)两次碾压致死、警察 100 血(`ENEMY_HEALTH`)
+/// 三次 —— 有还手余地,不会一撞就秒。
+pub(crate) const ENEMY_RUNOVER_DAMAGE: f32 = 40.0;
+/// 碾压把敌人推开的速度(米/秒)。
+pub(crate) const ENEMY_RUNOVER_KNOCK: f32 = 9.0;
 /// 命中标记的显示时长(秒)。
 pub(crate) const HITMARKER_TIME: f32 = 0.16;
 
@@ -1794,6 +1816,9 @@ pub(crate) const WATER_ID: &str = "water_procedural";
 
 /// 水面资产的分类。
 pub(crate) const WATER_CATEGORY: &str = "terrain";
+
+/// 测试用资产的类别标签(§1.3c:字面量集中在 const.rs)。
+pub(crate) const TEST_CATEGORY: &str = "prop";
 
 /// 水面 part 名。
 pub(crate) const WATER_PART: &str = "surface";
@@ -2591,3 +2616,22 @@ pub(crate) const BACKEND_WEBGPU: &str = "WebGPU";
 pub(crate) const BACKEND_PARAM: &str = "backend";
 
 pub(crate) const BACKEND_QUERY_WEBGL2: &str = "webgl2";
+
+// 运行时贴图图集(texture atlas)相关字面量。
+//
+// 贴图这一层的字符串有两类:一类是图集键的表面族名与贴图名,流水线按同一批
+// 名字写盘、运行时按同一批名字查表;另一类是测试用的资产 id。放在这里是为了
+// 让"写进去的名字"和"读出来的名字"只有一处定义,改一处不会只改一半。
+
+/// 表面族:车漆。
+pub(crate) const SURFACE_PAINT: &str = "paint";
+/// 表面族:金属。
+pub(crate) const SURFACE_METAL: &str = "metal";
+/// 图集键:表面族 + 贴图名。
+pub(crate) const ATLAS_PAINT_ALBEDO: &str = "paint/albedo";
+/// 测试用:往返读写用的资产 id。
+pub(crate) const ATLAS_TEST_ASSET: &str = "asset_round_trip";
+/// 测试用:从未加载过的资产 id,必须查不到。
+pub(crate) const ATLAS_TEST_MISSING_ASSET: &str = "asset_never_loaded";
+/// 测试断言消息:图集应当能解析。
+pub(crate) const ATLAS_PARSE_EXPECT: &str = "atlas should parse";

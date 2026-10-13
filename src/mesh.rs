@@ -35,7 +35,7 @@
 //! 展开后索引缓冲退化为顺序索引,但仍然真实生成并上传,方便后续 worker
 //! 在需要时改成共享顶点 / 索引优化。
 
-use crate::r#type::Vec3;
+use crate::{Display, r#type::Vec3};
 use serde::Deserialize;
 
 /// 一个三维向量,来自 JSON 数组 `[x, y, z]`。
@@ -129,6 +129,33 @@ pub struct MeshPart {
     /// 是否平面着色。为 true 时忽略顶点法线,统一使用面法线。
     #[serde(default = "default_true")]
     pub flat: bool,
+    /// 每个顶点的 UV 坐标(可缺省,缺省时按面法线做三平面投影)。
+    ///
+    /// 缺省不是「没有 UV」而是「用程序化投影兜底」:资产管线早期不产出 UV,
+    /// 若直接置零,所有零件的贴图会塌到同一个 texel 上,表现为整块纯色。
+    /// [`expand_asset`] 在缺省时按面法线选主轴生成投影坐标,保证新旧资产
+    /// 在同一条渲染路径上都有可用的 UV。
+    #[serde(default)]
+    pub uv: Option<Vec<[f32; 2]>>,
+    /// 每个顶点的切线,`w` 为手性符号(缺省时由面法线推导)。
+    #[serde(default)]
+    pub tangents: Option<Vec<[f32; 4]>>,
+    /// 表面粗糙度 0..1(缺省 [`DEFAULT_ROUGHNESS`] = 0.6,偏哑光)。
+    #[serde(default)]
+    pub roughness: Option<f32>,
+    /// 金属度 0..1(缺省 [`DEFAULT_METALLIC`] = 0.0,介电质)。
+    #[serde(default)]
+    pub metallic: Option<f32>,
+    /// 运行时贴图图集路径(可缺省,缺省时该零件只有标量 PBR)。
+    ///
+    /// 只有写入了 `atlas/<id>.bin` 的资产才会有这个字段。运行时管线经
+    /// HTTP 读取 `assets/*.json`,不读 GLB,所以贴图必须在这里有一个入口,
+    /// 否则第三层(图像纹理)在游戏里完全不可见。
+    #[serde(default, rename = "texture_atlas")]
+    pub texture_atlas: Option<String>,
+    /// 表面族(`paint` / `metal` / `glass` ...),决定该零件用图集里的哪套贴图。
+    #[serde(default, rename = "surface_kind")]
+    pub surface_kind: Option<String>,
 }
 
 /// `flat` 缺省时按 true(与资产 schema 一致)。
@@ -154,7 +181,7 @@ pub enum MeshError {
     Schema(String),
 }
 
-impl std::fmt::Display for MeshError {
+impl Display for MeshError {
     /// 把错误格式化成人类可读的一行。
     ///
     /// # Arguments
@@ -220,6 +247,13 @@ pub struct GpuMesh {
     pub min: Vec3,
     /// 展开后的世界包围盒最大角。
     pub max: Vec3,
+    /// 每顶点的 PBR 数据:`uv(2) | tangent(4) | rough(1) | metal(1)` = 8 f32。
+    ///
+    /// 单列而不是并进 `vertices`,是为了不动 [`FLOATS_PER_VERTEX`]=9 的
+    /// 紧凑布局 —— 那个常量被 `vertex_count`、包围盒推导和全部既有测试
+    /// 共用。GPU 侧由 [`crate::render::build_gpu_mesh`] 把两列合成
+    /// 20 f32 的交错缓冲。
+    pub pbr: Vec<f32>,
 }
 
 impl MeshAsset {
@@ -339,6 +373,87 @@ impl GpuMesh {
 /// 每个顶点的 f32 数量:position(3) + normal(3) + color(3)。
 pub const FLOATS_PER_VERTEX: usize = 9;
 
+/// 金属度缺省值:0.0 = 介电质(非金属)。
+pub(crate) const DEFAULT_METALLIC: f32 = 0.0;
+
+/// 粗糙度缺省值:0.6 = 偏哑光。涂装车漆实测约 0.35,哑光塑料约 0.8,
+/// 取中间值使缺省零件不至于看起来像塑料或镜子。
+pub(crate) const DEFAULT_ROUGHNESS: f32 = 0.6;
+
+/// 每个顶点的 PBR 数据 f32 数量:`uv(2) | tangent(4) | rough(1) | metal(1)`。
+pub(crate) const FLOATS_PER_PBR_VERTEX: usize = 8;
+
+/// 缺省 UV 的投影比例(每米多少个 UV 循环)。
+///
+/// 取 0.5:一块 2 m 宽的车门映出 1 个循环,颗粒度接近贴图的常见 TILE 值;
+/// 太密会让 2048² 的贴图在远处摩尔纹爆掉,太疏则细节拉不开。
+const DEFAULT_UV_SCALE: f32 = 0.5;
+
+/// 按面法线选主轴做三平面投影,给没有 UV 的面生成一组坐标。
+///
+/// 三平面而不是单轴:单轴投影会让与投影轴垂直的面(例如朝上的引擎盖被
+/// 按 X 投影)得到一条常量 UV,贴图整个塌成一条线。取法线绝对值最大的
+/// 轴作为投影面,保证任何朝向的面都有两个变化的坐标。
+///
+/// # Arguments
+///
+/// - `[f32; 3]` - 面法线。
+/// - `[f32; 3]` - 面上一个顶点的位置。
+/// - `f32` - 投影比例(UV 单位 / 米)。
+///
+/// # Returns
+///
+/// - `[f32; 2]` - 该面主投影平面上的 UV。
+fn triplanar_uv(normal: [f32; 3], point: [f32; 3], scale: f32) -> [f32; 2] {
+    let ax: f32 = normal[0].abs();
+    let ay: f32 = normal[1].abs();
+    let az: f32 = normal[2].abs();
+    if az >= ax && az >= ay {
+        [point[0] * scale, point[1] * scale]
+    } else if ax >= ay {
+        [point[1] * scale, point[2] * scale]
+    } else {
+        [point[0] * scale, point[2] * scale]
+    }
+}
+
+/// 推出一条与该面共面的单位切线 —— 法线贴图 TBN 里的 T 分量。
+///
+/// 缺省资产没有切线,但没有切线就做不了切线空间法线贴图,只能退回
+/// 屏幕空间扰动,那会让金属高光在相机移动时「游动」。取离法线最远的
+/// 坐标轴叉乘,保证 T 与 N 垂直;退化(法线正好是坐标轴)时换一个次选轴。
+///
+/// # Arguments
+///
+/// - `[f32; 3]` - 面法线。
+///
+/// # Returns
+///
+/// - `[f32; 3]` - 与该面共面的单位切线。
+fn tangent_for_normal(normal: [f32; 3]) -> [f32; 3] {
+    let axis: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let mut best: [f32; 3] = axis[0];
+    let mut best_dot: f32 = -1.0;
+    for candidate in axis {
+        let dot: f32 =
+            (candidate[0] * normal[0] + candidate[1] * normal[1] + candidate[2] * normal[2]).abs();
+        if dot > best_dot {
+            best_dot = dot;
+            best = candidate;
+        }
+    }
+    let cross: [f32; 3] = [
+        normal[1] * best[2] - normal[2] * best[1],
+        normal[2] * best[0] - normal[0] * best[2],
+        normal[0] * best[1] - normal[1] * best[0],
+    ];
+    let length: f32 = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+    if length < 1e-6 {
+        return [1.0, 0.0, 0.0];
+    }
+    [cross[0] / length, cross[1] / length, cross[2] / length]
+}
+
 /// 面积小于这个值(单位 m²)的三角形直接丢弃。
 ///
 /// 取 1e-9:最小资产(交通锥)也有 0.01 m 量级的小面,离得足够远,
@@ -417,11 +532,49 @@ pub fn expand_asset(asset: &MeshAsset) -> Result<GpuMesh, MeshError> {
             if !asset.y_up {
                 normal = [normal[0], normal[2], normal[1]];
             }
-            for vertex in [v0, v1, v2] {
+            // `uv` / `tangents` 缺省或长度对不上时整体退回程序化兜底 —— 逐顶点数组
+            // 长度一旦和 `positions` 不符,按角取值就会越界 panic。
+            let uv_matches: bool = part
+                .uv
+                .as_ref()
+                .is_some_and(|values: &Vec<[f32; 2]>| values.len() == part.positions.len());
+            let tangent_matches: bool = part
+                .tangents
+                .as_ref()
+                .is_some_and(|values: &Vec<[f32; 4]>| values.len() == part.positions.len());
+            // 粗糙度下限 0.04:0 会让 GGX 的分母除零并炸出 NaN 白斑。
+            let rough: f32 = part.roughness.unwrap_or(DEFAULT_ROUGHNESS).clamp(0.04, 1.0);
+            let metal: f32 = part.metallic.unwrap_or(DEFAULT_METALLIC).clamp(0.0, 1.0);
+            let derived_tangent: [f32; 3] = tangent_for_normal(normal);
+            for (slot, vertex) in [v0, v1, v2].into_iter().enumerate() {
                 mesh.get_vertices_mut().extend_from_slice(&[
                     vertex[0], vertex[1], vertex[2], //
                     normal[0], normal[1], normal[2], //
                     color[0], color[1], color[2],
+                ]);
+                let corner: usize = face[slot];
+                let corner_uv: [f32; 2] = match (uv_matches, part.uv.as_ref()) {
+                    (true, Some(values)) => values[corner],
+                    _ => triplanar_uv(normal, vertex, DEFAULT_UV_SCALE),
+                };
+                let corner_tangent: [f32; 4] = match (tangent_matches, part.tangents.as_ref()) {
+                    (true, Some(values)) => values[corner],
+                    _ => [
+                        derived_tangent[0],
+                        derived_tangent[1],
+                        derived_tangent[2],
+                        1.0,
+                    ],
+                };
+                mesh.pbr.extend_from_slice(&[
+                    corner_uv[0],
+                    corner_uv[1],
+                    corner_tangent[0],
+                    corner_tangent[1],
+                    corner_tangent[2],
+                    corner_tangent[3],
+                    rough,
+                    metal,
                 ]);
                 for axis in 0..3 {
                     if vertex[axis] < min[axis] {
@@ -704,6 +857,12 @@ pub fn cube_part(center: Vec3, half_size: f32, color: Vec3, name: &str) -> MeshP
         emissive: None,
         positions,
         normals: None,
+        uv: None,
+        tangents: None,
+        roughness: None,
+        metallic: None,
+        texture_atlas: None,
+        surface_kind: None,
         faces,
         face_colors: None,
         flat: true,

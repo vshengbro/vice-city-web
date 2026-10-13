@@ -302,6 +302,9 @@ pub(crate) const CULL_MODE_FRONT: &str = "front";
 /// 顶点属性格式:`float32x3`。
 pub(crate) const VERTEX_FORMAT_F32X3: &str = "float32x3";
 
+/// PBR 顶点属性用的两通道浮点格式(UV 与拆开的切线)。
+pub(crate) const VERTEX_FORMAT_F32X2: &str = "float32x2";
+
 /// 顶点属性格式:`float32x4`(model matrix 的 4 行)。
 pub(crate) const VERTEX_FORMAT_F32X4: &str = "float32x4";
 
@@ -601,7 +604,6 @@ fn fs_blur(in : VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(total / weight_sum, 0.0, 0.0, 1.0);
 }
 "#;
-
 
 /// 全屏三角形:所有离屏 pass 共用,UV 在这里翻一次。
 /// SSAO / AO 模糊模板里的占位符名。

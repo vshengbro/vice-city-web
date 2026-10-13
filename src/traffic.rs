@@ -30,7 +30,7 @@
 use crate::{
     FRAC_PI_2, PI,
     collision::{CAR_FOOTPRINT, CAR_STEP, CollisionWorld},
-    r#const::*,
+    r#config::*,
     player::{MAX_HEALTH, Player},
     r#type::{Vec2, Vec3},
 };
@@ -131,7 +131,7 @@ pub const STEER_MIN_SPEED: f32 = 1.2;
 pub(crate) const PICKUP_RADIUS: f32 = 2.2;
 /// 玩家走到车边多少米内可以按 F 上车。
 /// 车队巡航速度(米/秒)——城市道路 8–15 m/s,取区间中段。
-pub const CRUISE_SPEED: f32 = 11.5;
+pub(crate) const CRUISE_SPEED: f32 = 11.5;
 
 pub const ENTER_VEHICLE_RADIUS: f32 = 4.2;
 /// 车辆「靠边等人」的距离(米)。
@@ -173,7 +173,6 @@ const ROUTE_PICK: f32 = 0.62;
 /// 数值取自 [`CAR_STEP`]:车长 4.566 m,而世界里最薄的静态碰撞体只有
 /// 0.133 m(交通锥),一帧走 1.6 m 足以整个跳过它。子步保证任何单步
 /// 位移都短于最薄障碍 —— 那是「车不再穿楼」的最后一道保证。
-
 
 /// 「这一步其实没走成」的判定余量(米)。
 ///
@@ -611,11 +610,7 @@ impl TrafficCar {
         .abs()
             > CAR_FOOTPRINT[1];
         let axis: i32 = if skewed {
-            if to_x_street < to_z_street {
-                0
-            } else {
-                1
-            }
+            if to_x_street < to_z_street { 0 } else { 1 }
         } else {
             self.get_lane_axis()
         };
@@ -790,8 +785,7 @@ impl TrafficCar {
         // 位移按 `CAR_STEP` 切子步。被挡下时位移被吃掉,车就停在障碍
         // 前面 —— 这条是「不再穿楼」的最后一道保证,即使路网或蓝图出错,
         // 车也只会卡住而不会开进去。
-        let resolved: Vec2 =
-            world.resolve_car_footprint([here[0], here[2]], delta, self.get_yaw());
+        let resolved: Vec2 = world.resolve_car_footprint([here[0], here[2]], delta, self.get_yaw());
         self.set_position([resolved[0], here[1], resolved[1]]);
         if self.get_speed() > 0.0 {
             let moved: f32 = (resolved[0] - here[0]).abs() + (resolved[1] - here[2]).abs();
@@ -1324,12 +1318,12 @@ pub fn apply_pickup(player: &mut Player, pickup: &mut Pickup) {
 
 #[cfg(test)]
 mod tests {
-    use crate::r#const::*;
+    use super::{FRAC_PI_2, PI};
+    use crate::r#config::*;
     use crate::traffic::{
         DRIFT_SLIP_RATIO, LATERAL_GRIP, REVERSE_SPEED_MAX, STEER_MIN_SPEED, STEER_RATE, TrafficCar,
         WHEEL_RADIUS,
     };
-    use super::{FRAC_PI_2, PI};
     use crate::r#type::Vec3;
 
     fn empty_world() -> crate::collision::CollisionWorld {

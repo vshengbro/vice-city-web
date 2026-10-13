@@ -6,7 +6,7 @@
 //! WebGL2 / Canvas2D 渲染后端 + `wasm-bindgen` → GitHub Pages。
 //!
 //! 模块划分:
-//! - [`const`] —— 全项目字符串常量的单一来源(§1.3c)。
+//! - [`config`] —— 全项目字符串常量的单一来源(§1.3c)。
 //! - [`mesh`] —— 资产 JSON schema 解析 → GPU 顶点布局。
 //! - [`camera`] —— 轨道相机、投影矩阵、背面剔除。
 //! - [`collision`] —— 二维圆形 vs AABB / 圆分离与世界边界。
@@ -16,11 +16,12 @@
 //! - [`traffic`] —— 车队 AI、上下车、拾取物。
 //! - [`render`] —— WebGL2 / Canvas2D 两个渲染后端 + 共享光照参数。
 //! - [`game`] —— 场景蓝图、异步加载、固定步长循环、输入、昼夜循环。
+//! - [`texture`] —— 运行时贴图图集:二进制图集的解析与按资产/表面族取图。
 
 mod r#camera;
 mod r#collision;
 mod r#combat;
-mod r#const;
+mod r#config;
 mod r#enemy;
 mod r#game;
 mod r#interior;
@@ -28,6 +29,7 @@ mod r#mesh;
 mod r#player;
 mod r#render;
 mod r#spawn;
+mod r#texture;
 mod r#traffic;
 mod r#type;
 mod r#webgpu;
@@ -39,9 +41,25 @@ pub use euv::{App, wasm_bindgen::prelude::*};
 /// 拿到它们,不必自己写 `use euv::…`。
 pub use euv::{js_sys, wasm_bindgen, wasm_bindgen_futures, web_sys};
 
+pub(crate) use std::{
+    collections::HashMap,
+    iter,
+    sync::{Mutex, MutexGuard, OnceLock},
+};
+
+pub(crate) use serde::Deserialize;
+
 /// §6.1 同理:`std` 的常用常量在 crate 根**重新导出**一次,子模块就能
 /// `use super::*` 直接拿到 `FRAC_PI_2` / `PI`,不必在每个文件里写全路径。
-pub use std::{f32::consts::{FRAC_PI_2, PI}, fs};
+pub use std::{
+    cell::{Ref, RefMut},
+    cmp::Ordering,
+    f32::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU},
+    fmt::Display,
+    fs,
+    iter::once,
+    mem::{swap, take},
+};
 
 /// 挂载静态视图树并启动游戏循环。
 ///
@@ -52,6 +70,6 @@ pub use std::{f32::consts::{FRAC_PI_2, PI}, fs};
 #[wasm_bindgen]
 pub fn main() {
     console_error_panic_hook::set_once();
-    App::mount(r#const::APP_SELECTOR, r#game::app_root);
+    App::mount(r#config::APP_SELECTOR, r#game::app_root);
     r#game::boot();
 }

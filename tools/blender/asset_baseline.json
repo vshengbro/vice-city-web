@@ -1,0 +1,599 @@
+{
+  "count": 99,
+  "assets": [
+    {
+      "id": "animal_bird",
+      "category": "animal",
+      "old_tris": 273,
+      "old_parts": 6
+    },
+    {
+      "id": "animal_cat",
+      "category": "animal",
+      "old_tris": 446,
+      "old_parts": 6
+    },
+    {
+      "id": "animal_dog",
+      "category": "animal",
+      "old_tris": 450,
+      "old_parts": 6
+    },
+    {
+      "id": "animal_fish",
+      "category": "animal",
+      "old_tris": 200,
+      "old_parts": 6
+    },
+    {
+      "id": "beach_boardwalk_plank",
+      "category": "beach",
+      "old_tris": 144,
+      "old_parts": 1
+    },
+    {
+      "id": "beach_chair",
+      "category": "beach",
+      "old_tris": 548,
+      "old_parts": 4
+    },
+    {
+      "id": "beach_surfboard",
+      "category": "beach",
+      "old_tris": 364,
+      "old_parts": 2
+    },
+    {
+      "id": "beach_umbrella",
+      "category": "beach",
+      "old_tris": 512,
+      "old_parts": 5
+    },
+    {
+      "id": "bldg_apricot_motel",
+      "category": "building",
+      "old_tris": 2312,
+      "old_parts": 32
+    },
+    {
+      "id": "bldg_aqua_arcade",
+      "category": "building",
+      "old_tris": 6352,
+      "old_parts": 41
+    },
+    {
+      "id": "bldg_coral_hall",
+      "category": "building",
+      "old_tris": 5216,
+      "old_parts": 44
+    },
+    {
+      "id": "bldg_cream_block",
+      "category": "building",
+      "old_tris": 6152,
+      "old_parts": 40
+    },
+    {
+      "id": "bldg_deco_pink",
+      "category": "building",
+      "old_tris": 5092,
+      "old_parts": 43
+    },
+    {
+      "id": "bldg_deco_teal",
+      "category": "building",
+      "old_tris": 5688,
+      "old_parts": 41
+    },
+    {
+      "id": "bldg_lilac_tower",
+      "category": "building",
+      "old_tris": 6828,
+      "old_parts": 42
+    },
+    {
+      "id": "bldg_loft_showcase",
+      "category": "building",
+      "old_tris": 1072,
+      "old_parts": 8
+    },
+    {
+      "id": "bldg_mint_shop",
+      "category": "building",
+      "old_tris": 2456,
+      "old_parts": 33
+    },
+    {
+      "id": "bldg_pink_terrace",
+      "category": "building",
+      "old_tris": 6984,
+      "old_parts": 44
+    },
+    {
+      "id": "bldg_sand_midrise",
+      "category": "building",
+      "old_tris": 6592,
+      "old_parts": 43
+    },
+    {
+      "id": "bldg_shop_showcase",
+      "category": "building",
+      "old_tris": 1084,
+      "old_parts": 9
+    },
+    {
+      "id": "bldg_teal_loft",
+      "category": "building",
+      "old_tris": 2896,
+      "old_parts": 31
+    },
+    {
+      "id": "bldg_white_landmark",
+      "category": "building",
+      "old_tris": 7852,
+      "old_parts": 41
+    },
+    {
+      "id": "bus_city",
+      "category": "vehicle",
+      "old_tris": 5164,
+      "old_parts": 12
+    },
+    {
+      "id": "car_coupe",
+      "category": "vehicle",
+      "old_tris": 3972,
+      "old_parts": 9
+    },
+    {
+      "id": "car_police",
+      "category": "vehicle",
+      "old_tris": 4692,
+      "old_parts": 13
+    },
+    {
+      "id": "car_sedan",
+      "category": "vehicle",
+      "old_tris": 4220,
+      "old_parts": 9
+    },
+    {
+      "id": "car_taxi",
+      "category": "vehicle",
+      "old_tris": 4340,
+      "old_parts": 12
+    },
+    {
+      "id": "flower_cluster",
+      "category": "nature",
+      "old_tris": 392,
+      "old_parts": 4
+    },
+    {
+      "id": "grass_patch",
+      "category": "nature",
+      "old_tris": 152,
+      "old_parts": 3
+    },
+    {
+      "id": "marker_coin_ring",
+      "category": "marker",
+      "old_tris": 1248,
+      "old_parts": 2
+    },
+    {
+      "id": "marker_flame",
+      "category": "marker",
+      "old_tris": 480,
+      "old_parts": 5
+    },
+    {
+      "id": "misc_awning",
+      "category": "misc",
+      "old_tris": 324,
+      "old_parts": 2
+    },
+    {
+      "id": "misc_dumpster_pile",
+      "category": "misc",
+      "old_tris": 768,
+      "old_parts": 9
+    },
+    {
+      "id": "misc_graffiti_board",
+      "category": "misc",
+      "old_tris": 432,
+      "old_parts": 5
+    },
+    {
+      "id": "misc_helicopter",
+      "category": "misc",
+      "old_tris": 1200,
+      "old_parts": 6
+    },
+    {
+      "id": "misc_helipad_marking",
+      "category": "misc",
+      "old_tris": 516,
+      "old_parts": 4
+    },
+    {
+      "id": "misc_street_phone",
+      "category": "misc",
+      "old_tris": 318,
+      "old_parts": 5
+    },
+    {
+      "id": "palm_bushy",
+      "category": "palm",
+      "old_tris": 2708,
+      "old_parts": 7
+    },
+    {
+      "id": "palm_short",
+      "category": "palm",
+      "old_tris": 1892,
+      "old_parts": 6
+    },
+    {
+      "id": "palm_tall",
+      "category": "palm",
+      "old_tris": 2446,
+      "old_parts": 7
+    },
+    {
+      "id": "ped_dress",
+      "category": "pedestrian",
+      "old_tris": 1920,
+      "old_parts": 15
+    },
+    {
+      "id": "ped_overalls",
+      "category": "pedestrian",
+      "old_tris": 2264,
+      "old_parts": 17
+    },
+    {
+      "id": "ped_streetwear",
+      "category": "pedestrian",
+      "old_tris": 2264,
+      "old_parts": 17
+    },
+    {
+      "id": "ped_suit",
+      "category": "pedestrian",
+      "old_tris": 1752,
+      "old_parts": 13
+    },
+    {
+      "id": "pickup_ammo_box",
+      "category": "pickup",
+      "old_tris": 644,
+      "old_parts": 4
+    },
+    {
+      "id": "pickup_armor_vest",
+      "category": "pickup",
+      "old_tris": 864,
+      "old_parts": 4
+    },
+    {
+      "id": "pickup_cash_stack",
+      "category": "pickup",
+      "old_tris": 392,
+      "old_parts": 2
+    },
+    {
+      "id": "pickup_flare_pack",
+      "category": "pickup",
+      "old_tris": 752,
+      "old_parts": 3
+    },
+    {
+      "id": "pickup_grenade_case",
+      "category": "pickup",
+      "old_tris": 540,
+      "old_parts": 3
+    },
+    {
+      "id": "pickup_health_pack",
+      "category": "pickup",
+      "old_tris": 652,
+      "old_parts": 3
+    },
+    {
+      "id": "pickup_o2_tank",
+      "category": "pickup",
+      "old_tris": 964,
+      "old_parts": 3
+    },
+    {
+      "id": "pickup_rocket_round",
+      "category": "pickup",
+      "old_tris": 876,
+      "old_parts": 3
+    },
+    {
+      "id": "prop_bench",
+      "category": "prop",
+      "old_tris": 600,
+      "old_parts": 3
+    },
+    {
+      "id": "prop_construction_barrier",
+      "category": "prop",
+      "old_tris": 580,
+      "old_parts": 5
+    },
+    {
+      "id": "prop_dumpster",
+      "category": "prop",
+      "old_tris": 740,
+      "old_parts": 5
+    },
+    {
+      "id": "prop_fire_hydrant",
+      "category": "prop",
+      "old_tris": 816,
+      "old_parts": 5
+    },
+    {
+      "id": "prop_mailbox",
+      "category": "prop",
+      "old_tris": 832,
+      "old_parts": 6
+    },
+    {
+      "id": "prop_manhole_cover",
+      "category": "prop",
+      "old_tris": 436,
+      "old_parts": 5
+    },
+    {
+      "id": "prop_newsstand",
+      "category": "prop",
+      "old_tris": 1260,
+      "old_parts": 5
+    },
+    {
+      "id": "prop_palm_planter",
+      "category": "prop",
+      "old_tris": 1868,
+      "old_parts": 7
+    },
+    {
+      "id": "prop_parking_meter",
+      "category": "prop",
+      "old_tris": 472,
+      "old_parts": 4
+    },
+    {
+      "id": "prop_phone_booth",
+      "category": "prop",
+      "old_tris": 1126,
+      "old_parts": 8
+    },
+    {
+      "id": "prop_streetlight",
+      "category": "prop",
+      "old_tris": 784,
+      "old_parts": 5
+    },
+    {
+      "id": "prop_traffic_cone",
+      "category": "prop",
+      "old_tris": 248,
+      "old_parts": 3
+    },
+    {
+      "id": "prop_trafficlight",
+      "category": "prop",
+      "old_tris": 1088,
+      "old_parts": 9
+    },
+    {
+      "id": "prop_trash_bin",
+      "category": "prop",
+      "old_tris": 552,
+      "old_parts": 3
+    },
+    {
+      "id": "road_asphalt",
+      "category": "road",
+      "old_tris": 100,
+      "old_parts": 3
+    },
+    {
+      "id": "road_crosswalk",
+      "category": "road",
+      "old_tris": 84,
+      "old_parts": 1
+    },
+    {
+      "id": "road_drain_grate",
+      "category": "road",
+      "old_tris": 26,
+      "old_parts": 2
+    },
+    {
+      "id": "road_grass",
+      "category": "road",
+      "old_tris": 58,
+      "old_parts": 3
+    },
+    {
+      "id": "road_lane_line",
+      "category": "road",
+      "old_tris": 36,
+      "old_parts": 1
+    },
+    {
+      "id": "road_lane_line_yellow",
+      "category": "road",
+      "old_tris": 24,
+      "old_parts": 1
+    },
+    {
+      "id": "road_manhole_decal",
+      "category": "road",
+      "old_tris": 108,
+      "old_parts": 1
+    },
+    {
+      "id": "road_sand",
+      "category": "road",
+      "old_tris": 68,
+      "old_parts": 3
+    },
+    {
+      "id": "road_sidewalk",
+      "category": "road",
+      "old_tris": 122,
+      "old_parts": 2
+    },
+    {
+      "id": "ship_cruise",
+      "category": "vehicle",
+      "old_tris": 3800,
+      "old_parts": 9
+    },
+    {
+      "id": "ship_destroyer",
+      "category": "vehicle",
+      "old_tris": 1064,
+      "old_parts": 8
+    },
+    {
+      "id": "sign_arcade",
+      "category": "sign",
+      "old_tris": 888,
+      "old_parts": 4
+    },
+    {
+      "id": "sign_bar",
+      "category": "sign",
+      "old_tris": 680,
+      "old_parts": 4
+    },
+    {
+      "id": "sign_club",
+      "category": "sign",
+      "old_tris": 648,
+      "old_parts": 4
+    },
+    {
+      "id": "sign_diner",
+      "category": "sign",
+      "old_tris": 792,
+      "old_parts": 4
+    },
+    {
+      "id": "sign_hotel",
+      "category": "sign",
+      "old_tris": 616,
+      "old_parts": 4
+    },
+    {
+      "id": "sign_motel",
+      "category": "sign",
+      "old_tris": 648,
+      "old_parts": 4
+    },
+    {
+      "id": "sign_pizza",
+      "category": "sign",
+      "old_tris": 680,
+      "old_parts": 4
+    },
+    {
+      "id": "sign_tropic",
+      "category": "sign",
+      "old_tris": 808,
+      "old_parts": 4
+    },
+    {
+      "id": "terrain_mountain",
+      "category": "terrain",
+      "old_tris": 488,
+      "old_parts": 2
+    },
+    {
+      "id": "truck_pickup",
+      "category": "vehicle",
+      "old_tris": 4316,
+      "old_parts": 10
+    },
+    {
+      "id": "veh_airplane",
+      "category": "vehicle",
+      "old_tris": 1292,
+      "old_parts": 18
+    },
+    {
+      "id": "veh_boat",
+      "category": "vehicle",
+      "old_tris": 1392,
+      "old_parts": 14
+    },
+    {
+      "id": "veh_helicopter",
+      "category": "vehicle",
+      "old_tris": 1520,
+      "old_parts": 17
+    },
+    {
+      "id": "veh_jet",
+      "category": "vehicle",
+      "old_tris": 1476,
+      "old_parts": 18
+    },
+    {
+      "id": "wep_bat",
+      "category": "weapon",
+      "old_tris": 752,
+      "old_parts": 3
+    },
+    {
+      "id": "wep_grenade",
+      "category": "weapon",
+      "old_tris": 760,
+      "old_parts": 3
+    },
+    {
+      "id": "wep_pistol",
+      "category": "weapon",
+      "old_tris": 1188,
+      "old_parts": 4
+    },
+    {
+      "id": "wep_rocket_launcher",
+      "category": "weapon",
+      "old_tris": 2484,
+      "old_parts": 3
+    },
+    {
+      "id": "wep_shotgun",
+      "category": "weapon",
+      "old_tris": 1500,
+      "old_parts": 3
+    },
+    {
+      "id": "wep_smg",
+      "category": "weapon",
+      "old_tris": 1316,
+      "old_parts": 3
+    },
+    {
+      "id": "wep_tank",
+      "category": "vehicle",
+      "old_tris": 2240,
+      "old_parts": 6
+    },
+    {
+      "id": "yacht_sailboat",
+      "category": "vehicle",
+      "old_tris": 868,
+      "old_parts": 6
+    }
+  ]
+}
