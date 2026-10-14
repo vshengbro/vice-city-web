@@ -60,7 +60,6 @@ fn run_inner_webgl2(start: f64) -> Result<WebglReport, String> {
         .ok_or("getContext(webgl2) returned null (no WebGL2?)")?
         .dyn_into::<WebGl2RenderingContext>()
         .map_err(|_| "getContext(webgl2) not a WebGl2RenderingContext".to_string())?;
-
     // `start` 只在 `run_inner_webgl2` 内部用不到 —— 帧率用 `bench_start/end`
     // 单独算,免得把「建上下文 + 编译着色器」的一次性开销算进稳态帧率。
     let _: &f64 = &start;
@@ -69,7 +68,6 @@ fn run_inner_webgl2(start: f64) -> Result<WebglReport, String> {
     if width == 0 || height == 0 {
         return Err(format!("canvas is {width}x{height}"));
     }
-
     let program: WebGlProgram = build_program(&context)?;
     let vao: WebGlVertexArrayObject = context
         .create_vertex_array()
@@ -80,9 +78,7 @@ fn run_inner_webgl2(start: f64) -> Result<WebglReport, String> {
     let ibo: WebGlBuffer = context
         .create_buffer()
         .ok_or("createBuffer(ibo) returned null")?;
-
     context.bind_vertex_array(Some(&vao));
-
     context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&vbo));
     // `Float32Array::view` 直接零拷贝映射 wasm 线性内存 —— 不需要
     // 先把 f32 打包成字节再解包回来。
@@ -96,7 +92,6 @@ fn run_inner_webgl2(start: f64) -> Result<WebglReport, String> {
     }
     context.enable_vertex_attrib_array(0);
     context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, 8, 0);
-
     context.bind_buffer(WebGl2RenderingContext::ELEMENT_ARRAY_BUFFER, Some(&ibo));
     let indices: [u32; 3] = [0, 1, 2];
     unsafe {
@@ -107,13 +102,11 @@ fn run_inner_webgl2(start: f64) -> Result<WebglReport, String> {
             WebGl2RenderingContext::STATIC_DRAW,
         );
     }
-
     // ---- 帧率 --------------------------------------------------------
     context.use_program(Some(&program));
     context.viewport(0, 0, width as i32, height as i32);
     context.disable(WebGl2RenderingContext::DEPTH_TEST);
     context.disable(WebGl2RenderingContext::CULL_FACE);
-
     let mut bench_start: f64 = 0.0;
     let mut bench_end: f64 = 0.0;
     for frame in 0..BENCH_FRAMES {
@@ -131,7 +124,6 @@ fn run_inner_webgl2(start: f64) -> Result<WebglReport, String> {
     } else {
         crate::FPS_UNRESOLVED
     };
-
     // ---- 像素读回 ----------------------------------------------------
     // WebGL2 可以直接 `readPixels`,不需要像 WebGPU 那样绕
     // copyTextureToBuffer。但**必须**在同一帧里读:默认
@@ -159,13 +151,11 @@ fn run_inner_webgl2(start: f64) -> Result<WebglReport, String> {
             0,
         )
         .map_err(|_| "readPixels threw (swap chain already presented?)".to_string())?;
-
     // WebGL 的 `readPixels` 行序是**下往上**。统计只关心「有多少
     // 非黑像素」和均值,行序不影响结果,所以不翻转 —— 只要 WebGPU
     // 侧也用同口径统计即可(那边是 `copyTextureToBuffer`,上往下)。
     // 这里用 `width * 4` 当行距,因为 `readPixels` 的输出是紧密排列的。
     let stats: crate::PixelStats = crate::PixelStats::from_rgba(&pixels, width, height, width * 4);
-
     let mut errors: Vec<String> = Vec::new();
     loop {
         match context.get_error() {
@@ -184,7 +174,6 @@ fn run_inner_webgl2(start: f64) -> Result<WebglReport, String> {
         .and_then(|v: JsValue| v.as_string())
         .unwrap_or_else(|| String::from("?"));
     errors.push(format!("GL_RENDERER = {renderer}"));
-
     Ok(WebglReport {
         backend: String::from(BACKEND_WEBGL2),
         adapter: None,
