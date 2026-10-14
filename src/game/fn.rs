@@ -11060,8 +11060,7 @@ mod tests {
                     .first()
                     .and_then(|part: &crate::mesh::MeshPart| {
                         part.face_colors.as_ref().and_then(|c: &Vec<[f32; 3]>| {
-                            c.get(index)
-                                .map(|v: &[f32; 3]| [v[0], v[1], v[2]])
+                            c.get(index).map(|v: &[f32; 3]| [v[0], v[1], v[2]])
                         })
                     })
             };
