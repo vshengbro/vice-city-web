@@ -34,42 +34,31 @@ mod r#traffic;
 mod r#type;
 mod r#webgpu;
 
-pub use euv::{App, wasm_bindgen::prelude::*};
-
-/// §6.1:子模块只能 `use super::*;`,所以 `euv` 的这几个模块在 crate 根
-/// **重新导出**一次 —— `src/webgpu/mod.rs` 就能通过 `pub use super::…`
-/// 拿到它们,不必自己写 `use euv::…`。
-pub use euv::{js_sys, wasm_bindgen, wasm_bindgen_futures, web_sys};
-
-pub(crate) use std::{
-    collections::HashMap,
-    iter,
-    sync::{Mutex, MutexGuard, OnceLock},
+pub use euv::{
+    App, Data, VirtualNode, html, js_sys, js_sys::Function, js_sys::Promise, js_sys::Undefined,
+    wasm_bindgen, wasm_bindgen::JsCast, wasm_bindgen::prelude::*, wasm_bindgen_futures,
+    wasm_bindgen_futures::JsFuture, wasm_bindgen_futures::spawn_local, web_sys, web_sys::Document,
+    web_sys::DomRect, web_sys::Element, web_sys::Event, web_sys::EventTarget,
+    web_sys::HtmlCanvasElement, web_sys::HtmlInputElement, web_sys::KeyboardEvent,
+    web_sys::MouseEvent, web_sys::Node, web_sys::Response, web_sys::TouchEvent, web_sys::TouchList,
+    web_sys::WebGl2RenderingContext, web_sys::WebGlBuffer, web_sys::WebGlFramebuffer,
+    web_sys::WebGlProgram, web_sys::WebGlShader, web_sys::WebGlTexture,
+    web_sys::WebGlUniformLocation, web_sys::WebGlVertexArrayObject, web_sys::WheelEvent,
+    web_sys::Window, web_sys::window,
 };
 
-pub(crate) use serde::Deserialize;
+pub use serde::Deserialize;
 
-/// §6.1 同理:`std` 的常用常量在 crate 根**重新导出**一次,子模块就能
-/// `use super::*` 直接拿到 `FRAC_PI_2` / `PI`,不必在每个文件里写全路径。
+// §1.3d dedup: these constants are defined once and re-exported, so no two
+// modules may carry a second copy of the same value.
+pub(crate) use crate::{
+    collision::INSIDE_EPSILON, collision::RESOLVE_ITERATIONS, game::PED_POOL, game::STREET_PITCH,
+};
+
 pub use std::{
-    cell::{Ref, RefMut},
-    cmp::Ordering,
-    f32::consts::{FRAC_PI_2, FRAC_PI_4, PI, TAU},
-    fmt::Display,
-    fs,
-    iter::once,
-    mem::{swap, take},
+    cell::Cell, cell::Ref, cell::RefCell, cell::RefMut, cmp::Ordering, f32::consts::FRAC_PI_2,
+    f32::consts::FRAC_PI_4, f32::consts::PI, f32::consts::TAU, fmt::Display, fs, iter::once,
+    mem::swap, mem::take, rc::Rc,
 };
 
-/// 挂载静态视图树并启动游戏循环。
-///
-/// 挂载一棵**静态** `html!` 树(canvas + 加载进度条 + HUD + 帮助),
-/// 挂载完成后游戏循环和全部输入都由裸 `web_sys` + `Closure` 驱动,
-/// VDOM 不参与每帧渲染 —— 这是 canvas 游戏的正确做法
-/// (在事件回调里调用 euv hook 会因 hook context 丢失而静默白屏)。
-#[wasm_bindgen]
-pub fn main() {
-    console_error_panic_hook::set_once();
-    App::mount(r#config::APP_SELECTOR, r#game::app_root);
-    r#game::boot();
-}
+pub(crate) use std::{collections::HashMap, iter, sync::Mutex, sync::MutexGuard, sync::OnceLock};

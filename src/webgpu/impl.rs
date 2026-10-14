@@ -1,14 +1,3 @@
-//! WebGPU 渲染后端:每帧一个 render pass,把整座城市 instanced 画进游戏那块画布。
-//!
-//! 与 [`crate::render::WebGlRenderer`] 的关系是**平级后端**,不是替换:
-//! `game.rs` 里三条路径(WebGPU → WebGL2 → Canvas2D)按可用性依次回退,
-//! 现有 WebGL2 代码一行都没删。
-//!
-//! **本切片的范围**:地面 / 建筑 / 玩家角色(以及其余所有
-//! [`crate::render::SceneBatch`])全部走同一条 instanced pass,带深度
-//! 缓冲 + 背面剔除。阴影贴图、G-buffer、SSAO、SSR、bloom、湿地面这六条
-//! 增强管线**尚未移植**。
-
 use super::*;
 
 /// 顶点缓冲步长(字节):12 f32 × 4 = 48 B。
@@ -202,7 +191,6 @@ impl WebGpuRenderer {
         // WebGPU 会报 `Required member is undefined`,而且是异步的 ——
         // 画布直接黑给你看。
         set(&fragment_stage, FIELD_TARGETS, &targets)?;
-
         let primitive: Object = new_object();
         set(
             &primitive,
@@ -836,7 +824,6 @@ impl WebGpuRenderer {
         )?;
         let sampler: JsValue = call1(&device, METHOD_CREATE_SAMPLER, sampler_descriptor.as_ref())?;
         self.set_ao_sampler(sampler);
-
         // ⚠️ **三条各一个 buffer。** 同帧往同一个 buffer 写三次,
         // 队列时间线上只有最后一次生效 —— 而采样那条要半径/强度,
         // 模糊两条要的**方向**还不一样(H 一个 vec2、V 另一个)。
@@ -1031,12 +1018,10 @@ impl WebGpuRenderer {
     fn create_ao_pipelines_inner(&mut self) -> Result<(), String> {
         let layout: JsValue = self.build_ao_group_layout()?;
         self.set_ao_group_layout(layout.clone());
-
         let device: JsValue = self.get_device().clone();
         let vertex_module: JsValue = create_shader_module(&device, SHADER_FULLSCREEN_VERTEX)?;
         let ao_module: JsValue = create_shader_module(&device, &shader_ssao())?;
         let blur_module: JsValue = create_shader_module(&device, &shader_ao_blur())?;
-
         let pipeline_layout: JsValue = self.build_pipeline_layout_single(&layout)?;
         let mut built: [GpuAoPass; AO_PASS_COUNT] = empty_ao_passes();
         built[AO_PASS_SAMPLE] = GpuAoPass {
@@ -1075,7 +1060,6 @@ impl WebGpuRenderer {
     fn build_ao_group_layout(&self) -> Result<JsValue, String> {
         let device: JsValue = self.get_device().clone();
         let entries: JsValue = make_array();
-
         // ⚠️ binding 0 的采样器类型必须是 **`non-filtering`**。
         //
         // 槽 2 绑的是 G-buffer 的 `r32float`,WebGPU 把这种格式标成
@@ -1105,7 +1089,6 @@ impl WebGpuRenderer {
         )?;
         set(&sampler_entry, FIELD_SAMPLER, sampler_layout.as_ref())?;
         push_into(&entries, 0usize, sampler_entry.as_ref())?;
-
         // ⚠️ 槽 2(深度图)的 sampleType 必须是 `unfilterable-float`,
         // **不是** `float`。
         //
@@ -1140,7 +1123,6 @@ impl WebGpuRenderer {
             set(&texture_entry, FIELD_TEXTURE, texture_layout.as_ref())?;
             push_into(&entries, slot, texture_entry.as_ref())?;
         }
-
         // binding 3:uniform。
         let params_entry: Object = new_object();
         set(
@@ -1161,7 +1143,6 @@ impl WebGpuRenderer {
         )?;
         set(&params_entry, FIELD_BUFFER, params_layout.as_ref())?;
         push_into(&entries, 3usize, params_entry.as_ref())?;
-
         let layout_desc: Object = new_object();
         set(&layout_desc, FIELD_ENTRIES, &entries)?;
         call1(
@@ -1544,7 +1525,6 @@ impl WebGpuRenderer {
             set(&ao_texture_entry, FIELD_TEXTURE, ao_texture_layout.as_ref())?;
             push_into(&entries, 6usize, ao_texture_entry.as_ref())?;
         }
-
         let descriptor: Object = new_object();
         set(&descriptor, FIELD_ENTRIES, &entries)?;
         call1(
@@ -1641,14 +1621,14 @@ impl WebGpuRenderer {
     /// - `Result<usize, String>` - 这份资产在本表里的下标。
     pub fn upload_mesh(&mut self, mesh: &crate::render::MeshAssetGpu) -> Result<usize, String> {
         let device: JsValue = self.get_device().clone();
-        let vertex_bytes: &[u8] = f32_slice_to_bytes(&mesh.vertices);
-        let index_bytes: &[u8] = u32_slice_to_bytes(&mesh.indices);
+        let vertex_bytes: &[u8] = f32_slice_to_bytes(&mesh.get_vertices());
+        let index_bytes: &[u8] = u32_slice_to_bytes(&mesh.get_indices());
         let vertex_buffer: JsValue =
             create_buffer(&device, vertex_bytes.len(), USAGE_VERTEX_BUFFER)?;
         let index_buffer: JsValue = create_buffer(&device, index_bytes.len(), USAGE_INDEX_BUFFER)?;
         write_buffer(&device, &vertex_buffer, 0.0, vertex_bytes)?;
         write_buffer(&device, &index_buffer, 0.0, index_bytes)?;
-        let index_count: u32 = mesh.indices.len() as u32;
+        let index_count: u32 = mesh.get_indices().len() as u32;
         self.get_meshes_mut().push(GpuMesh {
             vertex_buffer,
             index_buffer,
@@ -1682,8 +1662,8 @@ impl WebGpuRenderer {
         mesh: &crate::render::MeshAssetGpu,
     ) -> Result<(), String> {
         let device: JsValue = self.get_device().clone();
-        let vertex_bytes: &[u8] = f32_slice_to_bytes(&mesh.vertices);
-        let index_bytes: &[u8] = u32_slice_to_bytes(&mesh.indices);
+        let vertex_bytes: &[u8] = f32_slice_to_bytes(&mesh.get_vertices());
+        let index_bytes: &[u8] = u32_slice_to_bytes(&mesh.get_indices());
         let Some(slot) = self.get_meshes_mut().get_mut(mesh_index) else {
             return Err(format!(
                 "{}: {mesh_index} of {}",
@@ -1710,21 +1690,21 @@ impl WebGpuRenderer {
         // 「按新数据重新分配」。WebGPU 没有 `bufferData`,所以必须自己
         // 记住容量,并在需要时**换一个更大的** `GPUBuffer`
         // (`GPUBuffer` 的大小在 `createBuffer` 之后不可更改)。
-        if vertex_bytes.len() > slot.vertex_capacity {
-            let capacity: usize = grown_capacity(slot.vertex_capacity, vertex_bytes.len());
+        if vertex_bytes.len() > slot.get_vertex_capacity() {
+            let capacity: usize = grown_capacity(slot.get_vertex_capacity(), vertex_bytes.len());
             let buffer: JsValue = create_buffer(&device, capacity, USAGE_VERTEX_BUFFER)?;
-            slot.vertex_buffer = buffer;
-            slot.vertex_capacity = capacity;
+            slot.set_vertex_buffer(buffer);
+            slot.set_vertex_capacity(capacity);
         }
-        if index_bytes.len() > slot.index_capacity {
-            let capacity: usize = grown_capacity(slot.index_capacity, index_bytes.len());
+        if index_bytes.len() > slot.get_index_capacity() {
+            let capacity: usize = grown_capacity(slot.get_index_capacity(), index_bytes.len());
             let buffer: JsValue = create_buffer(&device, capacity, USAGE_INDEX_BUFFER)?;
-            slot.index_buffer = buffer;
-            slot.index_capacity = capacity;
+            slot.set_index_buffer(buffer);
+            slot.set_index_capacity(capacity);
         }
-        write_buffer(&device, &slot.vertex_buffer, 0.0, vertex_bytes)?;
-        write_buffer(&device, &slot.index_buffer, 0.0, index_bytes)?;
-        slot.index_count = (index_bytes.len() / 4) as u32;
+        write_buffer(&device, &slot.get_vertex_buffer(), 0.0, vertex_bytes)?;
+        write_buffer(&device, &slot.get_index_buffer(), 0.0, index_bytes)?;
+        slot.set_index_count((index_bytes.len() / 4) as u32);
         Ok(())
     }
 
@@ -1853,7 +1833,7 @@ impl WebGpuRenderer {
         // NDC 深度是 `[0, 1]`;不搬的话整张阴影图的深度全落在
         // `[-1, 1]`,`ndc.z > 1.0` 的判据会把**所有**片元判成「视锥外」
         // → 影子全丢,而且画面看不出任何异常。
-        let light_matrix: Mat4 = shadow_view_projection(shadow_focus, lighting.light_dir);
+        let light_matrix: Mat4 = shadow_view_projection(shadow_focus, lighting.get_light_dir());
         let light_bytes: [f32; 16] = frame_bytes(&light_matrix);
         write_buffer(
             &device,
@@ -1935,9 +1915,9 @@ impl WebGpuRenderer {
             &color_attachment,
             FIELD_CLEAR_VALUE,
             &make_rgba(
-                lighting.sky_color[0],
-                lighting.sky_color[1],
-                lighting.sky_color[2],
+                lighting.get_sky_color()[0],
+                lighting.get_sky_color()[1],
+                lighting.get_sky_color()[2],
             ),
         )?;
         set(
@@ -1996,7 +1976,6 @@ impl WebGpuRenderer {
             &JsValue::from_str(STORE_OP_STORE),
         )?;
         push_into(&color_list, 1usize, normal_attachment.as_ref())?;
-
         let gbuffer_depth_view: JsValue = create_view(&self.get_ao_depth().clone())?;
         let linear_depth_attachment: Object = new_object();
         set(&linear_depth_attachment, FIELD_VIEW, &gbuffer_depth_view)?;
@@ -2018,7 +1997,6 @@ impl WebGpuRenderer {
         )?;
         push_into(&color_list, 2usize, linear_depth_attachment.as_ref())?;
         self.set_gbuffer_slots(3);
-
         set(&pass_descriptor, FIELD_COLOR_ATTACHMENTS, &color_list)?;
         set(
             &pass_descriptor,
@@ -2026,7 +2004,6 @@ impl WebGpuRenderer {
             &depth_attachment,
         )?;
         let pass: JsValue = call1(&encoder, METHOD_BEGIN_RENDER_PASS, pass_descriptor.as_ref())?;
-
         call1(&pass, METHOD_SET_PIPELINE, &self.get_pipeline().clone())?;
         set_bind_group(&pass, BINDING_GROUP, &self.get_bind_group().clone())?;
         // group 1 = 阴影图 + 比较采样器 + 光源矩阵。**必须**在主
@@ -2061,16 +2038,17 @@ impl WebGpuRenderer {
         let mut staged: Vec<(usize, Vec<&crate::render::Instance>)> = Vec::new();
         let mut total: usize = 0;
         let hidden: Vec<usize> = crate::game::hidden_batches();
-        for (index, batch) in scene.batches.iter().enumerate() {
+        let batches: &Vec<crate::render::SceneBatch> = scene.get_batches_ref();
+        for (index, batch) in batches.iter().enumerate() {
             // ⚠️ **不能**按 `opaque` 过滤!这个标志在 WebGL2 端的含义是
             // 「这个批次要不要参与背面剔除」,地面 / 水面等大片是
             // `opaque == false`(单面朝上,剔掉背面反而是对的)。
             // 直接 `!opaque => continue` 会把**地面整批丢掉** ——
             // 画面只剩远处建筑漂在天边,近处完全没有地。
-            if batch.instances.is_empty() || hidden.contains(&index) {
+            if batch.get_instances().is_empty() || hidden.contains(&index) {
                 continue;
             }
-            let kept: Vec<&crate::render::Instance> = if batch.near_cull {
+            let kept: Vec<&crate::render::Instance> = if batch.get_near_cull() {
                 batch
                     .instances
                     .iter()
@@ -2079,16 +2057,16 @@ impl WebGpuRenderer {
                     })
                     .collect()
             } else {
-                batch.instances.iter().collect()
+                batch.get_instances().iter().collect()
             };
             if kept.is_empty() {
                 continue;
             }
-            if self.get_meshes().get(batch.mesh_index).is_none() {
+            if self.get_meshes().get(batch.get_mesh_index()).is_none() {
                 continue;
             }
             total += kept.len();
-            staged.push((batch.mesh_index, kept));
+            staged.push((batch.get_mesh_index(), kept));
         }
         if total == 0 {
             call0(&pass, METHOD_END)?;
@@ -2120,7 +2098,7 @@ impl WebGpuRenderer {
             for instance in instances {
                 let before: usize = all.len();
                 all.extend_from_slice(instance.get_model_ref());
-                all.extend_from_slice(&instance.tint);
+                all.extend_from_slice(&instance.get_tint());
                 // pad 到 FLOATS_PER_INSTANCE:model 16 + tint 3 + 1 个 pad。
                 // 这一个 pad 是必需的 —— 少写会让第 2 个及以后的实例整体
                 // 前移一个 f32,读到错位的 model matrix。
@@ -2214,10 +2192,10 @@ impl WebGpuRenderer {
         let buffers: [JsValue; BLOOM_PASS_COUNT] = self.get_bloom_buffers();
         for (index, upload) in uploads.iter().enumerate() {
             let bytes: [f32; 12] = flatten_bloom(bloom_uniforms(
-                upload.threshold,
-                upload.strength,
-                upload.direction,
-                upload.size,
+                upload.get_threshold(),
+                upload.get_strength(),
+                upload.get_direction(),
+                upload.get_size(),
             ));
             write_buffer(device, &buffers[index], 0.0, f32_slice_to_bytes(&bytes))?;
         }
@@ -2313,25 +2291,26 @@ impl WebGpuRenderer {
         // 在视锥外而楼底落点在视锥内,只看原点会凭空抹掉一整块长影子。
         let mut staged: Vec<(usize, Vec<&crate::render::Instance>)> = Vec::new();
         let mut total: usize = 0;
-        for (index, batch) in scene.batches.iter().enumerate() {
-            if batch.instances.is_empty() || hidden.contains(&index) {
+        let batches: &Vec<crate::render::SceneBatch> = scene.get_batches_ref();
+        for (index, batch) in batches.iter().enumerate() {
+            if batch.get_instances().is_empty() || hidden.contains(&index) {
                 continue;
             }
             let visible: Vec<&crate::render::Instance> = batch
                 .instances
                 .iter()
                 .filter(|instance: &&crate::render::Instance| {
-                    instance_affects_shadow(instance, shadow_focus, lighting.light_dir)
+                    instance_affects_shadow(instance, shadow_focus, lighting.get_light_dir())
                 })
                 .collect();
             if visible.is_empty() {
                 continue;
             }
-            if self.get_meshes().get(batch.mesh_index).is_none() {
+            if self.get_meshes().get(batch.get_mesh_index()).is_none() {
                 continue;
             }
             total += visible.len();
-            staged.push((batch.mesh_index, visible));
+            staged.push((batch.get_mesh_index(), visible));
         }
         if total == 0 {
             return Ok(0);
@@ -2358,7 +2337,7 @@ impl WebGpuRenderer {
             for instance in instances {
                 let before: usize = all.len();
                 all.extend_from_slice(instance.get_model_ref());
-                all.extend_from_slice(&instance.tint);
+                all.extend_from_slice(&instance.get_tint());
                 // pad 到 FLOATS_PER_INSTANCE:少写会让第 2 个及以后的
                 // 实例整体前移一个 f32,读到错位的 model matrix。
                 all.resize(before + FLOATS_PER_INSTANCE, 0.0);
@@ -2431,13 +2410,20 @@ impl WebGpuRenderer {
             // 与 WebGL2 端同一条静默路径:下标越界不报错,只是不画。
             return Ok(0);
         };
-        set_vertex_buffer(pass, SLOT_VERTEX, &mesh.vertex_buffer)?;
-        set_index_buffer(pass, &mesh.index_buffer)?;
+        set_vertex_buffer(pass, SLOT_VERTEX, &mesh.get_vertex_buffer())?;
+        set_index_buffer(pass, &mesh.get_index_buffer())?;
         // `first_instance` 让顶点着色器的 `@location(4..8)` 从
         // instance buffer 的对应位置读 —— instance buffer 是整帧
         // 连续的一段,每个批次占其中 `count` 个实例。
-        draw_indexed(pass, mesh.index_count, count, 0u32, 0u32, first_instance)?;
-        Ok((mesh.index_count / 3) * count)
+        draw_indexed(
+            pass,
+            mesh.get_index_count(),
+            count,
+            0u32,
+            0u32,
+            first_instance,
+        )?;
+        Ok((mesh.get_index_count() / 3) * count)
     }
 
     /// 画布尺寸变化时重建深度纹理。
@@ -2638,7 +2624,6 @@ impl WebGpuRenderer {
         // 采样那条没有「自己的输出」可读,槽 1 绑深度图占位即可 ——
         // 着色器里采样 pass 不读它。
         let sources: [JsValue; AO_PASS_COUNT] = [depth_view.clone(), ping_view, pong_view];
-
         let mut passes: [GpuAoPass; AO_PASS_COUNT] = self.get_ao_passes().clone();
         for index in 0..AO_PASS_COUNT {
             let entries: JsValue = make_array();
@@ -2733,7 +2718,7 @@ impl WebGpuRenderer {
         encoder: &JsValue,
         lighting: &SceneLighting,
     ) -> Result<(), String> {
-        let strength: f32 = lighting.ao_strength;
+        let strength: f32 = lighting.get_ao_strength();
         // 关闭时不写 uniform 也不开 pass —— 质量档位调到 Low 时整条
         // SSAO 链不花一个 draw call。
         if strength <= 0.0 {
@@ -2977,42 +2962,6 @@ impl WebGpuRenderer {
         Ok(())
     }
 
-    /// `GPUDevice` 的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - 设备句柄。
-    pub fn get_device(&self) -> &JsValue {
-        &self.device
-    }
-
-    /// 画布上下文的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUCanvasContext`。
-    pub fn get_context(&self) -> &JsValue {
-        &self.context
-    }
-
-    /// 画布格式。
-    ///
-    /// # Returns
-    ///
-    /// - `&str` - `bgra8unorm` 之类。
-    pub fn get_format(&self) -> &str {
-        &self.format
-    }
-
-    /// GPU 侧资产表的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&[GpuMesh]` - 资产表。
-    pub fn get_meshes(&self) -> &[GpuMesh] {
-        &self.meshes
-    }
-
     /// GPU 侧资产表的可变引用。
     ///
     /// # Returns
@@ -3020,391 +2969,6 @@ impl WebGpuRenderer {
     /// - `&mut Vec<GpuMesh>` - 资产表。
     pub fn get_meshes_mut(&mut self) -> &mut Vec<GpuMesh> {
         &mut self.meshes
-    }
-
-    /// 主 pipeline 的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - pipeline 句柄。
-    pub fn get_pipeline(&self) -> &JsValue {
-        &self.pipeline
-    }
-
-    /// 设置主 pipeline。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - 建好的 pipeline。
-    pub fn set_pipeline(&mut self, pipeline: JsValue) {
-        self.pipeline = pipeline;
-    }
-
-    /// pipeline layout 的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// 设置 pipeline layout。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - layout 句柄。
-    pub fn set_pipeline_layout(&mut self, layout: JsValue) {
-        self.pipeline_layout = layout;
-    }
-
-    /// bind group layout 的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUBindGroupLayout` 句柄。
-    pub fn get_group_layout(&self) -> &JsValue {
-        &self.group_layout
-    }
-
-    /// 设置 bind group layout。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUBindGroupLayout` 句柄。
-    pub fn set_group_layout(&mut self, layout: JsValue) {
-        self.group_layout = layout;
-    }
-
-    /// 视投影 uniform buffer 的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - buffer 句柄。
-    pub fn get_frame_buffer(&self) -> &JsValue {
-        &self.frame_buffer
-    }
-
-    /// 设置视投影 uniform buffer。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - buffer 句柄。
-    pub fn set_frame_buffer(&mut self, buffer: JsValue) {
-        self.frame_buffer = buffer;
-    }
-
-    /// 着色参数 uniform buffer 的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - buffer 句柄。
-    pub fn get_shading_buffer(&self) -> &JsValue {
-        &self.shading_buffer
-    }
-
-    /// 设置着色参数 uniform buffer。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - buffer 句柄。
-    pub fn set_shading_buffer(&mut self, buffer: JsValue) {
-        self.shading_buffer = buffer;
-    }
-
-    /// bind group 的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - bind group 句柄。
-    pub fn get_bind_group(&self) -> &JsValue {
-        &self.bind_group
-    }
-
-    /// 设置 bind group。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - bind group 句柄。
-    pub fn set_bind_group(&mut self, group: JsValue) {
-        self.bind_group = group;
-    }
-
-    /// instance buffer 的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - buffer 句柄。
-    pub fn get_instance_buffer(&self) -> &JsValue {
-        &self.instance_buffer
-    }
-
-    /// 设置 instance buffer。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - buffer 句柄。
-    pub fn set_instance_buffer(&mut self, buffer: JsValue) {
-        self.instance_buffer = buffer;
-    }
-
-    /// instance buffer 当前容量的只读副本。
-    ///
-    /// # Returns
-    ///
-    /// configure 时记下的画布尺寸。
-    ///
-    /// # Returns
-    ///
-    /// 记下 configure 时的画布尺寸。
-    ///
-    /// # Arguments
-    ///
-    /// 画布句柄。
-    ///
-    /// # Returns
-    ///
-    /// - `usize` - 容量(实例数)。
-    pub fn get_instance_capacity(&self) -> usize {
-        self.instance_capacity
-    }
-
-    /// 设置 instance buffer 容量。
-    ///
-    /// # Arguments
-    ///
-    /// - `usize` - 容量(实例数)。
-    pub fn set_instance_capacity(&mut self, capacity: usize) {
-        self.instance_capacity = capacity;
-    }
-
-    /// 深度纹理当前尺寸的只读副本。
-    ///
-    /// # Returns
-    ///
-    /// - `(u32, u32)` - 宽高。
-    pub fn get_depth_size(&self) -> (u32, u32) {
-        self.depth_size
-    }
-
-    /// 设置深度纹理尺寸。
-    ///
-    /// # Arguments
-    ///
-    /// - `(u32, u32)` - 宽高。
-    pub fn set_depth_size(&mut self, size: (u32, u32)) {
-        self.depth_size = size;
-    }
-
-    /// 深度纹理的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - 纹理句柄。
-    pub fn get_depth_texture(&self) -> &JsValue {
-        &self.depth_texture
-    }
-
-    /// 设置深度纹理。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - 纹理句柄。
-    pub fn set_depth_texture(&mut self, texture: JsValue) {
-        self.depth_texture = texture;
-    }
-
-    /// GPU 侧资产表长度的只读副本(验收探针)。
-    ///
-    /// # Returns
-    ///
-    /// - `usize` - 资产条数。
-    pub fn get_gpu_mesh_count(&self) -> usize {
-        self.gpu_mesh_count
-    }
-
-    /// 设置 GPU 侧资产表长度(验收探针)。
-    ///
-    /// # Arguments
-    ///
-    /// - `usize` - 资产条数。
-    pub fn set_gpu_mesh_count(&mut self, count: usize) {
-        self.gpu_mesh_count = count;
-    }
-
-    /// 阴影管线。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPURenderPipeline` 句柄。
-    pub fn get_shadow_pipeline(&self) -> &JsValue {
-        &self.shadow_pipeline
-    }
-
-    /// 设置阴影管线。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPURenderPipeline` 句柄。
-    pub fn set_shadow_pipeline(&mut self, pipeline: JsValue) {
-        self.shadow_pipeline = pipeline;
-    }
-
-    /// 设置阴影管线的 pipeline layout。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUPipelineLayout` 句柄。
-    pub fn set_shadow_pipeline_layout(&mut self, layout: JsValue) {
-        self.shadow_pipeline_layout = layout;
-    }
-
-    /// 阴影管线的 bind group layout。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUBindGroupLayout` 句柄。
-    pub fn get_shadow_group_layout(&self) -> &JsValue {
-        &self.shadow_group_layout
-    }
-
-    /// 设置阴影管线的 bind group layout。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUBindGroupLayout` 句柄。
-    pub fn set_shadow_group_layout(&mut self, layout: JsValue) {
-        self.shadow_group_layout = layout;
-    }
-
-    /// 阴影管线的 bind group(group 0 = 光源矩阵)。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUBindGroup` 句柄。
-    pub fn get_shadow_bind_group(&self) -> &JsValue {
-        &self.shadow_bind_group
-    }
-
-    /// 设置阴影管线的 bind group。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUBindGroup` 句柄。
-    pub fn set_shadow_bind_group(&mut self, group: JsValue) {
-        self.shadow_bind_group = group;
-    }
-
-    /// 光源视投影矩阵 uniform buffer。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUBuffer` 句柄。
-    pub fn get_shadow_frame_buffer(&self) -> &JsValue {
-        &self.shadow_frame_buffer
-    }
-
-    /// 设置光源视投影矩阵 uniform buffer。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUBuffer` 句柄。
-    pub fn set_shadow_frame_buffer(&mut self, buffer: JsValue) {
-        self.shadow_frame_buffer = buffer;
-    }
-
-    /// 阴影深度纹理。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUTexture` 句柄。
-    pub fn get_shadow_texture(&self) -> &JsValue {
-        &self.shadow_texture
-    }
-
-    /// 设置阴影深度纹理。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUTexture` 句柄。
-    pub fn set_shadow_texture(&mut self, texture: JsValue) {
-        self.shadow_texture = texture;
-    }
-
-    /// 主管线的 group 1 bind group。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUBindGroup` 句柄。
-    pub fn get_shadow_sample_bind_group(&self) -> &JsValue {
-        &self.shadow_sample_bind_group
-    }
-
-    /// 取阴影 pass 专用的 instance buffer。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUBuffer` 句柄。
-    pub fn get_shadow_instance_buffer(&self) -> &JsValue {
-        &self.shadow_instance_buffer
-    }
-
-    /// 设置阴影 pass 专用的 instance buffer。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUBuffer` 句柄。
-    pub fn set_shadow_instance_buffer(&mut self, buffer: JsValue) {
-        self.shadow_instance_buffer = buffer;
-    }
-
-    /// 取阴影 instance buffer 的容量。
-    ///
-    /// # Returns
-    ///
-    /// - `usize` - 实例数。
-    pub fn get_shadow_instance_capacity(&self) -> usize {
-        self.shadow_instance_capacity
-    }
-
-    /// 设置阴影 instance buffer 的容量。
-    ///
-    /// # Arguments
-    ///
-    /// - `usize` - 实例数。
-    pub fn set_shadow_instance_capacity(&mut self, capacity: usize) {
-        self.shadow_instance_capacity = capacity;
-    }
-
-    /// 设置主管线的 group 1 bind group。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUBindGroup` 句柄。
-    pub fn set_shadow_sample_bind_group(&mut self, group: JsValue) {
-        self.shadow_sample_bind_group = group;
-    }
-
-    /// group 1 的 bind group layout。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUBindGroupLayout` 句柄。
-    pub fn get_shadow_sample_group_layout(&self) -> &JsValue {
-        &self.shadow_sample_group_layout
-    }
-
-    /// 设置 group 1 的 bind group layout。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUBindGroupLayout` 句柄。
-    pub fn set_shadow_sample_group_layout(&mut self, layout: JsValue) {
-        self.shadow_sample_group_layout = layout;
-    }
-
-    /// 本帧序号,供 SSAO 的逐帧抖动种子用。
-    ///
-    /// # Returns
-    ///
-    /// - `u64` - 帧计数。
-    pub fn get_frame_index(&self) -> u64 {
-        self.frame_index
     }
 
     /// 取三条 AO pass 的句柄。
@@ -3416,15 +2980,6 @@ impl WebGpuRenderer {
         self.ao_passes.clone()
     }
 
-    /// 设置三条 AO pass 的句柄。
-    ///
-    /// # Arguments
-    ///
-    /// - `[GpuAoPass; AO_PASS_COUNT]` - pipeline + bind group 配对。
-    pub fn set_ao_passes(&mut self, passes: [GpuAoPass; AO_PASS_COUNT]) {
-        self.ao_passes = passes;
-    }
-
     /// SSAO 三条 pass 各自的 uniform buffer(只读副本)。
     ///
     /// # Returns
@@ -3434,68 +2989,20 @@ impl WebGpuRenderer {
         self.ao_buffers.clone()
     }
 
-    /// 设置三条 AO pass 的 uniform buffer。
-    ///
-    /// # Arguments
-    ///
-    /// - `[JsValue; AO_PASS_COUNT]` - uniform buffer 句柄。
-    pub fn set_ao_buffers(&mut self, buffers: [JsValue; AO_PASS_COUNT]) {
-        self.ao_buffers = buffers;
-    }
-
     /// AO 的 bind group layout(只读副本)。
     ///
     /// # Returns
     ///
-    /// - `JsValue` - `GPUBindGroupLayout`。
-    pub fn get_ao_group_layout(&self) -> JsValue {
-        self.ao_group_layout.clone()
-    }
-
-    /// 设置 AO 的 bind group layout。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUBindGroupLayout`。
-    pub fn set_ao_group_layout(&mut self, layout: JsValue) {
-        self.ao_group_layout = layout;
-    }
 
     /// G-buffer 的视空间法线图。
     ///
     /// # Returns
     ///
-    /// - `JsValue` - 纹理句柄。
-    pub fn get_ao_normal(&self) -> JsValue {
-        self.ao_normal.clone()
-    }
-
-    /// 设置 G-buffer 的视空间法线图。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - 纹理句柄。
-    pub fn set_ao_normal(&mut self, texture: JsValue) {
-        self.ao_normal = texture;
-    }
 
     /// G-buffer 的线性深度图。
     ///
     /// # Returns
     ///
-    /// - `JsValue` - 纹理句柄。
-    pub fn get_ao_depth(&self) -> JsValue {
-        self.ao_depth.clone()
-    }
-
-    /// 设置 G-buffer 的线性深度图。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - 纹理句柄。
-    pub fn set_ao_depth(&mut self, texture: JsValue) {
-        self.ao_depth = texture;
-    }
 
     /// 半分辨率 AO 的 ping / pong 纹理。
     ///
@@ -3517,59 +3024,10 @@ impl WebGpuRenderer {
         self.ao_pong = pong;
     }
 
-    /// AO 四个目标当前的尺寸。
-    ///
-    /// # Returns
-    ///
-    /// - `(u32, u32)` - (0, 0) 表示还没建。
-    pub fn get_ao_size(&self) -> (u32, u32) {
-        self.ao_size
-    }
-
-    /// 设置 AO 四个目标的尺寸。
-    ///
-    /// # Arguments
-    ///
-    /// - `(u32, u32)` - 画布尺寸。
-    pub fn set_ao_size(&mut self, size: (u32, u32)) {
-        self.ao_size = size;
-    }
-
     /// AO 用的采样器。
     ///
     /// # Returns
     ///
-    /// - `JsValue` - `GPUSampler` 句柄。
-    pub fn get_ao_sampler(&self) -> JsValue {
-        self.ao_sampler.clone()
-    }
-
-    /// 设置 AO 用的采样器。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUSampler` 句柄。
-    pub fn set_ao_sampler(&mut self, sampler: JsValue) {
-        self.ao_sampler = sampler;
-    }
-
-    /// 城市 pass 现在的 MRT 附件数。
-    ///
-    /// # Returns
-    ///
-    /// - `u32` - 1 = 只写场景色,3 = 场景色 + 法线 + 线性深度。
-    pub fn get_gbuffer_slots(&self) -> u32 {
-        self.gbuffer_slots
-    }
-
-    /// 设置城市 pass 的 MRT 附件数。
-    ///
-    /// # Arguments
-    ///
-    /// - `u32` - 附件数。
-    pub fn set_gbuffer_slots(&mut self, slots: u32) {
-        self.gbuffer_slots = slots;
-    }
 
     /// 四条 bloom pipeline 各自的句柄(按值克隆一份)。
     ///
@@ -3583,15 +3041,6 @@ impl WebGpuRenderer {
         self.bloom_passes.clone()
     }
 
-    /// 设置四条 bloom pipeline 的句柄。
-    ///
-    /// # Arguments
-    ///
-    /// - `[GpuBloomPass; BLOOM_PASS_COUNT]` - pipeline + bind group 配对。
-    pub fn set_bloom_passes(&mut self, passes: [GpuBloomPass; BLOOM_PASS_COUNT]) {
-        self.bloom_passes = passes;
-    }
-
     /// 四条 bloom pass 各自的 uniform buffer(只读副本)。
     ///
     /// # Returns
@@ -3599,159 +3048,6 @@ impl WebGpuRenderer {
     /// - `[JsValue; BLOOM_PASS_COUNT]` - uniform buffer 句柄。
     pub fn get_bloom_buffers(&self) -> [JsValue; BLOOM_PASS_COUNT] {
         self.bloom_buffers.clone()
-    }
-
-    /// 设置四条 bloom pass 的 uniform buffer。
-    ///
-    /// # Arguments
-    ///
-    /// - `[JsValue; BLOOM_PASS_COUNT]` - uniform buffer 句柄。
-    pub fn set_bloom_buffers(&mut self, buffers: [JsValue; BLOOM_PASS_COUNT]) {
-        self.bloom_buffers = buffers;
-    }
-
-    /// bloom 颜色输入的普通采样器。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUSampler` 句柄。
-    pub fn get_bloom_sampler(&self) -> &JsValue {
-        &self.bloom_sampler
-    }
-
-    /// 设置 bloom 颜色输入的普通采样器。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUSampler` 句柄。
-    pub fn set_bloom_sampler(&mut self, sampler: JsValue) {
-        self.bloom_sampler = sampler;
-    }
-
-    /// bloom 提取 / 模糊的 bind group layout。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUBindGroupLayout` 句柄。
-    pub fn get_bloom_group_layout(&self) -> &JsValue {
-        &self.bloom_group_layout
-    }
-
-    /// 设置 bloom 提取 / 模糊的 bind group layout。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUBindGroupLayout` 句柄。
-    pub fn set_bloom_group_layout(&mut self, layout: JsValue) {
-        self.bloom_group_layout = layout;
-    }
-
-    /// bloom 合成的 bind group layout。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUBindGroupLayout` 句柄。
-    pub fn get_bloom_composite_group_layout(&self) -> &JsValue {
-        &self.bloom_composite_group_layout
-    }
-
-    /// 设置 bloom 合成的 bind group layout。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUBindGroupLayout` 句柄。
-    pub fn set_bloom_composite_group_layout(&mut self, layout: JsValue) {
-        self.bloom_composite_group_layout = layout;
-    }
-
-    /// 主场景离屏颜色目标。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUTexture` 句柄。
-    pub fn get_bloom_scene(&self) -> &JsValue {
-        &self.bloom_scene
-    }
-
-    /// 设置主场景离屏颜色目标。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUTexture` 句柄。
-    pub fn set_bloom_scene(&mut self, texture: JsValue) {
-        self.bloom_scene = texture;
-    }
-
-    /// 亮度提取目标。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUTexture` 句柄。
-    pub fn get_bloom_bright(&self) -> &JsValue {
-        &self.bloom_bright
-    }
-
-    /// 设置亮度提取目标。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUTexture` 句柄。
-    pub fn set_bloom_bright(&mut self, texture: JsValue) {
-        self.bloom_bright = texture;
-    }
-
-    /// 水平模糊目标(ping)。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUTexture` 句柄。
-    pub fn get_bloom_ping(&self) -> &JsValue {
-        &self.bloom_ping
-    }
-
-    /// 设置水平模糊目标(ping)。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUTexture` 句柄。
-    pub fn set_bloom_ping(&mut self, texture: JsValue) {
-        self.bloom_ping = texture;
-    }
-
-    /// 竖直模糊目标(pong)。
-    ///
-    /// # Returns
-    ///
-    /// - `&JsValue` - `GPUTexture` 句柄。
-    pub fn get_bloom_pong(&self) -> &JsValue {
-        &self.bloom_pong
-    }
-
-    /// 设置竖直模糊目标(pong)。
-    ///
-    /// # Arguments
-    ///
-    /// - `JsValue` - `GPUTexture` 句柄。
-    pub fn set_bloom_pong(&mut self, texture: JsValue) {
-        self.bloom_pong = texture;
-    }
-
-    /// 后处理目标当前尺寸(记的是画布尺寸)。
-    ///
-    /// # Returns
-    ///
-    /// - `(u32, u32)` - 宽高。
-    pub fn get_bloom_size(&self) -> (u32, u32) {
-        self.bloom_size
-    }
-
-    /// 设置后处理目标当前尺寸(记的是画布尺寸)。
-    ///
-    /// # Arguments
-    ///
-    /// - `(u32, u32)` - 宽高。
-    pub fn set_bloom_size(&mut self, size: (u32, u32)) {
-        self.bloom_size = size;
     }
 }
 

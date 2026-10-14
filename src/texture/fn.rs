@@ -16,7 +16,7 @@ use super::*;
 ///
 /// - `Result<&'a [u8], String>` - The next `n` bytes, or an error naming the
 ///   offset that ran past the end.
-fn take<'a>(data: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], String> {
+pub(crate) fn take<'a>(data: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], String> {
     let end: usize = *at + n;
     if end > data.len() {
         return Err(format!(
@@ -39,7 +39,7 @@ fn take<'a>(data: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], String
 /// # Returns
 ///
 /// - `Result<usize, String>` - The value, or an error if the file is short.
-fn read_u32(data: &[u8], at: &mut usize) -> Result<usize, String> {
+pub(crate) fn read_u32(data: &[u8], at: &mut usize) -> Result<usize, String> {
     let raw: &[u8] = take(data, at, 4)?;
     let value: u32 = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     Ok(value as usize)
@@ -88,14 +88,14 @@ pub fn parse_atlas(data: &[u8], size: u32) -> Result<AtlasSet, String> {
 /// Stored rather than uploaded directly so the render pass can bind the map a
 /// part asks for without every draw call re-parsing a blob. Populated during
 /// asset load; an asset absent from here falls back to scalar PBR.
-static ATLASES: OnceLock<Mutex<HashMap<String, AtlasSet>>> = OnceLock::new();
+pub(crate) static ATLASES: OnceLock<Mutex<HashMap<String, AtlasSet>>> = OnceLock::new();
 
 /// The process-wide atlas registry, created on first use.
 ///
 /// # Returns
 ///
 /// - `&'static Mutex<HashMap<String, AtlasSet>>` - The live registry.
-fn registry() -> &'static Mutex<HashMap<String, AtlasSet>> {
+pub(crate) fn registry() -> &'static Mutex<HashMap<String, AtlasSet>> {
     ATLASES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -127,7 +127,7 @@ pub fn lookup(asset_id: &str, kind: Option<&str>, map_name: &str) -> Option<Atla
     let kind: &str = kind?;
     let guard: MutexGuard<'_, HashMap<String, AtlasSet>> = registry().lock().ok()?;
     let set: &AtlasSet = guard.get(asset_id)?;
-    set.images.get(&format!("{kind}/{map_name}")).cloned()
+    set.get_images().get(&format!("{kind}/{map_name}")).cloned()
 }
 
 /// How many assets currently hold a decoded atlas.
@@ -158,7 +158,8 @@ pub fn loaded_count() -> usize {
 ///
 /// - `bool` - True when the albedo map exists.
 pub fn has_albedo(set: &AtlasSet, kind: &str) -> bool {
-    set.images.contains_key(&format!("{kind}/{MAP_ALBEDO}"))
+    set.get_images()
+        .contains_key(&format!("{kind}/{MAP_ALBEDO}"))
 }
 
 /// The albedo key for a surface family.
@@ -177,11 +178,10 @@ pub fn albedo_key(kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[cfg(test)]
 
     /// Build one atlas file in the on-disk format.
-    fn build(entries: &[(&str, usize)]) -> Vec<u8> {
+    pub(crate) fn build(entries: &[(&str, usize)]) -> Vec<u8> {
         let mut data: Vec<u8> = (entries.len() as u32).to_le_bytes().to_vec();
         for (key, len) in entries {
             data.extend_from_slice(&(key.len() as u32).to_le_bytes());
@@ -194,7 +194,7 @@ mod tests {
 
     /// A file with two maps round-trips to the right keys, sizes and payloads.
     #[test]
-    fn parses_two_maps_into_the_set() {
+    pub(crate) fn parses_two_maps_into_the_set() {
         let size: u32 = 2;
         let payload: usize = (size * size * 4) as usize;
         let data: Vec<u8> = build(&[
@@ -214,7 +214,7 @@ mod tests {
 
     /// The three map names must stay distinct or one silently overwrites another.
     #[test]
-    fn the_three_map_names_are_distinct() {
+    pub(crate) fn the_three_map_names_are_distinct() {
         assert_ne!(MAP_ALBEDO, MAP_NORMAL);
         assert_ne!(MAP_ALBEDO, MAP_ORM);
         assert_ne!(MAP_NORMAL, MAP_ORM);
@@ -223,7 +223,7 @@ mod tests {
     /// A truncated payload must be an error, never a short read that silently
     /// uploads a half-empty texture.
     #[test]
-    fn a_truncated_payload_is_rejected() {
+    pub(crate) fn a_truncated_payload_is_rejected() {
         let mut data: Vec<u8> = build(&[(ATLAS_PAINT_ALBEDO, 16)]);
         data.truncate(data.len() - 1);
         assert!(
@@ -235,7 +235,7 @@ mod tests {
     /// A truncated header must be rejected too — this is the failure that would
     /// otherwise read a garbage `count` and try to allocate millions of entries.
     #[test]
-    fn a_truncated_header_is_rejected() {
+    pub(crate) fn a_truncated_header_is_rejected() {
         assert!(
             parse_atlas(&[0, 0], 2).is_err(),
             "2 bytes cannot be a count"
@@ -249,7 +249,7 @@ mod tests {
     /// Negative control: a surface with no albedo map must report false, so a
     /// part can fall back to scalar PBR instead of binding a missing texture.
     #[test]
-    fn a_surface_without_an_albedo_map_reports_absent() {
+    pub(crate) fn a_surface_without_an_albedo_map_reports_absent() {
         let size: u32 = 2;
         let payload: usize = (size * size * 4) as usize;
         let data: Vec<u8> = build(&[("metal/albedo", payload)]);
@@ -264,13 +264,12 @@ mod tests {
     /// A stored asset is retrievable by id and surface family, and an unknown
     /// id or family yields `None` instead of another asset's texels.
     #[test]
-    fn a_stored_asset_is_found_by_id_and_surface() {
+    pub(crate) fn a_stored_asset_is_found_by_id_and_surface() {
         let size: u32 = 2;
         let payload: usize = (size * size * 4) as usize;
         let data: Vec<u8> = build(&[(ATLAS_PAINT_ALBEDO, payload)]);
         let set: AtlasSet = parse_atlas(&data, size).expect(ATLAS_PARSE_EXPECT);
         store_atlas(ATLAS_TEST_ASSET.to_string(), set);
-
         let found: Option<AtlasImage> = lookup(ATLAS_TEST_ASSET, Some(SURFACE_PAINT), MAP_ALBEDO);
         assert_eq!(
             found.map(|image: AtlasImage| image.byte_len()),
@@ -293,7 +292,7 @@ mod tests {
 
     /// The JSON a textured part carries must deserialise into `TextureRef`.
     #[test]
-    fn a_textured_part_deserialises_its_atlas_reference() {
+    pub(crate) fn a_textured_part_deserialises_its_atlas_reference() {
         // Built from the same consts the pipeline writes, so this test cannot
         // pass against a JSON shape the exporter no longer produces.
         let json: String = format!(

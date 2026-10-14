@@ -1,102 +1,4 @@
-//! 玩家角色:第三人称移动、步态动画、跟随相机目标、生命值与拾取计数。
-//!
-//! 复用 `ped_suit` 资产(不新建模)。行人资产在 JSON 里是**分部件**的
-//! (`torso` / `head` / `hair` / `upper_arm_L` … / `lower_leg_R` / `shoe_R`),
-//! 所以渲染时把每个 part 拆成一个独立 mesh + 独立批次,每帧按行走相位
-//! 给每个 part 算一条 model matrix —— 上臂 / 小臂 / 大腿 / 小腿绕各自
-//! 关节的局部 X 轴摆动,鞋子随小腿一起摆,停下时相位衰减回 0、肢体归位。
-//!
-//! 关节枢轴点不是手写的魔法坐标,而是从**每个 part 自己的包围盒**推出来
-//! 的:上臂枢轴 = 肩(盒顶面 Y + 靠近身体一侧的 X),大腿 = 胯,小腿 = 膝。
-//! 换模型时只要 part 划分一致,骨架自动跟着长。
-
-use crate::{
-    PI,
-    camera::Mat4,
-    collision::CollisionWorld,
-    r#config::*,
-    r#type::{Vec2, Vec3},
-};
-
-/// 步行速度(米/秒)。
-pub(crate) const WALK_SPEED: f32 = 4.6;
-/// 奔跑速度(米/秒,按住 Shift)。
-pub(crate) const RUN_SPEED: f32 = 8.4;
-/// 转身插值速度(1/秒):越小转身越「重」,不会瞬移式扭头。
-pub const TURN_RATE: f32 = 11.0;
-/// 行走相位推进速率(rad / 米):每走 1 米推进约 2.6 rad,约 2.4 步。
-pub const GAIT_RATE_PER_METER: f32 = 2.6;
-/// 肢体摆动幅度上限(弧度)。
-pub const LIMB_SWING: f32 = 0.62;
-/// 脚相对小腿的**自转**摆角上限(弧度)。
-///
-/// 取 0 而不是非零:脚是被小腿**带着走**的,踝关节自身在这套骨架里
-/// 不额外发力。留成可调常量是为了把「不摆」这件事显式写进骨架表,而不是
-/// 靠「表里没登记」来隐式实现 —— 后者正是本缺陷的成因(见 [`LIMB_PLAN`]
-/// 里鞋那一段的注释)。要加踝部旋转时改这一个数即可。
-pub const FOOT_SWING: f32 = 0.0;
-/// 停止后相位回零的速率(1/秒)。
-pub const GAIT_RELAX_RATE: f32 = 6.5;
-/// 起步 / 停步时速度的指数趋近速率(1/秒)。
-pub const SPEED_RAMP: f32 = 14.0;
-/// 低于这个平面速度(米/秒)就认为「站住了」:不转身、不推进相位。
-pub const PLANAR_EPSILON: f32 = 0.05;
-/// 玩家初始生命值。
-pub(crate) const MAX_HEALTH: f32 = 100.0;
-
-/// 玩家的全部**可动**骨架 part(与 `ped_suit` 的 part 划分一一对应)。
-///
-/// 每一项是 `(part 名, 父 part 名, 相位偏移, 摆动幅度)`。
-///
-/// **`parent` 不能省。** 资产把 `upper_leg_L` / `lower_leg_L` 切成两个
-/// 独立 part,各自带**绝对**局部坐标。渲染一节 limb 时必须知道它的父
-/// part 叫什么,才能把父关节的摆角叠加进来(见 [`limb_chain_matrix`])。
-/// 躯干 / 头 / 鞋这类没有父关节的 part 用空串表示「就是链根」。
-///
-/// 相位:左右反相(`GAIT_PHASE_R = π`),同一侧上下同相位,形成对角步态。
-pub(crate) const LIMB_PLAN: &[(&str, &str, f32, f32)] = &[
-    (PART_UPPER_ARM_L, "", GAIT_PHASE_L, LIMB_SWING),
-    (
-        PART_LOWER_ARM_L,
-        PART_UPPER_ARM_L,
-        GAIT_PHASE_L,
-        LIMB_SWING * 0.8,
-    ),
-    (PART_UPPER_ARM_R, "", GAIT_PHASE_R, LIMB_SWING),
-    (
-        PART_LOWER_ARM_R,
-        PART_UPPER_ARM_R,
-        GAIT_PHASE_R,
-        LIMB_SWING * 0.8,
-    ),
-    (PART_UPPER_LEG_L, "", GAIT_PHASE_L, LIMB_SWING),
-    (
-        PART_LOWER_LEG_L,
-        PART_UPPER_LEG_L,
-        GAIT_PHASE_L,
-        LIMB_SWING * 0.9,
-    ),
-    (PART_UPPER_LEG_R, "", GAIT_PHASE_R, LIMB_SWING),
-    (
-        PART_LOWER_LEG_R,
-        PART_UPPER_LEG_R,
-        GAIT_PHASE_R,
-        LIMB_SWING * 0.9,
-    ),
-    // 鞋挂在**小腿**上,不是躯干上。
-    //
-    // 漏掉这两项时 `limb_swing` 对鞋返回 `0.0`,于是鞋的矩阵退化成纯位姿
-    // (只有 `T(origin)·Ry(yaw)`),整条腿绕髋转起来时脚留在原地 —— 表现
-    // 就是「鞋子不跟随腿部」。实测(HEAD `25f4a53`):走路时 `shoe_L` 的平移列
-    // 恒等于 `origin`,而 `lower_leg_L` 在 ±0.39 m 之间摆动。
-    //
-    // 摆角取 `0`:脚本身相对小腿**不摆**,它是被小腿带着走的。GTA V 里
-    // 落脚那一瞬有轻微的踝部旋转,那属于摆动相位而不是幅度问题,靠
-    // `SWING` 之外的相位项表达;在这里给一个与小腿同相位的常量会把脚
-    // 变成第二条腿。
-    (PART_SHOE_L, PART_LOWER_LEG_L, GAIT_PHASE_L, FOOT_SWING),
-    (PART_SHOE_R, PART_LOWER_LEG_R, GAIT_PHASE_R, FOOT_SWING),
-];
+use super::*;
 
 /// 查某个 part 的父 part 名。
 ///
@@ -137,506 +39,6 @@ pub fn limb_swing(part: &str, phase: f32, amount: f32) -> f32 {
         return 0.0;
     };
     scale * amount * (phase + offset).sin()
-}
-
-/// 左腿相位:0。
-pub const GAIT_PHASE_L: f32 = 0.0;
-/// 右腿相位:与左腿反相。
-pub const GAIT_PHASE_R: f32 = PI;
-
-/// 一个玩家的运行时状态。
-#[derive(Clone, Debug)]
-pub struct Player {
-    /// 脚下世界坐标(Y 恒为 0,踩在人行道高度上由场景统一处理)。
-    position: Vec3,
-    /// 朝向(绕 Y 轴弧度,0 = 面向 +X)。
-    yaw: f32,
-    /// 当前水平速度(X / Z,米/秒)。
-    velocity: Vec2,
-    /// 行走相位(弧度)。
-    gait_phase: f32,
-    /// 当前步态幅度 0..1,由速度平滑驱动。
-    gait_amount: f32,
-    /// 生命值。
-    health: f32,
-    /// 护甲值:先于生命值承伤,按比例吸收伤害。
-    armor: f32,
-    /// 已拾取的现金。
-    cash: f32,
-    /// 当前驾驶的车辆索引(`None` = 在地面上)。
-    vehicle: Option<usize>,
-    /// 上一次收到的拾取提示(空串 = 无提示)。
-    notice: String,
-    /// 已被拾取掉的拾取物索引。
-    collected: Vec<usize>,
-    /// 身体高度(米):脚底到头顶。室内分离靠它判断「够不够得着」一块
-    /// 二层楼板 —— 站在一楼时头顶 1.9 m 够不到 2.95 m 的板,所以不会被
-    /// 上方的楼板推开。
-    height: f32,
-    /// 垂直速度(米/秒,向上为正)。踩在楼板上时被清零。
-    vertical_velocity: f32,
-    /// 脚底是否正踩在某块楼板 / 地面上。
-    grounded: bool,
-}
-
-impl Player {
-    /// 脚下世界坐标。
-    ///
-    /// # Returns
-    ///
-    /// - `Vec3` - 当前世界坐标(Y 恒为 0)。
-    pub fn get_position(&self) -> Vec3 {
-        self.position
-    }
-
-    /// 写入脚下世界坐标。
-    ///
-    /// # Arguments
-    ///
-    /// - `Vec3` - 新世界坐标。
-    pub fn set_position(&mut self, value: Vec3) {
-        self.position = value;
-    }
-
-    /// 朝向(绕 Y 轴弧度)。
-    ///
-    /// # Returns
-    ///
-    /// - `f32` - 当前朝向。
-    pub fn get_yaw(&self) -> f32 {
-        self.yaw
-    }
-
-    /// 写入朝向。
-    ///
-    /// # Arguments
-    ///
-    /// - `f32` - 新朝向(弧度)。
-    pub fn set_yaw(&mut self, value: f32) {
-        self.yaw = value;
-    }
-
-    /// 当前水平速度。
-    ///
-    /// # Returns
-    ///
-    /// - `Vec2` - X / Z 速度分量(米/秒)。
-    pub fn get_velocity(&self) -> Vec2 {
-        self.velocity
-    }
-
-    /// 写入当前水平速度。
-    ///
-    /// # Arguments
-    ///
-    /// - `Vec2` - 新速度(米/秒)。
-    pub fn set_velocity(&mut self, value: Vec2) {
-        self.velocity = value;
-    }
-
-    /// 行走相位。
-    ///
-    /// # Returns
-    ///
-    /// - `f32` - 当前相位(弧度)。
-    pub fn get_gait_phase(&self) -> f32 {
-        self.gait_phase
-    }
-
-    /// 写入行走相位。
-    ///
-    /// # Arguments
-    ///
-    /// - `f32` - 新相位(弧度)。
-    pub fn set_gait_phase(&mut self, value: f32) {
-        self.gait_phase = value;
-    }
-
-    /// 当前步态幅度。
-    ///
-    /// # Returns
-    ///
-    /// - `f32` - `0.0` 站立,`1.0` 全速行走。
-    pub fn get_gait_amount(&self) -> f32 {
-        self.gait_amount
-    }
-
-    /// 写入当前步态幅度。
-    ///
-    /// # Arguments
-    ///
-    /// - `f32` - 新幅度。
-    pub fn set_gait_amount(&mut self, value: f32) {
-        self.gait_amount = value;
-    }
-
-    /// 生命值。
-    ///
-    /// # Returns
-    ///
-    /// - `f32` - 当前生命值。
-    pub fn get_health(&self) -> f32 {
-        self.health
-    }
-
-    /// 写入生命值。
-    ///
-    /// # Arguments
-    ///
-    /// - `f32` - 新生命值。
-    pub fn set_health(&mut self, value: f32) {
-        self.health = value;
-    }
-
-    /// 护甲值。
-    ///
-    /// # Returns
-    ///
-    /// - `f32` - 当前护甲。
-    pub fn get_armor(&self) -> f32 {
-        self.armor
-    }
-
-    /// 写入护甲值。
-    ///
-    /// # Arguments
-    ///
-    /// - `f32` - 新护甲。
-    pub fn set_armor(&mut self, value: f32) {
-        self.armor = value;
-    }
-
-    /// 累加护甲(拾取护甲背心时用)。
-    ///
-    /// # Arguments
-    ///
-    /// - `f32` - 增量(可以为负)。
-    pub fn add_armor(&mut self, amount: f32) {
-        self.set_armor((self.get_armor() + amount).clamp(0.0, MAX_ARMOR));
-    }
-
-    /// 已拾取的现金。
-    ///
-    /// # Returns
-    ///
-    /// - `f32` - 当前现金。
-    pub fn get_cash(&self) -> f32 {
-        self.cash
-    }
-
-    /// 累加现金。
-    ///
-    /// # Arguments
-    ///
-    /// - `f32` - 增量(可以为负)。
-    pub fn set_cash_add(&mut self, amount: f32) {
-        self.cash += amount;
-    }
-
-    /// 当前驾驶的车辆索引。
-    ///
-    /// # Returns
-    ///
-    /// - `Option<usize>` - 在驾驶时为 `Some(索引)`,否则为 `None`。
-    pub fn get_vehicle(&self) -> Option<usize> {
-        self.vehicle
-    }
-
-    /// 写入当前驾驶的车辆索引。
-    ///
-    /// # Arguments
-    ///
-    /// - `Option<usize>` - 新车辆索引。
-    pub fn set_vehicle(&mut self, value: Option<usize>) {
-        self.vehicle = value;
-    }
-
-    /// 玩家是否坐在车里。
-    ///
-    /// # Returns
-    ///
-    /// - `bool` - 在车里时为 `true`。
-    pub fn get_driving(&self) -> bool {
-        self.vehicle.is_some()
-    }
-
-    /// 上一次收到的拾取提示。
-    ///
-    /// # Returns
-    ///
-    /// - `&str` - 提示文本,空串表示无提示。
-    pub fn get_notice(&self) -> &str {
-        &self.notice
-    }
-
-    /// 写入拾取提示。
-    ///
-    /// # Arguments
-    ///
-    /// - `String` - 新提示文本。
-    pub fn set_notice(&mut self, value: String) {
-        self.notice = value;
-    }
-
-    /// 已被拾取掉的拾取物索引。
-    ///
-    /// # Returns
-    ///
-    /// - `&Vec<usize>` - 已拾取的索引列表。
-    pub fn get_collected_ref(&self) -> &Vec<usize> {
-        &self.collected
-    }
-
-    /// 追加一个已拾取的拾取物索引。
-    ///
-    /// # Arguments
-    ///
-    /// - `usize` - 拾取物索引。
-    pub fn set_collected_push(&mut self, index: usize) {
-        self.collected.push(index);
-    }
-
-    /// 已被拾取的数量。
-    ///
-    /// # Returns
-    ///
-    /// - `usize` - 已拾取的拾取物个数。
-    pub fn collected_count(&self) -> usize {
-        self.get_collected_ref().len()
-    }
-
-    /// 身体高度(米)。
-    ///
-    /// # Returns
-    ///
-    /// - `f32` - 脚底到头顶的距离(米)。
-    pub fn get_height(&self) -> f32 {
-        self.height
-    }
-
-    /// 垂直速度(米/秒,向上为正)。
-    ///
-    /// # Returns
-    ///
-    /// - `f32` - 当前垂直速度(米/秒)。
-    pub fn get_vertical_velocity(&self) -> f32 {
-        self.vertical_velocity
-    }
-
-    /// 写入垂直速度。
-    ///
-    /// # Arguments
-    ///
-    /// - `f32` - 新的垂直速度(米/秒,向上为正)。
-    pub fn set_vertical_velocity(&mut self, value: f32) {
-        self.vertical_velocity = value;
-    }
-
-    /// 起跳(键位写入入口):给一个向上的初速度,并立刻离开「站着」状态。
-    ///
-    /// **必须同时把 `grounded` 打成 false。** 之前这个方法不存在,
-    /// `vertical_velocity` 只由 `step_vertical` 在「离开支撑面」的
-    /// 自由落体分支里写 —— 也就是说玩家站着时往上写一个正速度,
-    /// 下一帧 `support - y <= STEP_UP_TOLERANCE` 依然成立,立刻被
-    /// `set_vertical_velocity(0.0)` 抹掉。这正是「按了 Space 原地
-    /// 弹一下就停」的那种假跳跃:速度被地板吃掉,人根本没离开地面。
-    ///
-    /// 初速度取 [`JUMP_VELOCITY`],顶高 1.245 m(见该常量的推导),
-    /// 滞空 0.67 s。滞空途中的重力与落地判定都由 `step_vertical` 走
-    /// **同一套**积分,这里不重复实现。
-    ///
-    /// # Arguments
-    ///
-    /// - `bool` - 上一帧是否踩在支撑面上;滞空时不得二次起跳。
-    ///
-    /// # Returns
-    ///
-    /// - `bool` - 本次是否真的起跳(滞空时为 `false`)。
-    pub fn set_jump_requested(&mut self, was_grounded: bool) -> bool {
-        if !was_grounded {
-            return false;
-        }
-        // 经已有的 `set_*` 写入口,而不是 `self.field` 直写(§17.3/§17.12:
-        // accessor 体内直写合法,业务方法里不合法)。
-        self.set_vertical_velocity(JUMP_VELOCITY);
-        self.set_grounded(false);
-        true
-    }
-
-    /// 脚底是否正踩在某块楼板 / 地面上。
-    ///
-    /// # Returns
-    ///
-    /// - `bool` - 踩在支撑面上时为 `true`。
-    pub fn get_grounded(&self) -> bool {
-        self.grounded
-    }
-
-    /// 写入「是否踩在地上」。
-    ///
-    /// # Arguments
-    ///
-    /// - `bool` - 新的踩地状态。
-    pub fn set_grounded(&mut self, value: bool) {
-        self.grounded = value;
-    }
-
-    /// 在给定位置创建一个满血玩家。
-    ///
-    /// # Arguments
-    ///
-    /// - `Vec3` - 初始世界坐标。
-    /// - `f32` - 初始朝向(弧度)。
-    ///
-    /// # Returns
-    ///
-    /// - `Self` - 就绪的玩家状态。
-    pub fn new(position: Vec3, yaw: f32) -> Self {
-        Self {
-            position,
-            yaw,
-            velocity: [0.0, 0.0],
-            gait_phase: 0.0,
-            gait_amount: 0.0,
-            health: MAX_HEALTH,
-            armor: 0.0,
-            cash: 0.0,
-            vehicle: None,
-            notice: String::new(),
-            collected: Vec::new(),
-            height: PLAYER_BODY_HEIGHT,
-            vertical_velocity: 0.0,
-            grounded: true,
-        }
-    }
-
-    /// 把两轴按键输入的模长钳到不超过 1(斜向不快于直线的关键)。
-    ///
-    /// **钳长度,不是无脑除以模长。** 无脑归一化(`intent / |intent|`)会把
-    /// 半个身位的输入 `(0.5, 0.5)`(模长 0.707)放大成满速 —— 手柄半推和
-    /// 键盘全按之间就失去了区别,微调会变成冲刺。正确做法是**只把超过 1 的
-    /// 模长压下来**,模长不足 1 的原样保留,于是半速输入仍然是半速。
-    ///
-    /// 效果:W 给出 `1`,W+D 给出 `1 / √2 = 0.7071`,于是合速度恒为
-    /// `speed`(`speed * |intent|` ≤ `speed * 1`)。单轴输入时模长本来就是
-    /// 1,`scale` 恒为 1,直线档位**逐位不变**。
-    ///
-    /// # Arguments
-    ///
-    /// - `Vec2` - 原始的两轴输入(各分量 −1..1)。
-    ///
-    /// # Returns
-    ///
-    /// - `f32` - 缩放系数,模长超过 1 时为 `1 / |intent|`,否则为 1。
-    fn diagonal_scale(intent: Vec2) -> f32 {
-        let length: f32 = (intent[0] * intent[0] + intent[1] * intent[1]).sqrt();
-        if length > 1.0 { 1.0 / length } else { 1.0 }
-    }
-
-    /// 推进一个固定步长:移动、碰撞分离、转身、步态相位。
-    ///
-    /// # Arguments
-    ///
-    /// - `Vec2` - 期望的前 / 侧向输入(各分量 −1..1)。
-    /// - `Vec2` - 相机「前」方向的世界 XZ 分量。
-    /// - `f32` - 固定步长(秒)。
-    /// - `f32` - 目标速度上限(米/秒)。
-    /// - `&CollisionWorld` - 静态碰撞世界。
-    pub fn step(
-        &mut self,
-        intent: Vec2,
-        direction: Vec2,
-        dt: f32,
-        speed: f32,
-        world: &CollisionWorld,
-    ) {
-        // 目标速度 = 前向分量 + 侧向分量,两者**合起来**受 `speed` 上限约束,
-        // 所以斜向移动不比直线快(和 GTA V 的手感一致:那边按 W+D 也不会比
-        // 单按 W 快)。
-        //
-        // **「各自受上限」并不够。** 这里原来直接把
-        // `direction * forward + perp * strafe` 乘 `speed`,于是两轴分别顶到
-        // `speed` 时合速度是 `speed * √(forward² + strafe²)` —— W+D 时
-        // `√2 = 1.4142`。实测步行 6.5052(`4.6 * √2`,直线是 4.5998)、冲刺
-        // 11.8787(`8.4 * √2`,直线是 8.3997),斜向比直线快 41.4%。紧挨着这
-        // 段的旧注释写的却是「斜向移动不会比直线快」—— 注释描述的是**意图**,
-        // 代码做的是另一回事,两者对不上,于是这个偏差一直没人发现。
-        //
-        // **归一化的是 `intent`(按键轴),不是世界方向。** `direction` 本身
-        // 已经是单位向量(相机的水平朝向),旋过去不改变模长,所以「`intent`
-        // 归一 + `speed` 乘在旋后的方向上」与「合速度钳到 `speed`」完全等价,
-        // 取前者更省一次钳制。
-        let scale: f32 = Self::diagonal_scale(intent);
-        let forward: f32 = intent[1] * scale;
-        let strafe: f32 = intent[0] * scale;
-        let target: Vec2 = [
-            (direction[0] * forward + -direction[1] * strafe) * speed,
-            (direction[1] * forward + direction[0] * strafe) * speed,
-        ];
-        let ramp: f32 = (1.0 - (-SPEED_RAMP * dt).exp()).clamp(0.0, 1.0);
-        let current: Vec2 = self.get_velocity();
-        self.set_velocity([
-            current[0] + (target[0] - current[0]) * ramp,
-            current[1] + (target[1] - current[1]) * ramp,
-        ]);
-
-        // 碰撞:标准 **move_and_slide**。先把想要的位移交给
-        // `resolve_slide`,它只沿碰撞法线推出穿透深度,**切向分量原样
-        // 保留**。
-        //
-        // 之前这里是 `world.resolve(wanted)` —— 那是**全有全无**的位置
-        // 钳制:圆心被直接推到形状的最近面,沿墙方向的位移也一起没了。
-        // 于是顶着墙走时位移恰好为零,`want (-1.00, 0.00)` 拿到
-        // `got (+0.00, +0.00)`,几十帧推不动一毫米。卡点不固定在某一
-        // 面墙(实测 x = 28.3 / 28.4 / 33.1 / 35.0 各出现过一次),因为
-        // **每一面墙都这样**:被弹到哪就贴住哪面墙。
-        let velocity: Vec2 = self.get_velocity();
-        let here: Vec3 = self.get_position();
-        let delta: Vec2 = [velocity[0] * dt, velocity[1] * dt];
-        let radius: f32 = world.get_player_radius();
-        let resolved: Vec2 = world.resolve_slide([here[0], here[2]], delta, radius);
-        self.set_position([resolved[0], here[1], resolved[1]]);
-
-        // 速度取「**实际走出来的位移** / dt」,而不是把分离修正量加回去。
-        // 后者会被 1/dt 放大几十倍,一次 1 cm 的分离就会注入 0.6 m/s 的
-        // 侧向速度,角色会被「弹」着走。现在撞墙时**朝墙**的速度分量
-        // 自然归零,不会一直顶着墙搓,也不会被弹飞。
-        //
-        // 关键在于 `resolved - here` 现在**包含切向位移**了(滑动之前是
-        // 零),所以反算出来的速度正确地保留了沿墙分量,不会把玩家
-        // 钉死在接触点上。
-        let inverse_dt: f32 = 1.0 / dt.max(f32::EPSILON);
-        let achieved: Vec2 = [resolved[0] - here[0], resolved[1] - here[2]];
-        self.set_velocity([
-            (achieved[0] * inverse_dt).clamp(-speed, speed),
-            (achieved[1] * inverse_dt).clamp(-speed, speed),
-        ]);
-
-        // 转身 / 步态用**碰撞前的目标速度** `velocity`,而不是被墙削过的
-        // 实际速度:蹭着墙走时手脚照样摆,只是真的走不动 —— 这才符合直觉。
-        let planar: f32 = (velocity[0] * velocity[0] + velocity[1] * velocity[1]).sqrt();
-        if planar > PLANAR_EPSILON {
-            let desired: f32 = facing_yaw(velocity);
-            let turning: f32 = wrap_angle(desired - self.get_yaw()) * TURN_RATE * dt;
-            self.set_yaw(self.get_yaw() + turning);
-        }
-
-        // 步态:幅度跟随实际速度,相位按走过的距离推进。
-        let ratio: f32 = (planar / speed).clamp(0.0, 1.0);
-        let relaxed: f32 = (1.0 - (-GAIT_RELAX_RATE * dt).exp()).clamp(0.0, 1.0);
-        if planar > PLANAR_EPSILON {
-            let scaled: f32 = self.get_gait_amount() + (ratio - self.get_gait_amount()) * relaxed;
-            self.set_gait_amount(scaled);
-            self.set_gait_phase(
-                (self.get_gait_phase() + planar * GAIT_RATE_PER_METER * dt) % (2.0 * PI),
-            );
-        } else {
-            let shrunk: f32 = self.get_gait_amount() - self.get_gait_amount() * relaxed;
-            self.set_gait_amount(shrunk);
-            self.set_gait_phase(self.get_gait_phase() * (1.0 - relaxed));
-        }
-        self.set_gait_amount(self.get_gait_amount().clamp(0.0, 1.0));
-    }
 }
 
 /// 把角速度折成**朝向角**,使角色正面朝着它走的方向。
@@ -803,27 +205,9 @@ pub fn limb_matrix(origin: Vec3, yaw: f32, pivot: Vec3, swing: f32) -> Mat4 {
 
 #[cfg(test)]
 mod tests {
-    use crate::camera::Mat4;
-    use crate::collision::CollisionWorld;
-    use crate::r#config::{
-        DIAGONAL_SPEED_TOLERANCE, KEY_DIAGONAL, KEY_MODE, KEY_PART, KEY_STRAIGHT, MODE_SPRINT,
-        MODE_WALK, PART_LOWER_ARM_L, PART_LOWER_LEG_L, PART_SHOE_L, PART_SHOE_R, PART_UPPER_ARM_L,
-        PART_UPPER_LEG_L, PED_BOB_HEIGHT, T_DIAGONAL_MATCHES_STRAIGHT,
-        T_DISTAL_INHERITS_PARENT_SWING, T_DISTAL_LIMB_HAS_PARENT, T_FACING_MATCHES_VELOCITY,
-        T_HALF_INPUT_STAYS_HALF_SPEED, T_LEGS_ANTIPHASE, T_LIMB_STAYS_AT_ASSET_HEIGHT,
-        T_LIMBS_RELAX_TO_ZERO, T_PARENT_IN_PLAN, T_PED_BOB_DOUBLE_FREQUENCY,
-        T_PED_BOB_OUT_OF_PHASE, T_SAME_SIDE_IN_PHASE, T_SHOE_FOLLOWS_SHIN,
-        T_STRAIGHT_KEEPS_FULL_SPEED,
-    };
-    use crate::player::{
-        GAIT_PHASE_L, GAIT_PHASE_R, LIMB_PLAN, PART_ARM, PART_LEG, Player, RUN_SPEED, WALK_SPEED,
-        facing_yaw, joint_pivot, limb_chain_matrix, limb_parent, limb_swing,
-    };
-    use crate::r#type::{Mat4Data, Vec2, Vec3};
-    use crate::{FRAC_PI_2, PI};
-
+    use super::*;
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值(与 `camera.rs` 同形)。
-    fn fill(template: &str, args: &[(&str, &str)]) -> String {
+    pub(crate) fn fill(template: &str, args: &[(&str, &str)]) -> String {
         let mut out: String = template.to_string();
         let mut index: usize = 0;
         while index < args.len() {
@@ -834,8 +218,8 @@ mod tests {
     }
 
     /// 把列主序 `Mat4` 作用在一个点上。
-    fn apply(m: &Mat4, v: Vec3) -> Vec3 {
-        let e: &Mat4Data = m.get_elements();
+    pub(crate) fn apply(m: &Mat4, v: Vec3) -> Vec3 {
+        let e: Mat4Data = m.get_elements();
         [0, 1, 2].map(|r: usize| e[r] * v[0] + e[4 + r] * v[1] + e[8 + r] * v[2] + e[12 + r])
     }
 
@@ -843,7 +227,7 @@ mod tests {
     /// 的回归测试。`yaw = 0` 面向 `+Z`,所以朝 `+Z` 走必须是 0、朝 `+X`
     /// 走必须是 `+π/2`。旧的 `-vz.atan2(vx)` 恰好把这两条对调了 90°。
     #[test]
-    fn facing_yaw_points_the_model_along_the_velocity() {
+    pub(crate) fn facing_yaw_points_the_model_along_the_velocity() {
         for (velocity, want) in [
             (Vec2::from([0.0, 1.0]), 0.0),
             (Vec2::from([1.0, 0.0]), FRAC_PI_2),
@@ -868,7 +252,7 @@ mod tests {
     }
 
     /// 把角度折到 (−π, π],避免断言时被 ±2π 干扰。
-    fn wrap(angle: f32) -> f32 {
+    pub(crate) fn wrap(angle: f32) -> f32 {
         let two_pi: f32 = 2.0 * PI;
         let mut value: f32 = angle % two_pi;
         if value > PI {
@@ -892,7 +276,7 @@ mod tests {
     /// 包围盒必须和资产包围盒**逐轴相等**(平移 origin / 旋转 yaw 除外),
     /// 即 `Ry(yaw)·(I)` 不改变局部高度。
     #[test]
-    fn limb_vertices_stay_at_their_asset_height() {
+    pub(crate) fn limb_vertices_stay_at_their_asset_height() {
         // 实测自 `ped_suit` 资产的 `__VCW_DEBUG__.limbExtents`。
         let cases: [(&str, Vec3, Vec3, Vec3); 4] = [
             (
@@ -948,7 +332,7 @@ mod tests {
     /// 这条是 ab0610d 引入的原始意图,保留下来防止修高度时把串联也一起
     /// 抹掉(那样又回到「大腿摆动时小腿原地不动」)。
     #[test]
-    fn distal_limb_inherits_the_parents_swing() {
+    pub(crate) fn distal_limb_inherits_the_parents_swing() {
         let origin: Vec3 = [0.0, 0.0, 0.0];
         let shoulder: Vec3 = [0.156, 1.431, 0.0];
         let elbow: Vec3 = [0.202, 1.103, 0.0];
@@ -990,7 +374,7 @@ mod tests {
 
     /// 左右必须反相:两条腿同时朝前迈步就是「四肢不协调」。
     #[test]
-    fn left_and_right_legs_swing_in_opposite_phase() {
+    pub(crate) fn left_and_right_legs_swing_in_opposite_phase() {
         let phase: f32 = 1.1;
         let left: f32 = limb_swing(PART_UPPER_LEG_L, phase, 1.0);
         let right: f32 = limb_swing(crate::r#config::PART_UPPER_LEG_R, phase, 1.0);
@@ -1017,7 +401,7 @@ mod tests {
     /// 悬在摆动中段 —— 身体反而最高;脚一落地身体过零。每个高峰都错开
     /// 四分之一个步周期,叠起来就是弹簧式弹跳(用户报的「NPC 蹦蹦跳跳」)。
     #[test]
-    fn ped_bob_peaks_when_the_foot_plants() {
+    pub(crate) fn ped_bob_peaks_when_the_foot_plants() {
         let footfalls: [f32; 2] = [GAIT_PHASE_L, GAIT_PHASE_R];
         for phase in footfalls {
             // 此刻(脚正落地)身体必须是最高点。
@@ -1058,7 +442,7 @@ mod tests {
     /// 这条同时挡住 `cos(phi)`(只有 1 个峰)和 `sin(2·phi)`(2 个峰但
     /// 位置错开四分之一个周期)两种退化。
     #[test]
-    fn ped_bob_has_one_peak_per_footfall() {
+    pub(crate) fn ped_bob_has_one_peak_per_footfall() {
         // 只扫 `[0, TAU)` —— 闭区间会把末端 `TAU` 也算成一个峰,而那个
         // 峰其实就是 `t = 0` 的周期性重复,数出来就多一个。
         //
@@ -1122,7 +506,7 @@ mod tests {
 
     /// 同一侧的大腿 / 小腿必须同相位(否则就是抽搐而不是摆腿)。
     #[test]
-    fn thigh_and_shin_on_one_side_share_a_phase() {
+    pub(crate) fn thigh_and_shin_on_one_side_share_a_phase() {
         let phase: f32 = 0.7;
         let thigh: f32 = limb_swing(PART_UPPER_LEG_L, phase, 1.0);
         let shin: f32 = limb_swing(PART_LOWER_LEG_L, phase, 1.0);
@@ -1134,7 +518,7 @@ mod tests {
 
     /// 停下(`gait_amount = 0`)时所有关节必须归零。
     #[test]
-    fn every_limb_relaxes_to_zero_when_the_player_stops() {
+    pub(crate) fn every_limb_relaxes_to_zero_when_the_player_stops() {
         for (part, _, _, _) in LIMB_PLAN {
             assert!(
                 limb_swing(part, 2.3, 0.0).abs() < 1.0e-9,
@@ -1161,7 +545,7 @@ mod tests {
     ///
     /// 静止姿态用摆角全 0 复现(和渲染端 `gait_amount == 0` 一致)。
     #[test]
-    fn shoes_follow_the_shin_through_the_limb_chain() {
+    pub(crate) fn shoes_follow_the_shin_through_the_limb_chain() {
         // --- 1. 骨架表层 ---
         assert_eq!(
             limb_parent(PART_SHOE_L),
@@ -1318,7 +702,7 @@ mod tests {
 
     /// 小腿 / 小臂必须挂在父 part 上 —— 没有父关节的串联,腿会断成两截。
     #[test]
-    fn distal_limbs_declare_their_parent_joint() {
+    pub(crate) fn distal_limbs_declare_their_parent_joint() {
         assert_eq!(limb_parent(PART_LOWER_LEG_L), PART_UPPER_LEG_L);
         assert!(
             limb_parent(PART_UPPER_LEG_L).is_empty(),
@@ -1360,7 +744,7 @@ mod tests {
     /// # Returns
     ///
     /// - `f32` - 稳定后的速度模长(米/秒)。
-    fn settle_speed(intent: Vec2, speed: f32) -> f32 {
+    pub(crate) fn settle_speed(intent: Vec2, speed: f32) -> f32 {
         let world: CollisionWorld = CollisionWorld::new();
         let mut player: Player = Player::new([0.0, 0.0, 0.0], 0.0);
         let dt: f32 = 1.0 / 60.0;
@@ -1383,7 +767,7 @@ mod tests {
     /// `(0.7071, 0.7071)`,余量约 1e-6;容差取
     /// [`DIAGONAL_SPEED_TOLERANCE`] = 1e-3,又远低于修复前的 1.4142。
     #[test]
-    fn diagonal_movement_is_not_faster_than_straight() {
+    pub(crate) fn diagonal_movement_is_not_faster_than_straight() {
         for (mode, speed) in [(MODE_WALK, WALK_SPEED), (MODE_SPRINT, RUN_SPEED)] {
             let straight: f32 = settle_speed([0.0, 1.0], speed);
             for diagonal in [[1.0f32, 1.0f32], [-1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]] {
@@ -1417,7 +801,7 @@ mod tests {
     /// 修法也能让它变绿,而那是把走路和冲刺都拖慢了。所以这里独立地钉住
     /// 直线档位:`|W|` 落在 `speed` 的容差内,`Shift+W` 同理。
     #[test]
-    fn straight_movement_keeps_the_full_speed() {
+    pub(crate) fn straight_movement_keeps_the_full_speed() {
         for (mode, speed) in [(MODE_WALK, WALK_SPEED), (MODE_SPRINT, RUN_SPEED)] {
             let straight: f32 = settle_speed([0.0, 1.0], speed);
             let error: f32 = (straight - speed).abs() / speed;
@@ -1443,7 +827,7 @@ mod tests {
     /// **只把超过 1 的模长钳下来**。这条守着那个区别 —— `Player::step` 的
     /// `intent` 由 `axis()` 产生,每分量在 −1..1,0.5 正是真实会出现的值。
     #[test]
-    fn a_half_strength_input_stays_at_half_speed() {
+    pub(crate) fn a_half_strength_input_stays_at_half_speed() {
         for (mode, speed) in [(MODE_WALK, WALK_SPEED), (MODE_SPRINT, RUN_SPEED)] {
             let half: f32 = settle_speed([0.0, 0.5], speed);
             let full: f32 = settle_speed([0.0, 1.0], speed);

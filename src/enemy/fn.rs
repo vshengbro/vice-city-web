@@ -1,50 +1,4 @@
-//! 敌人 AI 的状态迁移与逐帧推进。
-//!
-//! 拆成独立文件是因为这一段是**整套玩法里唯一有「策略」的地方**:
-//! 武器数值在 `combat.rs` 的常量区,通缉的数值模型在
-//! [`crate::combat::Wanted`],而「什么时候该跑、什么时候该开枪、
-//! 什么时候该放弃」全部集中在这里,便于单独推演。
-//!
-//! 状态迁移的判据只有两个量 —— **距离** 与 **视线是否被挡**
-//! ([`crate::combat::has_line_of_sight`])。刻意不做「仇恨值」「难度系数」
-//! 这类隐式变量:GTA 的街头追逐之所以可读,正是因为警察的规则一眼能看穿。
-//!
-//! **性能**:每个敌人先过一次距离剔除 —— 超过
-//! [`ENEMY_ACTIVATION`] 的敌人不更新 AI、也不写实例。这不是优化细节,
-//! 而是这一层的存在意义:场上同时有几十个实体,只有靠近玩家的那几个需要
-//! 「活」。
-
-use crate::{
-    collision::CollisionWorld,
-    combat::{AiState, Enemy, Faction, face_towards, flat_distance, has_line_of_sight},
-    r#config::*,
-    r#type::{Vec2, Vec3},
-};
-
-/// 敌人开始「活」的距离(米)。
-///
-/// 比 [`ENEMY_SIGHT`] 远一截:这样玩家朝某条街冲过去时,警察是**先进入
-/// 激活圈、再用视线确认**的,而不是突然从画面边缘冒出来。
-const ENEMY_ACTIVATION: f32 = ENEMY_SIGHT * 1.9;
-/// 敌人交火时与玩家的理想距离(米):退到近处反而更容易被玩家打死。
-const ENEMY_STANDOFF: f32 = 9.0;
-/// 敌人「放弃追击」时回头看的距离(米)。
-const ENEMY_LEASH: f32 = 34.0;
-/// 巡逻半径(米):在自己出生点附近转,不会走丢。
-const ENEMY_WANDER_RADIUS: f32 = 7.0;
-
-/// 一个敌人这一帧要做什么的决策结果。
-#[derive(Clone, Copy, Debug)]
-pub struct EnemyDecision {
-    /// 迁移到的新状态。
-    pub next: AiState,
-    /// 期望移动方向(XZ,未归一化;零向量 = 原地不动)。
-    pub move_to: Vec2,
-    /// 期望朝向。
-    pub face: Vec3,
-    /// 本帧是否开火。
-    pub shoot: bool,
-}
+use super::*;
 
 /// 决定单个敌人下一帧的行为。
 ///
@@ -80,7 +34,7 @@ pub fn decide(
         Faction::Thug => true,
     };
     let idle: EnemyDecision = EnemyDecision {
-        next: enemy.get_state(),
+        next: *enemy.get_state(),
         move_to: [0.0, 0.0],
         face: player_at,
         shoot: false,
@@ -132,7 +86,7 @@ pub fn decide(
         };
     }
     // 看不见,但已经打过照面(离得不远) = 朝玩家最后已知位置摸过去。
-    if distance <= ENEMY_LEASH && enemy.get_state() == AiState::Chase {
+    if distance <= ENEMY_LEASH && *enemy.get_state() == AiState::Chase {
         return EnemyDecision {
             next: AiState::Chase,
             move_to: [player_at[0] - here[0], player_at[2] - here[2]],
@@ -153,7 +107,7 @@ pub fn decide(
 /// # Returns
 ///
 /// - `EnemyDecision` - 巡逻决策。
-fn patrol(enemy: &Enemy, wander: f32) -> EnemyDecision {
+pub(crate) fn patrol(enemy: &Enemy, wander: f32) -> EnemyDecision {
     let here: Vec3 = enemy.get_position();
     let home: Vec3 = enemy.get_home();
     // 巡逻点是**围绕出生点扫出来的一个点**。之前这里写的是
@@ -207,24 +161,24 @@ pub fn apply(
     // 计时器。
     enemy.step_timers(dt);
     // 速度:逃跑更快,其余按基准速度。
-    let speed: f32 = if decision.next == AiState::Flee {
+    let speed: f32 = if decision.get_next() == AiState::Flee {
         ENEMY_SPEED * ENEMY_FLEE_SPEED_GAIN
-    } else if decision.next == AiState::Chase || decision.next == AiState::Attack {
+    } else if decision.get_next() == AiState::Chase || decision.get_next() == AiState::Attack {
         ENEMY_SPEED
     } else {
         ENEMY_SPEED * 0.45
     };
     // 朝向:即使不动也要转,不然站桩的敌人会一直背对玩家。
     let here: Vec3 = enemy.get_position();
-    enemy.set_yaw(face_towards(enemy.get_yaw(), here, decision.face));
+    enemy.set_yaw(face_towards(enemy.get_yaw(), here, decision.get_face()));
     // 水平速度按决策方向积分,受碰撞分离约束。
-    let length: f32 =
-        (decision.move_to[0] * decision.move_to[0]) + (decision.move_to[1] * decision.move_to[1]);
+    let length: f32 = (decision.get_move_to()[0] * decision.get_move_to()[0])
+        + (decision.get_move_to()[1] * decision.get_move_to()[1]);
     let magnitude: f32 = length.sqrt();
     let velocity: Vec2 = if magnitude > f32::EPSILON {
         [
-            decision.move_to[0] / magnitude * speed,
-            decision.move_to[1] / magnitude * speed,
+            decision.get_move_to()[0] / magnitude * speed,
+            decision.get_move_to()[1] / magnitude * speed,
         ]
     } else {
         [0.0, 0.0]
@@ -236,7 +190,7 @@ pub fn apply(
     let achieved: Vec2 = [resolved[0] - here[0], resolved[1] - here[2]];
     enemy.set_velocity([achieved[0] * inverse_dt, achieved[1] * inverse_dt]);
     enemy.set_position([resolved[0], here[1], resolved[1]]);
-    enemy.set_state(decision.next);
+    enemy.set_state(decision.get_next());
     // 开火:只有「要求开火 + 冷却结束 + 没在硬直」才真的打。
     if wants_fire && enemy.get_fire_cooldown() <= 0.0 && enemy.get_hurt_timer() <= 0.0 {
         enemy.set_fire_cooldown(1.0 / ENEMY_FIRE_RATE);

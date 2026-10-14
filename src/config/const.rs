@@ -12,69 +12,71 @@
 //!   一个 const 再写 `style: STYLE_ROOT`。
 //! - DOM id / 事件名 / 按键码集中在此,便于与 `index.html` 对照。
 
+use super::*;
+
 /// 徒手状态:按 H 收起武器的提示。
-pub const NOTICE_UNARMED: &str = "weapon holstered";
+pub(crate) const NOTICE_UNARMED: &str = "weapon holstered";
 
 /// HUD 状态条的通用样式(容器)。
-pub const STYLE_STATUS: &str = "position:absolute;left:14px;bottom:74px;width:230px;display:flex;flex-direction:column;gap:5px;pointer-events:none;font-family:ui-monospace,monospace";
+pub(crate) const STYLE_STATUS: &str = "position:absolute;left:14px;bottom:74px;width:230px;display:flex;flex-direction:column;gap:5px;pointer-events:none;font-family:ui-monospace,monospace";
 /// 生命 / 护甲条的轨道样式。
-pub const STYLE_BAR_TRACK: &str =
+pub(crate) const STYLE_BAR_TRACK: &str =
     "width:100%;height:9px;border-radius:999px;background:rgba(255,255,255,.14);overflow:hidden";
 /// 弹药 / 现金行的样式。
-pub const STYLE_STAT_ROW: &str = "display:flex;flex-direction:row;align-items:center;justify-content:space-between;font-size:11px;color:#cfe9ff;text-shadow:0 1px 3px rgba(0,0,0,.85)";
+pub(crate) const STYLE_STAT_ROW: &str = "display:flex;flex-direction:row;align-items:center;justify-content:space-between;font-size:11px;color:#cfe9ff;text-shadow:0 1px 3px rgba(0,0,0,.85)";
 /// 任务提示行的样式。
-pub const STYLE_MISSION: &str = "position:absolute;right:14px;top:56px;max-width:340px;padding:7px 11px;border-radius:6px;background:rgba(10,12,22,.62);border:1px solid rgba(125,252,255,.3);font-family:ui-monospace,monospace;font-size:12px;line-height:1.5;color:#e6f6ff;pointer-events:none;white-space:pre-line";
+pub(crate) const STYLE_MISSION: &str = "position:absolute;right:14px;top:56px;max-width:340px;padding:7px 11px;border-radius:6px;background:rgba(10,12,22,.62);border:1px solid rgba(125,252,255,.3);font-family:ui-monospace,monospace;font-size:12px;line-height:1.5;color:#e6f6ff;pointer-events:none;white-space:pre-line";
 /// 通缉星容器的样式。
-pub const STYLE_WANTED: &str = "position:absolute;right:14px;top:14px;display:flex;flex-direction:row;gap:3px;font-size:17px;line-height:1;pointer-events:none;text-shadow:0 1px 4px rgba(0,0,0,.9)";
+pub(crate) const STYLE_WANTED: &str = "position:absolute;right:14px;top:14px;display:flex;flex-direction:row;gap:3px;font-size:17px;line-height:1;pointer-events:none;text-shadow:0 1px 4px rgba(0,0,0,.9)";
 /// 单颗星的样式。
-pub const STYLE_STAR: &str = "width:19px;height:19px;display:flex;align-items:center;justify-content:center;font-size:19px;line-height:1";
+pub(crate) const STYLE_STAR: &str = "width:19px;height:19px;display:flex;align-items:center;justify-content:center;font-size:19px;line-height:1";
 /// 准星的样式(一个十字,不挡视线)。
-pub const STYLE_CROSSHAIR: &str = "position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;pointer-events:none;opacity:.85";
+pub(crate) const STYLE_CROSSHAIR: &str = "position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;pointer-events:none;opacity:.85";
 /// 准星四臂的样式。
-pub const STYLE_CROSSHAIR_ARM: &str =
+pub(crate) const STYLE_CROSSHAIR_ARM: &str =
     "position:absolute;background:rgba(125,252,255,.95);box-shadow:0 0 3px rgba(0,0,0,.9)";
 /// 命中标记的样式。
-pub const STYLE_HITMARKER: &str = "position:absolute;left:50%;top:50%;width:26px;height:26px;margin:-13px 0 0 -13px;pointer-events:none;opacity:0;transition:opacity .12s linear";
+pub(crate) const STYLE_HITMARKER: &str = "position:absolute;left:50%;top:50%;width:26px;height:26px;margin:-13px 0 0 -13px;pointer-events:none;opacity:0;transition:opacity .12s linear";
 /// 小地图 canvas 的样式。
-pub const STYLE_MINIMAP: &str = "position:absolute;right:14px;bottom:14px;width:150px;height:150px;border-radius:8px;border:1px solid rgba(125,252,255,.32);background:#0b1020;pointer-events:none";
+pub(crate) const STYLE_MINIMAP: &str = "position:absolute;right:14px;bottom:14px;width:150px;height:150px;border-radius:8px;border:1px solid rgba(125,252,255,.32);background:#0b1020;pointer-events:none";
 
 /// 车辆损坏后的色调(耐久越低越暗)。
-pub const TINT_VEHICLE_MIN: [f32; 3] = [0.55, 0.42, 0.42];
+pub(crate) const TINT_VEHICLE_MIN: [f32; 3] = [0.55, 0.42, 0.42];
 
 /// 医院 A 的 X 坐标(米)。
-pub const HOSPITAL_A_X: f32 = 8.2;
+pub(crate) const HOSPITAL_A_X: f32 = 8.2;
 /// 医院 A 的 Z 坐标(米)。
-pub const HOSPITAL_A_Z: f32 = 8.2;
+pub(crate) const HOSPITAL_A_Z: f32 = 8.2;
 /// 医院 B 的 X 坐标(米)。
-pub const HOSPITAL_B_X: f32 = -52.0;
+pub(crate) const HOSPITAL_B_X: f32 = -52.0;
 /// 医院 B 的 Z 坐标(米)。
-pub const HOSPITAL_B_Z: f32 = 52.0;
+pub(crate) const HOSPITAL_B_Z: f32 = 52.0;
 /// 医院 C 的 X 坐标(米)。
-pub const HOSPITAL_C_X: f32 = 52.0;
+pub(crate) const HOSPITAL_C_X: f32 = 52.0;
 /// 医院 C 的 Z 坐标(米)。
-pub const HOSPITAL_C_Z: f32 = -52.0;
+pub(crate) const HOSPITAL_C_Z: f32 = -52.0;
 /// 医院 D 的 X 坐标(米)。
-pub const HOSPITAL_D_X: f32 = -98.0;
+pub(crate) const HOSPITAL_D_X: f32 = -98.0;
 /// 医院 D 的 Z 坐标(米)。
-pub const HOSPITAL_D_Z: f32 = -98.0;
+pub(crate) const HOSPITAL_D_Z: f32 = -98.0;
 /// 医院 E 的 X 坐标(米)。
-pub const HOSPITAL_E_X: f32 = 98.0;
+pub(crate) const HOSPITAL_E_X: f32 = 98.0;
 /// 医院 E 的 Z 坐标(米)。
-pub const HOSPITAL_E_Z: f32 = 98.0;
+pub(crate) const HOSPITAL_E_Z: f32 = 98.0;
 
 /// 水面每个面的自发光(全黑 —— 水面的「亮」来自反射,不是自发光)。
-pub const WATER_EMISSIVE: [f32; 3] = [0.0, 0.0, 0.0];
+pub(crate) const WATER_EMISSIVE: [f32; 3] = [0.0, 0.0, 0.0];
 
 /// 单元测试断言文案:头顶的楼板不得推开玩家。
-pub const T_INTERIOR_CEILING_ABOVE: &str = "头顶的楼板不得推开玩家,实际 {inside:?}";
+pub(crate) const T_INTERIOR_CEILING_ABOVE: &str = "头顶的楼板不得推开玩家,实际 {inside:?}";
 
 /// 单元测试断言文案:门洞是唯一能穿过的缺口。
-pub const T_INTERIOR_DOORWAY_PASSES: &str = "门洞中心必须能穿过去,实际 {through:?}";
+pub(crate) const T_INTERIOR_DOORWAY_PASSES: &str = "门洞中心必须能穿过去,实际 {through:?}";
 
 /// 二层 landing 压住整条梯段时,从 landing 下楼永远下不去 —— 自 `1ff7c38`
 /// (09-29)就存在的几何缺陷。二层楼板顶面恒为 3.20,`support_height` 取
 /// 「容差内最高的一块」时它恒中选,人钉在 3.20 一步都降不下来。
-pub const T_INTERIOR_LANDING_BLOCKS_DESCENT: &str =
+pub(crate) const T_INTERIOR_LANDING_BLOCKS_DESCENT: &str =
     "二层楼板不得盖住梯段,否则走不下楼梯;landing 压住 {heights:?}";
 
 /// 下楼必须真的逐级降到地面 —— 落到地面高度才算数,悬在梯段上不算。
@@ -1248,12 +1250,11 @@ pub(crate) const BLOOM_SCALE: f32 = 0.5;
 /// 1.6 m 刚好覆盖「楼与楼之间」「车与地面之间」这种一臂宽的接触关系;
 /// 再大就会把整条街的墙根一起压暗,看起来像脏雾而不是遮蔽。
 pub(crate) const SSAO_RADIUS: f32 = 1.6;
+/// SSAO 的采样数(固定循环,不做抖动)。
+pub(crate) const SSAO_SAMPLES: i32 = 8;
 
 /// SSAO 的采样幂次(越大对比越硬)。
 pub(crate) const SSAO_POWER: f32 = 2.2;
-
-/// SSAO 的采样数(固定循环,不做抖动)。
-pub(crate) const SSAO_SAMPLES: i32 = 8;
 
 /// AO 双边模糊的半径(以半分辨率 texel 为单位)。
 pub(crate) const AO_BLUR_RADIUS: i32 = 4;
@@ -1486,8 +1487,6 @@ pub(crate) const ENEMY_SPREAD: f32 = 0.07;
 pub(crate) const ENEMY_HIT_STUN: f32 = 0.18;
 /// 敌人尸体掉落现金。
 pub(crate) const ENEMY_CASH_DROP: f32 = 60.0;
-/// 敌人碰撞半径(米)。
-pub(crate) const ENEMY_RADIUS: f32 = 0.45;
 /// 敌人最低血量:低于这个值会逃跑。
 pub(crate) const ENEMY_FLEE_HEALTH: f32 = 22.0;
 /// 逃跑的移动速度倍率。
@@ -1672,8 +1671,6 @@ pub(crate) const WANTED_FLASH_TIME: f32 = 0.9;
 pub(crate) const ENEMY_WANTED_TOTAL: u32 = 8;
 /// 行人逃跑时的速度(米/秒)。
 pub(crate) const PED_FLEE_SPEED: f32 = 5.4;
-/// 行人的碰撞半径(米)。
-pub(crate) const PED_RADIUS: f32 = 0.4;
 /// 行人转身速率(1/秒)。
 pub(crate) const PED_TURN_RATE: f32 = 9.0;
 /// 行人步态相位推进速率(rad/米)。
@@ -1940,9 +1937,6 @@ pub(crate) const SHOWCASE_UPPER_BOTTOM: f32 = 2.95;
 
 /// 样板楼二层楼板上表面高度(米),与楼梯顶端齐平。
 pub(crate) const SHOWCASE_UPPER_TOP: f32 = 3.20;
-
-/// 样板楼外墙厚度(米)。
-pub(crate) const SHOWCASE_WALL_THICKNESS: f32 = 0.25;
 
 /// 样板楼门洞的半宽(米)——门洞净宽 1.60 m。
 pub(crate) const SHOWCASE_DOOR_HALF: f32 = 0.80;

@@ -4,6 +4,9 @@
 //! `crate::const`,因为 WebGPU 是**可选后端**:这些标识符只有走
 //! `navigator.gpu` 的路径才会被读到,和 WebGL2 的 `u_view_proj` 之类
 //! 是两套互不相干的命名空间,混在一起会让两边都难读。
+
+use super::*;
+
 /// `COPY_DST` —— 可被 `writeBuffer` / 复制指令**写入**。
 ///
 /// ⚠️ 按 `GPUBufferUsage` 规范是 **0x0008**,不是 0x0004(那是
@@ -12,21 +15,21 @@
 /// `writeBuffer` 全部失败,而 **validation scope 要到 draw 之后才报**,
 /// 且报的是「usage 不含 CopyDst」—— 画面全黑,矩阵恒为 0,
 /// 顶点全部塌到裁剪空间之外。
-pub const USAGE_COPY_DST: u32 = 0x0008;
+pub(crate) const USAGE_COPY_DST: u32 = 0x0008;
 
 /// `INDEX` —— 可作索引缓冲源。
-pub const USAGE_INDEX: u32 = 0x0010;
+pub(crate) const USAGE_INDEX: u32 = 0x0010;
 
 /// `VERTEX` —— 可作顶点缓冲源。
-pub const USAGE_VERTEX: u32 = 0x0020;
+pub(crate) const USAGE_VERTEX: u32 = 0x0020;
 
 /// `UNIFORM` —— 可绑定到 uniform buffer binding。
-pub const USAGE_UNIFORM: u32 = 0x0040;
+pub(crate) const USAGE_UNIFORM: u32 = 0x0040;
 
 // ---- GPUTextureUsage ----
 
 /// `RENDER_ATTACHMENT` —— 可作渲染目标(深度纹理用)。
-pub const USAGE_RENDER_ATTACHMENT: u32 = 0x0010;
+pub(crate) const USAGE_RENDER_ATTACHMENT: u32 = 0x0010;
 
 // ---- 组合好的实际取值 ----
 
@@ -541,7 +544,7 @@ pub(crate) const BINDING_BLOOM_AO_SAMPLER: u32 = 5;
 pub(crate) const BINDING_BLOOM_AO_MAP: u32 = 6;
 
 pub(crate) const SSAO_BLUR_BODY: &str = r#"
-struct BlurUniform {
+pub(crate) struct BlurUniform {
     // xy = 1/分辨率, z = 方向 x, w = 方向 y
     direction : vec4<f32>,
 };
@@ -551,13 +554,13 @@ struct BlurUniform {
 @group(0) @binding(2) var blur_depth : texture_2d<f32>;
 @group(0) @binding(3) var<uniform> blur : BlurUniform;
 
-struct VsOut {
+pub(crate) struct VsOut {
     @builtin(position) position : vec4<f32>,
     @location(0) uv : vec2<f32>,
 };
 
 @vertex
-fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
+pub(crate) fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
     var x : f32 = -1.0;
     var y : f32 = -1.0;
     if (index == 1u) {
@@ -572,7 +575,7 @@ fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
 }
 
 @fragment
-fn fs_blur(in : VsOut) -> @location(0) vec4<f32> {
+pub(crate) fn fs_blur(in : VsOut) -> @location(0) vec4<f32> {
     let centre_depth : f32 = textureSampleLevel(blur_depth, blur_sampler, in.uv, 0.0).r;
     if (centre_depth >= {NO_GEOMETRY}) {
         return vec4<f32>(1.0, 1.0, 1.0, 1.0);
@@ -620,7 +623,7 @@ pub(crate) const WGSL_SLOT_DEPTH_SIGMA: &str = "{DEPTH_SIGMA}";
 pub(crate) const WGSL_SLOT_SAMPLES: &str = "{SAMPLES}";
 
 pub(crate) const SSAO_BODY: &str = r#"
-struct AoUniform {
+pub(crate) struct AoUniform {
     // x = 1/宽度, y = 1/高度, z = 抖动种子, w = 强度下限
     misc : vec4<f32>,
     // x = 采样半径(米), y = 强度(0 = 关闭), z/w = 预留
@@ -632,13 +635,13 @@ struct AoUniform {
 @group(0) @binding(2) var ao_depth : texture_2d<f32>;
 @group(0) @binding(3) var<uniform> ao : AoUniform;
 
-struct VsOut {
+pub(crate) struct VsOut {
     @builtin(position) position : vec4<f32>,
     @location(0) uv : vec2<f32>,
 };
 
 @vertex
-fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
+pub(crate) fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
     var x : f32 = -1.0;
     var y : f32 = -1.0;
     if (index == 1u) {
@@ -656,17 +659,17 @@ fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
 ///
 /// 逐分量比较而不是四条 `||`:`sample_uv` 越界时整圈样本都得跳过,
 /// 提前返回的代价低于继续采样。
-fn inside_unit(value : vec2<f32>) -> bool {
+pub(crate) fn inside_unit(value : vec2<f32>) -> bool {
     return all(value >= vec2<f32>(0.0)) && all(value <= vec2<f32>(1.0));
 }
 
 /// 哈希到 [0,1),每像素抖动以打散采样噪声。
-fn hash(value : vec2<f32>) -> f32 {
+pub(crate) fn hash(value : vec2<f32>) -> f32 {
     return fract(sin(dot(value, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 
 @fragment
-fn fs_ssao(in : VsOut) -> @location(0) vec4<f32> {
+pub(crate) fn fs_ssao(in : VsOut) -> @location(0) vec4<f32> {
     let centre_depth : f32 = textureSampleLevel(ao_depth, ao_sampler, in.uv, 0.0).r;
     let strength : f32 = ao.params.y;
     if (centre_depth >= {NO_GEOMETRY} || strength <= 0.0) {
@@ -1081,11 +1084,11 @@ pub(crate) const SHADOW_NORMAL_OFFSET_SLOPE_GAIN: f32 = 2.0;
 
 /// WebGPU 顶点着色器。
 pub(crate) const SHADER_VERTEX: &str = r#"
-struct Frame {
+pub(crate) struct Frame {
     view_proj : mat4x4<f32>,
 };
 
-struct Varyings {
+pub(crate) struct Varyings {
     @builtin(position) clip : vec4<f32>,
     @location(0) normal : vec3<f32>,
     @location(1) color : vec3<f32>,
@@ -1096,7 +1099,7 @@ struct Varyings {
     @location(6) contact_ao : f32,
 };
 
-struct Shading {
+pub(crate) struct Shading {
     light_dir : vec4<f32>,
     light_color : vec4<f32>,
     ambient : vec4<f32>,
@@ -1156,7 +1159,7 @@ struct Shading {
 // 两项相乘成一条曲线:离基座近且贴地 → 压到 `ao_params.y`;离得远
 // 或站得高 → 回到 1.0(完全不压)。model 矩阵的第 4 列(row3)就是
 // 世界平移(WGSL 的 `mat4x4<f32>(row0..row3)` 按**列**构造)。
-fn contact_ao(world : vec3<f32>, base : vec3<f32>) -> f32 {
+pub(crate) fn contact_ao(world : vec3<f32>, base : vec3<f32>) -> f32 {
     let horizontal : f32 = length(world.xz - base.xz);
     let reach : f32 = max(shading.ao_params.z, 0.001);
     let feather : f32 = max(shading.ao_params.w, 0.001);
@@ -1175,7 +1178,7 @@ fn contact_ao(world : vec3<f32>, base : vec3<f32>) -> f32 {
 }
 
 @vertex
-fn vs_main(
+pub(crate) fn vs_main(
     @location(0) position : vec3<f32>,
     @location(1) normal : vec3<f32>,
     @location(2) color : vec3<f32>,
@@ -1227,14 +1230,14 @@ fn vs_main(
 /// 管线各有各的 pipeline layout,同一个 binding 号在它们里面指的是
 /// 不同的 buffer。
 pub(crate) const SHADER_SHADOW_VERTEX: &str = r#"
-struct ShadowFrame {
+pub(crate) struct ShadowFrame {
     view_proj : mat4x4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> shadow_frame : ShadowFrame;
 
 @vertex
-fn vs_shadow(
+pub(crate) fn vs_shadow(
     @location(0) position : vec3<f32>,
     @location(4) row0 : vec4<f32>,
     @location(5) row1 : vec4<f32>,
@@ -1254,7 +1257,7 @@ fn vs_shadow(
 /// 色相保持色调映射 → 接触 AO → 天空色晕染 → smoothstep 雾 → sRGB 编码),
 /// 这样两个后端画出来的是同一座城市,而不是「一个亮一个暗」的两种美术。
 pub(crate) const SHADER_FRAGMENT: &str = r#"
-struct Shading {
+pub(crate) struct Shading {
     light_dir : vec4<f32>,
     light_color : vec4<f32>,
     ambient : vec4<f32>,
@@ -1296,13 +1299,13 @@ struct Shading {
 @group(1) @binding(0) var shadow_map : texture_depth_2d;
 @group(1) @binding(1) var shadow_sampler : sampler_comparison;
 
-struct ShadowFrame {
+pub(crate) struct ShadowFrame {
     view_proj : mat4x4<f32>,
 };
 
 @group(1) @binding(2) var<uniform> shadow_frame : ShadowFrame;
 
-fn tonemap_luma(luma : f32, exposure : f32, white : f32) -> f32 {
+pub(crate) fn tonemap_luma(luma : f32, exposure : f32, white : f32) -> f32 {
     let w : f32 = select(1.0, white, white > 0.0000001);
     let x : f32 = max(luma, 0.0) * exposure;
     return (x * (1.0 + x / (w * w))) / (1.0 + x);
@@ -1310,7 +1313,7 @@ fn tonemap_luma(luma : f32, exposure : f32, white : f32) -> f32 {
 
 // 色相保持:只压亮度再按比例缩回 RGB,保住粉/薄荷这类浅色的色相。
 // 逐通道 clamp 会把 1.5 亮度的粉红面去色成纯白 —— 那正是「一片惨白」。
-fn tonemap(value : vec3<f32>, exposure : f32, white : f32) -> vec3<f32> {
+pub(crate) fn tonemap(value : vec3<f32>, exposure : f32, white : f32) -> vec3<f32> {
     let luma : f32 = dot(value, vec3<f32>(0.2126, 0.7152, 0.0722));
     if (luma <= 0.000001) {
         return vec3<f32>(0.0, 0.0, 0.0);
@@ -1321,7 +1324,7 @@ fn tonemap(value : vec3<f32>, exposure : f32, white : f32) -> vec3<f32> {
     return value * scale;
 }
 
-fn linear_to_srgb(value : vec3<f32>) -> vec3<f32> {
+pub(crate) fn linear_to_srgb(value : vec3<f32>) -> vec3<f32> {
     let c : vec3<f32> = clamp(value, vec3<f32>(0.0), vec3<f32>(1.0));
     let lo : vec3<f32> = c * 12.92;
     let hi : vec3<f32> = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
@@ -1341,7 +1344,7 @@ fn linear_to_srgb(value : vec3<f32>) -> vec3<f32> {
 /// 另外 WebGPU 的 NDC 深度是 `[0, 1]`(GL 是 `[-1, 1]`),所以
 /// `current` **不需要**再乘 `0.5 + 0.5`;而纹理里存下来的深度已经
 /// 是 `[0, 1]` 的设备深度,可以直接喂给 `textureSampleCompare`。
-fn sample_shadow(world : vec3<f32>, n_dot_l : f32) -> f32 {
+pub(crate) fn sample_shadow(world : vec3<f32>, n_dot_l : f32) -> f32 {
     let light_clip : vec4<f32> = shadow_frame.view_proj * vec4<f32>(world, 1.0);
     let ndc : vec3<f32> = light_clip.xyz / light_clip.w;
     // 走出 shadow frustum 的地方没有数据,判全亮而不是判全黑 ——
@@ -1404,14 +1407,14 @@ fn sample_shadow(world : vec3<f32>, n_dot_l : f32) -> f32 {
 /// ⚠️ 每个 `@fragment` 常量编译成**独立的** `GPUShaderModule`,彼此
 /// 看不见对方的类型。所以这个 `struct` 必须完整写在**城市**的片元
 /// 模块里,不能只声明在顶点模块 —— 否则报 `unresolved type 'FragOut'`。
-struct FragOut {
+pub(crate) struct FragOut {
     @location(0) color : vec4<f32>,
     @location(1) normal : vec4<f32>,
     @location(2) depth : vec4<f32>,
 }
 
 @fragment
-fn fs_main(
+pub(crate) fn fs_main(
     @location(0) normal : vec3<f32>,
     @location(1) color : vec3<f32>,
     @location(2) emissive : vec3<f32>,
@@ -1520,13 +1523,13 @@ fn fs_main(
 /// ⚠️ 必须 `return clip`(真实裁剪坐标),不能塞
 /// `vec4(clip.xy, 0.5, 1.0)` —— 那是几何 pass 踩过的坑。
 pub(crate) const SHADER_FULLSCREEN_VERTEX: &str = r#"
-struct FullscreenOut {
+pub(crate) struct FullscreenOut {
     @builtin(position) clip : vec4<f32>,
     @location(0) uv : vec2<f32>,
 };
 
 @vertex
-fn vs_fullscreen(@builtin(vertex_index) index : u32) -> FullscreenOut {
+pub(crate) fn vs_fullscreen(@builtin(vertex_index) index : u32) -> FullscreenOut {
     // 一个覆盖裁剪空间的三角形:(0,0) (2,0) (0,2)。
     let p : vec2<f32> = vec2<f32>(
         f32((index << 1u) & 2u),
@@ -1556,7 +1559,7 @@ fn vs_fullscreen(@builtin(vertex_index) index : u32) -> FullscreenOut {
 /// ⚠️ **合成那个入口多绑一对 sampler + 纹理**(槽位 3 / 4),所以它
 /// 用的是**另一条** bind group layout。
 pub(crate) const SHADER_BLOOM_FRAGMENT: &str = r#"
-struct BloomParams {
+pub(crate) struct BloomParams {
     // x = 亮度阈值, y = 合成强度, zw = 模糊方向(uv 单位)。
     params : vec4<f32>,
     // 高斯核权重 w0..w3。
@@ -1578,7 +1581,7 @@ struct BloomParams {
 
 // 取第 index 个核权重(index ∈ 0..4)。第 5 个(w4)放在 texel.x,
 // 所以这里单独分流而不是直接索引 kernel。
-fn kernel_weight(index : i32) -> f32 {
+pub(crate) fn kernel_weight(index : i32) -> f32 {
     if (index == 4) {
         return bloom.texel.x;
     }
@@ -1590,7 +1593,7 @@ fn kernel_weight(index : i32) -> f32 {
 // (threshold 与 threshold-knee 之间的 smoothstep)比硬阈值好:硬阈值会让
 // 亮度刚好越线的像素「突然」出现光晕,看起来像描边。
 @fragment
-fn fs_extract(
+pub(crate) fn fs_extract(
     @location(0) uv : vec2<f32>,
 ) -> @location(0) vec4<f32> {
     let color : vec3<f32> = textureSample(source_color, source_sampler, uv).rgb;
@@ -1605,7 +1608,7 @@ fn fs_extract(
 
 // 5 抽头线性采样优化的高斯核(等价于 9 抽头,只用 5 次纹理读取)。
 // 方向来自 uniform:水平传 (texel.x * spread, 0),竖直传 (0, texel.y * spread)。
-fn blur(uv : vec2<f32>) -> vec4<f32> {
+pub(crate) fn blur(uv : vec2<f32>) -> vec4<f32> {
     let direction : vec2<f32> = bloom.params.zw;
     var color : vec3<f32> = textureSample(source_color, source_sampler, uv).rgb
         * kernel_weight(0);
@@ -1620,7 +1623,7 @@ fn blur(uv : vec2<f32>) -> vec4<f32> {
 
 // 水平模糊:方向 (texel.x * spread, 0)。
 @fragment
-fn fs_blur_h(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+pub(crate) fn fs_blur_h(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     return blur(uv);
 }
 
@@ -1629,14 +1632,14 @@ fn fs_blur_h(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
 // 写死成两个函数体的话,核权重就得分叉两份,改一处忘另一处的症状是
 // 「光晕一边糊一边不糊」。
 @fragment
-fn fs_blur_v(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+pub(crate) fn fs_blur_v(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     return blur(uv);
 }
 
 // 合成:主场景颜色 + 模糊后的 bloom,加法混合。
 // 强度 bloom.params.y 由 Rust 侧算好再上传。
 @fragment
-fn fs_composite(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+pub(crate) fn fs_composite(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     let color : vec3<f32> = textureSample(source_color, source_sampler, uv).rgb;
     let glow : vec3<f32> = textureSample(blur_map, blur_sampler, uv).rgb;
     // SSAO 当**乘性**项作用在场景色上,而不是加一层黑 —— 加法会在本来
@@ -1664,115 +1667,3 @@ pub(crate) const GPU_ERR_NO_DEVICE: &str = "requestDevice() failed";
 pub(crate) const GPU_ERR_NO_CONTEXT: &str = "getContext(webgpu) returned null";
 
 pub(crate) const GPU_ERR_CONFIGURE_FAILED: &str = "context.configure failed";
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// AO 采样器必须是 `non-filtering`,深度纹理必须是
-    /// `unfilterable-float`。
-    ///
-    /// 这两个都错过:G-buffer 深度是 `r32float`,WebGPU 视其为
-    /// `UnfilterableFloat`,配 filtering 采样器或声明成 `float` 的
-    /// sampleType,整条 pass 的 bind group 当场作废 —— 而画面上只表现为
-    /// 「AO 没有效果」,没有任何报错指向它。
-    #[test]
-    fn the_ao_bind_layout_matches_the_unfilterable_depth_texture() {
-        assert_eq!(SAMPLE_TYPE_UNFILTERABLE_FLOAT, "unfilterable-float");
-        assert_eq!(SAMPLER_TYPE_NON_FILTERING, "non-filtering");
-        // 合成的 AO 图是 `r8unorm`,那边仍必须是 filtering —— 两个 bind
-        // group 的采样器要求相反,别互相照抄。
-        assert_eq!(AO_TARGET_FORMAT, "r8unorm");
-    }
-
-    /// SSAO 的视空间法线必须先编码到 [0,1] 再写 unorm 目标,读回来对称解码。
-    ///
-    /// 直接写 `dot(n, right)` 会被 unorm 钳到 0(背向相机的分量全是负),
-    /// `normalize()` 拿到的是被削过的法线,半球采样整个歪掉。
-    #[test]
-    fn the_view_normal_is_encoded_for_the_unorm_gbuffer() {
-        let source: &str = SHADER_FRAGMENT;
-        assert!(
-            source.contains("view_normal * 0.5 + vec3<f32>(0.5)"),
-            "fs_main must encode the view normal from [-1,1] to [0,1]"
-        );
-        let ssao: &str = SSAO_BODY;
-        assert!(
-            ssao.contains("* 2.0") && ssao.contains("vec3<f32>(1.0)"),
-            "fs_ssao must decode the view normal symmetrically"
-        );
-    }
-
-    /// 遮挡的判定方向:样本深度比场景**更近**才算遮挡。
-    ///
-    /// `step(sample_depth, scene_depth)` 命中的是相反的方向(场景更远)。
-    /// 写反时整张 AO 图恒为 1.0,而 99.8% 的样本都正常跑完了深度比较,
-    /// 看上去「管线在工作」,只是从来没判成过遮挡。
-    #[test]
-    fn occlusion_requires_the_scene_to_be_nearer_than_the_sample() {
-        let ssao: &str = SSAO_BODY;
-        assert!(
-            ssao.contains("let within : f32 = step(delta, 0.0);"),
-            "the occlusion test must reject samples whose scene depth is farther"
-        );
-        assert!(
-            ssao.contains("let delta : f32 = scene_depth - sample_depth;")
-                && ssao.contains("within * falloff"),
-            "occlusion must be scored from scene_depth - sample_depth"
-        );
-        // 只看代码行 —— 注释里为了讲清楚曾经写反过什么,正要把这段字符串
-        // 引用出来,按整段文本搜会自己撞上自己。
-        let code: Vec<&str> = ssao
-            .lines()
-            .filter(|line: &&str| {
-                let trimmed: &str = line.trim_start();
-                !trimmed.is_empty() && !trimmed.starts_with("//")
-            })
-            .collect();
-        assert!(
-            !code
-                .iter()
-                .any(|line: &&str| line.contains("step(sample_depth, scene_depth)")),
-            "step(sample_depth, scene_depth) is the inverted test -- it counts \
-             occlusion when the scene is FARTHER, which is backwards"
-        );
-    }
-
-    /// AO pass 里不能出现裸的 `textureSample`。
-    ///
-    /// 循环里带 `continue`,控制流依赖纹理值,**不是 uniform**,
-    /// WGSL 只允许在 uniform 控制流里调 `textureSample`。
-    #[test]
-    fn the_ao_passes_only_sample_from_uniform_control_flow() {
-        for body in [SSAO_BODY, SSAO_BLUR_BODY] {
-            for line in body.lines() {
-                let trimmed: &str = line.trim();
-                if trimmed.starts_with("//") {
-                    continue;
-                }
-                assert!(
-                    !trimmed.contains("textureSample("),
-                    "bare textureSample in a non-uniform path: {trimmed}"
-                );
-            }
-        }
-    }
-
-    /// 合成那条要把 AO 当**乘性**项作用在场景色上。
-    ///
-    /// 写成 `vec3<f32>(ao)` 会让 AO 取代整个场景 —— AO 接近 1.0 时画面
-    /// 是一片近乎纯白的象牙色,而调试信息、HUD、三角数全部照常,只有
-    /// 世界不见了。
-    #[test]
-    fn the_composite_multiplies_the_scene_by_ao() {
-        let source: &str = SHADER_BLOOM_FRAGMENT;
-        assert!(
-            source.contains("color * mix(1.0, ao, bloom.texel.w)"),
-            "the composite must multiply scene colour by AO"
-        );
-        assert!(
-            !source.contains("vec3<f32>(ao)"),
-            "vec3<f32>(ao) replaces the scene with the AO map"
-        );
-    }
-}

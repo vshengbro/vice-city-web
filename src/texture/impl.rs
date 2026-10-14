@@ -10,24 +10,6 @@ impl AtlasImage {
         self.pixels.as_slice()
     }
 
-    /// Width in texels.
-    ///
-    /// # Returns
-    ///
-    /// - `u32` - The width.
-    pub fn get_width(&self) -> u32 {
-        self.width
-    }
-
-    /// Height in texels.
-    ///
-    /// # Returns
-    ///
-    /// - `u32` - The height.
-    pub fn get_height(&self) -> u32 {
-        self.height
-    }
-
     /// Total byte length a GPU upload expects.
     ///
     /// # Returns

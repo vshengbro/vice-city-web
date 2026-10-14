@@ -1,339 +1,4 @@
-//! 游戏主体:场景搭建、异步资产加载、固定步长循环、输入、昼夜循环。
-//!
-//! 架构要点(与 `euv-game-real-api-notes` 的坑对应):
-//!
-//! - **不在 hook / 事件回调里调用 euv hook**。整个游戏只有一棵静态
-//!   `html!` 树(见 [`app_root`]),挂载完成后所有每帧逻辑都由裸
-//!   `web_sys` + `Closure` 驱动,VDOM 不参与每帧渲染。
-//! - 资产用 `fetch` + `wasm_bindgen_futures` 异步加载,带进度条。
-//! - 固定步长(累加器 + `requestAnimationFrame`),`dt` 钳位在 50 ms。
-//! - 场景按资产分批([`render::SceneBatch`]),同类资产只解析一次。
-
-use std::{
-    cell::{Cell, Ref, RefCell, RefMut},
-    collections::HashMap,
-    rc::Rc,
-};
-
-use euv::{
-    VirtualNode, html,
-    js_sys::{Function, Promise, Undefined},
-    wasm_bindgen::JsCast,
-    wasm_bindgen::prelude::*,
-    wasm_bindgen_futures::{JsFuture, spawn_local},
-    web_sys::{
-        Document, DomRect, Element, Event, EventTarget, HtmlCanvasElement, HtmlInputElement,
-        KeyboardEvent, MouseEvent, Node, Response, TouchEvent, TouchList, WheelEvent, Window,
-        window,
-    },
-};
-
-use crate::{
-    FRAC_PI_2, FRAC_PI_4, Ordering, PI, TAU,
-    camera::{CAMERA_MIN_HEIGHT, Camera, Mat4, OCCLUSION_MIN_DISTANCE, PRESS_IN_DISTANCE},
-    collision::{BodyKind, CAR_FOOTPRINT, CollisionWorld, DynamicBody, placement_box},
-    combat::{
-        AiState, Arsenal, Enemy, Faction, HurtState, Mission, Pedestrian, Wanted, Weapon,
-        apply_damage, body_matrix, falloff, flat_distance, has_line_of_sight, regen_armor,
-    },
-    r#config::*,
-    enemy::{aim_with_spread, decide, is_active},
-    interior::{FloorWorld, STEP_UP_TOLERANCE},
-    mesh::{Bounds, GpuMesh, MeshAsset, MeshError, MeshPart, expand_asset},
-    once,
-    player::{
-        Player, RUN_SPEED, WALK_SPEED, joint_pivot, limb_chain_matrix, limb_parent, limb_swing,
-    },
-    render::{
-        AdaptiveQuality, DayPhase, Instance, MeshAssetGpu, NEAR_CULL_RADIUS,
-        NEAR_CULL_RADIUS_FOLLOW, Renderer, Scene, SceneBatch, SceneLighting, SoftwareRenderer,
-        WebGlRenderer, build_gpu_mesh, normalize3,
-    },
-    spawn::{
-        advance_mission, build_hideouts, deploy_police, is_hidden, mission_blueprints, spawn_peds,
-        spawn_thugs,
-    },
-    take,
-    traffic::{PICKUP_RADIUS, Pickup, Traffic, TrafficCar, apply_pickup, nearest_car},
-    r#type::{Mat4Data, MeshExtent, PalmSpots, Placement, Vec2, Vec3},
-};
-
-// ===========================================================================
-// 常量
-//
-// 字符串常量统一放在 `crate::r#config`(上面已 glob 引入),
-// 这里只保留数值常量。
-// ===========================================================================
-
-/// 固定步长:1/60 秒。
-const FIXED_DT: f32 = 1.0 / 60.0;
-
-/// 单帧最大累积时间(秒),超过就丢弃(标签页切回来时不追赶)。
-const MAX_FRAME_TIME: f32 = 0.25;
-/// 远裁剪面距离(米)。
-///
-/// G-buffer 的线性深度、SSAO 的视空间位置重建、SSR 的射线步进
-/// 都以这个值做归一化,所以必须和相机真正使用的远裁剪面一致。
-const FAR_PLANE: f32 = 600.0;
-/// 滚轮每单位缩放。
-const ZOOM_STEP: f32 = 0.0016;
-
-/// 鼠标水平位移转相机偏航的灵敏度(弧度/像素)。
-///
-/// **符号由实测确定,不是试出来的。** 判据:在真实矩阵下把一对关于
-/// 玩家对称的世界点投影到屏幕,量 `ndc_x` 的变化。
-///
-/// 实测(玩家固定不动,鼠标右移 18 px = +0.108 rad):
-/// 对称点 `(-0.0968, +0.0968)` 的 `ndc_x` 同时 **增大** 到
-/// `(-0.0369, +0.1571)`(Δ = +0.0599 / +0.0602,两者相等 = 纯旋转)。
-/// `ndc_x` 增大 = 场景内容整体**右移**;内容右移 = 相机向左摇
-/// (与「相机左摇时,原本在画面中央右侧的物体会被推向更右」一致)。
-/// 所以 `dx > 0`(鼠标右移)对应的是视角**左转**,必须取负。
-///
-/// 取负之后:鼠标右移 → `yaw` 减小 → 视角右转,与玩家直觉一致。
-const LOOK_YAW_SENSITIVITY: f32 = -0.006;
-
-/// 鼠标纵向位移转相机俯角的灵敏度(弧度/像素)。
-///
-/// 屏幕 Y 向下为正,`dy > 0` 是鼠标下移。第三人称下 `pitch` 是相机
-/// **俯角**(`camera.rs` 的 `eye()` 用 `+ sin(pitch)·distance` 抬高眼点),
-/// 俯角增大 = 相机抬高 = 视线往下压,与玩家「往下看」一致,故取正。
-///
-/// 实测:向下拖 240 px → `camPitch` 0.16 → 1.05(Δ=+0.89,被
-/// `FOLLOW_PITCH_MAX` 截断),方向正确。
-const LOOK_PITCH_SENSITIVITY: f32 = 0.005;
-
-/// 下车后玩家与车身保持的距离(米)。
-const EXIT_CAR_OFFSET: f32 = 2.4;
-/// 所有会被游戏接管的按键。
-///
-/// 之所以用数组扫描而不是 `matches!`:这些键名都是 `&'static str` 常量,
-/// 放进 `matches!` 会被解释成 pattern 绑定(编译报 E0408),不是常量比较。
-const TRACKED_KEYS: &[&str] = &[
-    KEYW,
-    KEYS,
-    KEYA,
-    KEYD,
-    KEYT,
-    KEYF,
-    KEYTAB,
-    // 换弹就是 GTA V 的 R。曾经的 `KEYR` 常量已删 —— 它和 `KEY_RELOAD`
-    // 指向同一个 `KeyboardEvent.code`,两个常量只能留一个。
-    KEY_RELOAD,
-    DIGIT1,
-    DIGIT2,
-    DIGIT3,
-    KEY_MISSION,
-    ARROWUP,
-    ARROWDOWN,
-    ARROWLEFT,
-    ARROWRIGHT,
-    KEY_SHIFT_LEFT,
-    KEY_SHIFT_RIGHT,
-    // GTA V 键位(这一组补上的五个)。`KEYTAB` 同时在列:GTA V 的 Tab
-    // 是地图,`KEYTAB` 与 `KEY_MAP` 是同一个 `KeyboardEvent.code`。
-    KEY_SPACE,
-    KEY_GRENADE,
-    KEY_UNARMED,
-    KEY_CAMERA,
-    KEY_MAP,
-];
-
-/// 玩家骨架切 part 时的占位错误信息。
-
-/// 第三人称默认俯角(弧度)。
-///
-/// **必须很小。** 眼点高度 = `FOLLOW_HEIGHT + sin(pitch) · distance`。
-/// 旧的 0.22 rad 配 7.4 m 距离把相机顶到 2.96 m,而焦点只有 1.35 m ——
-/// 视线俯角约 12.6°,再叠上 30° 的垂直视场,画面下缘几乎全是地面。
-/// 站在街上时地面是一整张 `y = 0` 的网格,于是整屏被那片单色地面糊死,
-/// 角色和街景都看不见(实测:0.22 时整帧只有一种颜色,0.05 才露出楼房)。
-/// 0.05 rad(≈2.9°)让相机只比角色胸口高 0.37 m,取景是标准的
-/// 「越过肩膀看前方街道」。
-const FOLLOW_PITCH: f32 = 0.16;
-/// 第三人称垂直视场角(弧度)。
-///
-/// 取 75° 而不是 60°:玩家站在 14 m 宽的街道上,两侧的楼离镜头中心
-/// 轴约 20 m。60° 垂直视场配 16:9 画幅只有约 34° 的水平张角,半角
-/// 17° 在 7.4 m 处只覆盖 ±2.3 m —— 街道两侧的楼、行道树、路灯全部
-/// 落在视锥之外,画面里只剩脚下的一小块路面。75° 把水平张角拉到约
-/// 50°,半角 25° 覆盖 ±3.5 m,再配合稍近的跟随距离,整条街的立面
-/// 才进得了取景框。
-const FOLLOW_FOV: f32 = 1.309;
-/// 第三人称近裁剪面(米)。
-///
-/// **不能太小。** 0.05 m 配 420 m 的远平面是 8400:1 的深度比,在没有
-/// GPU 的软件光栅(swiftshader)上深度缓冲精度极低,近处几何的深度值
-/// 全被压到 0 附近,互相 `LEQUAL` 判等 —— 整帧只剩最后画的那个批次,
-/// 画面糊成一片单色(实测:贴地第三人称只有 2~3 种颜色,把 near 提到
-/// 12 m 反而"正常"了,因为近处几何直接被切掉、只剩远景不打架)。
-/// 相机最近的落点是 2.2 m(遮挡回避硬下限),0.35 m 的近平面已经
-/// 足够避开角色自身,又给深度缓冲留出 1200:1 的余量。
-const FOLLOW_NEAR: f32 = 0.35;
-/// 第三人称远裁剪面(米)。
-///
-/// 城市是 ±150 m 的网格,站在角落能看到的最远楼角约 420 m,但雾在
-/// 120 m 就开始起效,460 m 处完全融进天色 —— 所以 300 m 已经「看不出
-/// 被裁掉」,却把深度比从 8400:1 压到 857:1,配合 `FOLLOW_NEAR` 给出
-/// 软件光栅也能用的精度。
-const FOLLOW_FAR: f32 = 300.0;
-
-/// 第三人称跟随相机的默认距离(米)。
-///
-/// **取景比例的依据**:垂直视场 `FOLLOW_FOV = 60°`,焦点高度
-/// `FOLLOW_HEIGHT = 1.35 m`。角色约 1.8 m 高,在 7.4 m 处的垂直张角
-/// 是 `2·atan(0.9 / 7.4) ≈ 13.8°`,占 60° 视场约 **23%** 屏高 —— 角色
-/// 清晰可辨,同时周围两条街的立面 / 路缘 / 行道树都还在画面里。
-///
-/// 之前的 5.6 m 只有 ~17% 屏高,再叠加 `NEAR_CULL_RADIUS = 26 m` 的
-/// 近处剔除(相机离角色才 5.6 m,半径 26 m 内的**所有**楼都被剔掉)之后,
-/// 画面里只剩地面和一面近处的楼,角色几乎看不见。
-const FOLLOW_DISTANCE: f32 = 8.2;
-/// 第三人称跟随相机的最小距离(滚轮拉近下限)。
-const FOLLOW_DISTANCE_MIN: f32 = 2.2;
-/// 第三人称跟随相机的最大距离(滚轮拉远上限)。
-const FOLLOW_DISTANCE_MAX: f32 = 22.0;
-/// 遮挡回避「拉近」的阻尼速率(1/秒):越大越快缩进来。
-///
-/// 必须比拉远快一个量级 —— 撞墙时镜头的第一反应就该是「躲」,而不是
-/// 用 0.3 s 慢慢推进去展示墙面。
-const OCCLUSION_IN_RATE: f32 = 22.0;
-/// 遮挡回避「拉远」的阻尼速率(1/秒):离开墙后平滑弹回。
-const OCCLUSION_OUT_RATE: f32 = 3.4;
-/// 跟随焦点的高度(米)——看胸口而不是看脚。
-///
-/// 取 1.45 而不是 1.35:角色约 1.8 m 高,焦点略高一点能让头顶留在
-/// 取景框内,而不是被画面上缘切掉。
-const FOLLOW_HEIGHT: f32 = 1.45;
-/// 跟随焦点跟随角色的阻尼速率(1/秒):越大越硬,越小越飘。
-const FOLLOW_DAMPING: f32 = 9.0;
-/// 玩家碰撞圆半径(米)。
-const PLAYER_RADIUS: f32 = 0.35;
-
-/// 世界的**软边界**半径(米):玩家不许走出这个圆。
-///
-/// 这不是硬墙。城市是**程序化无限生成**的(见
-/// `step_streamed_surface` / `rebuild_streamed_surface`),任何一条硬边界都
-/// 等于在无限世界里砌一堵看不见的墙 —— 走到那儿就再也推不动,用户报的
-/// 「地图非无限大,触碰空气墙无法前进」正是它。
-///
-const WORLD_HALF: f32 = 150.0;
-
-// ===========================================================================
-// 动态实体的碰撞体尺寸与质量
-// ===========================================================================
-//
-// 质量以「一个人 = 1.0」为单位,方便直观比较。轿车取 30(1.5 t 量级对
-// 75 kg 的人),所以人被车顶开时人承担 30/31 的分离量、车只承担 1/31 ——
-// 手感上是「人被撞飞、车几乎不动」。
-
-/// 行人 / 玩家的等效碰撞圆半径(米)。
-const PED_RADIUS: f32 = 0.35;
-/// 敌人的等效碰撞圆半径(米)。
-const ENEMY_RADIUS: f32 = 0.35;
-/// 玩家质量(单位:一个「人」)。
-const PLAYER_MASS: f32 = 1.0;
-
-/// 动态层把玩家推开所需的最低自身速度(米/秒)。
-///
-/// 低于这个速度就认为玩家「站着不动」:人群的互相让位是在解算**扰动**,
-/// 不是解算墙 —— 静止时接受它会让每一帧都重复推出同一份分离向量
-/// (实测零输入时恒定 +0.094 m/帧,合 5.66 m/s,人站着不动一路漂走)。
-/// 静态层的推离不受此限制,那是真的解算结果。
-const PLAYER_PUSH_MIN_SPEED: f32 = 0.05;
-
-/// 低于这个长度的动态层位移直接丢弃(米)。
-///
-/// 与速度判据互补:贴着人群站着时 `resolve_all` 仍会给出亚毫米级的
-/// 数值噪声,阈值以下一律当作「没被推」。
-const PLAYER_PUSH_DEADZONE: f32 = 1e-3;
-/// 行人质量(单位:一个「人」)。
-const PED_MASS: f32 = 1.0;
-/// 敌人质量(单位:一个「人」)。
-const ENEMY_MASS: f32 = 1.0;
-/// 轿车质量(单位:一个「人」;30 ≈ 1.5 t 对 75 kg)。
-const CAR_MASS: f32 = 30.0;
-
-// ---------------------------------------------------------------------------
-// 棕榈布置(修「树木位置不合理 + 高度同质化」)
-// ---------------------------------------------------------------------------
-//
-// 原来棕榈是 `step += 24.0` 的**刚性格点**,三个调用点各自用
-// `0.9 + (index % 3) * 0.08` 算缩放 —— 全城只有 3 档高度,而且第 N 棵
-// 永远和第 N+3 棵同高、同模型、同位置偏移。整条街看起来像复制粘贴。
-//
-// 现在:间距在 MIN..MAX 之间按种子抖动,每棵有独立的沿街 / 垂直偏移,
-// `scale` 走**连续区间**并且有「成簇的高个」(按 PALM_TALL_FRACTION 抽签),
-// 所以高度有起伏而不是一层层齐平。
-
-/// 沿街两棵棕榈的最小间距(米)。
-const PALM_PITCH_MIN: f32 = 17.0;
-/// 沿街两棵棕榈的最大间距(米)。
-const PALM_PITCH_MAX: f32 = 33.0;
-/// 沿街两棵棕榈的平均间距(米):`PALM_PITCH_MIN` 与 `PALM_PITCH_MAX` 的中点。
-///
-/// 树位按 `PALM_PITCH_MAX` 的世界格点铺(见 [`street_slots`]),每格按这个
-/// 概率决定种不种,于是相邻两棵的实际间距期望正好落在
-/// `[PALM_PITCH_MIN, PALM_PITCH_MAX]` 这个区间里 —— 两端都写在规格里,
-/// 不能让任何一个常量变成没人引用的死数。
-const PALM_PITCH_AVG: f32 = (PALM_PITCH_MIN + PALM_PITCH_MAX) * 0.5;
-/// 沿街方向的随机抖动幅度(米):破掉人造的等距节奏。
-const PALM_PITCH_JITTER: f32 = 7.0;
-/// 垂直于街方向的随机抖动幅度(米):有的贴路沿、有的靠外侧。
-const PALM_SIDE_JITTER: f32 = 1.6;
-/// 沿街方向那一维要避开的**路口**半宽(米),等于路面半宽。
-///
-/// 横向那一维天生安全:`STREET_HALF_WIDTH + SIDEWALK_WIDTH * 0.55` 再加
-/// `±PALM_SIDE_JITTER / 2` 落在 `[8.18, 9.78]`,永远在人行道
-/// `[7.0, 10.6]` 里。**出问题的是沿街那一维** —— 它是自由走的
-/// `step + along_jitter`,每 `STREET_PITCH` 米就会撞上一次垂直街道的
-/// 轴线,于是每隔 60 m 就有一棵树种在**十字路口的沥青上**。
-///
-/// 用户报的是「道路上不能有树木」,那是硬约束,不是观感问题:实测
-/// 生成中心 (0, 0) 附近 830 棵里有 138 棵(16.6%)踩在路上,最近的一棵
-/// 离路中线只有 **0.03 m**,正对着车道中心。路口这一段直接不种树。
-const PALM_JUNCTION_GUARD: f32 = STREET_HALF_WIDTH;
-/// 抽中「高个」的概率(0..1):少量高树成簇,避免整片同高。
-const PALM_TALL_FRACTION: f32 = 0.22;
-/// 普通棕榈的最小缩放。
-const PALM_SCALE_MIN: f32 = 0.82;
-/// 普通棕榈的最大缩放。
-const PALM_SCALE_MAX: f32 = 1.08;
-/// 高个棕榈的最小缩放。
-const PALM_TALL_SCALE_MIN: f32 = 1.25;
-/// 高个棕榈的最大缩放。
-const PALM_TALL_SCALE_MAX: f32 = 1.65;
-
-/// 棕榈树干与可进入样板楼门洞之间必须留出的净距(米)。
-///
-/// 内院棕榈的散布半径抖动到 7.5 m 之后,树干会长到门洞里去;碰撞体
-/// 又跟着 `scale` 一起放大(高个 ×1.65),把门彻底堵死。留 6 m 净距。
-const PALM_SHOWCASE_CLEARANCE: f32 = 6.0;
-/// 棕榈碰撞半径最多按缩放放大到几倍(1.0 = 固定粗细)。
-///
-/// 树干粗细随树高走合理,但不能无上限:高个 ×1.65 再乘基准半径,
-/// 靠墙的树就把过道挤没了。这里封顶。
-const PALM_TRUNK_SCALE_CAP: f32 = 1.25;
-/// 玩家出生点(世界坐标):`SPAWN_LANE_STREET` 那条街的**东侧车道**,z = 45。
-///
-/// 选点是拿截图试出来的,踩过三个坑:
-///
-/// 1. 路中间(x = 30)不行 —— 相机落在另一侧车道,背后除了沥青什么都
-///    没有,整屏被单色地面糊死。
-/// 2. 人行道(x = 38.5)也不行 —— 行道树在 x = 38.98,相机往后退 7.4 m
-///    必然撞进树干,遮挡回避把距离一路压到 2.2 m,镜头直接怼在树皮上。
-/// 3. 横对着马路更不行 —— 相机被推到楼面(x ≈ 49)跟前,一出生就是一堵墙。
-///
-/// 现在这个点:车道内的 x 由 [`lane_x`] 从街道索引派生,离两侧的建筑和
-/// 行道树都有 6 m 以上;z = 45 远离 z = 24 / 60 两处路口,取景里是一条
-/// 笔直的街道,身后是同一条街往远处延伸,两侧是楼房和行道树。
-///
-/// **x 必须由 [`lane_x`] 派生。** 它原先写死成 `33.5`,那同样是 30 m 网格
-/// 的遗留(见 [`TRAFFIC_LANE_PLAN`]):街道网格变成 60 m 之后,`33.5` 落到
-/// 了街区内侧 —— 玩家一出生就站在楼和道具之间,而车队在 56.5 / 63.5 上跑,
-/// 于是最近的��离 23 m,超过 `ENTER_VEHICLE_RADIUS = 4.2`,按 F 上不了车。
-/// 「上车功能等于不存在」正是这个后果。
-const SPAWN_LANE_STREET: i32 = 1;
+use super::*;
 
 /// 玩家出生点(世界坐标):东侧车道 + 车道上的 z。
 ///
@@ -343,71 +8,9 @@ const SPAWN_LANE_STREET: i32 = 1;
 /// # Returns
 ///
 /// - `Vec3` - 玩家出生点。
-fn spawn_point() -> Vec3 {
+pub(crate) fn spawn_point() -> Vec3 {
     Vec3::from([lane_x(SPAWN_LANE_STREET, 1.0), GROUND_LEVEL, 45.0])
 }
-
-/// 玩家出生朝向(弧度)。
-///
-/// 玩家的前向是 `(cos yaw, -sin yaw)`。`yaw = PI/2` 时前向 = `(0, -1)`,
-/// 也就是朝北、顺着这条街往远处看 —— 相机落在角色南侧 7.4 m,同样在这
-/// 条街上,背后是同一条向远处延伸的马路,而不是楼面。
-const SPAWN_YAW: f32 = FRAC_PI_2;
-
-// ===========================================================================
-// 场景蓝图:街区网格(多条平行街道 × 横向连接街道)
-//
-// 城市从「一条 86 m 直线」扩成真正的网格:
-//
-// ```text
-//            x=-120    x=-60     x=0      x=60      x=120
-//   z=-120     +--------+--------+--------+--------+
-//              | block  | block  | block  | block  |
-//   z=-60      +=== 十字路口(南北向街道)==+
-//              | block  | block  | block  | block  |
-//   z=0        +=== 十字路口 ============+
-//              ...
-// ```
-//
-// 城市是**无限**的:街道轴线落在 `STREET_PITCH * k` 上,没有边界。
-// = 16 个网格路口,每个路口四角都有红绿灯。
-// ===========================================================================
-
-/// 街道半宽(路面,不含人行道)。
-const STREET_HALF_WIDTH: f32 = 7.0;
-/// 人行道宽度(单侧)。
-const SIDEWALK_WIDTH: f32 = 3.6;
-/// 相邻两条街道轴线之间的间距(米)。
-///
-/// 世界是**无限**的:轴线落在 `STREET_PITCH * k`(k 为任意整数)上,没有
-/// 边界。原先这是一张写死的 `&[-90, -30, 30, 90]`,城市被锁死在
-/// `[-150, 150]`,玩家走到 149 m 就撞墙。
-const STREET_PITCH: f32 = 60.0;
-/// 街区 / 道具的生成半径(米):以玩家为中心,这个半径内才生成城市内容。
-///
-/// 真实视距比这个小得多,但建筑有高度、街道有宽度,半径太小会看到
-/// 「楼凭空出现」。这一档取 300 m,配合 22 m 的剔除半径已经够远。
-const BLOCK_VIEW_RADIUS: f32 = 300.0;
-/// 街道索引的绝对值上限(安全阀)。
-///
-/// 街道索引本身没有上限 —— 真正的边界是**视距**。这个常量只保证
-/// 浮点坐标在荒谬远处时不至于让 `hash` 之类的位运算溢出,并且给
-/// 「玩家跑到多远算跑出世界」一个可测的判据。
-const STREET_INDEX_LIMIT: i32 = 100_000;
-/// 街区内部沿道路方向的楼间距(米),留出巷子 / 后巷。
-const LOT_PITCH: f32 = 34.0;
-/// 建筑围合的「内圈」半径(米):离街区中心多远开始放楼。
-const BLOCK_INNER: f32 = 11.0;
-/// 地面网格在每个方向上的分段数(整块一次,不是每街区一次)。
-const GROUND_SUBDIV: usize = 192;
-/// 地面网格单块的边长(米):以玩家为中心,左右各这么多。
-///
-/// 旧值是 300 m,固定铺满整城。世界改成无限之后
-/// 玩家可以一直往外走,300 m 必然不够 —— 现在这块地面会跟着玩家
-/// 重新生成,边长只决定「一次生成多少顶点」。
-const GROUND_SPAN: f32 = 480.0;
-/// 地面网格重新生成的步长(米):玩家走满这么远才重算一次。
-const GROUND_CELL_ALIGN: f32 = STREET_PITCH;
 
 /// 沿每条街道反复行走的「世界循环」—— 替代原先固定有限区间的一次性区间。
 ///
@@ -428,7 +31,7 @@ const GROUND_CELL_ALIGN: f32 = STREET_PITCH;
 ///
 /// - `Vec<(f32, f32, f32)>` - 每条街道的 `(轴线坐标, 起点, 终点)`,起点
 ///   终点已扣掉端点留边距。
-fn street_strips(center: f32, radius: f32, margin: f32) -> Vec<(f32, f32, f32)> {
+pub(crate) fn street_strips(center: f32, radius: f32, margin: f32) -> Vec<(f32, f32, f32)> {
     // 区间只由这一个中心决定。早期版本把「街道轴线方向的坐标」和
     // 「沿线方向的范围中心」一起取 min/max 当边界,于是中心在
     // (-6000, 1500) 时区间被撑成 7750 m 宽,每一段街道都铺了远超
@@ -457,7 +60,7 @@ fn street_strips(center: f32, radius: f32, margin: f32) -> Vec<(f32, f32, f32)> 
 /// # Returns
 ///
 /// - `(f32, f32)` - `(起点, 终点)`,单位米。
-fn ground_along_span(along_center: f32, radius: f32) -> (f32, f32) {
+pub(crate) fn ground_along_span(along_center: f32, radius: f32) -> (f32, f32) {
     (
         (along_center - radius).floor(),
         (along_center + radius).ceil(),
@@ -479,7 +82,7 @@ fn ground_along_span(along_center: f32, radius: f32) -> (f32, f32) {
 /// # Returns
 ///
 /// - `i32` - 街区索引(任意整数,正负皆可)。
-fn block_index(centre: f32) -> i32 {
+pub(crate) fn block_index(centre: f32) -> i32 {
     (centre / STREET_PITCH - 0.5).round() as i32
 }
 
@@ -503,7 +106,7 @@ fn block_index(centre: f32) -> i32 {
 /// # Returns
 ///
 /// - `u32` - 确定性种子。
-fn slot_seed(a: i32, b: i32, salt: u32) -> u32 {
+pub(crate) fn slot_seed(a: i32, b: i32, salt: u32) -> u32 {
     let mixed: u32 = (a as u32).wrapping_mul(0x9E37_79B1) ^ (b as u32).wrapping_mul(0x85EB_CA6D);
     hash2(mixed, salt)
 }
@@ -524,7 +127,7 @@ fn slot_seed(a: i32, b: i32, salt: u32) -> u32 {
 /// # Returns
 ///
 /// - `Vec<(i32, f32)>` - `(站位号, 站位坐标)`,按坐标升序。
-fn street_slots(lo: f32, hi: f32, step: f32) -> Vec<(i32, f32)> {
+pub(crate) fn street_slots(lo: f32, hi: f32, step: f32) -> Vec<(i32, f32)> {
     if hi < lo {
         return Vec::new();
     }
@@ -548,7 +151,7 @@ fn street_slots(lo: f32, hi: f32, step: f32) -> Vec<(i32, f32)> {
 /// # Returns
 ///
 /// - `f32` - 街道轴线的 X 或 Z 坐标(米)。
-fn street_axis(index: i32) -> f32 {
+pub(crate) fn street_axis(index: i32) -> f32 {
     STREET_PITCH * index as f32
 }
 
@@ -566,7 +169,7 @@ fn street_axis(index: i32) -> f32 {
 /// # Returns
 ///
 /// - `Vec<i32>` - 落在区间内的街道索引,升序。
-fn street_indices_in(lo: f32, hi: f32) -> Vec<i32> {
+pub(crate) fn street_indices_in(lo: f32, hi: f32) -> Vec<i32> {
     let mut out: Vec<i32> = Vec::new();
     if hi < lo {
         return out;
@@ -583,24 +186,12 @@ fn street_indices_in(lo: f32, hi: f32) -> Vec<i32> {
     out
 }
 
-/// 网格街道之间的一个街区:楼围合出一个内部院落,而不是沿街一条线。
-struct BlockLayout {
-    /// 街区中心的 X 坐标。
-    cx: f32,
-    /// 街区中心的 Z 坐标。
-    cz: f32,
-    /// 街区西侧那条街道的索引 —— 摆件种子由它定,不用枚举序号。
-    ix: i32,
-    /// 街区北侧那条街道的索引 —— 摆件种子由它定,不用枚举序号。
-    iz: i32,
-}
-
 /// 枚举全部 3×3 个街区中心(4 条街道围出 3×3 个街区)。
 ///
 /// # Returns
 ///
 /// - `Vec<BlockLayout>` - 9 个街区中心,顺序为行优先(先 z 后 x)。
-fn block_layouts() -> Vec<BlockLayout> {
+pub(crate) fn block_layouts() -> Vec<BlockLayout> {
     blocks_near(0.0, 0.0, BLOCK_VIEW_RADIUS)
 }
 
@@ -619,7 +210,7 @@ fn block_layouts() -> Vec<BlockLayout> {
 /// # Returns
 ///
 /// - `Vec<BlockLayout>` - 视距内的街区中心。
-fn blocks_near(x: f32, z: f32, radius: f32) -> Vec<BlockLayout> {
+pub(crate) fn blocks_near(x: f32, z: f32, radius: f32) -> Vec<BlockLayout> {
     let lo_x: f32 = x - radius;
     let hi_x: f32 = x + radius;
     let lo_z: f32 = z - radius;
@@ -656,7 +247,7 @@ fn blocks_near(x: f32, z: f32, radius: f32) -> Vec<BlockLayout> {
 /// # Returns
 ///
 /// - `bool` - `true` 表示该点在可通行的沥青面上。
-fn on_roadway(x: f32, z: f32) -> bool {
+pub(crate) fn on_roadway(x: f32, z: f32) -> bool {
     on_roadway_with_margin(x, z, 0.0)
 }
 
@@ -677,7 +268,7 @@ fn on_roadway(x: f32, z: f32) -> bool {
 /// # Returns
 ///
 /// - `bool` - `true` 表示该范围压在沥青面上。
-fn on_roadway_with_margin(x: f32, z: f32, margin: f32) -> bool {
+pub(crate) fn on_roadway_with_margin(x: f32, z: f32, margin: f32) -> bool {
     on_roadway_raw(x, z, margin)
 }
 
@@ -692,7 +283,7 @@ fn on_roadway_with_margin(x: f32, z: f32, margin: f32) -> bool {
 /// # Returns
 ///
 /// - `bool` - `true` 表示压在沥青面上。
-fn on_roadway_raw(x: f32, z: f32, margin: f32) -> bool {
+pub(crate) fn on_roadway_raw(x: f32, z: f32, margin: f32) -> bool {
     on_roadway_inner(x, z, margin)
 }
 
@@ -707,7 +298,7 @@ fn on_roadway_raw(x: f32, z: f32, margin: f32) -> bool {
 /// # Returns
 ///
 /// - `bool` - `true` 表示压在沥青面上。
-fn on_roadway_inner(x: f32, z: f32, margin: f32) -> bool {
+pub(crate) fn on_roadway_inner(x: f32, z: f32, margin: f32) -> bool {
     let reach: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH + margin;
     // 街道是无限密的,「到最近街道轴线的距离」闭式可解,不用枚举:
     // 索引取 round(坐标 / 间距),轴线就是间距乘回去。
@@ -715,60 +306,6 @@ fn on_roadway_inner(x: f32, z: f32, margin: f32) -> bool {
     let nearest_z: f32 = street_axis((z / STREET_PITCH).round() as i32);
     (x - nearest_x).abs() <= reach || (z - nearest_z).abs() <= reach
 }
-
-/// 一栋楼在场景里的摆放。
-struct BuildingPlacement {
-    /// 资产 id。
-    asset: &'static str,
-    /// 世界坐标(x, z)。
-    position: [f32; 2],
-    /// 绕 Y 轴的朝向(弧度)。
-    yaw: f32,
-    /// 统一缩放。
-    scale: f32,
-    /// 色调乘子,给同一批楼一点色彩变化。
-    tint: [f32; 3],
-}
-
-/// 楼 / 招牌 / 车 / 行人用的建筑资产池(全部不同资产,循环取用)。
-///
-/// 网格街区要摆 ~200 栋楼,如果只给 10 个不同资产,同一个 mesh 会以
-/// 20 个实例反复出现 —— 顶点数据仍然只解析一次(instancing 友好),
-/// 但远景会明显看出「同一栋楼在原地克隆」。12 个资产 + 按格子位置
-/// 做 `scale` / `tint` / `yaw` 抖动,足以让成片街区读起来是城市而不是
-/// 复制粘贴。
-const BUILDING_POOL: &[&str] = &[
-    BLDG_DECO_PINK,
-    BLDG_MINT_SHOP,
-    BLDG_CREAM_BLOCK,
-    BLDG_CORAL_HALL,
-    BLDG_TEAL_LOFT,
-    BLDG_AQUA_ARCADE,
-    BLDG_DECO_TEAL,
-    BLDG_SAND_MIDRISE,
-    BLDG_PINK_TERRACE,
-    BLDG_WHITE_LANDMARK,
-    BLDG_APRICOT_MOTEL,
-    BLDG_LILAC_TOWER,
-];
-
-/// 招牌资产池。
-const SIGN_POOL: &[&str] = &[
-    SIGN_HOTEL,
-    SIGN_PIZZA,
-    SIGN_CLUB,
-    SIGN_BAR,
-    SIGN_TROPIC,
-    SIGN_ARCADE,
-    SIGN_MOTEL,
-    SIGN_DINER,
-];
-
-/// 车辆资产池。
-const VEHICLE_POOL: &[&str] = &[CAR_TAXI, CAR_POLICE, CAR_SEDAN, CAR_COUPE, TRUCK_PICKUP];
-
-/// 行人资产池。
-const PED_POOL: &[&str] = &[PED_SUIT, PED_STREETWEAR, PED_DRESS, PED_OVERALLS];
 
 /// 确定性的整数哈希(无随机数依赖,同一 seed 永远生成同一座城市)。
 ///
@@ -783,7 +320,7 @@ const PED_POOL: &[&str] = &[PED_SUIT, PED_STREETWEAR, PED_DRESS, PED_OVERALLS];
 /// # Returns
 ///
 /// - `u32` - 哈希后的值。
-fn hash2(seed: u32, salt: u32) -> u32 {
+pub(crate) fn hash2(seed: u32, salt: u32) -> u32 {
     let mut h: u32 = seed.wrapping_mul(0x9E37_79B9).wrapping_add(salt);
     h ^= h >> 16;
     h = h.wrapping_mul(0x85EB_CA6B);
@@ -802,89 +339,9 @@ fn hash2(seed: u32, salt: u32) -> u32 {
 /// # Returns
 ///
 /// - `f32` - 落在 `[0, 1)` 的值。
-fn hash_unit(seed: u32, salt: u32) -> f32 {
+pub(crate) fn hash_unit(seed: u32, salt: u32) -> f32 {
     (hash2(seed, salt) % 10_000) as f32 / 10_000.0
 }
-
-/// 路灯 / 交通灯等街道道具的摆放。
-struct PropPlacement {
-    /// 资产 id。
-    asset: &'static str,
-    /// 世界坐标。
-    position: [f32; 3],
-    /// 朝向(弧度)。
-    yaw: f32,
-    /// 色调。
-    tint: [f32; 3],
-}
-
-/// 楼的位置在街区内的符号偏移(前 / 后 / 左 / 右 四条围合边)。
-///
-/// 街区的四边都放楼,中间留出 `BLOCK_INNER` 的内院 —— 这样每个街区
-/// 内部有建筑围合和巷子,而不是只有沿街一排。
-const BLOCK_RING: &[(f32, f32, f32)] = &[
-    // (相对街区中心的 dx, dz, 朝向街道的 yaw)
-    (0.0, -1.0, 0.0),
-    (0.0, 1.0, PI),
-    (-1.0, 0.0, FRAC_PI_2),
-    (1.0, 0.0, -FRAC_PI_2),
-];
-
-/// 可进入样板楼的世界摆放表。
-///
-/// 两栋楼**固定**摆在出生点两侧,而不是程序化街区生成的随机位置:
-/// 玩家出生在 `(33.5, 45)`,两栋分别在西边 `(10, 48)` 和东边 `(52, 48)`,
-/// 门洞都朝着出生点 —— 推门就进,不用找。
-///
-/// 坐标不是拍脑袋写的,是一次性网格搜索的结果,四个条件同时成立:
-/// 1. **不压车行道**:外轮廓的每个角离所有街道轴线都大于
-///    `STREET_HALF_WIDTH + SIDEWALK_WIDTH`(硬约束,见 `on_roadway`)。
-/// 2. **不与程序化楼重叠**:与 `build_city_buildings` 的每一栋都留 1 m。
-/// 3. **门前有一块 7 m 长的空地**:沿门洞法线往外采样,既没有别的楼,
-///    也没有路灯 / 长椅 / 垃圾桶 —— 玩家不会被一排道具堵在门外。
-/// 4. **门朝出生点**:门法线与「指向出生点」的方向夹角 < 37°。
-///
-/// **朝向**决定了门洞朝向:导出的资产里门洞在本地 **+Z** 面(`interior.py`
-/// 的临街面 `y_in`,经 `(x, z, -y)` 导出后成为本地 +Z),`Instance` 的约定
-/// 是本地 +Z → 世界 `(sin yaw, 0, cos yaw)`。所以:
-/// - `LOFT_YAW = +π/2` → 门法线 `(1, 0)`,门朝 +X,即朝东面的出生点;
-/// - `SHOP_YAW = -π/2` → 门法线 `(−1, 0)`,门朝 −X,即朝西面的出生点。
-///
-/// 两栋的门因此**相向而开**,从街区中间那条空地上就能同时看见两个开口。
-const SHOWCASE_YAW: f32 = FRAC_PI_2;
-/// 样板楼 B 的朝向与 A 相反,让两栋的门相向。
-const SHOWCASE_YAW_FLIPPED: f32 = -FRAC_PI_2;
-
-/// 样板楼 A(LOFT)所在街区的 X 索引 —— 街区中心在 `STREET_PITCH * k`。
-const SHOWCASE_LOFT_BLOCK_X: i32 = 0;
-/// 样板楼 A(LOFT)相对街区中心的 X 偏移(米)。
-///
-/// 偏移是必需的:街区中心正好落在两条街道的**中线上**吗?不 —— 街区
-/// 中心就是 `PITCH * k`,而街道轴线也在 `PITCH * k`,所以街区中心
-/// **就在街道上**。要放楼必须往街区内部挪,离两侧街道都留够
-/// `STREET_HALF_WIDTH + SIDEWALK_WIDTH`。
-const SHOWCASE_LOFT_OFFSET_X: f32 = -7.0;
-/// 样板楼 A(LOFT)所在街区的 Z 索引。
-const SHOWCASE_LOFT_BLOCK_Z: i32 = 0;
-/// 样板楼 A(LOFT)相对街区中心的 Z 偏移(米)。
-const SHOWCASE_LOFT_OFFSET_Z: f32 = 0.0;
-/// 样板楼 B(SHOP)所在街区的 X 索引。
-const SHOWCASE_SHOP_BLOCK_X: i32 = 0;
-/// 样板楼 B(SHOP)相对街区中心的 X 偏移(米)—— 与 A 相向而开。
-const SHOWCASE_SHOP_OFFSET_X: f32 = 7.0;
-/// 样板楼 B(SHOP)所在街区的 Z 索引。
-const SHOWCASE_SHOP_BLOCK_Z: i32 = 0;
-/// 样板楼 B(SHOP)相对街区中心的 Z 偏移(米)。
-const SHOWCASE_SHOP_OFFSET_Z: f32 = 0.0;
-/// 门洞在资产本地坐标里的 Z(米)—— `interior` 里的外墙就铺在这个面上。
-///
-/// 之前这个数字只以字面量 `6.4` 出现在 `interior.rs` 的四面墙里,验收
-/// 脚本要导航到门口时只能从源码里抄一遍。抄出来的数字和真实墙面差
-/// 0.1 m 就走不进门,与其抄不如让它成为一处命名常量。
-const SHOWCASE_DOOR_Z: f32 = 6.4;
-
-/// 外墙厚度(米)—— 与 `interior` 里铺墙用的 `WALL_T` 是同一个数。
-const SHOWCASE_WALL_THICKNESS: f32 = 0.2;
 
 /// 程序化生成整座城市的建筑布局。
 ///
@@ -901,49 +358,9 @@ const SHOWCASE_WALL_THICKNESS: f32 = 0.2;
 ///
 /// - `Vec<BuildingPlacement>` - 全城建筑摆放表(不含两栋可进入样板楼,
 ///   它们由 [`showcase_placements`] 单独提供)。
-fn build_city_buildings(cx: f32, cz: f32) -> Vec<BuildingPlacement> {
+pub(crate) fn build_city_buildings(cx: f32, cz: f32) -> Vec<BuildingPlacement> {
     build_city_buildings_with(BUILDING_FOOTPRINT_GUARD, cx, cz)
 }
-
-/// 可进入样板楼的**内墙之间**净跨(米),即资产 `floor_ground` 的 XZ 尺寸。
-///
-/// 这些数字是从 `assets/bldg_*_showcase.json` 的 `floor_ground` 包围盒
-/// **逐值量出来的**,不是手算的,所以碰撞体与可见几何一定对齐 —— 差
-/// 5 cm 就会出现「站在空气里」或者「被一层看不见的壳挡在门外」。
-const SHOWCASE_LOFT_SPAN: Vec2 = [11.50, 9.50];
-/// 商铺样板楼的内墙净跨(米)。
-const SHOWCASE_SHOP_SPAN: Vec2 = [9.50, 8.50];
-
-/// 样板楼外轮廓(不含挑出的线脚)的半尺寸(米)—— 资产 `shell` 包围盒。
-const SHOWCASE_LOFT_HALF: Vec2 = [6.00, 5.00];
-/// 商铺样板楼外轮廓半尺寸(米)。
-const SHOWCASE_SHOP_HALF: Vec2 = [5.00, 4.50];
-
-/// 可进入样板楼的几何蓝图:摆放 + 内墙净跨 + 外轮廓半尺寸。
-///
-/// 净跨 / 半尺寸按资产 id 分派而不是逐个实例存一份:它们是**资产的
-/// 属性**,不是摆放的属性,存两份就等于给「资产换了尺寸」留一个
-/// 悄悄不同步的口子。
-struct ShowcaseSpec {
-    /// 资产 id。
-    asset: &'static str,
-    /// 世界坐标(x, z)。
-    position: Vec2,
-    /// 绕 Y 轴的朝向(弧度):门洞法线 = `(sin yaw, cos yaw)`。
-    yaw: f32,
-    /// 内墙之间的净跨(米),按**资产本地** X / Z 记。
-    span: Vec2,
-    /// 外墙外皮之间的半跨(米),按**资产本地** X / Z 记。
-    half: Vec2,
-}
-
-/// 两栋样板楼蓝图的全集,等价于 `[ShowcaseSpec; 2]`。
-///
-/// 用类型别名而不是裸 `[ShowcaseSpec; 2]`,是因为 doc-comment 的
-/// 返回类型解析(`verify_doc_comment_format` 的 `->\s*([^{=;]+)`)会在
-/// `;` 处截断,于是 `# Returns` 里写正确的 `[ShowcaseSpec; 2]` 反而被判成
-/// 「与签名的 `[ShowcaseSpec` 不匹配」。展开后的类型完全等价。
-type ShowcaseSpecs = [ShowcaseSpec; 2];
 
 /// 两栋可进入样板楼的内墙净跨。
 ///
@@ -954,7 +371,7 @@ type ShowcaseSpecs = [ShowcaseSpec; 2];
 /// # Returns
 ///
 /// - `Vec2` - `(X 净跨, Z 净跨)`(米)。
-fn showcase_span(asset: &str) -> Vec2 {
+pub(crate) fn showcase_span(asset: &str) -> Vec2 {
     match asset {
         BLDG_LOFT_SHOWCASE => SHOWCASE_LOFT_SPAN,
         _ => SHOWCASE_SHOP_SPAN,
@@ -970,7 +387,7 @@ fn showcase_span(asset: &str) -> Vec2 {
 /// # Returns
 ///
 /// - `Vec2` - `(X 半跨, Z 半跨)`(米)。
-fn showcase_half(asset: &str) -> Vec2 {
+pub(crate) fn showcase_half(asset: &str) -> Vec2 {
     match asset {
         BLDG_LOFT_SHOWCASE => SHOWCASE_LOFT_HALF,
         _ => SHOWCASE_SHOP_HALF,
@@ -982,7 +399,7 @@ fn showcase_half(asset: &str) -> Vec2 {
 /// # Returns
 ///
 /// - `ShowcaseSpecs` - 两栋样板楼的完整蓝图。
-fn showcase_specs() -> ShowcaseSpecs {
+pub(crate) fn showcase_specs() -> ShowcaseSpecs {
     [
         ShowcaseSpec {
             asset: BLDG_LOFT_SHOWCASE,
@@ -1022,11 +439,11 @@ fn showcase_specs() -> ShowcaseSpecs {
 /// # Returns
 ///
 /// - `bool` - `true` 表示会重叠,这一栋必须放弃。
-fn hits_a_showcase(x: f32, z: f32, radius: f32) -> bool {
+pub(crate) fn hits_a_showcase(x: f32, z: f32, radius: f32) -> bool {
     showcase_specs().iter().any(|spec: &ShowcaseSpec| {
-        let dx: f32 = (x - spec.position[0]).abs();
-        let dz: f32 = (z - spec.position[1]).abs();
-        dx < radius + spec.half[0] && dz < radius + spec.half[1]
+        let dx: f32 = (x - spec.get_position()[0]).abs();
+        let dz: f32 = (z - spec.get_position()[1]).abs();
+        dx < radius + spec.get_half()[0] && dz < radius + spec.get_half()[1]
     })
 }
 
@@ -1042,7 +459,7 @@ fn hits_a_showcase(x: f32, z: f32, radius: f32) -> bool {
 /// # Returns
 ///
 /// - `Vec2` - 世界 XZ 坐标(米)。
-fn showcase_position(block_x: i32, block_z: i32, offset_x: f32, offset_z: f32) -> Vec2 {
+pub(crate) fn showcase_position(block_x: i32, block_z: i32, offset_x: f32, offset_z: f32) -> Vec2 {
     [
         street_axis(block_x) + STREET_PITCH * 0.5 + offset_x,
         street_axis(block_z) + STREET_PITCH * 0.5 + offset_z,
@@ -1090,10 +507,10 @@ pub fn showcase_door_approach(x: f32, z: f32, yaw: f32, outside: f32) -> Vec3 {
 pub fn showcase_to_world(index: usize, local: Vec2) -> Vec2 {
     let specs: [ShowcaseSpec; 2] = showcase_specs();
     let spec: &ShowcaseSpec = &specs[index];
-    let (sin_yaw, cos_yaw): (f32, f32) = spec.yaw.sin_cos();
+    let (sin_yaw, cos_yaw): (f32, f32) = spec.get_yaw().sin_cos();
     [
-        spec.position[0] + local[0] * cos_yaw + local[1] * sin_yaw,
-        spec.position[1] - local[0] * sin_yaw + local[1] * cos_yaw,
+        spec.get_position()[0] + local[0] * cos_yaw + local[1] * sin_yaw,
+        spec.get_position()[1] - local[0] * sin_yaw + local[1] * cos_yaw,
     ]
 }
 
@@ -1143,9 +560,9 @@ pub fn showcase_front_normal(index: usize) -> Vec2 {
 pub fn showcase_to_local(index: usize, world: Vec2) -> Vec2 {
     let specs: [ShowcaseSpec; 2] = showcase_specs();
     let spec: &ShowcaseSpec = &specs[index];
-    let (sin_yaw, cos_yaw): (f32, f32) = spec.yaw.sin_cos();
-    let dx: f32 = world[0] - spec.position[0];
-    let dz: f32 = world[1] - spec.position[1];
+    let (sin_yaw, cos_yaw): (f32, f32) = spec.get_yaw().sin_cos();
+    let dx: f32 = world[0] - spec.get_position()[0];
+    let dz: f32 = world[1] - spec.get_position()[1];
     [dx * cos_yaw - dz * sin_yaw, dx * sin_yaw + dz * cos_yaw]
 }
 
@@ -1182,7 +599,7 @@ pub fn showcase_stair_point(index: usize, local_z: f32) -> Vec2 {
 /// - `Vec<Vec2>` - 世界坐标路点,从门外到二层楼板。
 pub fn showcase_walk_route(index: usize) -> Vec<Vec2> {
     let spec: &ShowcaseSpec = &showcase_specs()[index];
-    let span: [f32; 2] = spec.span;
+    let span: [f32; 2] = spec.get_span();
     let hx: f32 = span[0] * 0.5;
     let hz: f32 = span[1] * 0.5;
     let sx0: f32 = hx - SHOWCASE_STAIR_WIDTH;
@@ -1237,13 +654,13 @@ pub fn showcase_walk_route(index: usize) -> Vec<Vec2> {
 /// # Returns
 ///
 /// - `Vec<BuildingPlacement>` - 两栋样板楼的摆放。
-fn showcase_placements() -> Vec<BuildingPlacement> {
+pub(crate) fn showcase_placements() -> Vec<BuildingPlacement> {
     showcase_specs()
         .iter()
         .map(|spec: &ShowcaseSpec| BuildingPlacement {
-            asset: spec.asset,
-            position: [spec.position[0], spec.position[1]],
-            yaw: spec.yaw,
+            asset: spec.get_asset(),
+            position: [spec.get_position()[0], spec.get_position()[1]],
+            yaw: spec.get_yaw(),
             scale: 1.0,
             tint: [1.0, 1.0, 1.0],
         })
@@ -1266,39 +683,40 @@ fn showcase_placements() -> Vec<BuildingPlacement> {
 ///
 /// - `&mut FloorWorld` - 室内碰撞世界。
 /// - `&ShowcaseSpec` - 该栋楼的蓝图。
-fn push_showcase_interior(interiors: &mut FloorWorld, spec: &ShowcaseSpec) {
+pub(crate) fn push_showcase_interior(interiors: &mut FloorWorld, spec: &ShowcaseSpec) {
     // 下面所有几何都先在**资产本地**坐标里写(本地 +Z = 门洞面),再统一
     // 交给 `place` 旋到世界。这样改 `spec.yaw` 只是换个朝向,几何本身一行
     // 都不用动 —— 而把世界坐标写死的话,一旦两栋楼朝向不同(现在就是:
     // 一个 +π/2、一个 −π/2,门相向),墙和门洞就会对不上。
-    let (hx, hz): (f32, f32) = (spec.span[0] * 0.5, spec.span[1] * 0.5);
-    let (ox, oz): (f32, f32) = (spec.half[0], spec.half[1]);
+    let (hx, hz): (f32, f32) = (spec.get_span()[0] * 0.5, spec.get_span()[1] * 0.5);
+    let (ox, oz): (f32, f32) = (spec.get_half()[0], spec.get_half()[1]);
     let wall_h: f32 = SHOWCASE_WALL_HEIGHT;
     let t: f32 = SHOWCASE_WALL_THICKNESS;
-    let (sin_yaw, cos_yaw): (f32, f32) = spec.yaw.sin_cos();
+    let (sin_yaw, cos_yaw): (f32, f32) = spec.get_yaw().sin_cos();
 
     // 本地 (x, z) → 世界 (x, z)。`yaw` 为 90° 的整数倍时结果是精确的
     // 轴对齐盒,所以 `FloorWorld` 的 AABB 假设依然成立。
-    let place = |local: Vec2, y: f32| -> Vec3 {
+    let place: &dyn Fn(Vec2, f32) -> Vec3 = &|local: Vec2, y: f32| -> Vec3 {
         [
-            spec.position[0] + local[0] * cos_yaw + local[1] * sin_yaw,
+            spec.get_position()[0] + local[0] * cos_yaw + local[1] * sin_yaw,
             y,
-            spec.position[1] - local[0] * sin_yaw + local[1] * cos_yaw,
+            spec.get_position()[1] - local[0] * sin_yaw + local[1] * cos_yaw,
         ]
     };
     // 一个本地轴对齐盒 → 推入室内碰撞世界。
-    let mut push = |min_xz: Vec2, max_xz: Vec2, lo: f32, hi: f32, is_slab: bool| {
-        let a: Vec3 = place(min_xz, lo);
-        let b: Vec3 = place(max_xz, hi);
-        // 旋转 90° 整数倍会交换 X / Z,所以两个角要各自取 min / max。
-        let lo_corner: Vec3 = [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])];
-        let hi_corner: Vec3 = [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])];
-        if is_slab {
-            interiors.push_slab(lo_corner, hi_corner);
-        } else {
-            interiors.push_wall(lo_corner, hi_corner);
-        }
-    };
+    let mut push: &mut dyn FnMut(Vec2, Vec2, f32, f32, bool) =
+        &mut |min_xz: Vec2, max_xz: Vec2, lo: f32, hi: f32, is_slab: bool| {
+            let a: Vec3 = place(min_xz, lo);
+            let b: Vec3 = place(max_xz, hi);
+            // 旋转 90° 整数倍会交换 X / Z,所以两个角要各自取 min / max。
+            let lo_corner: Vec3 = [a[0].min(b[0]), a[1].min(b[1]), a[2].min(b[2])];
+            let hi_corner: Vec3 = [a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])];
+            if is_slab {
+                interiors.push_slab(lo_corner, hi_corner);
+            } else {
+                interiors.push_wall(lo_corner, hi_corner);
+            }
+        };
 
     // ---- 楼梯:贴着本地 +X 内墙,从门洞那一头往楼里排 ---------------
     // 方向是从导出 JSON 里量出来的:`stair` 的第一级(最低的一级,顶面
@@ -1399,16 +817,19 @@ fn push_showcase_interior(interiors: &mut FloorWorld, spec: &ShowcaseSpec) {
 /// # Arguments
 ///
 /// - `&Game` - 只读借用,只取玩家位置与室内碰撞体。
-fn probe_nearby_shapes(game: &Game) {
-    let here: Vec2 = [game.player.get_position()[0], game.player.get_position()[2]];
-    let radius: f32 = game.world.get_player_radius();
+pub(crate) fn probe_nearby_shapes(game: &Game) {
+    let here: Vec2 = [
+        game.get_player().get_position()[0],
+        game.get_player().get_position()[2],
+    ];
+    let radius: f32 = game.get_world().get_player_radius();
     let mut hits: Vec<String> = Vec::new();
     // 关键:墙体**不在** `game.world` 里。样板楼作为实心 AABB 推进碰撞
     // 世界会在门洞外砌一堵看不见的墙,所以它们被移到了
     // `game.interiors`(见 `build_collision_world` 的注释)。第一次跑这个
     // 探针只扫 `world`,拿回来 12 个圆柱道具、零个 AABB —— 因为墙根本
     // 不在那儿。查室内几何必须读 `interiors`。
-    for piece in game.interiors.get_floors() {
+    for piece in game.get_interiors().get_floors() {
         let (lo, hi, label): (Vec3, Vec3, &str) = match piece {
             crate::interior::Floor::Slab { min, max } => (*min, *max, "S"),
             crate::interior::Floor::Wall { min, max } => (*min, *max, "W"),
@@ -1439,7 +860,7 @@ fn probe_nearby_shapes(game: &Game) {
     // 嫌疑人:它把圆心沿**最近面**推出 `penetration`,而玩家一旦站到
     // 1800 多个 shape 里某个的**内部**,走「最小松弛轴」分支会一次
     // 推出好几米。诊断必须同时看两个世界。
-    for shape in game.world.get_shapes() {
+    for shape in game.get_world().get_shapes() {
         let (center, half, kind): (Vec2, Vec2, &str) = match shape {
             crate::collision::Shape::Aabb { center, half } => (*center, *half, "B"),
             crate::collision::Shape::Circle { center, radius } => {
@@ -1486,18 +907,11 @@ fn probe_nearby_shapes(game: &Game) {
 /// # Arguments
 ///
 /// - `&mut FloorWorld` - 室内碰撞世界。
-fn build_showcase_interiors(interiors: &mut FloorWorld) {
+pub(crate) fn build_showcase_interiors(interiors: &mut FloorWorld) {
     for spec in showcase_specs() {
         push_showcase_interior(interiors, &spec);
     }
 }
-
-/// 楼的最大占地半尺寸(米)—— 用来保证整栋楼都不压到车行道。
-///
-/// 取一个偏保守的常数而不是逐个资产的包围盒:建筑资产的包围盒差异很大
-/// (10.7 m 到 6.4 m),用统一余量判定简单、可预测,而且宁可少摆一栋楼
-/// 也不会出现「隐形墙堵住车道」。
-const BUILDING_FOOTPRINT_GUARD: f32 = 11.0;
 
 /// 楼的占地(含余量)是否压到车行道。
 ///
@@ -1510,7 +924,7 @@ const BUILDING_FOOTPRINT_GUARD: f32 = 11.0;
 /// # Returns
 ///
 /// - `bool` - `true` 表示楼的任一轴向范围压到了沥青面。
-fn footprint_hits_roadway(x: f32, z: f32, guard: f32) -> bool {
+pub(crate) fn footprint_hits_roadway(x: f32, z: f32, guard: f32) -> bool {
     on_roadway_with_margin(x, z, guard)
 }
 
@@ -1523,18 +937,21 @@ fn footprint_hits_roadway(x: f32, z: f32, guard: f32) -> bool {
 /// # Returns
 ///
 /// - `Vec<BuildingPlacement>` - 楼的摆放列表。
-fn build_city_buildings_with(guard: f32, cx: f32, cz: f32) -> Vec<BuildingPlacement> {
+pub(crate) fn build_city_buildings_with(guard: f32, cx: f32, cz: f32) -> Vec<BuildingPlacement> {
     let mut out: Vec<BuildingPlacement> = Vec::new();
     for block in blocks_near(cx, cz, BLOCK_VIEW_RADIUS) {
         // 种子按**世界街区索引**取,不是枚举序号 `bi`。枚举序号随生成中心
         // 的窗口平移而整体错位,拿它当种子等于让同一栋楼在流式重建后原地
         // 换模型 —— 实测一次 60 m 重建里 60 栋楼有 44 栋换了模型。
         for (edge, (dx, dz, yaw)) in BLOCK_RING.iter().enumerate() {
-            let count: usize =
-                2 + (hash2(slot_seed(block.ix, block.iz, 0x5EED), edge as u32) % 2) as usize;
+            let count: usize = 2
+                + (hash2(
+                    slot_seed(block.get_ix(), block.get_iz(), 0x5EED),
+                    edge as u32,
+                ) % 2) as usize;
             for slot in 0..count {
                 // 每栋楼一个种子:(街区 x, 街区 z, 边, 站位)。
-                let seed: u32 = slot_seed(block.ix, block.iz, 0x9E37)
+                let seed: u32 = slot_seed(block.get_ix(), block.get_iz(), 0x9E37)
                     ^ (edge as u32).wrapping_mul(0x0000_1000)
                     ^ (slot as u32);
                 // 沿边错开:LOT_PITCH 的间距 + 确定性抖动,形成巷子。
@@ -1542,10 +959,16 @@ fn build_city_buildings_with(guard: f32, cx: f32, cz: f32) -> Vec<BuildingPlacem
                 let jitter: f32 = (hash_unit(seed, 1) - 0.5) * 6.0;
                 let (px, pz): (f32, f32) = if dx.abs() > 0.5 {
                     // 左右边:沿 Z 排布。
-                    (block.cx + dx * BLOCK_INNER, block.cz + along + jitter)
+                    (
+                        block.get_cx() + dx * BLOCK_INNER,
+                        block.get_cz() + along + jitter,
+                    )
                 } else {
                     // 前后边:沿 X 排布。
-                    (block.cx + along + jitter, block.cz + dz * BLOCK_INNER)
+                    (
+                        block.get_cx() + along + jitter,
+                        block.get_cz() + dz * BLOCK_INNER,
+                    )
                 };
                 // 整栋楼都要让开车行道:除了中心点,四角也得在沥青面之外。
                 // `guard` 是资产包围盒的最大半尺寸(由下面的
@@ -1629,7 +1052,7 @@ fn build_city_buildings_with(guard: f32, cx: f32, cz: f32) -> Vec<BuildingPlacem
 ///
 /// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
-fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
+pub(crate) fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
     let mut out: Vec<PropPlacement> = Vec::new();
     let corner: f32 = STREET_HALF_WIDTH + 0.9;
     // ---- 每个网格路口四个角的交通灯 ----
@@ -1732,7 +1155,7 @@ fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
 ///
 /// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
-fn build_city_palms(cx: f32, _cz: f32) -> PalmSpots {
+pub(crate) fn build_city_palms(cx: f32, _cz: f32) -> PalmSpots {
     let mut out: Vec<[f32; 3]> = Vec::new();
     // 原来这里是 `step += 24.0` 的**刚性格点**:所有棕榈严格等距、位置
     // 完全确定、模型全同款,于是整条街的树像复制粘贴 —— 用户报的
@@ -1749,7 +1172,7 @@ fn build_city_palms(cx: f32, _cz: f32) -> PalmSpots {
     // 先枚举**世界坐标固定**的候选格点(间距取抖动区间上界,保证不漏),
     // 再用种子在这个格点上判定「这格要不要种、往哪偏」—— 于是重建前后
     // 同一格永远给出同一棵树。
-    const SLOT_PITCH: f32 = PALM_PITCH_MAX;
+    pub(crate) const SLOT_PITCH: f32 = PALM_PITCH_MAX;
     for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 26.0) {
         let line_index: i32 = (line / STREET_PITCH).round() as i32;
         for (slot, cell) in street_slots(strip_lo, strip_hi, SLOT_PITCH) {
@@ -1793,13 +1216,13 @@ fn build_city_palms(cx: f32, _cz: f32) -> PalmSpots {
     // 索引取,重建后同一片内院还是同一片内院。
     for block in block_layouts() {
         for k in 0..2 {
-            let seed: u32 = slot_seed(block.ix, block.iz, 0x9E37) ^ k;
-            let angle: f32 = (k as f32 * 2.2) + block_index(block.cx) as f32 * 0.7;
+            let seed: u32 = slot_seed(block.get_ix(), block.get_iz(), 0x9E37) ^ k;
+            let angle: f32 = (k as f32 * 2.2) + block_index(block.get_cx()) as f32 * 0.7;
             let radius: f32 = 4.0 + hash_unit(seed, 6) * 3.5;
             let scale: f32 =
                 PALM_SCALE_MIN + hash_unit(seed, 7) * (PALM_TALL_SCALE_MAX - PALM_SCALE_MIN);
-            let px: f32 = block.cx + angle.sin() * radius;
-            let pz: f32 = block.cz + angle.cos() * radius;
+            let px: f32 = block.get_cx() + angle.sin() * radius;
+            let pz: f32 = block.get_cz() + angle.cos() * radius;
             // **必须让开可进入的样板楼。** 内院棕榈原本落在固定 5 m 圆
             // 上,和样板楼门口的距离是「碰巧够用」;半径一抖动到 7.5 m,
             // 树干就长到门洞里去了 —— 碰撞体(半径随 scale 放大到
@@ -1824,7 +1247,7 @@ fn build_city_palms(cx: f32, _cz: f32) -> PalmSpots {
 ///
 /// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
-fn build_city_vehicles(cx: f32, _cz: f32) -> Vec<Placement> {
+pub(crate) fn build_city_vehicles(cx: f32, _cz: f32) -> Vec<Placement> {
     let mut out: Vec<(&'static str, [f32; 3], f32)> = Vec::new();
     let lane: f32 = STREET_HALF_WIDTH - 2.6;
     for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 40.0) {
@@ -1865,7 +1288,7 @@ fn build_city_vehicles(cx: f32, _cz: f32) -> Vec<Placement> {
 ///
 /// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
-fn build_city_signs(cx: f32, _cz: f32) -> Vec<Placement> {
+pub(crate) fn build_city_signs(cx: f32, _cz: f32) -> Vec<Placement> {
     let mut out: Vec<(&'static str, [f32; 3], f32)> = Vec::new();
     let face: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH + 3.2;
     for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 34.0) {
@@ -1900,7 +1323,7 @@ fn build_city_signs(cx: f32, _cz: f32) -> Vec<Placement> {
 ///
 /// - `f32` - 生成中心的世界 X(米),用于确定流式加载范围。
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
-fn build_city_peds(cx: f32, _cz: f32) -> Vec<Placement> {
+pub(crate) fn build_city_peds(cx: f32, _cz: f32) -> Vec<Placement> {
     let mut out: Vec<(&'static str, [f32; 3], f32)> = Vec::new();
     for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 20.0) {
         let line_index: i32 = (line / STREET_PITCH).round() as i32;
@@ -1920,436 +1343,6 @@ fn build_city_peds(cx: f32, _cz: f32) -> Vec<Placement> {
     out
 }
 
-// ===========================================================================
-// 游戏状态
-// ===========================================================================
-
-/// `DayPhase` 的默认相位(正午)。
-const DEFAULT_PHASE: DayPhase = DayPhase::Noon;
-
-/// 按键的按住状态。
-pub(crate) struct InputState {
-    /// W / A / S / D / 方向键。
-    keys: HashMap<String, bool>,
-    /// 当前昼夜相位。
-    phase: DayPhase,
-    /// 鼠标是否按下拖拽。
-    dragging: bool,
-    /// 上一次指针位置。
-    last_pointer: [f64; 2],
-    /// 双指上一次的距离(用于捏合缩放)。
-    last_pinch: f64,
-    /// 当前是否持有指针锁(视角走 `movement_x/y`,不需要按住左键)。
-    ///
-    /// 锁定态与「按住左键拖拽」是两套输入源,`dragging` 只描述后者。
-    /// 分开存是因为两者可以同时为真(锁着的时候也允许拖拽),而退出锁
-    /// 时必须能只清掉属于锁的那部分。
-    pointer_locked: bool,
-    /// 左键是否按下(开火)。
-    fire_held: bool,
-    /// 本帧是否刚按下左键(单发武器只响一次)。
-    fire_pressed: bool,
-    /// 鼠标是否刚抬起。
-    fire_released: bool,
-    /// 鼠标在画布内的归一化位置(`-1.0..1.0`,Y 向上)。
-    aim_point: [f64; 2],
-    /// 画布的 CSS 像素尺寸,用于把鼠标坐标换算成 NDC。
-    viewport: [f64; 2],
-    /// 驾驶时**当前接管方向盘**的按键(`"KeyA"` / `"ArrowLeft"` …),
-    /// 空串表示没人按。
-    ///
-    /// 这不是为了「记住谁按着」,而是为了 A/D 与方向键**同时按住**时裁决
-    /// 谁说话 —— 见 [`InputState::steer_axis`]。`keys` 本身是「谁按着」,
-    /// 单独一个布尔值回答不了「两个方向同时按」这种问题。
-    steer_key: String,
-}
-
-/// Default construction for [`InputState`].
-impl Default for InputState {
-    /// default。
-    fn default() -> Self {
-        Self {
-            keys: HashMap::new(),
-            phase: DEFAULT_PHASE,
-            dragging: false,
-            last_pointer: [0.0, 0.0],
-            last_pinch: 0.0,
-            pointer_locked: false,
-            fire_held: false,
-            fire_pressed: false,
-            fire_released: false,
-            aim_point: [0.0, 0.0],
-            viewport: [1280.0, 720.0],
-            steer_key: String::new(),
-        }
-    }
-}
-
-/// Inherent implementation of [`InputState`].
-impl InputState {
-    /// 某个键是否按住(按 `KeyboardEvent.code` 判定,兼容所有键盘布局)。
-    ///
-    /// # Arguments
-    ///
-    /// - `&str` - str 的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `bool` - 判定结果。
-    fn held(&self, code: &str) -> bool {
-        self.get_keys().get(code).copied().unwrap_or(false)
-    }
-
-    /// 当前拥有方向盘的按键(空串 = 没人按)。
-    ///
-    /// # Returns
-    ///
-    /// - `&str` - `KeyboardEvent.code`,借用本结构内部的 `steer_key`。
-    fn get_steer_key(&self) -> &str {
-        &self.steer_key
-    }
-
-    /// 写回「当前谁拥有方向盘」。传空串即交还控制权。
-    ///
-    /// # Arguments
-    ///
-    /// - `String` - 新的拥有者按键。
-    fn set_steer_key(&mut self, value: String) {
-        self.steer_key = value;
-    }
-
-    /// 驾驶时的舵角输入(−1..1,**左负右正**,与 `drive` 的约定一致)。
-    ///
-    /// 两组键都能转方向盘:A/D 与 ←/→。方向键**只**在这里被读,
-    /// 而这个函数**只有驾驶时**才被 `simulate` 调用,所以步行时方向键
-    /// 既不会开车,也不会进移动轴 —— GTA V 的移动只认 WASD。
-    ///
-    /// 符号直接由「拥有方向盘的那个键」决定,而不是把两组的键塞进
-    /// 一个 `axis` 调用 —— 后者会把 `ArrowRight` 当成 `KeyA` 的反向键,
-    /// 算出 `0 - 1 = -1`,右箭头反而左转。
-    ///
-    /// **为什么是「后按的赢」而不是相加:**A/D 与方向键各自都是满舵 ±1,
-    /// 相加在两组反向时正好得 0 —— 玩家明明压着两个相反方向,车却
-    /// 笔直走,体感就是「方向盘突然失灵」。成熟开车游戏(Forza、GTA V
-    /// 的辅助转向)统一用后按优先:每次按下一个转向键就把控制权交给它,
-    /// 直到它松开为止。`steer_key` 记的就是这个「当前谁拥有方向盘」。
-    ///
-    /// # Returns
-    ///
-    /// - `f32` - 舵角:左转 −1.0,右转 +1.0,无人按键 `0.0`。
-    pub fn steer_axis(&self) -> f32 {
-        // 拥有者一旦松手,控制权作废,回到「谁在按就听谁」。
-        let owner: &str = self.get_steer_key();
-        if !owner.is_empty() && self.held(owner) {
-            return steer_sign(owner);
-        }
-        // 没人拥有方向盘:按「右优先,其次左」兜底,同样是满舵二选一。
-        if self.held(KEYD) || self.held(ARROWRIGHT) {
-            return 1.0;
-        }
-        if self.held(KEYA) || self.held(ARROWLEFT) {
-            return -1.0;
-        }
-        0.0
-    }
-
-    /// 记下「这个键此刻接管了方向盘」。keyup 时对应清除。
-    ///
-    /// # Arguments
-    ///
-    /// - `&str` - 被按下的 `KeyboardEvent.code`。
-    pub fn claim_steer(&mut self, code: &str) {
-        if is_steer_key(code) {
-            self.set_steer_key(String::from(code));
-        }
-    }
-
-    /// 当前按下的按键集合的只读视图。
-    ///
-    /// # Returns
-    ///
-    /// - `&HashMap<String, bool>` - 按键按下状态表。
-    pub fn get_keys(&self) -> &HashMap<String, bool> {
-        &self.keys
-    }
-}
-
-/// 一份完整的游戏运行时状态。
-///
-/// 全部包在 `Rc<RefCell<..>>` 里供 RAF 闭包与事件闭包共享;
-/// 闭包内部遵循「先取快照再短暂 borrow_mut」的写法,避免 RefCell 重叠借用。
-pub struct Game {
-    /// canvas 元素。
-    pub canvas: HtmlCanvasElement,
-    /// 相机。
-    pub camera: Camera,
-    /// 场景(资产 + 批次)。
-    pub scene: Scene,
-    /// 流式世界:地面批次 —— 玩家跨过阈值时这块网格会被整体重建。
-    pub ground_batch: usize,
-    /// 流式世界:水面批次 —— 同上。
-    pub water_batch: usize,
-    /// 流式世界:当前地面 / 水面是围绕哪个点生成的(米)。
-    pub streamed_center: Vec2,
-    /// 注入开火剩余帧数(验收通道,见 [`apply_teleport_request`] 的 `hold` 分支)。
-    pub hold_frames: u32,
-    /// 验收期间的时间加速倍率(1.0 = 正常)。
-    ///
-    /// 无头浏览器把 rAF 节流到约 1 fps,而 `MAX_FRAME_TIME` 把每帧的真实
-    /// 间隔钳到 0.25 s —— 合起来游戏只跑 **25% 速度**。走完 7 个路点要
-    /// 二十分钟,验证一轮全量功能要跑将近一个小时。加速只改喂给模拟的
-    /// 步数,不改物理常量,所以走的仍然是同一套积分。
-    pub speed_scale: f32,
-    /// 验收期间是否免疫伤害(见 [`apply_teleport_request`] 的 `safe` 分支)。
-    ///
-    /// 走位验证要花好几分钟真实时间(无头浏览器把 rAF 节流到约 1 fps,
-    /// 模拟只跑 6% 速度),而街上敌人一直在开火 —— 前几轮实测血量从
-    /// 91 一路掉到 68,掉光就重生到最近的医院点,玩家被瞬移回城中心,
-    /// 看起来就是「走位脚本把玩家弹飞了」。
-    pub safe_mode: bool,
-
-    /// 验收脚本下达的「朝这个**世界**方向持续走」请求(米/秒归一化向量)。
-    ///
-    /// 不走 WASD 是因为 WASD 是**相机相对**的:脚本必须先把相机转到
-    /// 正前方才能让 W 变成世界某个方向,而无头浏览器里合成鼠标事件进不了
-    /// 相机的拖拽监听器 —— 上一步就是卡在这里。直接给世界方向,移动这一段
-    /// 走的仍然是 `Player::step` 的真实积分(含碰撞分离与室内判定)。
-    pub walk_request: Vec2,
-    /// 流式世界:资产 id → 场景网格索引,重建静态批次时要用。
-    pub asset_index: HashMap<String, usize>,
-    /// 流式世界:静态批次(楼 / 树 / 道具 / 招牌)占用的批次表长度。
-    ///
-    /// 静态批次是 `build_scene` 按生成中心铺的,流式重建时整段换掉;
-    /// 批次表是**尾插**的,玩家骨架 / 车队 / 拾取物的批次在静态批次之后,
-    /// 所以「静态段长度」就是把静态部分与动态部分分开的唯一依据。
-    pub static_batch_count: usize,
-    /// 走完 `Player::step` 之后的玩家 XZ(验收探针用)。
-    ///
-    /// 「有速度、无位移」必须能分清是哪一层把人按住了:`Player::step`
-    /// 走 `resolve_slide`(静态),`resolve_dynamic_bodies` 之后还会
-    /// **无条件**把玩家 XZ 覆盖成分离结果。两者的输出都记下来,探针
-    /// 直接对比就知道是谁把位置钉住的 —— 只看最终坐标永远只能猜。
-    pub after_static_step: Vec2,
-    /// 走完 `resolve_dynamic_bodies` 之后的玩家 XZ(验收探针用)。
-    pub after_dynamic_step: Vec2,
-    /// 走完 `step_vertical` 之后的玩家 XZ(验收探针用)。
-    ///
-    /// `step_vertical` 名义上只管 Y,但它结尾是
-    /// `set_position([x, y, z])`,`x` / `z` 来自 `resolve_interior` ——
-    /// 于是它**会改写 XZ**。夹在静态层与动态层之间,不改写就看不到它。
-    pub after_vertical_step: Vec2,
-    /// 被静态几何挡住视线、因此**没有结算伤害**的敌人枪数(验收探针用)。
-    ///
-    /// 「隔墙掉血」的验收不能只看 `health` 没掉:掉血也可能是因为
-    /// 那一帧根本没有敌人开火。这个计数器区分「看得见但打偏」与
-    /// 「隔墙、这一枪被门控挡掉」,两者都需要在报告里出现。
-    pub shots_blocked_by_geometry: u32,
-    /// 走进 `step_vertical` **之前**玩家所在的 XZ(室内层要靠它还原位移)。
-    ///
-    /// `step_vertical` 需要知道「静态层这一帧把人推进了多远」,才能把
-    /// 切向分量从隔墙上滑过去而不是原路弹回。位置本身不含这个信息:
-    /// 拿不到上一帧位置就只能做纯分离,那正是「有速度、无位移」的
-    /// 成因。所以在 `Player::step` 之前先存一份。
-    pub previous_step_xz: Vec2,
-    /// 输入状态。
-    pub input: InputState,
-    /// 渲染后端。
-    /// 本帧**真的**提交给 GPU 的三角形数。
-    ///
-    /// HUD 上那个 `{N} tris` 读的是 `scene.total_triangles`,一个静态
-    /// 常量 —— WebGL2 与 WebGPU 会显示同一个数,哪怕其中一个后端一帧
-    /// 都没画出来。要判断某个后端是否真的在画,只能看这个字段。
-    pub gpu_submitted: u32,
-
-    /// 资产是否已经构建完、可以往 GPU 上传了。
-    ///
-    /// ⚠️ WebGPU 的设备获取是**异步**的,而资产加载也是异步的,两条
-    /// `spawn_local` 谁先跑完是不确定的:资产那边可能先把 mesh 全部
-    /// 推给**上一个** renderer(或根本没 renderer),于是 WebGPU 装好
-    /// 时自己手里是空的 —— 表现为「上传 80 个 mesh 成功、每帧也报告
-    /// 提交了几十万三角形,画布却只有一片天空」:那些批次查不到 mesh,
-    /// 被静默跳过。
-    ///
-    /// 这里用一个布尔量把「有 renderer」和「有资产」两件事**都**满足
-    /// 之后的上传串起来,顺序问题就不存在了。
-    pub assets_built: bool,
-
-    pub renderer: Option<Renderer>,
-    /// 已加载的资产数量。
-    pub loaded_assets: usize,
-    /// 总资产数量。
-    pub total_assets: usize,
-    /// 已渲染帧数(测试用)。
-    pub frame_count: u64,
-    /// 已完成的固定步数(测试用)。
-    pub ticks: u64,
-    /// 加载失败信息(有值时显示在遮罩上)。
-    pub load_error: Option<String>,
-    /// 后备方案是否启用(资产 fetch 全部失败)。
-    pub using_fallback: bool,
-    /// 固定步长累加器(秒)。
-    pub accumulator: f32,
-    /// 按实测帧率自动降档的画质状态机。
-    pub quality: AdaptiveQuality,
-    /// 上一帧的 `requestAnimationFrame` 时间戳(秒)。
-    pub frame_time: f32,
-    /// 验收探针:几个已知世界点投到屏幕上的位置。
-    /// 离玩家最近的一栋楼的中心(x, z)。
-    ///
-    /// 验收脚本拿它当「推挤目标」:街区布局是程序化生成的,写死一个
-    /// 魔法坐标早晚会推到空地上,所以在生成碰撞世界时顺手算一次存下。
-    pub nearest_building: Option<[f32; 2]>,
-    /// 当前帧的画布像素尺寸(调试通道用来报角色在屏幕上的像素坐标)。
-    pub canvas_size: Cell<(u32, u32)>,
-    pub probe: Vec<Option<[f32; 2]>>,
-    /// 玩家状态(位置 / 朝向 / 步态 / 生命值 / 拾取)。
-    pub player: Player,
-    /// 车队与拾取物。
-    pub traffic: Traffic,
-    /// 静态碰撞世界(玩家圆 vs 建筑 / 车 / 道具 + 世界边界)。
-    pub world: CollisionWorld,
-    /// 室内碰撞世界(可进入楼的楼板 / 隔墙 / 楼梯)。
-    ///
-    /// 刻意与 [`Self::world`] 分开:后者是**纯二维**的,车行道、公交车
-    /// 和 200 栋实心楼全都走它;只有玩家进入样板楼时才额外查这一份。
-    pub interiors: FloorWorld,
-    /// 玩家骨架每个 part 的批次索引(与 `PED_SUIT` 资产 part 一一对应)。
-    pub player_batches: Vec<PlayerLimbBatch>,
-    /// 车队车辆每个批次对应的车辆索引。
-    pub car_batches: Vec<usize>,
-    /// 每辆车四个可转车轮的批次。
-    pub car_wheel_batches: Vec<CarWheelBatch>,
-    /// 车型 id → 该车型切好的「单个车轮」mesh 索引(0..4 四个 slot 共用)。
-    pub car_wheel_meshes: HashMap<String, Vec<usize>>,
-    /// 拾取物每个批次对应的拾取物索引。
-    pub pickup_batches: Vec<usize>,
-    /// 本帧是否收到「起跳」请求。
-    ///
-    /// 键位回调**不直接**改 `player.vertical_velocity`:事件闭包跑在
-    /// RAF 之外,直接写物理状态会和 `step_vertical` 抢同一帧的落地面
-    /// 判定。改成置一个「本帧请求起跳」的标志,由 `step_vertical` 在
-    /// 自己算完支撑面之后消费 —— 积分顺序因此只有一条。
-    pub jump_queued: bool,
-    /// 是否处于第三人称跟随模式(V 键在跟随 / 第一人称之间切换)。
-    pub third_person: bool,
-    /// 第三人称跟随焦点的阻尼插值后的世界坐标。
-    pub follow_target: Vec3,
-    /// 资产 id → 原始包围盒(碰撞世界推导的唯一来源)。
-    pub asset_bounds: HashMap<String, Bounds>,
-    /// 武器架(当前武器 / 弹药 / 换弹 / 瞄准)。
-    pub arsenal: Arsenal,
-    /// 玩家受击状态(无敌帧 / 脱战计时 / 重生倒计时)。
-    pub hurt: HurtState,
-    /// 通缉等级。
-    pub wanted: Wanted,
-    /// 场上全部敌人(警察 + 混混)。
-    pub enemies: Vec<Enemy>,
-    /// 场上全部行人。
-    pub peds: Vec<Pedestrian>,
-    /// 敌人每个实例对应的批次索引。
-    pub enemy_batches: Vec<usize>,
-    /// 手持武器的批次索引(`usize::MAX` 表示当前武器没有模型)。
-    pub weapon_batch: usize,
-    /// 当前武器对应的 mesh 索引。
-    pub weapon_mesh: usize,
-    /// 场景 mesh 索引表(切枪时按资产 id 查批次)。
-    pub index_map: HashMap<String, usize>,
-    /// 行人每个实例对应的批次索引。
-    pub ped_batches: Vec<usize>,
-    /// 当前任务。
-    pub mission: Mission,
-    /// 命中标记的剩余显示时间(秒)。
-    pub hitmarker: f32,
-    /// 本帧是否打中了敌人(喂给 HUD)。
-    pub did_hit: bool,
-    /// 累计击杀数(统计 / 任务判定)。
-    pub kills: u32,
-    /// 藏身区(后巷 / 警局门口)的圆心列表。
-    pub hideouts: Vec<Vec2>,
-    /// 已接 / 已完成的任务计数。
-    pub missions_done: u32,
-    /// 通缉是否刚刚升星(供 HUD 播一次性提示)。
-    pub wanted_flash: f32,
-    /// 地图是否处于打开状态(Tab 键)。
-    pub map_open: bool,
-    /// 还在空中的手雷(按下 G 投出,落地后结算爆炸)。
-    pub live_grenades: Vec<Grenade>,
-    /// 当前瞄准的俯仰角(弧度)。
-    pub aim_pitch: f32,
-}
-
-/// 玩家骨架的一个 part 批次:part 名 + 枢轴 + 批次索引。
-#[derive(Clone, Debug)]
-pub struct PlayerLimbBatch {
-    /// part 名(与资产 JSON 的 `name` 一致)。
-    pub part: String,
-    /// 关节枢轴的资产本地坐标。
-    pub pivot: Vec3,
-    /// 父关节(肩 / 胯)枢轴的资产本地坐标;无父关节时等于 `pivot`。
-    ///
-    /// 资产把上臂 / 小臂切成两个独立 part,各自带绝对局部坐标,
-    /// 所以渲染一节 limb 需要**两个**枢轴:自己的(肘 / 膝)与父关节的
-    /// (肩 / 胯)。见 [`crate::player::limb_chain_matrix`]。
-    pub root_pivot: Vec3,
-    /// 该 part 在场景批次表里的索引。
-    pub batch: usize,
-}
-
-/// 一辆车的四个可转车轮各占一个批次。
-///
-/// 车身保持「整张车一个批次」不变(它不需要单独动画),只有轮子被切出来
-/// 独立变换 —— 与玩家肢体的 `PlayerLimbBatch` 同一套做法。
-#[derive(Clone, Debug)]
-pub struct CarWheelBatch {
-    /// 对应的车辆索引。
-    pub car: usize,
-    /// 第几个轮子(0..4,对应 `WHEEL_MOUNTS` 的顺序)。
-    pub slot: usize,
-    /// 该轮子在资产本地坐标的安装位(轮心)。
-    pub mount: Vec3,
-    /// 该轮子批次的场景索引。
-    pub batch: usize,
-}
-
-/// 挂载到 canvas 上的事件驱动所需的共享引用。
-#[derive(Clone)]
-struct GameHandles {
-    game: Rc<RefCell<Game>>,
-    window: Window,
-    canvas: HtmlCanvasElement,
-    hud: Option<Element>,
-    phase_label: Option<Element>,
-    phase_slider: Option<HtmlInputElement>,
-    health_bar: Option<Element>,
-    armor_bar: Option<Element>,
-    ammo: Option<Element>,
-    cash: Option<Element>,
-    wanted: Option<Element>,
-    mission: Option<Element>,
-    hitmarker: Option<Element>,
-    minimap: Option<HtmlCanvasElement>,
-    map_panel: Option<Element>,
-    map_detail: Option<Element>,
-}
-
-// ===========================================================================
-// 程序化地面网格
-// ===========================================================================
-
-/// 展开中的程序化地面缓冲。
-///
-/// `build_ground` 逐步把顶点 / 面 / 逐面颜色写进这三个缓冲,最后交给
-/// `expand_asset` 之外的同一套顶点格式。打包成结构体是为了让
-/// `push_quad` 的参数个数落在 clippy 的阈值内(7 个)。
-struct QuadBuffers<'a> {
-    /// 顶点缓冲(每顶点 3 个 f32)。
-    positions: &'a mut Vec<[f32; 3]>,
-    /// 面索引缓冲。
-    faces: &'a mut Vec<[usize; 3]>,
-    /// 逐面颜色缓冲。
-    face_colors: &'a mut Vec<[f32; 3]>,
-}
-
 /// 以逆时针(从 +Y 俯视)顺序向展开缓冲推入一个水平矩形。
 ///
 /// # Arguments
@@ -2361,7 +1354,7 @@ struct QuadBuffers<'a> {
 /// - `f32` - Z 上界。
 /// - `f32` - 高度 Y。
 /// - `[f32; 3]` - 面颜色。
-fn push_quad(
+pub(crate) fn push_quad(
     buffers: &mut QuadBuffers,
     x0: f32,
     x1: f32,
@@ -2370,15 +1363,15 @@ fn push_quad(
     y: f32,
     color: [f32; 3],
 ) {
-    let base: usize = buffers.positions.len();
-    buffers.positions.push([x0, y, z0]);
-    buffers.positions.push([x1, y, z0]);
-    buffers.positions.push([x1, y, z1]);
-    buffers.positions.push([x0, y, z1]);
-    buffers.faces.push([base, base + 2, base + 1]);
-    buffers.faces.push([base, base + 3, base + 2]);
-    buffers.face_colors.push(color);
-    buffers.face_colors.push(color);
+    let base: usize = buffers.get_positions().len();
+    buffers.get_mut_positions().push([x0, y, z0]);
+    buffers.get_mut_positions().push([x1, y, z0]);
+    buffers.get_mut_positions().push([x1, y, z1]);
+    buffers.get_mut_positions().push([x0, y, z1]);
+    buffers.get_mut_faces().push([base, base + 2, base + 1]);
+    buffers.get_mut_faces().push([base, base + 3, base + 2]);
+    buffers.get_mut_face_colors().push(color);
+    buffers.get_mut_face_colors().push(color);
 }
 
 /// 构造程序化水面:外海 + 内湖,两块独立的顶点色网格。
@@ -2567,16 +1560,16 @@ pub fn build_ground() -> MeshAsset {
 /// 于是后面几段的街道枚举全都读到了最后一个单元的中心,而不是本函数
 /// 的中心 —— 一块以 (-6000, 1500) 为心的地面上会混进 z = -6240 的路缘石。
 pub fn build_ground_near(centre_x: f32, centre_z: f32) -> MeshAsset {
-    const ROAD: [f32; 3] = [0.085, 0.085, 0.098];
-    const ROAD_ALT: [f32; 3] = [0.100, 0.100, 0.114];
-    const SIDEWALK: [f32; 3] = [0.44, 0.42, 0.40];
-    const SIDEWALK_EDGE: [f32; 3] = [0.36, 0.345, 0.335];
-    const CURB: [f32; 3] = [0.62, 0.60, 0.57];
-    const LOT_GROUND: [f32; 3] = [0.145, 0.155, 0.135];
-    const LOT_ALT: [f32; 3] = [0.165, 0.175, 0.150];
-    const LINE_YELLOW: [f32; 3] = [0.92, 0.70, 0.10];
-    const LINE_WHITE: [f32; 3] = [0.82, 0.82, 0.80];
-    const CROSSWALK: [f32; 3] = [0.88, 0.88, 0.85];
+    pub(crate) const ROAD: [f32; 3] = [0.085, 0.085, 0.098];
+    pub(crate) const ROAD_ALT: [f32; 3] = [0.100, 0.100, 0.114];
+    pub(crate) const SIDEWALK: [f32; 3] = [0.44, 0.42, 0.40];
+    pub(crate) const SIDEWALK_EDGE: [f32; 3] = [0.36, 0.345, 0.335];
+    pub(crate) const CURB: [f32; 3] = [0.62, 0.60, 0.57];
+    pub(crate) const LOT_GROUND: [f32; 3] = [0.145, 0.155, 0.135];
+    pub(crate) const LOT_ALT: [f32; 3] = [0.165, 0.175, 0.150];
+    pub(crate) const LINE_YELLOW: [f32; 3] = [0.92, 0.70, 0.10];
+    pub(crate) const LINE_WHITE: [f32; 3] = [0.82, 0.82, 0.80];
+    pub(crate) const CROSSWALK: [f32; 3] = [0.88, 0.88, 0.85];
 
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut faces: Vec<[usize; 3]> = Vec::new();
@@ -2827,50 +1820,24 @@ pub fn build_ground_near(centre_x: f32, centre_z: f32) -> MeshAsset {
     }
 }
 
-// ===========================================================================
-// 资产加载
-// ===========================================================================
-
-/// manifest.json 的结构(只取用得到的字段)。
-#[derive(serde::Deserialize)]
-struct Manifest {
-    /// 资产总数(manifest 自报值,HUD 里做对照)。
-    #[serde(default)]
-    asset_count: usize,
-    /// 资产条目。
-    #[serde(default)]
-    assets: Vec<ManifestEntry>,
-}
-
-/// manifest 里的一个资产条目。
-#[derive(Clone, serde::Deserialize)]
-struct ManifestEntry {
-    /// 资产 id。
-    id: String,
-    /// 分类(仅用于调试输出)。
-    category: String,
-    /// 相对 assets/ 的文件名。
-    file: String,
-}
-
 /// 需要加载的资产清单(场景蓝图里引用到的全部资产)。
 ///
 /// # Returns
 ///
 /// - `Vec<&'static str>` - 计算结果。
-fn required_asset_ids() -> Vec<&'static str> {
+pub(crate) fn required_asset_ids() -> Vec<&'static str> {
     let mut ids: Vec<&'static str> = Vec::new();
     // 资产清单只回答「场景引用了哪些资产」,与玩家站在哪里无关;城市是
     // 程序化生成的,任何位置的取用集合都一样,所以固定按原点求一次。
     for building in &build_city_buildings(0.0, 0.0) {
-        ids.push(building.asset);
+        ids.push(building.get_asset());
     }
     // 两栋可进入样板楼必须预载,否则场景里根本没有它们的批次。
     for building in &showcase_placements() {
-        ids.push(building.asset);
+        ids.push(building.get_asset());
     }
     for prop in &build_city_props(0.0, 0.0) {
-        ids.push(prop.asset);
+        ids.push(prop.get_asset());
     }
     ids.push(PALM_TALL);
     ids.push(PALM_SHORT);
@@ -2940,11 +1907,11 @@ async fn fetch_text(url: &str) -> Result<String, String> {
 ///
 /// - `Option<String>` - The path relative to `assets/`, or `None` when no part
 ///   is textured — in which case the asset renders on scalar PBR alone.
-fn first_atlas_reference(asset: &MeshAsset) -> Option<String> {
+pub(crate) fn first_atlas_reference(asset: &MeshAsset) -> Option<String> {
     asset
         .parts
         .iter()
-        .find_map(|part: &crate::mesh::MeshPart| part.texture_atlas.clone())
+        .find_map(|part: &crate::mesh::MeshPart| part.get_texture_atlas().clone())
 }
 
 /// Fetch a binary body — the atlas blobs, which are raw bytes rather than text.
@@ -2988,7 +1955,7 @@ async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// # Returns
 ///
 /// - `Vec<u8>` - The bytes; empty when the value is not a buffer.
-fn js_array_buffer_to_vec(value: &JsValue) -> Vec<u8> {
+pub(crate) fn js_array_buffer_to_vec(value: &JsValue) -> Vec<u8> {
     let Some(buffer) = value.dyn_ref::<js_sys::ArrayBuffer>() else {
         return Vec::new();
     };
@@ -2998,7 +1965,6 @@ fn js_array_buffer_to_vec(value: &JsValue) -> Vec<u8> {
 // ===========================================================================
 // 场景搭建
 // ===========================================================================
-
 /// 把一个已解析的资产加入场景(每个资产只解析一次,多个批次复用同一个 mesh)。
 ///
 /// # Arguments
@@ -3013,13 +1979,13 @@ fn js_array_buffer_to_vec(value: &JsValue) -> Vec<u8> {
 /// # Returns
 ///
 /// - `Result<MeshAsset, String>` - 解析出的资产;失败时给出可直接打印的信息。
-fn parse_asset(id: &str, json: &str) -> Result<MeshAsset, String> {
+pub(crate) fn parse_asset(id: &str, json: &str) -> Result<MeshAsset, String> {
     let asset: MeshAsset =
         serde_json::from_str(json).map_err(|err: serde_json::Error| format!("{id}: {err}"))?;
-    if !asset.bounds_envelope_is_sane() {
+    if !asset.get_bounds_envelope_is_sane() {
         console_log(&format!("[vcw] {id}: bounds envelope is inverted or empty"));
     }
-    if asset.category.is_empty() {
+    if asset.get_category().is_empty() {
         console_log(&format!(
             "[vcw] {id}: missing category (see SCHEMA.md \u{a7}5)"
         ));
@@ -3038,12 +2004,12 @@ fn parse_asset(id: &str, json: &str) -> Result<MeshAsset, String> {
 /// # Returns
 ///
 /// - `Result<usize, String>` - 该资产在 `scene.meshes` 里的索引。
-fn push_parsed_asset(
+pub(crate) fn push_parsed_asset(
     scene: &mut Scene,
     index_map: &mut HashMap<String, usize>,
     asset: &MeshAsset,
 ) -> Result<usize, String> {
-    let id: &str = &asset.id;
+    let id: &str = &asset.get_id();
     if let Some(existing) = index_map.get(id) {
         return Ok(*existing);
     }
@@ -3052,12 +2018,12 @@ fn push_parsed_asset(
         asset
             .parts
             .iter()
-            .map(|part: &MeshPart| part.faces.len())
+            .map(|part: &MeshPart| part.get_faces().len())
             .sum(),
     );
-    for part in &asset.parts {
-        let emissive: [f32; 3] = part.emissive.unwrap_or([0.0; 3]);
-        for _ in &part.faces {
+    for part in asset.get_parts() {
+        let emissive: [f32; 3] = part.get_emissive().unwrap_or([0.0; 3]);
+        for _ in part.get_faces() {
             part_emissive.push(emissive);
         }
     }
@@ -3073,19 +2039,19 @@ fn push_parsed_asset(
 /// # Returns
 ///
 /// - `Scene` - 计算结果。
-fn build_fallback_scene() -> Scene {
+pub(crate) fn build_fallback_scene() -> Scene {
     let mut scene: Scene = Scene::default();
     let ground: MeshAsset = build_ground();
     let mut part_emissive: Vec<[f32; 3]> = Vec::with_capacity(
         ground
             .parts
             .iter()
-            .map(|part: &MeshPart| part.faces.len())
+            .map(|part: &MeshPart| part.get_faces().len())
             .sum(),
     );
-    for part in &ground.parts {
-        let emissive: [f32; 3] = part.emissive.unwrap_or([0.0; 3]);
-        for _ in &part.faces {
+    for part in ground.get_parts() {
+        let emissive: [f32; 3] = part.get_emissive().unwrap_or([0.0; 3]);
+        for _ in part.get_faces() {
             part_emissive.push(emissive);
         }
     }
@@ -3116,7 +2082,7 @@ fn build_fallback_scene() -> Scene {
             color,
             FALLBACK_BLOCK,
         );
-        let mut emissive: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0]; part.faces.len()];
+        let mut emissive: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0]; part.get_faces().len()];
         // 顶部一条自发光带,夜里当霓虹。
         for face in emissive.iter_mut().take(2) {
             *face = [0.9, 0.25, 0.75];
@@ -3206,7 +2172,7 @@ pub(crate) fn query_number(key: &str, fallback: f32) -> f32 {
 /// # Returns
 ///
 /// - `Option<String>` - 解码后的值。
-fn query_value(key: &str) -> Option<String> {
+pub(crate) fn query_value(key: &str) -> Option<String> {
     let search: Option<String> = window().and_then(|w: Window| w.location().search().ok());
     let query: String = search?;
     for pair in query.trim_start_matches('?').split('&') {
@@ -3249,7 +2215,7 @@ pub(crate) fn query_phase() -> DayPhase {
 /// # Returns
 ///
 /// - `bool` - 查询串里出现了该值。
-fn query_backend_is(value: &str) -> bool {
+pub(crate) fn query_backend_is(value: &str) -> bool {
     query_value(BACKEND_PARAM).as_deref() == Some(value)
 }
 
@@ -3267,7 +2233,7 @@ fn query_backend_is(value: &str) -> bool {
 /// - `&HashMap<String, usize>` - HashMap<String, usize> 的只读引用。
 /// - `f32` - 流式生成中心的世界 X(米)。
 /// - `f32` - 流式生成中心的世界 Z(米)。
-fn build_scene(
+pub(crate) fn build_scene(
     scene: &mut Scene,
     index_map: &HashMap<String, usize>,
     cx: f32,
@@ -3282,12 +2248,12 @@ fn build_scene(
         ground
             .parts
             .iter()
-            .map(|part: &MeshPart| part.faces.len())
+            .map(|part: &MeshPart| part.get_faces().len())
             .sum(),
     );
-    for part in &ground.parts {
-        let emissive: [f32; 3] = part.emissive.unwrap_or([0.0; 3]);
-        for _ in &part.faces {
+    for part in ground.get_parts() {
+        let emissive: [f32; 3] = part.get_emissive().unwrap_or([0.0; 3]);
+        for _ in part.get_faces() {
             ground_emissive.push(emissive);
         }
     }
@@ -3309,12 +2275,12 @@ fn build_scene(
         water
             .parts
             .iter()
-            .map(|part: &MeshPart| part.faces.len())
+            .map(|part: &MeshPart| part.get_faces().len())
             .sum(),
     );
-    for part in &water.parts {
-        let emissive: [f32; 3] = part.emissive.unwrap_or([0.0; 3]);
-        for _ in &part.faces {
+    for part in water.get_parts() {
+        let emissive: [f32; 3] = part.get_emissive().unwrap_or([0.0; 3]);
+        for _ in part.get_faces() {
             water_emissive.push(emissive);
         }
     }
@@ -3330,17 +2296,17 @@ fn build_scene(
     // 建筑:程序化生成的网格街区围合。同类资产合批后每批次一次
     // instanced draw call,顶点数据仍然只解析一次。
     for building in &build_city_buildings(cx, cz) {
-        let Some(&mesh_index) = index_map.get(building.asset) else {
+        let Some(&mesh_index) = index_map.get(&**building.get_asset()) else {
             continue;
         };
         let batch: usize = find_or_create_batch(scene, mesh_index);
         scene.push_instance(
             batch,
             Instance::new(
-                [building.position[0], 0.0, building.position[1]],
-                building.yaw,
-                building.scale,
-                building.tint,
+                [building.get_position()[0], 0.0, building.get_position()[1]],
+                building.get_yaw(),
+                building.get_scale(),
+                building.get_tint(),
             ),
         );
     }
@@ -3352,30 +2318,30 @@ fn build_scene(
     // —— 见 `WebGlRenderer::upload_mesh` 上那段关于下标错位的警告。
     // 所以这里绝不能改成「每栋楼 push 一个新批次再传一次 mesh」。
     for building in &showcase_placements() {
-        let Some(&mesh_index) = index_map.get(building.asset) else {
+        let Some(&mesh_index) = index_map.get(&**building.get_asset()) else {
             continue;
         };
         let batch: usize = find_or_create_batch(scene, mesh_index);
         scene.push_instance(
             batch,
             Instance::new(
-                [building.position[0], 0.0, building.position[1]],
-                building.yaw,
-                building.scale,
-                building.tint,
+                [building.get_position()[0], 0.0, building.get_position()[1]],
+                building.get_yaw(),
+                building.get_scale(),
+                building.get_tint(),
             ),
         );
     }
 
     // 街道道具(含每个路口四角的交通灯):按资产分组 → 天然 instancing。
     for prop in &build_city_props(cx, cz) {
-        let Some(&mesh_index) = index_map.get(prop.asset) else {
+        let Some(&mesh_index) = index_map.get(&**prop.get_asset()) else {
             continue;
         };
         let batch: usize = find_or_create_batch(scene, mesh_index);
         scene.push_instance(
             batch,
-            Instance::new(prop.position, prop.yaw, 1.0, prop.tint),
+            Instance::new(prop.get_position(), prop.get_yaw(), 1.0, prop.get_tint()),
         );
     }
 
@@ -3424,29 +2390,8 @@ fn build_scene(
         let batch: usize = find_or_create_batch(scene, mesh_index);
         scene.push_instance(batch, Instance::new(*position, *yaw, 1.0, [1.0, 1.0, 1.0]));
     }
-    (ground_slot, water_slot, scene.batches.len())
+    (ground_slot, water_slot, scene.get_batches().len())
 }
-
-/// 玩家走到哪里了才需要重新生成地面 —— 距离当前生成中心超过这一档。
-///
-/// 地面块边长是 [`GROUND_SPAN`],玩家站在正中时离边缘还有一半。阈值
-/// 取一整个街道间距(60 m):世界无限,但**每走一格街道才重算一次**是
-/// 够的 —— 地面网格本身就是按街道网格对齐的,重算与不重算在视觉上
-/// 完全一致,只有走到块外才必须重来。
-const STREAM_REBUILD_STEP: f32 = STREET_PITCH;
-
-/// NPC 换批的伪随机相位由街区坐标算出 —— 同一街区永远得到同一批行人,
-/// 不会因为换块抖动而每次都不一样。
-const NPC_PHASE_SCALE: f32 = 0.017;
-
-/// 流式窗口边界的预留余量(米):摆件钉在街道轴线旁边的最大偏移。
-///
-/// 生成窗口的边界是**街道轴线**,而路灯、长椅、报摊、电话亭最多挂在轴线外
-/// `STREET_HALF_WIDTH + SIDEWALK_WIDTH + 2.2` ≈ 13.6 m 处,沿线点缀还有
-/// `+13 m`。回归测试要断言「窗口内部的世界不许变」,就必须先扣掉这一圈,
-/// 否则边界那一档站位的正常进出窗口会被算成凭空消失。
-#[cfg(test)]
-const STREAM_SNAPSHOT_PAD: f32 = 16.0;
 
 /// 玩家当前位置是否已经走出当前地面块。
 ///
@@ -3458,7 +2403,7 @@ const STREAM_SNAPSHOT_PAD: f32 = 16.0;
 /// # Returns
 ///
 /// - `bool` - `true` 表示该重建了。
-fn stream_needs_rebuild(player: Vec2, center: Vec2) -> bool {
+pub(crate) fn stream_needs_rebuild(player: Vec2, center: Vec2) -> bool {
     (player[0] - center[0]).abs() > STREAM_REBUILD_STEP
         || (player[1] - center[1]).abs() > STREAM_REBUILD_STEP
 }
@@ -3503,27 +2448,28 @@ pub fn rebuild_streamed_surface(
         (water_batch, build_water_near(cx, cz)),
     ];
     for (batch, asset) in surfaces {
-        let Some(target) = scene.batches.get(batch) else {
+        let batches: &Vec<SceneBatch> = scene.get_batches_ref();
+        let Some(target) = batches.get(batch) else {
             continue;
         };
-        let mesh_index: usize = target.mesh_index;
+        let mesh_index: usize = target.get_mesh_index();
         let mut emissive: Vec<[f32; 3]> = Vec::with_capacity(
             asset
                 .parts
                 .iter()
-                .map(|part: &MeshPart| part.faces.len())
+                .map(|part: &MeshPart| part.get_faces().len())
                 .sum(),
         );
-        for part in &asset.parts {
-            let value: [f32; 3] = part.emissive.unwrap_or([0.0; 3]);
-            for _ in &part.faces {
+        for part in asset.get_parts() {
+            let value: [f32; 3] = part.get_emissive().unwrap_or([0.0; 3]);
+            for _ in part.get_faces() {
                 emissive.push(value);
             }
         }
         let Ok(mesh) = expand_asset(&asset) else {
             continue;
         };
-        let Some(slot) = scene.meshes.get_mut(mesh_index) else {
+        let Some(slot) = scene.get_mut_meshes().get_mut(mesh_index) else {
             continue;
         };
         *slot = build_gpu_mesh(&mesh, &emissive);
@@ -3547,7 +2493,11 @@ pub fn rebuild_streamed_surface(
 /// - `&mut Renderer` - 渲染后端。
 /// - `&Scene` - 场景(提供新网格数据)。
 /// - `&[usize]` - 被改写过的 `Scene::meshes` 下标。
-fn reupload_streamed_meshes(renderer: &mut Renderer, scene: &Scene, rewritten: &[usize]) {
+pub(crate) fn reupload_streamed_meshes(
+    renderer: &mut Renderer,
+    scene: &Scene,
+    rewritten: &[usize],
+) {
     // WebGPU 后端有和 WebGL2 **完全相同**的约束:GPU 资产表必须与
     // `scene.meshes` 一一对应且顺序一致,所以两条 GPU 路径都要重传。
     // 软件后端的 `draw` 直接读 `scene.meshes`,没有第二份 GPU 拷贝。
@@ -3555,7 +2505,7 @@ fn reupload_streamed_meshes(renderer: &mut Renderer, scene: &Scene, rewritten: &
     match renderer {
         Renderer::WebGl(webgl) => {
             for index in rewritten {
-                let Some(mesh) = scene.meshes.get(*index) else {
+                let Some(mesh) = scene.get_meshes().get(*index) else {
                     continue;
                 };
                 if let Err(error) = webgl.replace_mesh(*index, mesh) {
@@ -3563,7 +2513,7 @@ fn reupload_streamed_meshes(renderer: &mut Renderer, scene: &Scene, rewritten: &
                     if failures <= REPLACE_MESH_REPORT_LIMIT {
                         console_log(&format!(
                             "{LOG_REPLACE_MESH_FAILED} {index} ({} verts): {error}",
-                            mesh.vertices.len()
+                            mesh.get_vertices().len()
                         ));
                     }
                 }
@@ -3571,7 +2521,7 @@ fn reupload_streamed_meshes(renderer: &mut Renderer, scene: &Scene, rewritten: &
         }
         Renderer::WebGpu(gpu) => {
             for index in rewritten {
-                let Some(mesh) = scene.meshes.get(*index) else {
+                let Some(mesh) = scene.get_meshes().get(*index) else {
                     continue;
                 };
                 if let Err(error) = gpu.replace_mesh(*index, mesh) {
@@ -3579,7 +2529,7 @@ fn reupload_streamed_meshes(renderer: &mut Renderer, scene: &Scene, rewritten: &
                     if failures <= REPLACE_MESH_REPORT_LIMIT {
                         console_log(&format!(
                             "{LOG_REPLACE_MESH_FAILED} {index} ({} verts): {error}",
-                            mesh.vertices.len()
+                            mesh.get_vertices().len()
                         ));
                     }
                 }
@@ -3632,38 +2582,43 @@ fn reupload_streamed_meshes(renderer: &mut Renderer, scene: &Scene, rewritten: &
 /// - `usize` - 重建之后新的静态段长度。静态段长度会随生成中心变化,
 ///   调用方必须写回 `Game::static_batch_count`,否则下一次重建会按旧长度切,
 ///   把动态段的头几个批次误当成静态段丢掉。
-fn rebuild_static_batches(
+pub(crate) fn rebuild_static_batches(
     scene: &mut Scene,
     index_map: &HashMap<String, usize>,
     static_batch_count: usize,
     cx: f32,
     cz: f32,
 ) -> usize {
-    if static_batch_count == 0 || static_batch_count > scene.batches.len() {
+    if static_batch_count == 0 || static_batch_count > scene.get_batches().len() {
         return static_batch_count;
     }
     // 先把动态段**摘下来**(而不是让 `truncate` 连它一起丢掉),静态段重铺
     // 完再接回去 —— 顺序不变,`mesh_index` 也不变,下标自然重新对上。
-    let dynamic: Vec<SceneBatch> = scene.batches.split_off(static_batch_count);
+    let dynamic: Vec<SceneBatch> = scene.get_mut_batches().split_off(static_batch_count);
     for building in build_city_buildings(cx, cz) {
-        let Some(&mesh_index) = index_map.get(building.asset) else {
+        let Some(&mesh_index) = index_map.get(&**building.get_asset()) else {
             continue;
         };
         let batch: usize = find_or_create_batch(scene, mesh_index);
-        let position: [f32; 3] = [building.position[0], 0.0, building.position[1]];
+        let position: [f32; 3] = [building.get_position()[0], 0.0, building.get_position()[1]];
         scene.push_instance(
             batch,
-            Instance::new(position, building.yaw, building.scale, building.tint),
+            Instance::new(
+                position,
+                building.get_yaw(),
+                building.get_scale(),
+                building.get_tint(),
+            ),
         );
     }
     for prop in build_city_props(cx, cz) {
-        let Some(&mesh_index) = index_map.get(prop.asset) else {
+        let Some(&mesh_index) = index_map.get(&**prop.get_asset()) else {
             continue;
         };
         let batch: usize = find_or_create_batch(scene, mesh_index);
         scene.push_instance(
             batch,
-            Instance::new(prop.position, prop.yaw, 1.0, prop.tint),
+            Instance::new(prop.get_position(), prop.get_yaw(), 1.0, prop.get_tint()),
         );
     }
     for (index, spot) in build_city_palms(cx, cz).iter().enumerate() {
@@ -3706,8 +2661,8 @@ fn rebuild_static_batches(
     // `Game::static_batch_count`,否则下一次重建会按旧长度切,把静态段切短
     // 一截、把动态段的头几个批次误当成静态段丢掉 —— 那等于把同一个 bug 换
     // 个偏移再犯一次。
-    let new_static_count: usize = scene.batches.len();
-    scene.batches.extend(dynamic);
+    let new_static_count: usize = scene.get_batches().len();
+    scene.get_mut_batches().extend(dynamic);
     new_static_count
 }
 
@@ -3721,11 +2676,11 @@ fn rebuild_static_batches(
 /// # Returns
 ///
 /// - `usize` - 计数结果。
-fn find_or_create_batch(scene: &mut Scene, mesh_index: usize) -> usize {
+pub(crate) fn find_or_create_batch(scene: &mut Scene, mesh_index: usize) -> usize {
     if let Some(position) = scene
         .batches
         .iter()
-        .position(|batch: &SceneBatch| batch.mesh_index == mesh_index)
+        .position(|batch: &SceneBatch| batch.get_mesh_index() == mesh_index)
     {
         return position;
     }
@@ -3735,7 +2690,6 @@ fn find_or_create_batch(scene: &mut Scene, mesh_index: usize) -> usize {
 // ===========================================================================
 // 碰撞世界:从资产 bounds 自动推导
 // ===========================================================================
-
 /// 按场景蓝图把静态碰撞体铺进碰撞世界。
 ///
 /// 建筑 / 车辆 / 道具 → AABB。盒子**不是**资产的整体包围盒,而是
@@ -3752,7 +2706,7 @@ fn find_or_create_batch(scene: &mut Scene, mesh_index: usize) -> usize {
 /// - `&HashMap<String, Bounds>` - 资产 id → 实心足迹包围盒(见 [`solid_bounds`])。
 /// - `f32` - 流式生成中心的世界 X(米)。
 /// - `f32` - 流式生成中心的世界 Z(米)。
-fn build_collision_world(
+pub(crate) fn build_collision_world(
     world: &mut CollisionWorld,
     bounds_map: &HashMap<String, Bounds>,
     cx: f32,
@@ -3765,10 +2719,10 @@ fn build_collision_world(
         push_box(
             world,
             bounds_map,
-            building.asset,
-            [building.position[0], 0.0, building.position[1]],
-            building.yaw,
-            building.scale,
+            building.get_asset(),
+            [building.get_position()[0], 0.0, building.get_position()[1]],
+            building.get_yaw(),
+            building.get_scale(),
         );
     }
     // 可进入样板楼**不进**二维碰撞世界。
@@ -3792,19 +2746,19 @@ fn build_collision_world(
         //
         // 棕榈树已经用同一条 `on_lane` 规则排除(见下面的循环);这里让
         // 小道具也服从同一条规则,车道才是真的能开过去的。
-        if on_lane(prop.position[0]) {
+        if on_lane(prop.get_position()[0]) {
             continue;
         }
         push_box(
             world,
             bounds_map,
-            prop.asset,
-            [prop.position[0], 0.0, prop.position[1]],
-            prop.yaw,
+            prop.get_asset(),
+            [prop.get_position()[0], 0.0, prop.get_position()[1]],
+            prop.get_yaw(),
             // 小道具的 AABB 收窄:长椅 / 垃圾桶 / 消防栓 / 报摊 / 电话亭的
             // 原始包围盒比它们实际占的地方大不少,全量推进去会把人行道
             // 和车道边缘堵死,玩家和车都过不去。
-            prop_collider_scale(prop.asset),
+            prop_collider_scale(prop.get_asset()),
         );
     }
     for spot in build_city_palms(cx, cz).iter() {
@@ -3840,7 +2794,7 @@ fn build_collision_world(
 /// # Returns
 ///
 /// - `f32` - 碰撞体线性缩放。
-fn prop_collider_scale(asset: &str) -> f32 {
+pub(crate) fn prop_collider_scale(asset: &str) -> f32 {
     match asset {
         PROP_BENCH | PROP_TRASH_BIN | PROP_FIRE_HYDRANT | PROP_NEWSSTAND | PROP_PHONE_BOOTH => {
             SMALL_PROP_COLLIDER_SCALE
@@ -3873,7 +2827,7 @@ fn prop_collider_scale(asset: &str) -> f32 {
 /// - `Vec3` - 摆放位置(世界坐标)。
 /// - `f32` - 绕 Y 轴的朝向(弧度)。
 /// - `f32` - 统一缩放。
-fn push_box(
+pub(crate) fn push_box(
     world: &mut CollisionWorld,
     bounds_map: &HashMap<String, Bounds>,
     asset: &str,
@@ -3898,7 +2852,7 @@ fn push_box(
 /// - `&mut HashMap<String, Bounds>` - 资产 id → 碰撞足迹。
 /// - `&str` - 资产 id。
 /// - `&MeshAsset` - 已解析的资产。
-fn collider_bounds(bounds: &mut HashMap<String, Bounds>, id: &str, asset: &MeshAsset) {
+pub(crate) fn collider_bounds(bounds: &mut HashMap<String, Bounds>, id: &str, asset: &MeshAsset) {
     bounds.insert(String::from(id), solid_bounds(asset));
 }
 
@@ -3923,31 +2877,31 @@ fn collider_bounds(bounds: &mut HashMap<String, Bounds>, id: &str, asset: &MeshA
 /// # Returns
 ///
 /// - `Bounds` - 实心足迹的 `(min, max)`;y 取资产 `bounds` 原值(二维世界不看 y)。
-fn solid_bounds(asset: &MeshAsset) -> Bounds {
-    let fallback: Bounds = match asset.bounds.clone() {
+pub(crate) fn solid_bounds(asset: &MeshAsset) -> Bounds {
+    let fallback: Bounds = match asset.get_bounds().clone() {
         Some(bounds) => bounds,
         None => Bounds {
             min: [-0.5, 0.0, -0.5],
             max: [0.5, 2.0, 0.5],
         },
     };
-    let y_lo: f32 = fallback.min[1].max(BODY_BAND_LO);
-    let y_hi: f32 = fallback.max[1].min(BODY_BAND_HI);
+    let y_lo: f32 = fallback.get_min()[1].max(BODY_BAND_LO);
+    let y_hi: f32 = fallback.get_max()[1].min(BODY_BAND_HI);
     if y_hi < y_lo {
         return fallback;
     }
     let mut lo: [f32; 2] = [f32::MAX, f32::MAX];
     let mut hi: [f32; 2] = [f32::MIN, f32::MIN];
     let mut found: bool = false;
-    for part in &asset.parts {
-        for face in &part.faces {
-            let Some(tri): Option<Vec3> = part.positions.get(face[0]).copied() else {
+    for part in asset.get_parts() {
+        for face in part.get_faces() {
+            let Some(tri): Option<Vec3> = part.get_positions().get(face[0]).copied() else {
                 continue;
             };
-            let Some(second): Option<Vec3> = part.positions.get(face[1]).copied() else {
+            let Some(second): Option<Vec3> = part.get_positions().get(face[1]).copied() else {
                 continue;
             };
-            let Some(third): Option<Vec3> = part.positions.get(face[2]).copied() else {
+            let Some(third): Option<Vec3> = part.get_positions().get(face[2]).copied() else {
                 continue;
             };
             let y_min: f32 = tri[1].min(second[1]).min(third[1]);
@@ -3968,10 +2922,11 @@ fn solid_bounds(asset: &MeshAsset) -> Bounds {
         return fallback;
     }
     Bounds {
-        min: [lo[0], fallback.min[1], lo[1]],
-        max: [hi[0], fallback.max[1], hi[1]],
+        min: [lo[0], fallback.get_min()[1], lo[1]],
+        max: [hi[0], fallback.get_max()[1], hi[1]],
     }
 }
+
 /// 取一个资产声明的本地包围盒,缺省时退化成 1 m 见方。
 ///
 /// # Arguments
@@ -3982,34 +2937,13 @@ fn solid_bounds(asset: &MeshAsset) -> Bounds {
 /// # Returns
 ///
 /// - `(Vec3, Vec3)` - 包围盒的 `(min, max)`。
-fn local_bounds(bounds_map: &HashMap<String, Bounds>, asset: &str) -> (Vec3, Vec3) {
+pub(crate) fn local_bounds(bounds_map: &HashMap<String, Bounds>, asset: &str) -> (Vec3, Vec3) {
     match bounds_map.get(asset) {
-        Some(bounds) => (bounds.get_min(), bounds.get_max()),
+        Some(bounds) => (*bounds.get_min(), *bounds.get_max()),
         None => ([-0.5, 0.0, -0.5], [0.5, 2.0, 0.5]),
     }
 }
 
-// ===========================================================================
-// 交通 AI + 拾取物蓝图
-// ===========================================================================
-
-/// 车道中心相对街道中轴线的横向偏移(米)。
-///
-/// 路面半宽 `STREET_HALF_WIDTH` = 7 m,双向车道各占一半,车道中心落在
-/// ±3.5 m 处 —— 正好压在程序化地面画的车道虚线上。
-const LANE_OFFSET_X: f32 = 3.5;
-/// 车队循环轨道的半长(米):车沿 Z 跑完这一段就 wrap 回起点。
-///
-/// 世界本身没有边界,这一档只是「车队循环一圈多长」,不是世界的边。
-/// 旧值是 `CITY_HALF - 30`,把世界边长当成了循环长度。
-const TRAFFIC_HALF: f32 = 600.0;
-
-/// 实心大道具(交通灯 / 路灯)碰撞体不缩放。
-const FULL_PROP_COLLIDER_SCALE: f32 = 1.0;
-/// 小型路边道具碰撞体缩到 55%(见 [`prop_collider_scale`] 的原因)。
-const SMALL_PROP_COLLIDER_SCALE: f32 = 0.55;
-/// 锥桶碰撞体缩到 30%(锥桶本来就该被车碾过去,不该挡路)。
-const CONE_COLLIDER_SCALE: f32 = 0.3;
 /// 判定某个 X 坐标是否落在任意一条南北向街道的车道里。
 ///
 /// # Arguments
@@ -4019,24 +2953,13 @@ const CONE_COLLIDER_SCALE: f32 = 0.3;
 /// # Returns
 ///
 /// - `bool` - `true` 表示该 X 在某条街的车道缓冲带内。
-fn on_lane(x: f32) -> bool {
+pub(crate) fn on_lane(x: f32) -> bool {
     // 世界是无限网格,「任一街道的车道缓冲带」是无限个区间;只可能
     // 检查紧邻 x 的那一条,再按 2 的步长镜像一次就覆盖 ±。
     let nearest: f32 = street_axis((x / STREET_PITCH).round() as i32);
     let offset: f32 = (x - nearest).abs();
     (offset - LANE_OFFSET_X).abs() < LANE_CLEAR_MARGIN
 }
-
-/// 棕榈树干碰撞半径(米)—— 只挡人,树叶可以从中穿过。
-const PALM_TRUNK_RADIUS: f32 = 0.4;
-/// 实心足迹的高度带下沿(米):小腿高度。矮于此的地面贴片 / 车道涂装不该挡人。
-const BODY_BAND_LO: f32 = 0.10;
-/// 实心足迹的高度带上沿(米):头顶高度。二维碰撞世界没有高度概念,
-/// 所以高于这条线的几何(雨篷 / 檐口 / 路灯臂 / 屋顶设备)对行走的玩家
-/// 不存在 —— 把它们算进碰撞盒就是空气墙。
-const BODY_BAND_HI: f32 = 1.90;
-/// 车道缓冲区半宽(米):街道中轴线两侧这么多米内不放静态碰撞体。
-const LANE_CLEAR_MARGIN: f32 = 1.8;
 
 /// 南北向街道的车道 X 坐标,也就是车队实际会出现的 X 坐标。
 ///
@@ -4051,104 +2974,16 @@ const LANE_CLEAR_MARGIN: f32 = 1.8;
 /// # Returns
 ///
 /// - `f32` - 该街道的车道 X 坐标(米)。
-fn lane_x(street_index: i32, side: f32) -> f32 {
+pub(crate) fn lane_x(street_index: i32, side: f32) -> f32 {
     street_axis(street_index) + side * LANE_OFFSET_X
 }
-
-/// 「车道落在哪条街上」这条回归测试要填的槽位名(§1.3c:字符串不写死在逻辑里)。
-const SLOT_TRAFFIC_LANE: &str = "lane_x";
-/// 同上,车辆资产 id 槽位。
-const SLOT_TRAFFIC_ASSET: &str = "asset";
-/// 同上,车道起始 Z 槽位。
-const SLOT_TRAFFIC_START_Z: &str = "start_z";
-
-/// 回归测试:车队车道必须落在沥青面上。{asset} 的车道 x={lane_x} 不在路上。
-const T_TRAFFIC_LANE_OFF_ROAD: &str = "车队车道必须压在沥青面上,否则车会骑在楼和道具上:{asset} lane_x={lane_x} \
-     start_z={start_z}";
-
-/// 车队车道蓝图:`(资产, 街道索引, 车道哪一侧, 起始 Z, 巡航速度, 方向)`。
-///
-/// 每辆车被钉在一个固定 X 上、只沿 Z 跑,到 ±[`TRAFFIC_HALF`] wrap,所以
-/// 结构上不可能拐弯、也不可能开进人行道或楼里 —— 车**永远穿不过建筑**。
-/// 车辆自己的朝向由 [`traffic::TrafficCar::get_yaw`] 从行驶方向推出。
-///
-/// **车道 X 由 [`lane_x`] 从街道索引派生,不写死字面量。** 这些坐标原先是
-/// `30 ± LANE_OFFSET_X`(= ±26.5 / ±33.5),而那时的街道网格间距是 30 m;
-/// [`STREET_PITCH`] 后来改成 60 m(无限街道网格)之后,`±26.5 / ±33.5` 就
-/// 落到了**两条街之间**的街区内侧 —— 那个位置按定义摆满了楼和道具。
-/// 车队于是直接骑在城市的障碍上,而玩家按 F 上车开的就是这条车道:
-///
-/// 实测满油门 3.6 s 冲到 `SPEED_MAX * 1.6 = 24 m/s`、沿 Z 跑了 54 m 之后,
-/// 车头撞进 (33, 0) 一块 0.52 m 见方的路灯基座,`drive` 的撞墙分支把速度
-/// 砍到 0.25 倍,此后 `speed = (speed + DRIVE_ACCEL·dt) · 0.25 = 0.0611 m/s`
-/// 永久平衡 —— 油门踩到底、车却一动不动,正是用户报的「汽车无法操作」。
-/// 同一辆车倒车 20 m 再满油门,又在 z = 2.543 处以同一个 0.061 m/s 冻住,
-/// 说明那不是一次偶发蹭墙,而是整条车道被封死。
-///
-/// 从 [`street_axis`] 派生之后,车道永远贴着一条真实街道的沥青面;
-/// 街道网格再改,车队也不会开进街区。
-type TrafficLane = (&'static str, i32, f32, f32, f32, f32);
-
-/// 车队车道蓝图表。`街道索引` 交给 [`traffic_lanes`] 在运行时解成坐标。
-const TRAFFIC_LANE_PLAN: &[TrafficLane] = &[
-    // (资产 id, 街道索引, 车道侧 +1 / -1, 初始 Z, 巡航速度, 行驶方向)
-    //
-    // 街道索引 1 的轴线在 x = 60,两侧车道就是 60 ± 3.5 = 56.5 / 63.5;
-    // 索引 0 的轴线在 x = 0,两侧是 ±3.5。玩家出生点 (33.5, 45) 就在索引 1
-    // 那条街上,所以车会从玩家眼前开过 —— 上车测试有确定性。
-    (CAR_SEDAN, 1, 1.0, 60.0, crate::traffic::CRUISE_SPEED, -1.0),
-    (CAR_TAXI, 1, -1.0, -30.0, crate::traffic::CRUISE_SPEED, 1.0),
-    (CAR_COUPE, 1, 1.0, -60.0, crate::traffic::CRUISE_SPEED, -1.0),
-    (
-        TRUCK_PICKUP,
-        1,
-        -1.0,
-        90.0,
-        crate::traffic::CRUISE_SPEED,
-        1.0,
-    ),
-    (
-        CAR_POLICE,
-        1,
-        1.0,
-        110.0,
-        crate::traffic::CRUISE_SPEED,
-        -1.0,
-    ),
-    (
-        CAR_SEDAN,
-        -1,
-        -1.0,
-        -60.0,
-        crate::traffic::CRUISE_SPEED,
-        1.0,
-    ),
-    (CAR_TAXI, -1, 1.0, 30.0, crate::traffic::CRUISE_SPEED, -1.0),
-    (CAR_COUPE, -1, -1.0, 90.0, crate::traffic::CRUISE_SPEED, 1.0),
-    (
-        TRUCK_PICKUP,
-        -1,
-        1.0,
-        -90.0,
-        crate::traffic::CRUISE_SPEED,
-        -1.0,
-    ),
-    (
-        CAR_POLICE,
-        -1,
-        -1.0,
-        100.0,
-        crate::traffic::CRUISE_SPEED,
-        1.0,
-    ),
-];
 
 /// 把车道蓝图解成 `Traffic::populate` 要的 `(资产, 车道 X, 起始 Z, 速度)`。
 ///
 /// # Returns
 ///
 /// - `Vec<(&'static str, f32, f32, f32)>` - 与输入同序的车道坐标。
-fn traffic_lanes() -> Vec<(&'static str, f32, f32, f32)> {
+pub(crate) fn traffic_lanes() -> Vec<(&'static str, f32, f32, f32)> {
     TRAFFIC_LANE_PLAN
         .iter()
         .map(
@@ -4158,54 +2993,6 @@ fn traffic_lanes() -> Vec<(&'static str, f32, f32, f32)> {
         )
         .collect()
 }
-
-/// 地面拾取物蓝图:`(资产, HUD 名, 世界坐标)`。
-///
-/// 全部落在 X = 30 这条街的人行道上(`30 ± (7 + 2.2)`),玩家出生点就在
-/// 同一条人行道上,走几步就能捡到。`marker_flame` 是任务目标点,夜里靠
-/// 自身 emissive 远远就能看见。
-const PICKUP_PLACEMENTS: &[(&str, &str, Vec3)] = &[
-    // 出生点 (30, 0) 在十字路口。拾取物沿两条街的人行道分布,
-    // 坐标从人行道外沿推出(不落在车道缓冲带里,见 TRAFFIC_LANE_PLAN)。
-    (PICKUP_HEALTH_PACK, NOTICE_HEALTH, [35.4, 0.35, 36.0]),
-    (WEP_SMG, NOTICE_WEAPON, [24.6, 0.35, 24.0]),
-    (PICKUP_CASH_STACK, NOTICE_CASH, [24.6, 0.35, 4.0]),
-    (PICKUP_ARMOR_VEST, NOTICE_ARMOR, [24.6, 0.35, -12.0]),
-    (PICKUP_AMMO_BOX, NOTICE_AMMO, [35.4, 0.35, 56.0]),
-    (WEP_PISTOL, NOTICE_WEAPON, [24.6, 0.35, 20.0]),
-    (WEP_BAT, NOTICE_WEAPON, [35.4, 0.35, -26.0]),
-    (WEP_GRENADE, NOTICE_WEAPON, [24.6, 0.35, 30.0]),
-    (PICKUP_HEALTH_PACK, NOTICE_HEALTH, [35.4, 0.35, 40.0]),
-    (PICKUP_AMMO_BOX, NOTICE_AMMO, [24.6, 0.35, -30.0]),
-    (PICKUP_CASH_STACK, NOTICE_CASH, [35.4, 0.35, 52.0]),
-    (MARKER_FLAME, NOTICE_MARKER, [26.5, 0.35, -60.0]),
-];
-
-/// 需要按 part 切出可转车轮的车型资产 id。
-///
-/// 只有这五个 `car_*` 资产带 `tyres` / `hubs` 部件(见各自的
-/// `parts[].name`);把它们留一份原始 `MeshAsset` 好切单轮网格。
-const CAR_ASSET_IDS: &[&str] = &[CAR_TAXI, CAR_COUPE, CAR_SEDAN, CAR_POLICE, TRUCK_PICKUP];
-
-/// 玩家骨架要渲染的 part 名(躯干 / 头 / 头发 + 四肢 + 两只鞋)。
-///
-/// 顺序不重要(每个 part 一个独立批次),但必须与 `ped_suit.json` 的
-/// `parts[].name` 完全一致。
-const PLAYER_PARTS: &[&str] = &[
-    PART_TORSO,
-    PART_HEAD,
-    PART_HAIR,
-    PART_UPPER_ARM_L,
-    PART_LOWER_ARM_L,
-    PART_UPPER_ARM_R,
-    PART_LOWER_ARM_R,
-    PART_UPPER_LEG_L,
-    PART_LOWER_LEG_L,
-    PART_UPPER_LEG_R,
-    PART_LOWER_LEG_R,
-    PART_SHOE_L,
-    PART_SHOE_R,
-];
 
 /// 从 `ped_suit` 的原始 JSON 里切出单个 part 的网格 + 枢轴,并挂成场景批次。
 ///
@@ -4222,24 +3009,24 @@ const PLAYER_PARTS: &[&str] = &[
 /// # Returns
 ///
 /// - `usize` - 新批次的索引。
-fn push_player_part(scene: &mut Scene, asset: &MeshAsset, part_name: &str) -> usize {
+pub(crate) fn push_player_part(scene: &mut Scene, asset: &MeshAsset, part_name: &str) -> usize {
     let Some(part) = asset
         .parts
         .iter()
-        .find(|candidate: &&MeshPart| candidate.name == part_name)
+        .find(|candidate: &&MeshPart| candidate.get_name() == part_name)
     else {
         return usize::MAX;
     };
     let part: &MeshPart = part;
-    let mut emissive: Vec<[f32; 3]> = Vec::with_capacity(part.faces.len());
-    let base: [f32; 3] = part.emissive.unwrap_or([0.0; 3]);
-    for _ in &part.faces {
+    let mut emissive: Vec<[f32; 3]> = Vec::with_capacity(part.get_faces().len());
+    let base: [f32; 3] = part.get_emissive().unwrap_or([0.0; 3]);
+    for _ in part.get_faces() {
         emissive.push(base);
     }
     let solo: MeshAsset = MeshAsset {
-        id: asset.id.clone(),
-        category: asset.category.clone(),
-        y_up: asset.y_up,
+        id: asset.get_id().clone(),
+        category: asset.get_category().clone(),
+        y_up: asset.get_y_up(),
         bounds: None,
         parts: vec![part.clone()],
     };
@@ -4284,7 +3071,7 @@ fn push_player_part(scene: &mut Scene, asset: &MeshAsset, part_name: &str) -> us
 /// # Returns
 ///
 /// - `Mat4Data` - 列主序 model matrix。
-fn car_wheel_model(position: Vec3, yaw: f32, mount: Vec3, spin: f32) -> Mat4Data {
+pub(crate) fn car_wheel_model(position: Vec3, yaw: f32, mount: Vec3, spin: f32) -> Mat4Data {
     let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
     let (sin_spin, cos_spin): (f32, f32) = spin.sin_cos();
     // 安装位随车身转到世界:与 `Instance::new` 同一套约定
@@ -4344,7 +3131,7 @@ fn car_wheel_model(position: Vec3, yaw: f32, mount: Vec3, spin: f32) -> Mat4Data
 /// # Returns
 ///
 /// - `usize` - 新 mesh 的索引;资产里没有轮子时返回 `usize::MAX`。
-fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
+pub(crate) fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
     let mount: [f32; 3] = crate::traffic::WHEEL_MOUNTS[slot];
     let sign_x: f32 = if mount[0] >= 0.0 { 1.0 } else { -1.0 };
     let sign_z: f32 = if mount[2] >= 0.0 { 1.0 } else { -1.0 };
@@ -4353,7 +3140,7 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
         let Some(part) = asset
             .parts
             .iter()
-            .find(|candidate: &&MeshPart| candidate.name == name)
+            .find(|candidate: &&MeshPart| candidate.get_name() == name)
         else {
             continue;
         };
@@ -4370,14 +3157,14 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
         // 三角面是**顶点下标**(`faces: Vec<[usize; 3]>`),不是连续三顶点。
         // 一个面只在其三个顶点**全部**落在本象限时保留 —— 轮子之间没有
         // 跨象限的面,直接按面筛即可。
-        let normals: &Option<Vec<[f32; 3]>> = &part.normals;
+        let normals: &Option<Vec<[f32; 3]>> = &part.get_normals();
         let mut kept_face_indices: Vec<usize> = Vec::new();
         let mut new_positions: Vec<[f32; 3]> = Vec::new();
         let mut new_normals: Vec<[f32; 3]> = Vec::new();
         let mut new_faces: Vec<[usize; 3]> = Vec::new();
-        for (face_index, face) in part.faces.iter().enumerate() {
+        for (face_index, face) in part.get_faces().iter().enumerate() {
             let inside: bool = face.iter().all(|vertex: &usize| {
-                let position: [f32; 3] = part.positions[*vertex];
+                let position: [f32; 3] = part.get_positions()[*vertex];
                 let sx: f32 = if position[0] >= 0.0 { 1.0 } else { -1.0 };
                 let sz: f32 = if position[2] >= 0.0 { 1.0 } else { -1.0 };
                 (sx - sign_x).abs() < 0.5 && (sz - sign_z).abs() < 0.5
@@ -4388,7 +3175,7 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
             kept_face_indices.push(face_index);
             let base: usize = new_positions.len();
             for vertex in face {
-                let position: [f32; 3] = part.positions[*vertex];
+                let position: [f32; 3] = part.get_positions()[*vertex];
                 new_positions.push([
                     position[0] - mount[0],
                     position[1] - mount[1],
@@ -4408,12 +3195,14 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
         // `kept_indices` 的第 k 个,直接按下标取回原色。
         let kept_indices: Vec<usize> = kept_face_indices;
         let face_colors: Option<Vec<[f32; 3]>> =
-            part.face_colors.as_ref().map(|colors: &Vec<[f32; 3]>| {
-                kept_indices
-                    .iter()
-                    .map(|index: &usize| colors.get(*index).copied().unwrap_or([0.0; 3]))
-                    .collect()
-            });
+            part.get_face_colors()
+                .as_ref()
+                .map(|colors: &Vec<[f32; 3]>| {
+                    kept_indices
+                        .iter()
+                        .map(|index: &usize| colors.get(*index).copied().unwrap_or([0.0; 3]))
+                        .collect()
+                });
         // 顶点被重排过,所以 UV / 切线必须按同一映射搬运,不能整体丢弃 ——
         // 丢弃会让裁剪后的资产突然退回程序化投影,贴图尺度凭空突变。
         // 用具名函数而不是闭包:闭包捕获了 `new_faces`,无法声明成
@@ -4428,7 +3217,7 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
         /// # Returns
         ///
         /// - `Vec<T>` - 按面顺序展开的逐角数据。
-        fn remap_corners<T: Copy>(faces: &Vec<[usize; 3]>, values: &Vec<T>) -> Vec<T> {
+        pub(crate) fn remap_corners<T: Copy>(faces: &Vec<[usize; 3]>, values: &Vec<T>) -> Vec<T> {
             faces
                 .iter()
                 .flat_map(|face: &[usize; 3]| face.iter().map(|i: &usize| values[*i]))
@@ -4447,21 +3236,21 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
             positions: new_positions,
             normals: Some(new_normals),
             faces: new_faces,
-            base_color: part.base_color,
-            emissive: part.emissive,
+            base_color: part.try_get_base_color(),
+            emissive: part.try_get_emissive(),
             uv: rebuilt_uv,
             tangents: rebuilt_tangents,
-            roughness: part.roughness,
-            metallic: part.metallic,
+            roughness: part.try_get_roughness(),
+            metallic: part.try_get_metallic(),
             // Carry the texture reference across the clone. This path crops a
             // part into sub-parts (wheels from bodies, limbs from torsos);
             // nulling these here would drop the atlas link and silently render
             // the clone with scalar PBR only, which is invisible in a test that
             // only checks geometry.
-            texture_atlas: part.texture_atlas.clone(),
-            surface_kind: part.surface_kind.clone(),
+            texture_atlas: part.try_get_texture_atlas().clone(),
+            surface_kind: part.try_get_surface_kind().clone(),
             face_colors,
-            flat: part.flat,
+            flat: part.get_flat(),
         });
     }
     if parts.is_empty() {
@@ -4469,15 +3258,15 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
     }
     let mut emissive: Vec<[f32; 3]> = Vec::new();
     for part in &parts {
-        let base: [f32; 3] = part.emissive.unwrap_or([0.0; 3]);
-        for _ in &part.faces {
+        let base: [f32; 3] = part.get_emissive().unwrap_or([0.0; 3]);
+        for _ in part.get_faces() {
             emissive.push(base);
         }
     }
     let solo: MeshAsset = MeshAsset {
-        id: asset.id.clone(),
-        category: asset.category.clone(),
-        y_up: asset.y_up,
+        id: asset.get_id().clone(),
+        category: asset.get_category().clone(),
+        y_up: asset.get_y_up(),
         bounds: None,
         parts,
     };
@@ -4499,17 +3288,17 @@ fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) -> usize {
 /// # Returns
 ///
 /// - `(Vec3, Vec3)` - 该 part 的本地包围盒;找不到时退化成 1 m 见方。
-fn part_local_bounds(asset: &MeshAsset, part_name: &str) -> (Vec3, Vec3) {
+pub(crate) fn part_local_bounds(asset: &MeshAsset, part_name: &str) -> (Vec3, Vec3) {
     let Some(part) = asset
         .parts
         .iter()
-        .find(|candidate: &&MeshPart| candidate.name == part_name)
+        .find(|candidate: &&MeshPart| candidate.get_name() == part_name)
     else {
         return ([-0.5, 0.0, -0.5], [0.5, 2.0, 0.5]);
     };
     let mut min: Vec3 = [f32::INFINITY; 3];
     let mut max: Vec3 = [f32::NEG_INFINITY; 3];
-    for position in &part.positions {
+    for position in part.get_positions() {
         for axis in 0..3 {
             min[axis] = min[axis].min(position[axis]);
             max[axis] = max[axis].max(position[axis]);
@@ -4521,7 +3310,6 @@ fn part_local_bounds(asset: &MeshAsset, part_name: &str) -> (Vec3, Vec3) {
 // ===========================================================================
 // 输入绑定
 // ===========================================================================
-
 /// 在 canvas 上挂上鼠标 / 触摸 / 滚轮事件。
 ///
 /// 全部用裸 `web_sys::EventTarget::add_event_listener_with_callback` +
@@ -4531,8 +3319,8 @@ fn part_local_bounds(asset: &MeshAsset, part_name: &str) -> (Vec3, Vec3) {
 /// # Arguments
 ///
 /// - `&GameHandles` - GameHandles 的只读引用。
-fn bind_pointer_events(handles: &GameHandles) {
-    let canvas: &HtmlCanvasElement = &handles.canvas;
+pub(crate) fn bind_pointer_events(handles: &GameHandles) {
+    let canvas: &HtmlCanvasElement = &handles.get_canvas();
 
     // ---- 指针锁:锁定态下用 movement_x/y 转视角,不需要按住左键 ----
     //
@@ -4559,8 +3347,8 @@ fn bind_pointer_events(handles: &GameHandles) {
                 return;
             }
             {
-                let mut game: RefMut<Game> = handles.game.borrow_mut();
-                apply_look_delta(&mut game.camera, dx, dy);
+                let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                apply_look_delta(&mut game.get_mut_camera(), dx, dy);
             }
             event.prevent_default();
         }));
@@ -4574,7 +3362,7 @@ fn bind_pointer_events(handles: &GameHandles) {
     {
         // 闭包是 `'static`,不能借用函数参数里的 `&canvas`,所以克隆一份
         // 句柄(`HtmlCanvasElement` 是引用计数的,克隆很便宜)。
-        let locked_canvas: HtmlCanvasElement = handles.canvas.clone();
+        let locked_canvas: HtmlCanvasElement = handles.get_canvas().clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |event: Event| {
             // 已经在锁里就不重复申请(重复调用在部分实现里会报错)。
             if is_pointer_locked() {
@@ -4592,10 +3380,10 @@ fn bind_pointer_events(handles: &GameHandles) {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
             let locked: bool = is_pointer_locked();
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
-            game.input.pointer_locked = locked;
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+            game.get_mut_input().set_pointer_locked(locked);
             if !locked {
-                game.input.dragging = false;
+                game.get_mut_input().set_dragging(false);
             }
         }));
         attach(canvas, EVENT_POINTERLOCKCHANGE, closure);
@@ -4610,9 +3398,9 @@ fn bind_pointer_events(handles: &GameHandles) {
             };
             let (x, y): (f64, f64) = (mouse.client_x() as f64, mouse.client_y() as f64);
             {
-                let mut game: RefMut<Game> = handles.game.borrow_mut();
-                game.input.dragging = true;
-                game.input.last_pointer = [x, y];
+                let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                game.get_mut_input().set_dragging(true);
+                game.get_mut_input().set_last_pointer([x, y]);
             }
             // 拖拽时不要让页面滚动 / 选中文本。
             event.prevent_default();
@@ -4627,16 +3415,16 @@ fn bind_pointer_events(handles: &GameHandles) {
             };
             let (x, y): (f64, f64) = (mouse.client_x() as f64, mouse.client_y() as f64);
             {
-                let game: Ref<Game> = handles.game.borrow();
-                if !game.input.dragging {
+                let game: Ref<Game> = handles.get_game().borrow();
+                if !game.get_input().get_dragging() {
                     return;
                 }
-                let dx: f64 = x - game.input.last_pointer[0];
-                let dy: f64 = y - game.input.last_pointer[1];
+                let dx: f64 = x - game.get_input().get_last_pointer()[0];
+                let dy: f64 = y - game.get_input().get_last_pointer()[1];
                 drop(game);
-                let mut game: RefMut<Game> = handles.game.borrow_mut();
-                apply_look_delta(&mut game.camera, dx, dy);
-                game.input.last_pointer = [x, y];
+                let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                apply_look_delta(&mut game.get_mut_camera(), dx, dy);
+                game.get_mut_input().set_last_pointer([x, y]);
             }
         }));
         attach(canvas, EVENT_POINTERMOVE, closure);
@@ -4644,16 +3432,16 @@ fn bind_pointer_events(handles: &GameHandles) {
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
-            game.input.dragging = false;
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+            game.get_mut_input().set_dragging(false);
         }));
         attach(canvas, EVENT_POINTERUP, closure);
     }
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
-            game.input.dragging = false;
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+            game.get_mut_input().set_dragging(false);
         }));
         attach(canvas, EVENT_POINTERCANCEL, closure);
     }
@@ -4666,20 +3454,20 @@ fn bind_pointer_events(handles: &GameHandles) {
                 return;
             };
             let delta: f64 = wheel.delta_y();
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
             // 滚轮改的是**期望距离**,不是当前距离 —— 当前距离由遮挡
             // 回避每帧改写,直接写它会被下一帧的回避覆盖掉,滚轮就失灵。
             let zoomed: f32 =
-                game.camera.get_desired_distance() * (1.0 + (delta as f32) * ZOOM_STEP);
+                game.get_camera().get_desired_distance() * (1.0 + (delta as f32) * ZOOM_STEP);
             // 第三人称模式下滚轮只调「跟随距离」,有明确的近 / 远下限,
             // 否则玩家会一路滚到贴脸或者飞到天上。
-            if game.third_person {
-                game.camera
+            if game.get_third_person() {
+                game.get_mut_camera()
                     .set_desired_distance(zoomed.clamp(FOLLOW_DISTANCE_MIN, FOLLOW_DISTANCE_MAX));
             } else {
-                game.camera.set_distance(zoomed);
-                game.camera.clamp_distance();
-                game.camera.confine_to_city();
+                game.get_mut_camera().set_distance(zoomed);
+                game.get_mut_camera().clamp_distance();
+                game.get_mut_camera().confine_to_city();
             }
             drop(game);
             event.prevent_default();
@@ -4703,18 +3491,18 @@ fn bind_pointer_events(handles: &GameHandles) {
             };
             let (x, y): (f64, f64) = (touch.client_x() as f64, touch.client_y() as f64);
             {
-                let mut game: RefMut<Game> = handles.game.borrow_mut();
-                let previous: [f64; 2] = game.input.last_pointer;
-                if game.input.last_pinch > 0.0 {
+                let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                let previous: [f64; 2] = game.get_input().get_last_pointer();
+                if game.get_input().get_last_pinch() > 0.0 {
                     // 从双指恢复成单指:只重置基准,不跳转视角。
-                    game.input.last_pointer = [x, y];
-                    game.input.last_pinch = 0.0;
+                    game.get_mut_input().set_last_pointer([x, y]);
+                    game.get_mut_input().set_last_pinch(0.0);
                     return;
                 }
                 let dx: f64 = x - previous[0];
                 let dy: f64 = y - previous[1];
-                apply_look_delta(&mut game.camera, dx, dy);
-                game.input.last_pointer = [x, y];
+                apply_look_delta(&mut game.get_mut_camera(), dx, dy);
+                game.get_mut_input().set_last_pointer([x, y]);
             }
             event.prevent_default();
         }));
@@ -4733,12 +3521,12 @@ fn bind_pointer_events(handles: &GameHandles) {
                         return;
                     };
                     let (x, y): (f64, f64) = (touch.client_x() as f64, touch.client_y() as f64);
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
-                    let previous: [f64; 2] = game.input.last_pointer;
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                    let previous: [f64; 2] = game.get_input().get_last_pointer();
                     let dx: f64 = x - previous[0];
                     let dy: f64 = y - previous[1];
-                    apply_look_delta(&mut game.camera, dx, dy);
-                    game.input.last_pointer = [x, y];
+                    apply_look_delta(&mut game.get_mut_camera(), dx, dy);
+                    game.get_mut_input().set_last_pointer([x, y]);
                 }
                 2 => {
                     // 双指:捏合缩放 + 双指平移。
@@ -4759,37 +3547,37 @@ fn bind_pointer_events(handles: &GameHandles) {
                     // 持着 `RefMut` 调 `forward()` 就是一次真实的重入 borrow
                     // —— WASM 里 panic 不可 catch,直接白屏。
                     let (mut camera, previous_pinch, previous_center): (Camera, f64, [f64; 2]) = {
-                        let mut game: RefMut<Game> = handles.game.borrow_mut();
-                        let previous_pinch: f64 = game.input.last_pinch;
-                        let previous_center: [f64; 2] = game.input.last_pointer;
-                        let camera: Camera = take(&mut game.camera);
+                        let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                        let previous_pinch: f64 = game.get_input().get_last_pinch();
+                        let previous_center: [f64; 2] = game.get_input().get_last_pointer();
+                        let camera: Camera = take(&mut game.get_mut_camera());
                         (camera, previous_pinch, previous_center)
                     };
                     if previous_pinch > 0.0 {
                         let scale: f32 = (previous_pinch / distance.max(1.0)) as f32;
-                        camera.distance = (camera.distance * scale).clamp(12.0, 180.0);
+                        camera.set_distance((camera.get_distance() * scale).clamp(12.0, 180.0));
                         camera.confine_to_city();
                         // 双指平移:中心位移反向推动相机焦点。
                         let forward: [f32; 3] = camera.forward();
                         let right: [f32; 3] = normalize3([-forward[2], 0.0, forward[0]]);
-                        let pan: f32 = camera.distance * 0.0016;
+                        let pan: f32 = camera.get_distance() * 0.0016;
                         for axis in 0..3 {
-                            camera.target[axis] += (right[axis]
+                            camera.get_target()[axis] += (right[axis]
                                 * (center_x - previous_center[0]) as f32
                                 - forward[axis] * (center_y - previous_center[1]) as f32)
                                 * pan;
                         }
                     }
                     {
-                        let mut game: RefMut<Game> = handles.game.borrow_mut();
-                        game.camera = camera;
-                        game.input.last_pinch = distance;
-                        game.input.last_pointer = [center_x, center_y];
+                        let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                        game.set_camera(camera);
+                        game.get_mut_input().set_last_pinch(distance);
+                        game.get_mut_input().set_last_pointer([center_x, center_y]);
                     }
                 }
                 _ => {
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
-                    game.input.last_pinch = 0.0;
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                    game.get_mut_input().set_last_pinch(0.0);
                 }
             }
             event.prevent_default();
@@ -4799,16 +3587,16 @@ fn bind_pointer_events(handles: &GameHandles) {
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
-            game.input.last_pinch = 0.0;
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+            game.get_mut_input().set_last_pinch(0.0);
         }));
         attach(canvas, EVENT_TOUCHEND, closure);
     }
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |_event: Event| {
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
-            game.input.last_pinch = 0.0;
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+            game.get_mut_input().set_last_pinch(0.0);
         }));
         attach(canvas, EVENT_TOUCHCANCEL, closure);
     }
@@ -4821,7 +3609,11 @@ fn bind_pointer_events(handles: &GameHandles) {
 /// - `&E` - E 的只读引用。
 /// - `&str` - str 的只读引用。
 /// - `Closure<dyn FnMut(Event)>` - 输入值。
-fn attach<E: AsRef<EventTarget>>(target: &E, name: &str, closure: Closure<dyn FnMut(Event)>) {
+pub(crate) fn attach<E: AsRef<EventTarget>>(
+    target: &E,
+    name: &str,
+    closure: Closure<dyn FnMut(Event)>,
+) {
     let _: Result<(), euv::wasm_bindgen::JsValue> = target
         .as_ref()
         .add_event_listener_with_callback(name, closure.as_ref().unchecked_ref::<Function>());
@@ -4838,7 +3630,7 @@ fn attach<E: AsRef<EventTarget>>(target: &E, name: &str, closure: Closure<dyn Fn
 /// # Returns
 ///
 /// - `bool` - 当前是否处于指针锁状态。
-fn is_pointer_locked() -> bool {
+pub(crate) fn is_pointer_locked() -> bool {
     // 走 `window().document()` 而不是 web_sys 的 `document()` 自由函数:
     // euv 重导出的 web_sys 里没有 `document` 这个绑定,而 `window` 有。
     window()
@@ -4882,11 +3674,12 @@ fn is_pointer_locked() -> bool {
 /// - `&mut Camera` - 相机的可变引用。
 /// - `f64` - 水平位移(像素)。
 /// - `f64` - 纵向位移(像素)。
-fn apply_look_delta(camera: &mut Camera, dx: f64, dy: f64) {
-    camera.yaw += dx as f32 * LOOK_YAW_SENSITIVITY;
-    camera.pitch += dy as f32 * LOOK_PITCH_SENSITIVITY;
+pub(crate) fn apply_look_delta(camera: &mut Camera, dx: f64, dy: f64) {
+    camera.set_yaw(camera.get_yaw() + dx as f32 * LOOK_YAW_SENSITIVITY);
+    camera.set_pitch(camera.get_pitch() + dy as f32 * LOOK_PITCH_SENSITIVITY);
     camera.clamp_pitch();
 }
+
 /// 绑定「开火 / 瞄准 / 右键」三组鼠标事件。
 ///
 /// 之所以和 [`bind_pointer_events`] 的相机拖拽**分开绑**:相机那个
@@ -4896,8 +3689,8 @@ fn apply_look_delta(camera: &mut Camera, dx: f64, dy: f64) {
 /// # Arguments
 ///
 /// - `&GameHandles` - GameHandles 的只读引用。
-fn bind_combat_mouse(handles: &GameHandles) {
-    let canvas: &HtmlCanvasElement = &handles.canvas;
+pub(crate) fn bind_combat_mouse(handles: &GameHandles) {
+    let canvas: &HtmlCanvasElement = &handles.get_canvas();
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |event: Event| {
@@ -4908,11 +3701,12 @@ fn bind_combat_mouse(handles: &GameHandles) {
                 return;
             }
             let (x, y): (f64, f64) = (mouse.client_x() as f64, mouse.client_y() as f64);
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
-            game.input.fire_held = true;
-            game.input.fire_pressed = true;
-            game.input.aim_point = [x, y];
-            game.input.viewport = [CANVAS_CSS_W, CANVAS_CSS_H];
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+            game.get_mut_input().set_fire_held(true);
+            game.get_mut_input().set_fire_pressed(true);
+            game.get_mut_input().set_aim_point([x, y]);
+            game.get_mut_input()
+                .set_viewport([CANVAS_CSS_W, CANVAS_CSS_H]);
             event.prevent_default();
         }));
         attach(canvas, EVENT_MOUSEDOWN, closure);
@@ -4926,9 +3720,9 @@ fn bind_combat_mouse(handles: &GameHandles) {
             if mouse.button() != MOUSE_BUTTON_LEFT {
                 return;
             }
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
-            game.input.fire_held = false;
-            game.input.fire_released = true;
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+            game.get_mut_input().set_fire_held(false);
+            game.get_mut_input().set_fire_released(true);
         }));
         attach(canvas, EVENT_MOUSEUP, closure);
     }
@@ -4940,8 +3734,8 @@ fn bind_combat_mouse(handles: &GameHandles) {
                 return;
             };
             let (x, y): (f64, f64) = (mouse.client_x() as f64, mouse.client_y() as f64);
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
-            game.input.aim_point = [x, y];
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+            game.get_mut_input().set_aim_point([x, y]);
         }));
         attach(canvas, EVENT_MOUSEMOVE, closure);
     }
@@ -4953,7 +3747,8 @@ fn bind_combat_mouse(handles: &GameHandles) {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |event: Event| {
             event.prevent_default();
-            drop(&handles);
+            let borrowed: &GameHandles = &handles;
+            let _: &GameHandles = borrowed;
         }));
         attach(canvas, EVENT_CONTEXTMENU, closure);
     }
@@ -4964,8 +3759,8 @@ fn bind_combat_mouse(handles: &GameHandles) {
 /// # Arguments
 ///
 /// - `&GameHandles` - GameHandles 的只读引用。
-fn bind_keyboard(handles: &GameHandles) {
-    let window: &Window = &handles.window;
+pub(crate) fn bind_keyboard(handles: &GameHandles) {
+    let window: &Window = &handles.get_window();
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |event: Event| {
@@ -4981,11 +3776,13 @@ fn bind_keyboard(handles: &GameHandles) {
                 return;
             }
             let is_press: bool = {
-                let mut game: RefMut<Game> = handles.game.borrow_mut();
-                let was: bool = game.input.held(&code);
-                game.input.keys.insert(code.clone(), true);
+                let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                let was: bool = game.get_input().get_held(&code);
+                game.get_mut_input()
+                    .get_mut_keys()
+                    .insert(code.clone(), true);
                 // 转向键互相抢占时「后按的赢」,所以必须记下这一下是谁按的。
-                game.input.claim_steer(&code);
+                game.get_mut_input().claim_steer(&code);
                 !was
             };
             // 方向键在浏览器里默认会滚动页面。方向键现在真能开车了,
@@ -4998,66 +3795,69 @@ fn bind_keyboard(handles: &GameHandles) {
             }
             match code.as_str() {
                 KEYT => {
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
-                    game.input.phase = game.input.phase.next();
-                    let phase: DayPhase = game.input.phase;
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                    let next_phase: DayPhase = game.get_input().phase.next();
+                    game.get_mut_input().set_phase(next_phase);
+                    let phase: DayPhase = game.get_input().get_phase();
                     drop(game);
                     sync_phase_ui(&handles, phase);
                 }
                 KEYF => {
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
                     toggle_vehicle(&mut game);
                 }
                 KEY_RELOAD => {
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
-                    if game.arsenal.reload() {
-                        game.player.set_notice(String::from(NOTICE_RELOADED));
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                    if game.get_mut_arsenal().reload() {
+                        game.get_mut_player()
+                            .set_notice(String::from(NOTICE_RELOADED));
                     }
                 }
                 DIGIT1 => {
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
-                    game.arsenal.set_weapon(Weapon::Pistol);
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                    game.get_mut_arsenal().set_weapon(Weapon::Pistol);
                     rebind_weapon_batch(&mut game);
                 }
                 DIGIT2 => {
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
-                    game.arsenal.set_weapon(Weapon::Smg);
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                    game.get_mut_arsenal().set_weapon(Weapon::Smg);
                     rebind_weapon_batch(&mut game);
                 }
                 DIGIT3 => {
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
-                    game.arsenal.set_weapon(Weapon::Bat);
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                    game.get_mut_arsenal().set_weapon(Weapon::Bat);
                     rebind_weapon_batch(&mut game);
                 }
                 KEY_MISSION => {
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
                     toggle_mission(&mut game);
                 }
                 KEY_CAMERA => {
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
                     toggle_camera_mode(&mut game);
                 }
                 KEY_MAP => {
                     // Tab 是**地图**,不是第三人称切换(见 `toggle_map`)。
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
-                    game.map_open = !game.map_open;
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                    let map_open: bool = game.get_map_open();
+                    game.set_map_open(!map_open);
                     drop(game);
                     sync_map_visibility(&handles);
                 }
                 KEY_SPACE => {
                     // 只置标志,不直接写垂直速度:物理积分在 `step_vertical`。
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
-                    game.jump_queued = true;
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                    game.set_jump_queued(true);
                 }
                 KEY_GRENADE => {
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
                     throw_grenade(&mut game);
                 }
                 KEY_UNARMED => {
                     // 收起武器:手上没模型,开火键也不再结算 —— GTA V 的 H。
-                    let mut game: RefMut<Game> = handles.game.borrow_mut();
-                    if game.arsenal.get_weapon() != Weapon::Unarmed {
-                        game.arsenal.set_weapon(Weapon::Unarmed);
+                    let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                    if game.get_arsenal().get_weapon() != Weapon::Unarmed {
+                        game.get_mut_arsenal().set_weapon(Weapon::Unarmed);
                         rebind_weapon_batch(&mut game);
                     }
                 }
@@ -5073,11 +3873,13 @@ fn bind_keyboard(handles: &GameHandles) {
                 return;
             };
             let code: String = keyboard.code();
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
-            game.input.keys.insert(code.clone(), false);
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+            game.get_mut_input()
+                .get_mut_keys()
+                .insert(code.clone(), false);
             // 拥有方向盘的那个键松开了,控制权作废,回到「谁在按就听谁」。
-            if game.input.steer_key == code {
-                game.input.steer_key = String::new();
+            if *game.get_input().get_steer_key() == code {
+                game.get_mut_input().set_steer_key(String::new());
             }
         }));
         attach(window, EVENT_KEYUP, closure);
@@ -5090,19 +3892,19 @@ fn bind_keyboard(handles: &GameHandles) {
 ///
 /// - `&GameHandles` - GameHandles 的只读引用。
 /// - `DayPhase` - 输入值。
-fn sync_phase_ui(handles: &GameHandles, phase: DayPhase) {
-    if let Some(label) = &handles.phase_label {
+pub(crate) fn sync_phase_ui(handles: &GameHandles, phase: DayPhase) {
+    if let Some(label) = &handles.get_phase_label() {
         label.set_text_content(Some(phase.label()));
     }
-    if let Some(slider) = &handles.phase_slider {
+    if let Some(slider) = &handles.get_phase_slider() {
         let _: Result<(), euv::wasm_bindgen::JsValue> =
             slider.set_attribute(ATTR_VALUE, &format!("{}", phase.slider_value()));
     }
     let hud: String = {
-        let game: Ref<Game> = handles.game.borrow();
+        let game: Ref<Game> = handles.get_game().borrow();
         format_hud(&game, 0)
     };
-    if let Some(element) = &handles.hud {
+    if let Some(element) = &handles.get_hud() {
         element.set_text_content(Some(&hud));
     }
     publish_debug_state(handles, &hud);
@@ -5128,7 +3930,7 @@ fn sync_phase_ui(handles: &GameHandles, phase: DayPhase) {
 /// # Returns
 ///
 /// - `MeshExtent` - `[min_x, min_y, min_z, max_x, max_y, max_z]`。
-fn gpu_mesh_extent(mesh: &MeshAssetGpu) -> MeshExtent {
+pub(crate) fn gpu_mesh_extent(mesh: &MeshAssetGpu) -> MeshExtent {
     let stride: usize = GPU_STRIDE_FLOATS;
     let mut out: MeshExtent = [
         f32::INFINITY,
@@ -5138,7 +3940,7 @@ fn gpu_mesh_extent(mesh: &MeshAssetGpu) -> MeshExtent {
         f32::NEG_INFINITY,
         f32::NEG_INFINITY,
     ];
-    for vertex in mesh.vertices.chunks_exact(stride) {
+    for vertex in mesh.get_vertices().chunks_exact(stride) {
         for axis in 0..3 {
             let value: f32 = vertex[axis];
             if value < out[axis] {
@@ -5166,7 +3968,7 @@ fn gpu_mesh_extent(mesh: &MeshAssetGpu) -> MeshExtent {
 /// # Returns
 ///
 /// - `String` - 合法 JSON:`"null"` 或 `"[x, z]"`。
-fn json_point(point: Option<[f32; 2]>) -> String {
+pub(crate) fn json_point(point: Option<[f32; 2]>) -> String {
     match point {
         Some([x, z]) => format!("[{},{}]", x, z),
         None => String::from(JSON_NULL),
@@ -5182,7 +3984,7 @@ fn json_point(point: Option<[f32; 2]>) -> String {
 /// # Returns
 ///
 /// - `String` - 形如 `[1, 2, 3]` 的 JSON 数组。
-fn json_f32s(values: &[f32]) -> String {
+pub(crate) fn json_f32s(values: &[f32]) -> String {
     let wide: Vec<f64> = values.iter().map(|value: &f32| *value as f64).collect();
     format!("[{}]", join_f64(&wide))
 }
@@ -5203,7 +4005,7 @@ fn json_f32s(values: &[f32]) -> String {
 /// # Arguments
 ///
 /// - `&mut Game` - 游戏状态,写入传送后的位置。
-fn apply_teleport_request(game: &mut Game) {
+pub(crate) fn apply_teleport_request(game: &mut Game) {
     let window: Option<web_sys::Window> = web_sys::window();
     let Some(window) = window else {
         return;
@@ -5216,7 +4018,7 @@ fn apply_teleport_request(game: &mut Game) {
     if !aim_request.is_null() && !aim_request.is_undefined() {
         let _: bool = js_sys::Reflect::set(&window, &aim_key, &JsValue::NULL).unwrap_or(false);
         if let Some(yaw) = aim_request.as_f64() {
-            game.camera.set_yaw(yaw as f32);
+            game.get_mut_camera().set_yaw(yaw as f32);
         }
     }
     let key: JsValue = JsValue::from_str(K_TELEPORT_WINDOW);
@@ -5249,7 +4051,7 @@ fn apply_teleport_request(game: &mut Game) {
         .ok()
         .and_then(|value: JsValue| value.as_f64())
     {
-        game.speed_scale = (scale as f32).clamp(0.1, 8.0);
+        game.set_speed_scale((scale as f32).clamp(0.1, 8.0));
         return;
     }
     // `safe` 子命令:打开 / 关闭无敌,直到脚本清掉为止。
@@ -5268,8 +4070,8 @@ fn apply_teleport_request(game: &mut Game) {
         .map(|value: JsValue| value.is_truthy())
         .unwrap_or(false)
     {
-        game.safe_mode = true;
-        game.player.set_health(PLAYER_MAX_HEALTH);
+        game.set_safe_mode(true);
+        game.get_mut_player().set_health(PLAYER_MAX_HEALTH);
         if !wants_walk {
             return;
         }
@@ -5300,9 +4102,9 @@ fn apply_teleport_request(game: &mut Game) {
             .unwrap_or(0.0);
         // 松手时把速度一起清掉。只清输入方向的话,玩家会带着余速
         // 继续滑行好几米 —— 下一个路点就从偏离的位置起步,撞墙。
-        game.walk_request = [dx, dz];
+        game.set_walk_request([dx, dz]);
         if dx == 0.0 && dz == 0.0 {
-            game.player.set_velocity([0.0, 0.0]);
+            game.get_mut_player().set_velocity([0.0, 0.0]);
         }
         // **必须清掉请求**,否则下一帧会掉进下面的传送分支:
         // `has_walk` 变成 false,于是 `read("x")` / `read("z")` 读不到
@@ -5311,7 +4113,7 @@ fn apply_teleport_request(game: &mut Game) {
         let _: bool = js_sys::Reflect::set(&window, &key, &JsValue::NULL).unwrap_or(false);
         return;
     }
-    let read = |field: &str, fallback: f32| -> f32 {
+    let read: &dyn Fn(&str, f32) -> f32 = &|field: &str, fallback: f32| -> f32 {
         let field_key: JsValue = JsValue::from_str(field);
         js_sys::Reflect::get(&request, &field_key)
             .ok()
@@ -5340,18 +4142,20 @@ fn apply_teleport_request(game: &mut Game) {
         // 监听器(实测 `fire_held` 恒为 false),于是从事件层往下的整条
         // 链路一次都测不到。设成 true 之后,`fire_weapon` 走的是**和真人
         // 一样的那段代码**:扣弹匣、算冷却、算命中、结算伤害。
-        game.input.fire_held = true;
-        game.input.fire_pressed = true;
-        game.input.aim_point = [CANVAS_CSS_W * 0.5, CANVAS_CSS_H * 0.5];
-        game.input.viewport = [CANVAS_CSS_W, CANVAS_CSS_H];
+        game.get_mut_input().set_fire_held(true);
+        game.get_mut_input().set_fire_pressed(true);
+        game.get_mut_input()
+            .set_aim_point([CANVAS_CSS_W * 0.5, CANVAS_CSS_H * 0.5]);
+        game.get_mut_input()
+            .set_viewport([CANVAS_CSS_W, CANVAS_CSS_H]);
         // 只注入一帧:`fire_held` 是「按住」语义,不清掉就会一直开火,
         // 脚本连发 14 下就变成扣光整个弹匣外加打空全部备弹。
-        game.hold_frames = 1;
+        game.set_hold_frames(1);
         return;
     }
-    let here: Vec3 = game.player.get_position();
-    game.player.set_position([x, here[1], z]);
-    game.camera.set_target([x, FOLLOW_HEIGHT, z]);
+    let here: Vec3 = game.get_player().get_position();
+    game.get_mut_player().set_position([x, here[1], z]);
+    game.get_mut_camera().set_target([x, FOLLOW_HEIGHT, z]);
     // **不能**顺手把 `streamed_center` 设成目的地。那样下一帧
     // `stream_needs_rebuild` 看到「玩家 == 中心」就判定不用重建,于是
     // 传送过去看到的还是旧地形的三角形数 —— 这正是第一轮 P3 观察到的
@@ -5368,14 +4172,14 @@ fn apply_teleport_request(game: &mut Game) {
 /// # Returns
 ///
 /// - `()` - 无返回值,结果通过 `window.__vcw` 暴露。
-fn publish_debug_state(handles: &GameHandles, hud: &str) {
+pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
     // 读阶段整体包在一个 block 里:所有取值与两份 JSON 字面量都在这里算完,
     // block 结束时 `Ref` 随作用域析构,之后才写 `window` —— 写 `window` 走
     // `web_sys::window()` / `js_sys::JSON::parse`,是 §borrow 的可重入调用,
     // 不能与活着的 guard 同处一个作用域。
     let (json, visibility): (String, String) = {
-        let game: Ref<Game> = handles.game.borrow();
-        let position: Vec3 = game.player.get_position();
+        let game: Ref<Game> = handles.get_game().borrow();
+        let position: Vec3 = game.get_player().get_position();
         let car_x: Vec<f64> = game
             .traffic
             .get_cars_ref()
@@ -5400,15 +4204,16 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
             .traffic
             .get_pickups_ref()
             .iter()
-            .find(|p: &&Pickup| !p.get_taken() && p.get_asset() == PICKUP_HEALTH_PACK)
+            .find(|p: &&Pickup| !p.get_taken() && *p.get_asset() == PICKUP_HEALTH_PACK)
             .map(|p: &Pickup| {
                 let at: Vec3 = p.get_position();
                 [f64::from(at[0]), f64::from(at[2])]
             });
         // 正在开的那辆车的实时坐标 / 速度:用来证明"车真的在动",而不是
         // 只有相机在动。
-        let (cdrive_x, cdrive_z, cdrive_v): (f64, f64, f64) = match game.player.get_vehicle() {
-            Some(index) => match game.traffic.get_cars_ref().get(index) {
+        let (cdrive_x, cdrive_z, cdrive_v): (f64, f64, f64) = match game.get_player().get_vehicle()
+        {
+            Some(index) => match game.get_traffic().get_cars_ref().get(index) {
                 Some(car) => {
                     let at: Vec3 = car.get_position();
                     (
@@ -5422,50 +4227,50 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
             None => (0.0, 0.0, 0.0),
         };
         // 相机眼点:验收脚本靠它核对「回避之后眼点到底站在哪」。
-        let eye: Vec3 = game.camera.eye();
+        let eye: Vec3 = game.get_camera().eye();
         // 探针必须序列化成**合法 JSON**:`{:?}` 打出的是 Rust 的
         // `Some([1.0, 2.0])`,在 JSON 里是非法的,整份 `window.__vcw`
         // 会因此解析失败,自动化脚本就再也读不到任何状态。
         // 验收探针:第一个不透明批次的实例矩阵与数量,用来判断「模型矩阵
         // 是不是没写进去」。
-        let b0: String = match game.scene.batches.first() {
+        let b0: String = match game.get_scene().get_batches().first() {
             Some(batch) => format!(
                 "{:?} x{}",
                 batch
                     .instances
                     .first()
                     .map(|i: &Instance| i.get_model_ref()),
-                batch.instances.len()
+                batch.get_instances().len()
             ),
             None => String::from(crate::r#config::NO_BATCHES),
         };
-        let bn: usize = game.scene.batches.len();
+        let bn: usize = game.get_scene().get_batches().len();
         // 流式地面的当前生成中心:验收脚本用它证明地面跟着玩家走。
-        let stream_x: f32 = game.streamed_center[0];
-        let stream_z: f32 = game.streamed_center[1];
+        let stream_x: f32 = game.get_streamed_center()[0];
+        let stream_z: f32 = game.get_streamed_center()[1];
         // 全量验收脚本要看「走到远处之后脚下还有没有地」,所以把三角形数
         // 和击杀数一起挂出来:三角形塌成 0 就是几何没生成,击杀数用来确认
         // 战斗回路是活的。
-        let tris: usize = game.scene.total_triangles;
+        let tris: usize = game.get_scene().get_total_triangles();
         // `gpu_submitted`:本帧**真的**提交给 GPU 的三角形数(见 render
         // 循环里那个同名变量)。`tris` 是静态场景常量,不能用来判断
         // 某个后端有没有画出来东西。
-        let gpu_submitted: usize = game.gpu_submitted as usize;
+        let gpu_submitted: usize = game.get_gpu_submitted() as usize;
         // 画质档位:SSR / SSAO 按档位开关(见 `QualityTier::wants_ssr`)。
         // 档位掉到 Medium/Low 之后,湿地面反射会**静默消失** —— 画面看起来
         // 仍然「正常」,只是少了整条 SSR 管线。验收脚本看不见这个字段就只能
         // 靠猜,所以必须挂出来。
-        let quality: String = game.quality.get_tier().tier_name().to_string();
-        let kills: u32 = game.kills;
-        let loaded: usize = game.loaded_assets;
+        let quality: String = game.get_quality().get_tier().tier_name().to_string();
+        let kills: u32 = game.get_kills();
+        let loaded: usize = game.get_loaded_assets();
         // 验收脚本要导航到样板楼门口才能验证「进门 → 上楼」,所以把门外的
         // 站位坐标一起挂出来。脚本自己从源码抄 `6.4` 的话,内墙改一次就得
         // 跟着改脚本,迟早对不上。
         let door_spec: &ShowcaseSpec = &showcase_specs()[0];
         let door_at: Vec3 = showcase_door_approach(
-            door_spec.position[0],
-            door_spec.position[1],
-            door_spec.yaw,
+            door_spec.get_position()[0],
+            door_spec.get_position()[1],
+            door_spec.get_yaw(),
             1.6,
         );
         let route_points: Vec<[f32; 2]> = showcase_walk_route(0);
@@ -5479,18 +4284,18 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
             door_at[0],
             door_at[1],
             door_at[2],
-            door_spec.yaw,
-            door_spec.position[0],
-            door_spec.position[1]
+            door_spec.get_yaw(),
+            door_spec.get_position()[0],
+            door_spec.get_position()[1]
         );
-        let wheel_count: usize = game.car_wheel_batches.len();
+        let wheel_count: usize = game.get_car_wheel_batches().len();
         // 车轮批次总数 + 第一个车轮的 Y 基向量(自转角的可观测代理):
         // 停车时该向量是 [0,1,0];车轮滚动时会随转角在 XZ 平面里摆动。
-        let wheel_probe: String = match game.car_wheel_batches.first() {
+        let wheel_probe: String = match game.get_car_wheel_batches().first() {
             None => String::from("[]"),
-            Some(wheel) => match game.scene.batches.get(wheel.batch) {
+            Some(wheel) => match game.get_scene().get_batches().get(wheel.get_batch()) {
                 None => String::from("[]"),
-                Some(batch) => match batch.instances.first() {
+                Some(batch) => match batch.get_instances().first() {
                     None => String::from("[]"),
                     Some(instance) => {
                         let m: Mat4Data = *instance.get_model_ref();
@@ -5504,7 +4309,7 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
         };
         // 最近的建筑实例位置:验收脚本要拿它当「推挤目标」,而不是写死
         // 一个魔法坐标 —— 街区布局会变,写死的坐标早晚会推到空气上。
-        let bpos_json: String = json_point(game.nearest_building);
+        let bpos_json: String = json_point(Some(game.get_nearest_building()));
         // ---- 战斗 / 通缉 / 任务 / 行人的探针:自动化验收靠这几个字段 ----
         let enemies_json: String = {
             let items: Vec<String> = game
@@ -5537,7 +4342,7 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
                     // 走同一个函数 [`ped_bob`]。验收脚本要靠它判「身体
                     // 起伏的波峰有没有和落脚对齐」:脚点屏幕 Y 会混进透视,
                     // 读矩阵里的 Y 才是唯一不受相机影响的读数。
-                    let bob: f32 = ped_bob(ped);
+                    let bob: f32 = ped_bob(&ped);
                     format!(
                         "{{\"x\":{:.2},\"z\":{:.2},\"down\":{},\"gait\":{:.2},\
                          \"gaitPhase\":{:.4},\"bob\":{:.5}}}",
@@ -5554,51 +4359,56 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
         };
         let wanted_json: String = format!(
             "{{\"stars\":{},\"heat\":{:.3},\"unseen\":{:.2},\"hidden\":{},\"cooling\":{:.2}}}",
-            game.wanted.get_stars(),
-            game.wanted.get_heat(),
-            game.wanted.get_unseen(),
-            is_hidden(&game.hideouts, position),
-            game.wanted.get_unseen()
+            game.get_wanted().get_stars(),
+            game.get_wanted().get_heat(),
+            game.get_wanted().get_unseen(),
+            is_hidden(&game.get_hideouts(), position),
+            game.get_wanted().get_unseen()
         );
         let combat_json: String = format!(
             "{{\"weapon\":{},\"mag\":{},\"reload\":{},\"kills\":{},\"damage\":{:.2},\"hp\":{:.1},\"armor\":{:.1},\"cash\":{},\"missions\":{},\"mission_active\":{},\"mission_title\":\"{}\",\"respawn\":{:.2},\"hitmarker\":{:.2},\"aim\":[{:.3},{:.3}],\"pitch\":{:.3},\"fire_held\":{}}}",
-            game.arsenal.get_weapon() as u8,
-            game.arsenal.get_magazine(),
-            game.arsenal.is_reloading(),
-            game.kills,
-            game.hurt.get_since_hit(),
-            game.player.get_health(),
-            game.player.get_armor(),
-            game.player.get_cash(),
-            game.missions_done,
-            game.mission.is_active(),
-            game.mission.get_title(),
-            game.hurt.get_respawn(),
-            game.hitmarker,
-            game.arsenal.get_aim()[0],
-            game.arsenal.get_aim()[1],
-            game.aim_pitch,
-            game.input.fire_held
+            game.get_arsenal().get_weapon() as u8,
+            game.get_arsenal().get_magazine(),
+            game.get_arsenal().is_reloading(),
+            game.get_kills(),
+            game.get_hurt().get_since_hit(),
+            game.get_player().get_health(),
+            game.get_player().get_armor(),
+            game.get_player().get_cash(),
+            game.get_missions_done(),
+            game.get_mission().is_active(),
+            game.get_mission().get_title(),
+            game.get_hurt().get_respawn(),
+            game.get_hitmarker(),
+            game.get_arsenal().get_aim()[0],
+            game.get_arsenal().get_aim()[1],
+            game.get_aim_pitch(),
+            game.get_input().get_fire_held()
         );
         let limbs_json: String = {
             let parts: Vec<String> = game
                 .player_batches
                 .iter()
                 .map(|limb: &PlayerLimbBatch| {
-                    format!("{{\"part\":\"{}\",\"batch\":{}}}", limb.part, limb.batch)
+                    format!(
+                        "{{\"part\":\"{}\",\"batch\":{}}}",
+                        limb.get_part(),
+                        limb.get_batch()
+                    )
                 })
                 .collect();
             format!("[{}]", parts.join(JSON_COMMA))
         };
         let limb_model: String = {
-            let first: Option<&PlayerLimbBatch> = game.player_batches.first();
-            let batch_index: Option<usize> = first.map(|limb: &PlayerLimbBatch| limb.batch);
+            let limb_batches: Vec<PlayerLimbBatch> = game.get_player_batches();
+            let first: Option<PlayerLimbBatch> = limb_batches.first().cloned();
+            let batch_index: Option<usize> = first.map(|limb: PlayerLimbBatch| limb.get_batch());
             let instance: Option<&Instance> = match batch_index {
                 Some(index) => game
                     .scene
                     .batches
                     .get(index)
-                    .and_then(|batch: &SceneBatch| batch.instances.first()),
+                    .and_then(|batch: &SceneBatch| batch.get_instances().first()),
                 None => None,
             };
             let model: Option<Mat4Data> = instance.map(|inst: &Instance| *inst.get_model_ref());
@@ -5611,14 +4421,14 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
         // 有了这两个像素坐标,验收脚本能直接算出角色在画面里有多高、落在
         // 画面的哪个位置 —— 不用靠肉眼判断「看没看见」。
         let char_box: String = {
-            let size: (u32, u32) = game.canvas_size.get();
+            let size: (u32, u32) = game.get_canvas_size().get();
             let (canvas_w, canvas_h): (f32, f32) = (size.0 as f32, size.1 as f32);
-            let base: Vec3 = game.player.get_position();
+            let base: Vec3 = game.get_player().get_position();
             let head: Vec3 = [base[0], base[1] + PED_SCREEN_PROBE_HEIGHT, base[2]];
             let feet: Option<(f32, f32, f32)> =
-                game.camera.world_to_screen(base, canvas_w, canvas_h);
+                game.get_camera().world_to_screen(base, canvas_w, canvas_h);
             let crown: Option<(f32, f32, f32)> =
-                game.camera.world_to_screen(head, canvas_w, canvas_h);
+                game.get_camera().world_to_screen(head, canvas_w, canvas_h);
             match (feet, crown) {
                 (Some(f), Some(c)) => {
                     format!("[{:.1},{:.1},{:.1},{:.1},{:.1}]", f.0, f.1, c.0, c.1, c.2)
@@ -5626,12 +4436,16 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
                 _ => String::from(JSON_NULL),
             }
         };
-        let ft: Vec<f32> = game.follow_target.to_vec();
+        let ft: Vec<f32> = game.get_follow_target().to_vec();
 
-        let tgt: Vec<f32> = game.camera.get_target().to_vec();
+        let tgt: Vec<f32> = game.get_camera().get_target().to_vec();
         let ft_json: String = json_f32s(&ft);
         let tgt_json: String = json_f32s(&tgt);
-        let mm: Vec<f32> = game.camera.view_projection(1.0).get_elements().to_vec();
+        let mm: Vec<f32> = game
+            .get_camera()
+            .view_projection(1.0)
+            .get_elements()
+            .to_vec();
         let mm_json: String = json_f32s(&mm);
         let probe_json: String = game
             .probe
@@ -5646,69 +4460,69 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
             "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"gpuSubmitted\":{gpu_submitted},\"quality\":\"{quality}\",\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf},\"mapOpen\":{map_open},\"grenadesLeft\":{grenades},\"liveGrenades\":{live_grenades},\"grenadeTubes\":{tubes}{DEBUG_CLOSE}",
             x = position[0],
             z = position[2],
-            yaw = game.player.get_yaw(),
-            cyaw = game.camera.get_yaw(),
-            phase = game.input.phase.as_str(),
+            yaw = game.get_player().get_yaw(),
+            cyaw = game.get_camera().get_yaw(),
+            phase = game.get_input().get_phase().as_str(),
             pickup_pos = join_pickups(&game),
             hp_at = match health_pack {
                 Some(at) => format!("[{},{}]", at[0], at[1]),
                 None => String::from(JSON_NULL),
             },
-            hp = game.player.get_health(),
-            cash = game.player.get_cash(),
-            veh = match game.player.get_vehicle() {
+            hp = game.get_player().get_health(),
+            cash = game.get_player().get_cash(),
+            veh = match game.get_player().get_vehicle() {
                 Some(index) => format!("{index}"),
                 None => String::from(JSON_NULL),
             },
-            gphase = game.player.get_gait_phase(),
-            gamount = game.player.get_gait_amount(),
-            mode = if game.third_person {
+            gphase = game.get_player().get_gait_phase(),
+            gamount = game.get_player().get_gait_amount(),
+            mode = if game.get_third_person() {
                 HUD_THIRD_PERSON
             } else {
                 HUD_FIRST_PERSON
             },
-            shapes = game.world.get_shapes().len(),
-            inside = game.world.contains_point([position[0], position[2]]),
-            cdist = game.camera.get_distance(),
-            cdist_target = game.camera.get_desired_distance(),
-            coccluded = game.camera.get_occluded(),
+            shapes = game.get_world().get_shapes().len(),
+            inside = game.get_world().contains_point([position[0], position[2]]),
+            cdist = game.get_camera().get_distance(),
+            cdist_target = game.get_camera().get_desired_distance(),
+            coccluded = game.get_camera().get_occluded(),
             ceye_x = eye[0],
             ceye_y = eye[1],
             ceye_z = eye[2],
             py = position[1],
-            grounded = game.player.get_grounded(),
-            wr0 = game.walk_request[0],
-            wr1 = game.walk_request[1],
-            vx = game.player.get_velocity()[0],
-            vz = game.player.get_velocity()[1],
-            rsp = game.hurt.get_respawn(),
-            saf = game.safe_mode,
-            vy = game.player.get_vertical_velocity(),
-            map_open = game.map_open,
-            grenades = game.arsenal.get_grenade_tubes(),
-            live_grenades = game.live_grenades.len(),
-            tubes = game.arsenal.get_grenade_tubes(),
+            grounded = game.get_player().get_grounded(),
+            wr0 = game.get_walk_request()[0],
+            wr1 = game.get_walk_request()[1],
+            vx = game.get_player().get_velocity()[0],
+            vz = game.get_player().get_velocity()[1],
+            rsp = game.get_hurt().get_respawn(),
+            saf = game.get_safe_mode(),
+            vy = game.get_player().get_vertical_velocity(),
+            map_open = game.get_map_open(),
+            grenades = game.get_arsenal().get_grenade_tubes(),
+            live_grenades = game.get_live_grenades().len(),
+            tubes = game.get_arsenal().get_grenade_tubes(),
             interiors_json = format!(
                 "{{\"count\":{},\"inSolid\":{}}}",
-                game.interiors.get_floors().len(),
-                game.interiors
+                game.get_interiors().get_floors().len(),
+                game.get_interiors()
                     .contains_interior_point([position[0], position[2]], position[1] + 0.5)
             ),
-            cclear = game.camera.get_eye_clearance(),
-            cpitch = game.camera.get_pitch(),
+            cclear = game.get_camera().get_eye_clearance(),
+            cpitch = game.get_camera().get_pitch(),
             car_x = join_f64(&car_x),
             car_z = join_f64(&car_z),
             car_speed = join_f64(&car_speed),
-            total = game.traffic.get_pickups_ref().len(),
-            taken = game.player.collected_count(),
+            total = game.get_traffic().get_pickups_ref().len(),
+            taken = game.get_player().collected_count(),
             hud = hud
                 .replace(CHAR_QUOTE, "")
                 .replace(CHAR_BACKSLASH, JSON_SLASH),
             cdrive_x = cdrive_x,
             cdrive_z = cdrive_z,
             cdrive_v = cdrive_v,
-            throttle = axis(&game.input, KEYW, KEYS),
-            frames = game.frame_count,
+            throttle = axis(&game.get_input(), KEYW, KEYS),
+            frames = game.get_frame_count(),
             enemies_json = enemies_json,
             peds_json = peds_json,
             wanted_json = wanted_json,
@@ -5748,15 +4562,15 @@ fn publish_debug_state(handles: &GameHandles, hud: &str) {
 /// # Returns
 ///
 /// - `String` - 挂到 `window.__VCW_DEBUG__` 的 JSON 字面量。
-fn visibility_json(game: &Game, char_box: &str) -> String {
-    let size: (u32, u32) = game.canvas_size.get();
+pub(crate) fn visibility_json(game: &Game, char_box: &str) -> String {
+    let size: (u32, u32) = game.get_canvas_size().get();
     let (canvas_w, canvas_h): (f32, f32) = (size.0 as f32, size.1 as f32);
-    let feet: Vec3 = game.player.get_position();
+    let feet: Vec3 = game.get_player().get_position();
     let crown: Vec3 = [feet[0], feet[1] + PED_SCREEN_PROBE_HEIGHT, feet[2]];
     let foot_screen: Option<(f32, f32, f32)> =
-        game.camera.world_to_screen(feet, canvas_w, canvas_h);
+        game.get_camera().world_to_screen(feet, canvas_w, canvas_h);
     let crown_screen: Option<(f32, f32, f32)> =
-        game.camera.world_to_screen(crown, canvas_w, canvas_h);
+        game.get_camera().world_to_screen(crown, canvas_w, canvas_h);
     let (screen_x, screen_y, height_px): (f64, f64, f64) = match (foot_screen, crown_screen) {
         (Some(f), Some(c)) => (f64::from(f.0), f64::from(f.1), f64::from((f.1 - c.1).abs())),
         _ => (0.0, 0.0, 0.0),
@@ -5788,7 +4602,10 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
     // 自相矛盾的结论(实测静态层停在 z=35.243、动态层把玩家顶到 35.550,
     // 而 6 m 内报告为空 —— 因为查询点在墙的**另一边**)。
     let near_shapes: String = {
-        let here: Vec2 = [game.after_static_step[0], game.after_static_step[1]];
+        let here: Vec2 = [
+            game.get_after_static_step()[0],
+            game.get_after_static_step()[1],
+        ];
         let mut scored: Vec<(f32, String)> = game
             .world
             .get_shapes()
@@ -5843,14 +4660,14 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
                 let count: usize = game
                     .scene
                     .batches
-                    .get(limb.batch)
-                    .map(|batch: &SceneBatch| batch.instances.len())
+                    .get(limb.get_batch())
+                    .map(|batch: &SceneBatch| batch.get_instances().len())
                     .unwrap_or(0);
                 let translation: String = game
                     .scene
                     .batches
-                    .get(limb.batch)
-                    .and_then(|batch: &SceneBatch| batch.instances.first())
+                    .get(limb.get_batch())
+                    .and_then(|batch: &SceneBatch| batch.get_instances().first())
                     .map(|instance: &Instance| {
                         let m: Mat4Data = *instance.get_model_ref();
                         format!("[{:.3},{:.3},{:.3}]", m[12], m[13], m[14])
@@ -5858,7 +4675,8 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
                     .unwrap_or_else(|| String::from(JSON_NULL));
                 format!(
                     "{{\"part\":\"{}\",\"batch\":{},\"n\":{count},\"t\":{translation}}}",
-                    limb.part, limb.batch
+                    limb.get_part(),
+                    limb.get_batch()
                 )
             })
             .collect();
@@ -5874,13 +4692,15 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
                 let mesh: Option<&MeshAssetGpu> = game
                     .scene
                     .batches
-                    .get(limb.batch)
-                    .and_then(|batch: &SceneBatch| game.scene.meshes.get(batch.mesh_index));
+                    .get(limb.get_batch())
+                    .and_then(|batch: &SceneBatch| {
+                        game.get_scene().get_meshes().get(batch.get_mesh_index())
+                    });
                 mesh.map(|mesh: &MeshAssetGpu| {
                     let extent: MeshExtent = gpu_mesh_extent(mesh);
                     format!(
                         "{{\"part\":\"{}\",\"extent\":{}}}",
-                        limb.part,
+                        limb.get_part(),
                         json_f32s(&extent)
                     )
                 })
@@ -5908,7 +4728,7 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
     // `SceneBatch::mesh_index` 整体错位 —— 症状就是「批次有实例、
     // 模型矩阵也对,画面上却什么都没有」,而 `draw_batch` 越界时是
     // 静默 `return 0`,不报任何错。
-    let gpu_probe: String = match &game.renderer {
+    let gpu_probe: String = match &game.get_renderer() {
         Some(Renderer::WebGl(webgl)) => format!(
             "{{\"meshes\":{},\"oob\":{},\"lastIndexCount\":{}}}",
             webgl.get_gpu_mesh_count(),
@@ -5933,12 +4753,15 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
     // 给出中心、半长与竖直区间,这样「谁把 0.307 m 推回去的」在
     // JSON 里就能直接读出来,不用再猜。
     let near_interiors: String = {
-        let here: Vec2 = [game.after_static_step[0], game.after_static_step[1]];
-        let body_min: f32 = game.player.get_position()[1];
-        let body_max: f32 = body_min + game.player.get_height();
-        let radius: f32 = game.world.get_player_radius();
+        let here: Vec2 = [
+            game.get_after_static_step()[0],
+            game.get_after_static_step()[1],
+        ];
+        let body_min: f32 = game.get_player().get_position()[1];
+        let body_max: f32 = body_min + game.get_player().get_height();
+        let radius: f32 = game.get_world().get_player_radius();
         let mut items: Vec<String> = Vec::new();
-        for floor in game.interiors.get_floors() {
+        for floor in game.get_interiors().get_floors() {
             let (min, max): (Vec3, Vec3) = match floor {
                 crate::interior::Floor::Slab { min: _, max: _ } => continue,
                 crate::interior::Floor::Wall { min, max } => (*min, *max),
@@ -5976,9 +4799,9 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
     };
     let json: String = format!(
         "{DEBUG_OPEN}\"charVisible\":{char_visible},\"charBoxHeightPct\":{painted},\"charBox\":{char_box},\"playerScreenX\":{screen_x},\"playerScreenY\":{screen_y},\"playerScreenPct\":{screen_pct},\"playerX\":{px},\"playerZ\":{pz},\"cameraDist\":{dist},\"camOccluded\":{occluded},\"camClearance\":{clearance},\"canvasWidth\":{canvas_w},\"canvasHeight\":{canvas_h},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"pickups\":{{\"total\":{pickup_total},\"taken\":{pickup_taken}}},\"frames\":{frames},\"sceneMeshes\":{scene_meshes},\"gpu\":{gpu_probe},\"afterStatic\":[{asx},{asz}],\"afterVertical\":[{avx},{avz}],\"afterDynamic\":[{adx},{adz}],\"nearShapes\":{near_shapes},\"nearInteriors\":{near_interiors},\"shotsBlocked\":{shots_blocked},\"limbState\":{limb_state},\"limbExtents\":{limb_extents}{DEBUG_CLOSE}",
-        dist = game.camera.get_distance(),
-        occluded = game.camera.get_occluded(),
-        clearance = game.camera.get_eye_clearance(),
+        dist = game.get_camera().get_distance(),
+        occluded = game.get_camera().get_occluded(),
+        clearance = game.get_camera().get_eye_clearance(),
         canvas_w = size.0,
         canvas_h = size.1,
         px = feet[0],
@@ -5990,17 +4813,17 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
         painted = screen_pct,
         car_x = join_f64(&car_x),
         car_z = join_f64(&car_z),
-        pickup_total = game.traffic.get_pickups_ref().len(),
-        pickup_taken = game.player.collected_count(),
-        frames = game.frame_count,
-        scene_meshes = game.scene.meshes.len(),
-        asx = game.after_static_step[0],
-        asz = game.after_static_step[1],
-        avx = game.after_vertical_step[0],
-        avz = game.after_vertical_step[1],
-        adx = game.after_dynamic_step[0],
-        adz = game.after_dynamic_step[1],
-        shots_blocked = game.shots_blocked_by_geometry,
+        pickup_total = game.get_traffic().get_pickups_ref().len(),
+        pickup_taken = game.get_player().collected_count(),
+        frames = game.get_frame_count(),
+        scene_meshes = game.get_scene().get_meshes().len(),
+        asx = game.get_after_static_step()[0],
+        asz = game.get_after_static_step()[1],
+        avx = game.get_after_vertical_step()[0],
+        avz = game.get_after_vertical_step()[1],
+        adx = game.get_after_dynamic_step()[0],
+        adz = game.get_after_dynamic_step()[1],
+        shots_blocked = game.get_shots_blocked_by_geometry(),
     );
     json
 }
@@ -6014,9 +4837,9 @@ fn visibility_json(game: &Game, char_box: &str) -> String {
 /// # Returns
 ///
 /// - `String` - 形如 `[[35.4,-4.0],[24.6,12.0]]` 的字面量。
-fn join_pickups(game: &Game) -> String {
+pub(crate) fn join_pickups(game: &Game) -> String {
     let mut out: Vec<String> = Vec::new();
-    for pickup in game.traffic.get_pickups_ref() {
+    for pickup in game.get_traffic().get_pickups_ref() {
         if pickup.get_taken() {
             continue;
         }
@@ -6035,7 +4858,7 @@ fn join_pickups(game: &Game) -> String {
 /// # Returns
 ///
 /// - `String` - 逗号分隔的数字串(不含方括号)。
-fn join_f64(values: &[f64]) -> String {
+pub(crate) fn join_f64(values: &[f64]) -> String {
     let parts: Vec<String> = values
         .iter()
         .map(|value: &f64| format!("{value}"))
@@ -6053,27 +4876,27 @@ fn join_f64(values: &[f64]) -> String {
 /// # Returns
 ///
 /// - `String` - 结果字符串。
-fn format_hud(game: &Game, triangles: u32) -> String {
+pub(crate) fn format_hud(game: &Game, triangles: u32) -> String {
     let backend: &str = game
         .renderer
         .as_ref()
         .map(|renderer: &Renderer| renderer.backend_name())
         .unwrap_or(BACKEND_NONE);
-    let position: Vec3 = game.player.get_position();
-    let health: String = format!("{:.0}", game.player.get_health().max(0.0));
-    let cash: String = format!("{}", game.player.get_cash());
-    let pickup_total: usize = game.traffic.get_pickups_ref().len();
-    let collected: usize = game.player.collected_count();
-    let driving: &str = match game.player.get_vehicle() {
+    let position: Vec3 = game.get_player().get_position();
+    let health: String = format!("{:.0}", game.get_player().get_health().max(0.0));
+    let cash: String = format!("{}", game.get_player().get_cash());
+    let pickup_total: usize = game.get_traffic().get_pickups_ref().len();
+    let collected: usize = game.get_player().collected_count();
+    let driving: &str = match game.get_player().get_vehicle() {
         Some(_) => HUD_DRIVING,
         None => HUD_ON_FOOT,
     };
-    let mode: &str = if game.third_person {
+    let mode: &str = if game.get_third_person() {
         HUD_THIRD_PERSON
     } else {
         HUD_FIRST_PERSON
     };
-    let notice: String = game.player.get_notice().to_string();
+    let notice: String = game.get_player().get_notice().to_string();
     let notice_part: String = if notice.is_empty() {
         String::new()
     } else {
@@ -6081,11 +4904,11 @@ fn format_hud(game: &Game, triangles: u32) -> String {
     };
     format!(
         "{HUD_TITLE} · {backend} · phase {} · {mode} · {driving} · HP {health} · ${cash} · pickups {collected}/{pickup_total} · xyz {:.1} {:.1} {:.1} · {triangles} tris · frame {}{notice_part}",
-        game.input.phase.label(),
+        game.get_input().get_phase().label(),
         position[0],
         position[1],
         position[2],
-        game.frame_count,
+        game.get_frame_count(),
     )
 }
 
@@ -6099,7 +4922,7 @@ fn format_hud(game: &Game, triangles: u32) -> String {
 ///
 /// - `&GameHandles` - 事件句柄。
 /// - `u32` - 本帧三角面数。
-fn sync_hud(handles: &GameHandles, triangles: u32) {
+pub(crate) fn sync_hud(handles: &GameHandles, triangles: u32) {
     // 先把本帧要显示的**全部**文本在 borrow 内取出来,再写 DOM。
     // `set_attribute` / `set_text_content` 是 web-sys 调用,会重入 JS;
     // `game` 的 `Ref` 一直活到函数尾,期间任何重入 borrow 都会 panic
@@ -6114,14 +4937,15 @@ fn sync_hud(handles: &GameHandles, triangles: u32) {
         String,
         &str,
     ) = {
-        let game: Ref<Game> = handles.game.borrow();
-        let health_pct: f64 = (f64::from(game.player.get_health()) / f64::from(PLAYER_MAX_HEALTH)
+        let game: Ref<Game> = handles.get_game().borrow();
+        let health_pct: f64 =
+            (f64::from(game.get_player().get_health()) / f64::from(PLAYER_MAX_HEALTH) * 100.0)
+                .clamp(0.0, 100.0);
+        let armor_pct: f64 = (f64::from(game.get_player().get_armor()) / f64::from(MAX_ARMOR)
             * 100.0)
             .clamp(0.0, 100.0);
-        let armor_pct: f64 =
-            (f64::from(game.player.get_armor()) / f64::from(MAX_ARMOR) * 100.0).clamp(0.0, 100.0);
-        let weapon: Weapon = game.arsenal.get_weapon();
-        let ammo_text: String = if game.arsenal.is_reloading() {
+        let weapon: Weapon = game.get_arsenal().get_weapon();
+        let ammo_text: String = if game.get_arsenal().is_reloading() {
             format!("{} · RELOADING", weapon.label())
         } else if weapon == Weapon::Bat {
             format!("{} · melee", weapon.label())
@@ -6129,29 +4953,29 @@ fn sync_hud(handles: &GameHandles, triangles: u32) {
             format!(
                 "{} · {}/{}",
                 weapon.label(),
-                game.arsenal.get_magazine(),
-                game.arsenal.get_reserve()
+                game.get_arsenal().get_magazine(),
+                game.get_arsenal().get_reserve()
             )
         };
-        let cash_text: String = format!("{CASH_SIGN}{}", game.player.get_cash());
-        let stars: u32 = game.wanted.get_stars();
+        let cash_text: String = format!("{CASH_SIGN}{}", game.get_player().get_cash());
+        let stars: u32 = game.get_wanted().get_stars();
         // 亮星用实心 ★,熄星用空心 ☆ —— 形状本身就带信息,不只靠颜色。
         let lit: String = HUD_STAR_ON.repeat(stars as usize);
         let dark: String = HUD_STAR_OFF.repeat((WANTED_MAX - stars) as usize);
         let wanted_text: String = format!("{lit}{dark}");
-        let mission_text: String = if game.mission.is_active() {
-            let target: Vec3 = game.mission.get_target();
-            let distance: f32 = flat_distance(target, game.player.get_position());
+        let mission_text: String = if game.get_mission().is_active() {
+            let target: Vec3 = game.get_mission().get_target();
+            let distance: f32 = flat_distance(target, game.get_player().get_position());
             format!(
                 "{}· {}\ngoal {:.0} m away",
-                game.mission.get_title(),
-                mission_stage_label(game.mission.get_stage()),
+                game.get_mission().get_title(),
+                mission_stage_label(game.get_mission().get_stage()),
                 distance
             )
         } else {
             String::from(MISSION_IDLE)
         };
-        let opacity: &str = if game.hitmarker > 0.0 {
+        let opacity: &str = if game.get_hitmarker() > 0.0 {
             HUD_OPACITY_ON
         } else {
             HUD_OPACITY_OFF
@@ -6167,36 +4991,36 @@ fn sync_hud(handles: &GameHandles, triangles: u32) {
         )
     };
     // ---- 血条 / 护甲条 ----
-    if let Some(bar) = &handles.health_bar {
+    if let Some(bar) = &handles.get_health_bar() {
         let _: Result<(), euv::wasm_bindgen::JsValue> = bar.set_attribute(
             ATTR_STYLE,
             &format!("width:{health_pct:.1}%;background:{COLOR_HEALTH}"),
         );
     }
-    if let Some(bar) = &handles.armor_bar {
+    if let Some(bar) = &handles.get_armor_bar() {
         let _: Result<(), euv::wasm_bindgen::JsValue> = bar.set_attribute(
             ATTR_STYLE,
             &format!("width:{armor_pct:.1}%;background:{COLOR_ARMOR}"),
         );
     }
     // ---- 弹药 ----
-    if let Some(element) = &handles.ammo {
+    if let Some(element) = &handles.get_ammo() {
         element.set_text_content(Some(&ammo_text));
     }
     // ---- 现金 ----
-    if let Some(element) = &handles.cash {
+    if let Some(element) = &handles.get_cash() {
         element.set_text_content(Some(&cash_text));
     }
     // ---- 通缉星 ----
-    if let Some(element) = &handles.wanted {
+    if let Some(element) = &handles.get_wanted() {
         element.set_text_content(Some(&wanted_text));
     }
     // ---- 任务 ----
-    if let Some(element) = &handles.mission {
+    if let Some(element) = &handles.get_mission() {
         element.set_text_content(Some(&mission_text));
     }
     // ---- 命中标记 ----
-    if let Some(element) = &handles.hitmarker {
+    if let Some(element) = &handles.get_hitmarker() {
         let _: Result<(), euv::wasm_bindgen::JsValue> = element.set_attribute(ATTR_STYLE, opacity);
     }
     // ---- 小地图 ----
@@ -6213,7 +5037,7 @@ fn sync_hud(handles: &GameHandles, triangles: u32) {
 /// # Returns
 ///
 /// - `&'static str` - 展示文本。
-fn mission_stage_label(stage: u32) -> &'static str {
+pub(crate) fn mission_stage_label(stage: u32) -> &'static str {
     match stage {
         MISSION_GOTO => MISSION_LABEL_GOTO,
         MISSION_DRIVE => MISSION_LABEL_DRIVE,
@@ -6230,8 +5054,8 @@ fn mission_stage_label(stage: u32) -> &'static str {
 /// # Arguments
 ///
 /// - `&GameHandles` - 事件句柄。
-fn draw_minimap(handles: &GameHandles) {
-    let Some(canvas) = &handles.minimap else {
+pub(crate) fn draw_minimap(handles: &GameHandles) {
+    let Some(canvas) = &handles.get_minimap() else {
         return;
     };
     let Some(context) = canvas.get_context("2d").ok().flatten() else {
@@ -6246,8 +5070,8 @@ fn draw_minimap(handles: &GameHandles) {
     context.clear_rect(0.0, 0.0, size, size);
     context.set_fill_style_str(COLOR_MINIMAP_BG);
     context.fill_rect(0.0, 0.0, size, size);
-    let game: Ref<Game> = handles.game.borrow();
-    let here: Vec3 = game.player.get_position();
+    let game: Ref<Game> = handles.get_game().borrow();
+    let here: Vec3 = game.get_player().get_position();
     let center: Vec2 = [here[0], here[2]];
     // 世界 → 地图像素:以玩家为中心,固定比例(不随速度缩放)。
     let scale: f64 = size / (2.0 * f64::from(MINIMAP_RANGE));
@@ -6275,8 +5099,8 @@ fn draw_minimap(handles: &GameHandles) {
         );
     }
     // 任务目标。
-    if game.mission.is_active() {
-        let target: Vec3 = game.mission.get_target();
+    if game.get_mission().is_active() {
+        let target: Vec3 = game.get_mission().get_target();
         let dx: f64 = f64::from(target[0] - here[0]) * scale;
         let dz: f64 = f64::from(target[2] - here[2]) * scale;
         context.set_fill_style_str(COLOR_MINIMAP_OBJECTIVE);
@@ -6284,7 +5108,7 @@ fn draw_minimap(handles: &GameHandles) {
     }
     // 敌人。
     context.set_fill_style_str(COLOR_MINIMAP_ENEMY);
-    for enemy in &game.enemies {
+    for enemy in game.get_enemies() {
         if !enemy.is_alive() {
             continue;
         }
@@ -6295,7 +5119,7 @@ fn draw_minimap(handles: &GameHandles) {
     }
     // 玩家:一个朝向三角。
     context.set_fill_style_str(COLOR_MINIMAP_PLAYER);
-    let yaw: f32 = game.player.get_yaw();
+    let yaw: f32 = game.get_player().get_yaw();
     let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
     let points: [f64; 6] = [
         cos_yaw as f64 * 7.0,
@@ -6323,13 +5147,13 @@ fn draw_minimap(handles: &GameHandles) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `&'static str` - 拾取物的资产 id。
-fn apply_combat_pickup(game: &mut Game, asset: &'static str) {
+pub(crate) fn apply_combat_pickup(game: &mut Game, asset: &'static str) {
     if asset == PICKUP_ARMOR_VEST {
-        game.player.add_armor(ARMOR_PICKUP_GAIN);
-        game.player.set_notice(String::from(NOTICE_ARMOR));
+        game.get_mut_player().add_armor(ARMOR_PICKUP_GAIN);
+        game.get_mut_player().set_notice(String::from(NOTICE_ARMOR));
     } else if asset == PICKUP_AMMO_BOX {
-        game.arsenal.add_ammo(AMMO_PICKUP_GAIN);
-        game.player.set_notice(String::from(NOTICE_AMMO));
+        game.get_mut_arsenal().add_ammo(AMMO_PICKUP_GAIN);
+        game.get_mut_player().set_notice(String::from(NOTICE_AMMO));
     } else if let Some(weapon) = Weapon::from_asset(asset) {
         // **第 10 条的根因。** 地上摆着 `wep_pistol` / `wep_smg` /
         // `wep_bat` / `wep_grenade`(见 `PICKUP_PLACEMENTS`),但这个函数
@@ -6343,16 +5167,17 @@ fn apply_combat_pickup(game: &mut Game, asset: &'static str) {
         //    路径本来就有现成实现,拾取流程只是忘了接);
         // 3. 切枪后给满弹匣,否则新枪是空的,照样「无法射击」。
         if weapon == Weapon::Grenade {
-            if game.arsenal.add_grenade() {
-                game.arsenal.set_weapon(Weapon::Grenade);
+            if game.get_mut_arsenal().add_grenade() {
+                game.get_mut_arsenal().set_weapon(Weapon::Grenade);
             }
         } else {
-            game.arsenal.set_weapon(weapon);
+            game.get_mut_arsenal().set_weapon(weapon);
         }
         rebind_weapon_batch(game);
-        game.arsenal
-            .finish_reload(game.arsenal.get_weapon().magazine());
-        game.player.set_notice(String::from(NOTICE_WEAPON));
+        let magazine: u32 = game.get_arsenal().get_weapon().magazine();
+        game.get_mut_arsenal().finish_reload(magazine);
+        game.get_mut_player()
+            .set_notice(String::from(NOTICE_WEAPON));
     }
 }
 
@@ -6361,18 +5186,19 @@ fn apply_combat_pickup(game: &mut Game, asset: &'static str) {
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn rebind_weapon_batch(game: &mut Game) {
-    let asset: &'static str = game.arsenal.get_weapon().asset();
-    game.weapon_mesh = match game.index_map.get(asset) {
+pub(crate) fn rebind_weapon_batch(game: &mut Game) {
+    let asset: &'static str = game.get_arsenal().get_weapon().asset();
+    game.set_weapon_mesh(match game.get_index_map().get(asset) {
         Some(mesh_index) => *mesh_index,
         None => usize::MAX,
-    };
-    let mesh: usize = game.weapon_mesh;
+    });
+    let mesh: usize = game.get_weapon_mesh();
     if mesh == usize::MAX {
-        game.weapon_batch = usize::MAX;
+        game.set_weapon_batch(usize::MAX);
         return;
     }
-    game.weapon_batch = find_or_create_batch(&mut game.scene, mesh);
+    let batch: usize = find_or_create_batch(game.get_mut_scene(), mesh);
+    game.set_weapon_batch(batch);
 }
 
 /// 阵营的数值编码(给探针用)。
@@ -6384,7 +5210,7 @@ fn rebind_weapon_batch(game: &mut Game) {
 /// # Returns
 ///
 /// - `u8` - 警察为 0,混混为 1。
-fn faction_code(faction: Faction) -> u8 {
+pub(crate) fn faction_code(faction: Faction) -> u8 {
     match faction {
         Faction::Police => 0,
         Faction::Thug => 1,
@@ -6404,7 +5230,7 @@ fn faction_code(faction: Faction) -> u8 {
 /// # Returns
 ///
 /// - `Vec<f32>` - 横向与纵向合并后的轴线位置(米)。
-fn map_street_lines(center: Vec2) -> Vec<f32> {
+pub(crate) fn map_street_lines(center: Vec2) -> Vec<f32> {
     street_indices_in(center[0] - MINIMAP_RANGE, center[0] + MINIMAP_RANGE)
         .iter()
         .map(|index: &i32| street_axis(*index))
@@ -6431,7 +5257,7 @@ fn map_street_lines(center: Vec2) -> Vec<f32> {
 /// # Returns
 ///
 /// - `Option<Element>` - 挂在 body 上的 HUD 根节点;创建失败时为 `None`。
-fn build_hud_dom(document: &Document) -> Option<Element> {
+pub(crate) fn build_hud_dom(document: &Document) -> Option<Element> {
     let Some(body) = document.body() else {
         return None;
     };
@@ -6525,7 +5351,12 @@ fn build_hud_dom(document: &Document) -> Option<Element> {
 /// # Returns
 ///
 /// - `Option<Element>` - 新的节点;创建失败时为 `None`。
-fn make_element(document: &Document, tag: &str, id: &str, style: &str) -> Option<Element> {
+pub(crate) fn make_element(
+    document: &Document,
+    tag: &str,
+    id: &str,
+    style: &str,
+) -> Option<Element> {
     let element: Element = document.create_element(tag).ok()?;
     let _: Result<(), euv::wasm_bindgen::JsValue> = element.set_attribute(ATTR_ID, id);
     let _: Result<(), euv::wasm_bindgen::JsValue> = element.set_attribute(ATTR_STYLE, style);
@@ -6538,7 +5369,7 @@ fn make_element(document: &Document, tag: &str, id: &str, style: &str) -> Option
 ///
 /// - `f32` - 输入值。
 /// - `&str` - str 的只读引用。
-fn set_progress(percent: f32, text: &str) {
+pub(crate) fn set_progress(percent: f32, text: &str) {
     let Some(document) = window().and_then(|window: Window| window.document()) else {
         return;
     };
@@ -6552,7 +5383,7 @@ fn set_progress(percent: f32, text: &str) {
 }
 
 /// 隐藏加载遮罩。
-fn hide_loading() {
+pub(crate) fn hide_loading() {
     let Some(document) = window().and_then(|window: Window| window.document()) else {
         return;
     };
@@ -6567,7 +5398,7 @@ fn hide_loading() {
 /// # Arguments
 ///
 /// - `&str` - str 的只读引用。
-fn show_loading_error(message: &str) {
+pub(crate) fn show_loading_error(message: &str) {
     let Some(document) = window().and_then(|window: Window| window.document()) else {
         return;
     };
@@ -6583,7 +5414,6 @@ fn show_loading_error(message: &str) {
 // ===========================================================================
 // 游戏循环
 // ===========================================================================
-
 /// 把键盘输入翻译成「角色移动 / 车队行驶 / 相机跟随」。
 ///
 /// 这是第三人称控制的核心:默认模式下 WASD 驱动**玩家角色**(不是相机),
@@ -6594,12 +5424,12 @@ fn show_loading_error(message: &str) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧的秒数增量。
-fn simulate(game: &mut Game, delta: f32) {
-    let forward_input: f32 = axis(&game.input, KEYW, KEYS);
-    let strafe_input: f32 = axis(&game.input, KEYD, KEYA);
+pub(crate) fn simulate(game: &mut Game, delta: f32) {
+    let forward_input: f32 = axis(&game.get_input(), KEYW, KEYS);
+    let strafe_input: f32 = axis(&game.get_input(), KEYD, KEYA);
     // 验收通道的「朝世界方向走」优先于键盘:它绕过相机朝向,让脚本不用
     // 先转相机就能沿直线推进。零向量表示不干预。
-    let world_walk: Vec2 = game.walk_request;
+    let world_walk: Vec2 = game.get_walk_request();
     // 驾驶时 A/D 与左右方向键**共同**当方向盘:横向输入就是舵角,不再被
     // `set_position([lane_x, ...])` 吃掉。
     //
@@ -6607,13 +5437,14 @@ fn simulate(game: &mut Game, delta: f32) {
     // 直接接同一个 `steer_axis`,因此左 = 负、右 = 正。**只有驾驶时**才
     // 调它:步行分支的 `intent` 只由 WASD 组成,所以方向键既不会开车,
     // 也不会变成第四个移动键 —— GTA V 的移动只认 WASD。
-    let steer_input: f32 = game.input.steer_axis();
-    let running: bool = game.input.held(KEY_SHIFT_LEFT) || game.input.held(KEY_SHIFT_RIGHT);
+    let steer_input: f32 = game.get_input().steer_axis();
+    let running: bool =
+        game.get_input().get_held(KEY_SHIFT_LEFT) || game.get_input().get_held(KEY_SHIFT_RIGHT);
     let dt: f32 = delta.min(FIXED_DT * 4.0);
 
     // 相机水平朝向:WASD 的「前」永远跟着相机走,所以拖鼠标转相机就能
     // 转移动方向(第三人称射击的标准操作)。
-    let camera_yaw: f32 = game.camera.get_yaw();
+    let camera_yaw: f32 = game.get_camera().get_yaw();
     let forward: Vec2 = if world_walk != [0.0, 0.0] {
         world_walk
     } else {
@@ -6627,33 +5458,36 @@ fn simulate(game: &mut Game, delta: f32) {
     };
 
     // 车队先走:玩家开的那辆由 `drive` 接管,其余按巡航速度循环。
-    let driven: Option<usize> = game.player.get_vehicle();
+    let driven: Option<usize> = game.get_player().get_vehicle();
     match driven {
         Some(index) => {
-            if let Some(car) = game.traffic.get_car_mut(index) {
-                car.drive(forward_input, steer_input, dt, &game.world);
+            let world: CollisionWorld = game.get_world_ref().clone();
+            if let Some(car) = game.get_mut_traffic().get_car_mut(index) {
+                car.drive(forward_input, steer_input, dt, &world);
             }
         }
         None => {
             // 玩家在路边「招手」:附近的车会减速停靠,不然 8–14 m/s 的车
             // 徒步根本追不上,上车功能等于不存在。
-            let here: Vec3 = game.player.get_position();
-            game.traffic.step(dt, Some([here[0], here[2]]), &game.world);
+            let here: Vec3 = game.get_player().get_position();
+            let world: CollisionWorld = game.get_world_ref().clone();
+            game.get_mut_traffic()
+                .step(dt, Some([here[0], here[2]]), &world);
         }
     }
 
     // 玩家。
-    match game.player.get_vehicle() {
+    match game.get_player().get_vehicle() {
         Some(index) => {
             // 在车里:位置 / 朝向跟着车走,角色隐藏(姿态由车接管)。
-            if let Some(car) = game.traffic.get_car_mut(index) {
+            if let Some(car) = game.get_mut_traffic().get_car_mut(index) {
                 let position: Vec3 = car.get_position();
                 let yaw: f32 = car.get_yaw();
-                game.player.set_position(position);
-                game.player.set_yaw(yaw);
-                game.player.set_velocity([0.0, 0.0]);
-                game.player.set_gait_amount(0.0);
-                game.player.set_gait_phase(0.0);
+                game.get_mut_player().set_position(position);
+                game.get_mut_player().set_yaw(yaw);
+                game.get_mut_player().set_velocity([0.0, 0.0]);
+                game.get_mut_player().set_gait_amount(0.0);
+                game.get_mut_player().set_gait_phase(0.0);
             }
         }
         None => {
@@ -6662,17 +5496,19 @@ fn simulate(game: &mut Game, delta: f32) {
             // 预旋转会导致两次旋转,按下 W 时角色会朝侧面走。
             let intent: Vec2 = [strafe_input, forward_input];
             let wanted: f32 = if running { RUN_SPEED } else { WALK_SPEED };
-            let feet: Vec3 = game.player.get_position();
+            let feet: Vec3 = game.get_player().get_position();
             // 记下静态层动手**之前**的位置:`step_vertical` 要靠它算出
             // 这一帧的位移,才能把切向分量沿隔墙滑过去。
-            game.previous_step_xz = [feet[0], feet[2]];
+            game.set_previous_step_xz([feet[0], feet[2]]);
             let speed: f32 = wanted;
-            game.player.step(intent, forward, dt, speed, &game.world);
+            let world: CollisionWorld = game.get_world_ref().clone();
+            game.get_mut_player()
+                .step(intent, forward, dt, speed, &world);
             // 静态层(`resolve_slide`)刚定下的位置:验收探针拿它和
             // `after_dynamic_step` 对比,就知道是人被动态层按回去了,
             // 还是静态层自己就没让他走。
-            let after_static: Vec3 = game.player.get_position();
-            game.after_static_step = [after_static[0], after_static[2]];
+            let after_static: Vec3 = game.get_player().get_position();
+            game.set_after_static_step([after_static[0], after_static[2]]);
             // 垂直方向紧接着水平分离之后算:`Player::step` 刚刚定下
             // 了「这一帧人走到了哪」,现在才知道脚下是哪块板。
             step_vertical(game, dt);
@@ -6681,19 +5517,19 @@ fn simulate(game: &mut Game, delta: f32) {
             // XZ** —— 而它跑在静态层之后、动态层之前,是「有速度、无位移」
             // 的第三个嫌疑人,前两个探针都看不到它。`nearShapes` 查的是
             // 静态碰撞世界,查不到隔墙。
-            let after_vertical: Vec3 = game.player.get_position();
-            game.after_vertical_step = [after_vertical[0], after_vertical[2]];
+            let after_vertical: Vec3 = game.get_player().get_position();
+            game.set_after_vertical_step([after_vertical[0], after_vertical[2]]);
         }
     }
 
-    if game.safe_mode {
+    if game.get_safe_mode() {
         // 只回血不够:掉到 0 的那一帧 `step_combat` 已经进了 `step_death`,
         // 之后血量拉满也救不回来 —— `hurt` 还在重生倒计时里,下一次
         // `step_death` 照样把玩家扔到最近的医院点。实测每段走位结束
         // 都被弹到 (33.5, 32.9) 附近,两次不同起点弹到几乎同一点,正是
         // 医院点而不是碰撞解算的结果。
-        game.hurt.revive();
-        game.player.set_health(PLAYER_MAX_HEALTH);
+        game.get_hurt().revive();
+        game.get_mut_player().set_health(PLAYER_MAX_HEALTH);
     }
     collect_pickups(game);
     step_combat(game, dt);
@@ -6701,16 +5537,16 @@ fn simulate(game: &mut Game, delta: f32) {
     // 否则车穿车、人穿人、敌人站进人身体里。
     resolve_dynamic_bodies(game);
     {
-        let after_dynamic: Vec3 = game.player.get_position();
-        game.after_dynamic_step = [after_dynamic[0], after_dynamic[2]];
+        let after_dynamic: Vec3 = game.get_player().get_position();
+        game.set_after_dynamic_step([after_dynamic[0], after_dynamic[2]]);
     }
     step_streamed_surface(game);
     update_camera(game, delta);
     // 注入的开火只持续一帧,到期后放开。
-    if game.hold_frames > 0 {
-        game.hold_frames -= 1;
-        if game.hold_frames == 0 {
-            game.input.fire_held = false;
+    if game.get_hold_frames() > 0 {
+        game.set_hold_frames(1);
+        if game.get_hold_frames() == 0 {
+            game.get_mut_input().set_fire_held(false);
         }
     }
 }
@@ -6724,10 +5560,10 @@ fn simulate(game: &mut Game, delta: f32) {
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn step_streamed_surface(game: &mut Game) {
-    let here: Vec3 = game.player.get_position();
+pub(crate) fn step_streamed_surface(game: &mut Game) {
+    let here: Vec3 = game.get_player().get_position();
     let player: Vec2 = [here[0], here[2]];
-    let center: Vec2 = game.streamed_center;
+    let center: Vec2 = game.get_streamed_center();
     if !stream_needs_rebuild(player, center) {
         return;
     }
@@ -6735,12 +5571,14 @@ fn step_streamed_surface(game: &mut Game) {
     // 一格就看到地面整体跳一格。
     let next_x: f32 = street_axis((player[0] / STREET_PITCH).round() as i32);
     let next_z: f32 = street_axis((player[1] / STREET_PITCH).round() as i32);
-    let index_map: HashMap<String, usize> = game.asset_index.clone();
-    let static_count: usize = game.static_batch_count;
+    let index_map: HashMap<String, usize> = game.get_asset_index().clone();
+    let static_count: usize = game.get_static_batch_count();
+    let ground_batch: usize = game.get_ground_batch();
+    let water_batch: usize = game.get_water_batch();
     let (rewritten, new_static_count): (Vec<usize>, usize) = rebuild_streamed_surface(
-        &mut game.scene,
-        game.ground_batch,
-        game.water_batch,
+        game.get_mut_scene(),
+        ground_batch,
+        water_batch,
         next_x,
         next_z,
         &index_map,
@@ -6748,7 +5586,7 @@ fn step_streamed_surface(game: &mut Game) {
     );
     // 静态段长度随生成中心变化,不写回的话下一次重建会按旧长度切,把动态段
     // 的头几个批次误当成静态段丢掉 —— 同一个 bug 换个偏移再犯一次。
-    game.static_batch_count = new_static_count;
+    game.set_static_batch_count(new_static_count);
     // 街道流式换块时,NPC 也得跟着换一批。流式重建原本只换地面 / 水面,
     // `populate_combatants` 一辈子只在初始化跑一次 —— 于是 NPC 永远留在
     // 出生点半径 28 m 内:开车走到 z = 651(实测最近行人 563 m)整条街空无一人,
@@ -6757,10 +5595,11 @@ fn step_streamed_surface(game: &mut Game) {
     repopulate_streamed_combatants(game, next_x, next_z);
     // 地面 / 水面的顶点数据换了,GPU 缓冲必须跟着换 —— 否则玩家走出街区
     // 边界后看到的还是出生点那块地,而 CPU 侧探针报告的却是新数据。
-    if let Some(renderer) = game.renderer.as_mut() {
-        reupload_streamed_meshes(renderer, &game.scene, &rewritten);
+    if let Some(mut renderer) = game.get_mut_renderer().take() {
+        reupload_streamed_meshes(&mut renderer, game.get_scene(), &rewritten);
+        game.get_mut_renderer().replace(renderer);
     }
-    game.streamed_center = [next_x, next_z];
+    game.set_streamed_center([next_x, next_z]);
 }
 
 /// 流式换块时把 NPC 搬到玩家周围的新街区。
@@ -6776,18 +5615,18 @@ fn step_streamed_surface(game: &mut Game) {
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 新街区中心的 X(米)。
 /// - `f32` - 新街区中心的 Z(米)。
-fn repopulate_streamed_combatants(game: &mut Game, next_x: f32, next_z: f32) {
+pub(crate) fn repopulate_streamed_combatants(game: &mut Game, next_x: f32, next_z: f32) {
     let here: Vec3 = [next_x, 0.0, next_z];
     let phase: f32 = next_x * NPC_PHASE_SCALE + next_z * NPC_PHASE_SCALE;
     let mut peds: Vec<Pedestrian> = Vec::new();
     let mut enemies: Vec<Enemy> = Vec::new();
     repopulate_combatants_at(&mut peds, &mut enemies, here, phase);
-    game.peds = peds;
+    game.set_peds(peds);
     // 敌人无条件一起换:警察只是顺带被丢掉,`deploy_police` 每帧会按通缉星数
     // 重新增派到玩家周围,混混则由这里补齐。之前这里挂着
     // `if stars == 0` 的条件,于是只要玩家身上有星(打了一场就摘不掉),
     // 混混就永远留在出生点 —— 实测开到 600 m 外最近敌人 565.8 m。
-    game.enemies = enemies;
+    game.set_enemies(enemies);
 }
 
 /// [`Self::repopulate_streamed_combatants`] 真正的换批动作。
@@ -6801,7 +5640,7 @@ fn repopulate_streamed_combatants(game: &mut Game, next_x: f32, next_z: f32) {
 /// - `&mut Vec<Enemy>` - 敌人表,整体替换(警察由 `deploy_police` 重派)。
 /// - `Vec3` - 新街区中心。
 /// - `f32` - 伪随机相位。
-fn repopulate_combatants_at(
+pub(crate) fn repopulate_combatants_at(
     peds: &mut Vec<Pedestrian>,
     enemies: &mut Vec<Enemy>,
     at: Vec3,
@@ -6827,11 +5666,11 @@ fn repopulate_combatants_at(
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧秒数(已在 [`simulate`] 里钳位)。
-fn step_vertical(game: &mut Game, dt: f32) {
-    let here: Vec3 = game.player.get_position();
-    let radius: f32 = game.world.get_player_radius();
+pub(crate) fn step_vertical(game: &mut Game, dt: f32) {
+    let here: Vec3 = game.get_player().get_position();
+    let radius: f32 = game.get_world().get_player_radius();
     let body_min: f32 = here[1];
-    let body_max: f32 = here[1] + game.player.get_height();
+    let body_max: f32 = here[1] + game.get_player().get_height();
 
     // ---- 1. 室内水平分离:门垛 / 隔墙 / 外墙只对「身体够得着」的生效。
     // 站在街上时身体区间 y = 0..1.75 与楼板相交,但 `resolve_interior`
@@ -6869,11 +5708,11 @@ fn step_vertical(game: &mut Game, dt: f32) {
     // **静态层落点不能直接拿来当起点,也不能拿来当结果。** 拿它当结果就是
     // 缺陷本身(那正是「穿墙」);拿它当起点就是上面这个「弹到另一侧」。
     let travel: Vec2 = [
-        here[0] - game.previous_step_xz[0],
-        here[2] - game.previous_step_xz[1],
+        here[0] - game.get_previous_step_xz()[0],
+        here[2] - game.get_previous_step_xz()[1],
     ];
-    let pushed: Vec2 = game.interiors.resolve_interior_slide(
-        game.previous_step_xz,
+    let pushed: Vec2 = game.get_interiors().resolve_interior_slide(
+        game.get_previous_step_xz(),
         travel,
         body_min,
         body_max,
@@ -6896,9 +5735,13 @@ fn step_vertical(game: &mut Game, dt: f32) {
     //
     // `support_along_frame` 负责切分与逐级抬升;60 fps 的一帧只有一个
     // 小步,行为与修复前完全一致。
-    let from: Vec2 = [game.previous_step_xz[0], game.previous_step_xz[1]];
+    let from: Vec2 = [
+        game.get_previous_step_xz()[0],
+        game.get_previous_step_xz()[1],
+    ];
     let (found, stepped): (Option<f32>, f32) =
-        game.interiors.support_along_frame(from, [x, z], here[1]);
+        game.get_interiors()
+            .support_along_frame(from, [x, z], here[1]);
     let support: f32 = found.unwrap_or(GROUND_LEVEL);
     let on_slab: bool = found.is_some();
     // 逐级抬升后的脚底高度(没有支撑时保持原值,交给下面的自由落体)。
@@ -6914,56 +5757,56 @@ fn step_vertical(game: &mut Game, dt: f32) {
     //
     // 所以这里必须**先**问 grounded、再决定走哪条积分路径:起跳成功就
     // 直接进入「上升」分支,绝不回头让贴面判定把速度清掉。
-    let jumped: bool = if game.jump_queued {
-        let was_grounded: bool = game.player.get_grounded();
+    let jumped: bool = if game.get_jump_queued() {
+        let was_grounded: bool = game.get_player().get_grounded();
         // 起跳失败(滞空时按键)时把标志吃掉,否则它会一直挂到落地为止。
-        game.jump_queued = false;
-        game.player.set_jump_requested(was_grounded)
+        game.set_jump_queued(false);
+        game.get_mut_player().set_jump_requested(was_grounded)
     } else {
         false
     };
     if jumped {
         // 上升段:先扣重力,再位移。与下面的自由落体**同一条公式**,
         // 只是初速度来自 `jump()` 而不是 0。
-        let rising: f32 = game.player.get_vertical_velocity() - GRAVITY * dt;
+        let rising: f32 = game.get_player().get_vertical_velocity() - GRAVITY * dt;
         let rising: f32 = rising.max(-TERMINAL_VELOCITY);
         let next: f32 = y + rising * dt;
         if rising <= 0.0 && next <= support + GROUND_SNAP_SKIN {
             // 矮跳:一步之内就落回支撑面(理论上不会,初速 7.4 m/s 远大于
             // 一个 16.7 ms 步长能吞掉的高度),留着以防常量被调小。
             y = support;
-            game.player.set_vertical_velocity(0.0);
-            game.player.set_grounded(true);
+            game.get_mut_player().set_vertical_velocity(0.0);
+            game.get_mut_player().set_grounded(true);
         } else {
             y = next;
-            game.player.set_vertical_velocity(rising);
-            game.player.set_grounded(false);
+            game.get_mut_player().set_vertical_velocity(rising);
+            game.get_mut_player().set_grounded(false);
         }
     } else if on_slab && support - y <= STEP_UP_TOLERANCE {
         // 踩住了(含上一级台阶):贴面,垂直速度清零。
         y = support;
-        game.player.set_vertical_velocity(0.0);
-        game.player.set_grounded(true);
+        game.get_mut_player().set_vertical_velocity(0.0);
+        game.get_mut_player().set_grounded(true);
     } else {
         // 离开了支撑面:自由落体,落到板面或地面上。
         if y <= GROUND_LEVEL {
             // 已经在地面上,不用算重力。
             y = GROUND_LEVEL;
-            game.player.set_vertical_velocity(0.0);
-            game.player.set_grounded(true);
+            game.get_mut_player().set_vertical_velocity(0.0);
+            game.get_mut_player().set_grounded(true);
         } else {
-            let falling: f32 = game.player.get_vertical_velocity() - GRAVITY * dt;
+            let falling: f32 = game.get_player().get_vertical_velocity() - GRAVITY * dt;
             let falling: f32 = falling.max(-TERMINAL_VELOCITY);
             let next: f32 = y + falling * dt;
             if falling <= 0.0 && next <= support + GROUND_SNAP_SKIN {
                 // 穿过板面:吸附上去,不再积累速度。
                 y = support;
-                game.player.set_vertical_velocity(0.0);
-                game.player.set_grounded(true);
+                game.get_mut_player().set_vertical_velocity(0.0);
+                game.get_mut_player().set_grounded(true);
             } else {
                 y = next;
-                game.player.set_vertical_velocity(falling);
-                game.player.set_grounded(false);
+                game.get_mut_player().set_vertical_velocity(falling);
+                game.get_mut_player().set_grounded(false);
             }
         }
     }
@@ -6972,11 +5815,11 @@ fn step_vertical(game: &mut Game, dt: f32) {
     let floor: f32 = if on_slab { support } else { GROUND_LEVEL };
     if y < floor {
         y = (y + ANTI_TUNNEL_LIFT_SPEED * dt).min(floor);
-        game.player.set_vertical_velocity(0.0);
-        game.player.set_grounded(true);
+        game.get_mut_player().set_vertical_velocity(0.0);
+        game.get_mut_player().set_grounded(true);
     }
 
-    game.player.set_position([x, y, z]);
+    game.get_mut_player().set_position([x, y, z]);
 }
 
 /// 战斗 / 通缉 / 行人 / 任务的一帧推进。
@@ -6989,29 +5832,33 @@ fn step_vertical(game: &mut Game, dt: f32) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧秒数(已在 [`simulate`] 里钳位)。
-fn step_combat(game: &mut Game, dt: f32) {
-    if game.hurt.is_wasted() {
+pub(crate) fn step_combat(game: &mut Game, dt: f32) {
+    if game.get_hurt().is_wasted() {
         step_death(game, dt);
         return;
     }
-    game.arsenal.tick(dt);
+    game.get_mut_arsenal().tick(dt);
     // 手雷要在 `fire_weapon` **之前**推进:爆炸会在本帧结算伤害,
     // 放后面的话这一帧的命中反馈会晚一帧才出现。
     step_live_grenades(game, dt);
-    regen_armor(&mut game.player, &mut game.hurt, dt);
+    {
+        let mut hurt: HurtState = game.get_mut_hurt().clone();
+        regen_armor(game.get_mut_player(), &mut hurt, dt);
+        game.set_hurt(hurt);
+    }
     update_aim(game);
     fire_weapon(game);
     step_enemies(game, dt);
     step_peds(game, dt);
     // 社交是群体行为,必须在所有行人各自步进完之后统一算一次。
-    update_ped_social(&mut game.peds, dt);
+    update_ped_social(&mut game.get_mut_peds(), dt);
     update_wanted(game, dt);
     update_mission(game, dt);
-    if game.hitmarker > 0.0 {
-        game.hitmarker = (game.hitmarker - dt).max(0.0);
+    if game.get_hitmarker() > 0.0 {
+        game.set_hitmarker((game.get_hitmarker() - dt).max(0.0));
     }
-    if game.wanted_flash > 0.0 {
-        game.wanted_flash = (game.wanted_flash - dt).max(0.0);
+    if game.get_wanted_flash() > 0.0 {
+        game.set_wanted_flash((game.get_wanted_flash() - dt).max(0.0));
     }
 }
 
@@ -7028,29 +5875,29 @@ fn step_combat(game: &mut Game, dt: f32) {
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn update_aim(game: &mut Game) {
-    let yaw: f32 = game.camera.get_yaw();
+pub(crate) fn update_aim(game: &mut Game) {
+    let yaw: f32 = game.get_camera().get_yaw();
     let forward: Vec2 = [yaw.cos(), -yaw.sin()];
     // 开车时不瞄准(和 GTA 一致)。
-    if game.player.get_driving() {
-        game.arsenal.set_aim(forward);
+    if game.get_player().get_driving() {
+        game.get_mut_arsenal().set_aim(forward);
         return;
     }
-    let size: (u32, u32) = game.canvas_size.get();
+    let size: (u32, u32) = game.get_canvas_size().get();
     let (canvas_w, canvas_h): (f32, f32) = (size.0 as f32, size.1 as f32);
     if canvas_w <= 0.0 || canvas_h <= 0.0 {
-        game.arsenal.set_aim(forward);
+        game.get_mut_arsenal().set_aim(forward);
         return;
     }
-    let eye: Vec3 = game.camera.eye();
+    let eye: Vec3 = game.get_camera().eye();
     let aspect: f32 = canvas_w / canvas_h;
-    let fov_y: f32 = game.camera.get_fov_y();
+    let fov_y: f32 = game.get_camera().get_fov_y();
     // 该深度上的半高 / 半宽(米)。
     let half_h: f32 = (fov_y * 0.5).tan() * AIM_DEPTH;
     let half_w: f32 = half_h * aspect;
     let right: Vec2 = [forward[1], -forward[0]];
     // 鼠标归一化到 -1..1;y 向上。
-    let pointer: [f64; 2] = game.input.aim_point;
+    let pointer: [f64; 2] = game.get_input().get_aim_point();
     let ndc_x: f32 = ((pointer[0] / canvas_w as f64) * 2.0 - 1.0) as f32;
     let ndc_y: f32 = (1.0 - (pointer[1] / canvas_h as f64) * 2.0) as f32;
     // 目标点:该深度平面上按 NDC 插值出来的一个点。
@@ -7060,7 +5907,7 @@ fn update_aim(game: &mut Game) {
         eye[2] + forward[1] * AIM_DEPTH + right[1] * ndc_x * half_w,
     ];
     // 射线的起点是角色的胸口,不是相机 —— 子弹从手上出去。
-    let here: Vec3 = game.player.get_position();
+    let here: Vec3 = game.get_player().get_position();
     let muzzle: Vec3 = [here[0], here[1] + AIM_CHEST_HEIGHT, here[2]];
     let direction: Vec3 = [
         target[0] - muzzle[0],
@@ -7069,14 +5916,14 @@ fn update_aim(game: &mut Game) {
     ];
     // 俯仰:向上打时把 XZ 分量放大,等价于「抬高枪口」。
     let flat: f32 = (direction[0] * direction[0] + direction[2] * direction[2]).sqrt();
-    game.arsenal.set_aim([direction[0], direction[2]]);
+    game.get_mut_arsenal().set_aim([direction[0], direction[2]]);
     // 俯仰单独存:近战判定与射线终点都要用。
     let pitch: f32 = if flat > f32::EPSILON {
         direction[1].atan2(flat)
     } else {
         0.0
     };
-    game.aim_pitch = pitch.clamp(-AIM_PITCH_LIMIT, AIM_PITCH_LIMIT);
+    game.set_aim_pitch(pitch.clamp(-AIM_PITCH_LIMIT, AIM_PITCH_LIMIT));
 }
 
 /// 开火:hitscan 射线 + 距离衰减,命中敌人给反馈并加通缉热度。
@@ -7088,34 +5935,34 @@ fn update_aim(game: &mut Game) {
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn fire_weapon(game: &mut Game) {
-    let wants: bool = game.input.fire_held;
-    if !wants || !game.arsenal.can_fire() {
-        if wants && game.arsenal.get_magazine() == 0 && !game.arsenal.is_reloading() {
-            game.player.set_notice(String::from(NOTICE_EMPTY));
-            let _: bool = game.arsenal.reload();
+pub(crate) fn fire_weapon(game: &mut Game) {
+    let wants: bool = game.get_input().get_fire_held();
+    if !wants || !game.get_arsenal().can_fire() {
+        if wants && game.get_arsenal().get_magazine() == 0 && !game.get_arsenal().is_reloading() {
+            game.get_mut_player().set_notice(String::from(NOTICE_EMPTY));
+            let _: bool = game.get_mut_arsenal().reload();
         }
         return;
     }
-    if !game.arsenal.fire(0) {
+    if !game.get_mut_arsenal().fire(0) {
         return;
     }
-    let weapon: Weapon = game.arsenal.get_weapon();
-    let here: Vec3 = game.player.get_position();
+    let weapon: Weapon = game.get_arsenal().get_weapon();
+    let here: Vec3 = game.get_player().get_position();
     let muzzle: Vec3 = [here[0], here[1] + AIM_CHEST_HEIGHT, here[2]];
-    let aim: Vec2 = game.arsenal.get_aim();
+    let aim: Vec2 = game.get_arsenal().get_aim();
     // 枪口方向:水平瞄准 × cos(pitch),垂直分量 = sin(pitch)。
-    let pitch: f32 = game.aim_pitch;
+    let pitch: f32 = game.get_aim_pitch();
     let flat: f32 = pitch.cos();
     let direction: Vec3 = [aim[0] * flat, pitch.sin(), aim[1] * flat];
     let range: f32 = weapon.range();
     // 先求射线打到静态几何的位置(墙 / 楼 / 车)。
     let wall_hit: Option<(f32, Vec2)> =
-        crate::collision::ray_to_shapes(&game.world, muzzle, direction);
+        crate::collision::ray_to_shapes(&game.get_world(), muzzle, direction);
     let wall_distance: f32 = wall_hit.map_or(range, |hit: (f32, Vec2)| hit.0);
     // 再扫敌人:取射程内、且比墙更近的第一个。
     let mut best: Option<(usize, f32)> = None;
-    for (index, enemy) in game.enemies.iter().enumerate() {
+    for (index, enemy) in game.get_enemies().iter().enumerate() {
         if !enemy.is_alive() {
             continue;
         }
@@ -7145,22 +5992,23 @@ fn fire_weapon(game: &mut Game) {
     match best {
         Some((index, distance)) => {
             let damage: f32 = falloff(weapon, distance);
-            let killed: bool = game.enemies[index].damage(damage);
+            let killed: bool = game.get_mut_enemies()[index].damage(damage);
             // 命中时把敌人往后推一点:纯粹是手感 —— 被打的人会晃,
             // 让 hitscan 有了「打到东西」的实感。
             let knock: Vec2 = [-aim[0] * HIT_KNOCKBACK, -aim[1] * HIT_KNOCKBACK];
-            game.enemies[index].knock_back(knock);
-            game.hitmarker = HITMARKER_TIME;
-            game.did_hit = true;
-            game.wanted.add_heat(WANTED_PER_SHOT + WANTED_PER_HIT);
+            game.get_mut_enemies()[index].knock_back(knock);
+            game.set_hitmarker(HITMARKER_TIME);
+            game.set_did_hit(true);
+            game.get_mut_wanted()
+                .add_heat(WANTED_PER_SHOT + WANTED_PER_HIT);
             if killed {
-                game.kills += 1;
+                game.set_kills(1);
                 let drop: f32 = ENEMY_CASH_DROP;
-                game.player.set_cash_add(drop);
-                game.player.set_notice(String::from(NOTICE_KILL));
-                game.mission.set_target_enemy(usize::MAX);
+                game.get_mut_player().set_cash_add(drop);
+                game.get_mut_player().set_notice(String::from(NOTICE_KILL));
+                game.get_mut_mission().set_target_enemy(Some(usize::MAX));
             } else {
-                game.player.set_notice(String::from(NOTICE_HIT));
+                game.get_mut_player().set_notice(String::from(NOTICE_HIT));
             }
             // 「干掉某人」的目标:**什么都不用做**。
             // 目标是不是死了由敌人表回答(`mission_target_state` 查
@@ -7174,7 +6022,7 @@ fn fire_weapon(game: &mut Game) {
         None => {
             if weapon == Weapon::Bat {
                 // 球棒挥空也算一次开火反馈。
-                game.hitmarker = 0.0;
+                game.set_hitmarker(0.0);
             }
         }
     }
@@ -7195,7 +6043,7 @@ fn fire_weapon(game: &mut Game) {
 /// # Returns
 ///
 /// - `f32` - 射线到球心的距离(米);球心在射线背后时返回一个大值。
-fn ray_sphere_distance(origin: Vec3, direction: Vec3, center: Vec3, radius: f32) -> f32 {
+pub(crate) fn ray_sphere_distance(origin: Vec3, direction: Vec3, center: Vec3, radius: f32) -> f32 {
     let to: Vec3 = [
         center[0] - origin[0],
         center[1] - origin[1],
@@ -7212,6 +6060,7 @@ fn ray_sphere_distance(origin: Vec3, direction: Vec3, center: Vec3, radius: f32)
     }
     (along - (radius * radius - perpendicular_sq).sqrt().max(0.0)).max(0.0)
 }
+
 /// 撞死一个敌人之后的结算:计数、掉钱、提示。
 ///
 /// 跟子弹命中那条路径(`fire_weapon` 里 `if killed`)保持一致。
@@ -7220,10 +6069,10 @@ fn ray_sphere_distance(origin: Vec3, direction: Vec3, center: Vec3, radius: f32)
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn on_enemy_killed_by_car(game: &mut Game) {
-    game.kills += 1;
-    game.player.set_cash_add(ENEMY_CASH_DROP);
-    game.player.set_notice(String::from(NOTICE_KILL));
+pub(crate) fn on_enemy_killed_by_car(game: &mut Game) {
+    game.set_kills(1);
+    game.get_mut_player().set_cash_add(ENEMY_CASH_DROP);
+    game.get_mut_player().set_notice(String::from(NOTICE_KILL));
 }
 
 /// 敌人 AI 的一帧推进。
@@ -7235,14 +6084,14 @@ fn on_enemy_killed_by_car(game: &mut Game) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧秒数。
-fn step_enemies(game: &mut Game, dt: f32) {
-    let player_at: Vec3 = game.player.get_position();
-    let wanted: bool = game.wanted.get_stars() > 0;
+pub(crate) fn step_enemies(game: &mut Game, dt: f32) {
+    let player_at: Vec3 = game.get_player().get_position();
+    let wanted: bool = game.get_wanted().get_stars() > 0;
     // 通缉增派:按星数补足警察。
-    let stars: u32 = game.wanted.get_stars();
-    let phase: f32 = game.frame_count as f32 * 0.017;
+    let stars: u32 = game.get_wanted().get_stars();
+    let phase: f32 = game.get_frame_count() as f32 * 0.017;
     deploy_police(
-        &mut game.enemies,
+        &mut game.get_mut_enemies(),
         stars,
         player_at,
         ENEMY_WANTED_TOTAL,
@@ -7251,10 +6100,10 @@ fn step_enemies(game: &mut Game, dt: f32) {
     // 玩家开的车这一帧扫过的线段(上一帧 → 本帧)。判定必须扫掠:24 m/s
     // 一帧 0.4 m,只看帧末点会把擦身而过的敌人整个漏掉 —— 和行人那边
     // (`step_peds`)同一个道理,同一个 `point_to_segment_distance`。
-    let (car_from, car_to, car_speed): (Vec2, Vec2, f32) = match game.player.get_vehicle() {
-        Some(vehicle) => match game.traffic.get_cars_ref().get(vehicle) {
+    let (car_from, car_to, car_speed): (Vec2, Vec2, f32) = match game.get_player().get_vehicle() {
+        Some(vehicle) => match game.get_traffic().get_cars_ref().get(vehicle) {
             Some(car) => (
-                game.previous_step_xz,
+                game.get_previous_step_xz(),
                 [car.get_position()[0], car.get_position()[2]],
                 car.get_speed(),
             ),
@@ -7262,13 +6111,13 @@ fn step_enemies(game: &mut Game, dt: f32) {
         },
         None => ([0.0, 0.0], [0.0, 0.0], 0.0),
     };
-    for index in 0..game.enemies.len() {
+    for index in 0..game.get_enemies().len() {
         // 尸体单独推进,不受激活圈影响(要等它自己消失)。
-        if !game.enemies[index].is_alive() {
-            game.enemies[index].step_death(dt);
+        if !game.get_enemies()[index].is_alive() {
+            game.get_mut_enemies()[index].step_death(dt);
             continue;
         }
-        let at: Vec3 = game.enemies[index].get_position();
+        let at: Vec3 = game.get_enemies()[index].get_position();
         // 碾压:车扫过敌人所在的位置。判定圈 = 车身 + 敌人身体。
         //
         // 之前**根本没有**车撞敌人的判定 —— `step_enemies` 从头到尾没提过
@@ -7280,13 +6129,13 @@ fn step_enemies(game: &mut Game, dt: f32) {
                 let dx: f32 = at[0] - car_to[0];
                 let dz: f32 = at[2] - car_to[1];
                 let length: f32 = (dx * dx + dz * dz).sqrt().max(f32::EPSILON);
-                let killed: bool = game.enemies[index].damage(ENEMY_RUNOVER_DAMAGE);
-                game.enemies[index].knock_back([
+                let killed: bool = game.get_mut_enemies()[index].damage(ENEMY_RUNOVER_DAMAGE);
+                game.get_mut_enemies()[index].knock_back([
                     dx / length * ENEMY_RUNOVER_KNOCK,
                     dz / length * ENEMY_RUNOVER_KNOCK,
                 ]);
-                game.did_hit = true;
-                game.hitmarker = HITMARKER_TIME;
+                game.set_did_hit(true);
+                game.set_hitmarker(HITMARKER_TIME);
                 if killed {
                     on_enemy_killed_by_car(game);
                 }
@@ -7296,19 +6145,18 @@ fn step_enemies(game: &mut Game, dt: f32) {
             continue;
         }
         let decision: crate::enemy::EnemyDecision = decide(
-            &game.enemies[index],
+            &game.get_enemies()[index],
             player_at,
-            &game.world,
+            &game.get_world(),
             wanted,
-            game.enemies[index].get_wander(),
+            game.get_enemies()[index].get_wander(),
         );
-        let fired: bool = crate::enemy::apply(
-            &mut game.enemies[index],
-            &decision,
-            dt,
-            &game.world,
-            decision.shoot,
-        );
+        let world_ref: CollisionWorld = game.get_world_ref().clone();
+        let shoot: bool = decision.get_shoot();
+        let fired: bool = match game.get_mut_enemies().get_mut(index) {
+            Some(enemy) => crate::enemy::apply(enemy, &decision, dt, &world_ref, shoot),
+            None => false,
+        };
         if fired {
             enemy_shot(game, index);
         }
@@ -7317,11 +6165,11 @@ fn step_enemies(game: &mut Game, dt: f32) {
     // 距离外重生 —— 这就是 GTA 里「警察越来越多」的实现方式。
     if stars > 0 {
         let mut index: usize = 0;
-        while index < game.enemies.len() {
-            if game.enemies[index].death_expired()
-                && game.enemies[index].get_faction() == Faction::Police
+        while index < game.get_enemies().len() {
+            if game.get_enemies()[index].death_expired()
+                && game.get_enemies()[index].get_faction() == Faction::Police
             {
-                let at: Vec3 = game.enemies[index].get_position();
+                let at: Vec3 = game.get_enemies()[index].get_position();
                 let dx: f32 = at[0] - player_at[0];
                 let dz: f32 = at[2] - player_at[2];
                 let length: f32 = (dx * dx + dz * dz).sqrt().max(f32::EPSILON);
@@ -7330,24 +6178,25 @@ fn step_enemies(game: &mut Game, dt: f32) {
                     at[1],
                     player_at[2] + dz / length * ENEMY_SPAWN_DIST,
                 ];
-                let yaw: f32 = game.enemies[index].get_yaw();
-                game.enemies[index].respawn(far, yaw);
+                let yaw: f32 = game.get_enemies()[index].get_yaw();
+                game.get_mut_enemies()[index].respawn(far, yaw);
             }
             index += 1;
         }
     }
     // 回收尸体:死亡计时归零的敌人从尾部弹出(顺序不影响正确性)。
     let mut index: usize = 0;
-    while index < game.enemies.len() {
-        if game.enemies[index].death_expired() {
-            game.enemies.swap_remove(index);
+    while index < game.get_enemies().len() {
+        if game.get_enemies()[index].death_expired() {
+            game.get_mut_enemies().swap_remove(index);
         } else {
             index += 1;
         }
     }
     // 批次表跟着收缩,避免索引错位。
-    if game.enemy_batches.len() > game.enemies.len() {
-        game.enemy_batches.truncate(game.enemies.len());
+    if game.get_enemy_batches().len() > game.get_enemies().len() {
+        let enemy_count: usize = game.get_enemies().len();
+        game.get_mut_enemy_batches().truncate(enemy_count);
     }
 }
 
@@ -7357,8 +6206,8 @@ fn step_enemies(game: &mut Game, dt: f32) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `usize` - 开火的敌人索引。
-fn enemy_shot(game: &mut Game, index: usize) {
-    let Some(enemy) = game.enemies.get(index) else {
+pub(crate) fn enemy_shot(game: &mut Game, index: usize) {
+    let Some(enemy) = game.get_enemies().get(index) else {
         return;
     };
     // 先把需要的量拷贝出来再放开借用 —— 后面要改 `wanted`。
@@ -7366,11 +6215,11 @@ fn enemy_shot(game: &mut Game, index: usize) {
     let wander: f32 = enemy.get_wander();
     let shots: u32 = enemy.get_shots();
     // 开枪加一点热度(开火本身就会被通缉,追踪的人是你)。
-    game.wanted.add_heat(WANTED_PER_SHOT * 0.5);
-    if let Some(shooter) = game.enemies.get_mut(index) {
+    game.get_mut_wanted().add_heat(WANTED_PER_SHOT * 0.5);
+    if let Some(shooter) = game.get_mut_enemies().get_mut(index) {
         shooter.mark_shot();
     }
-    let player_at: Vec3 = game.player.get_position();
+    let player_at: Vec3 = game.get_player().get_position();
     // **视线门控:敌人「看得见」才谈得上打中。**
     //
     // `decide` 层(`src/enemy.rs:76`)算过一次 `sees`,但那只用来决定
@@ -7390,14 +6239,18 @@ fn enemy_shot(game: &mut Game, index: usize) {
     // 实测玩家停在楼里(`inSolid == true`)、19 m 外的警察持续开火,
     // 90 帧掉 31.8 血,门控计数器全程为 0。`blocks_sight` 补上这一半。
     let sight_y: f32 = from[1] + AIM_CHEST_HEIGHT;
-    if !has_line_of_sight(&game.world, from, player_at, ENEMY_FIRE_RANGE.max(1.0))
-        || game
-            .interiors
-            .blocks_sight([from[0], from[2]], [player_at[0], player_at[2]], sight_y)
+    if !has_line_of_sight(
+        &game.get_world(),
+        from,
+        player_at,
+        ENEMY_FIRE_RANGE.max(1.0),
+    ) || game
+        .interiors
+        .blocks_sight([from[0], from[2]], [player_at[0], player_at[2]], sight_y)
     {
         // 记一笔,验收探针据此确认「这一枪是被视线挡掉的」而不是
         // 别的分支提前 return 的。
-        game.shots_blocked_by_geometry += 1;
+        game.set_shots_blocked_by_geometry(1);
         return;
     }
     let center: Vec3 = [player_at[0], player_at[1] + AIM_CHEST_HEIGHT, player_at[2]];
@@ -7426,19 +6279,20 @@ fn enemy_shot(game: &mut Game, index: usize) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 原始伤害。
-fn hurt_player(game: &mut Game, amount: f32) {
-    if game.hurt.is_wasted() || game.hurt.is_invulnerable() {
+pub(crate) fn hurt_player(game: &mut Game, amount: f32) {
+    if game.get_hurt().is_wasted() || game.get_hurt().is_invulnerable() {
         return;
     }
-    let dealt: f32 = apply_damage(&mut game.player, amount);
+    let dealt: f32 = apply_damage(game.get_mut_player(), amount);
     if dealt <= 0.0 {
         return;
     }
-    game.hurt.on_hit(PLAYER_HIT_INVULN);
-    if game.player.get_health() <= 0.0 {
-        game.hurt.waste(RESPAWN_DELAY);
-        game.player.set_health(0.0);
-        game.player.set_notice(String::from(NOTICE_WASTED));
+    game.get_hurt().on_hit(PLAYER_HIT_INVULN);
+    if game.get_player().get_health() <= 0.0 {
+        game.get_hurt().waste(RESPAWN_DELAY);
+        game.get_mut_player().set_health(0.0);
+        game.get_mut_player()
+            .set_notice(String::from(NOTICE_WASTED));
     }
 }
 
@@ -7448,31 +6302,33 @@ fn hurt_player(game: &mut Game, amount: f32) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧秒数。
-fn update_wanted(game: &mut Game, dt: f32) {
-    let player_at: Vec3 = game.player.get_position();
+pub(crate) fn update_wanted(game: &mut Game, dt: f32) {
+    let player_at: Vec3 = game.get_player().get_position();
     // 藏身区:站在后巷 / 警局门口就强制降温。
-    let hidden: bool = is_hidden(&game.hideouts, player_at);
+    let hidden: bool = is_hidden(&game.get_hideouts(), player_at);
     // 「被看见」:有没有任何一个活着的警察视线通畅。
     let mut spotted: bool = false;
-    for enemy in &game.enemies {
+    for enemy in game.get_enemies() {
         if !enemy.is_alive() || enemy.get_faction() != Faction::Police {
             continue;
         }
         let at: Vec3 = enemy.get_position();
         if flat_distance(at, player_at) <= ENEMY_SIGHT
-            && has_line_of_sight(&game.world, at, player_at, ENEMY_SIGHT)
+            && has_line_of_sight(&game.get_world(), at, player_at, ENEMY_SIGHT)
         {
             spotted = true;
             break;
         }
     }
-    let before: u32 = game.wanted.get_stars();
-    let after: u32 = game.wanted.update(dt, spotted, hidden);
+    let before: u32 = game.get_wanted().get_stars();
+    let after: u32 = game.get_mut_wanted().update(dt, spotted, hidden);
     if after > before {
-        game.wanted_flash = WANTED_FLASH_TIME;
-        game.player.set_notice(String::from(NOTICE_WANTED));
+        game.set_wanted_flash(WANTED_FLASH_TIME);
+        game.get_mut_player()
+            .set_notice(String::from(NOTICE_WANTED));
     } else if after == 0 && before > 0 {
-        game.player.set_notice(String::from(NOTICE_CLEARED));
+        game.get_mut_player()
+            .set_notice(String::from(NOTICE_CLEARED));
     }
 }
 
@@ -7489,7 +6345,7 @@ fn update_wanted(game: &mut Game, dt: f32) {
 /// # Returns
 ///
 /// - `(usize, bool)` - 目标索引(`usize::MAX` 表示没有目标),以及它是否已死。
-fn mission_target_state(mission: &Mission, enemies: &[Enemy]) -> (usize, bool) {
+pub(crate) fn mission_target_state(mission: &Mission, enemies: &[Enemy]) -> (usize, bool) {
     let index: usize = mission.get_target_enemy().unwrap_or(usize::MAX);
     let dead: bool = index != usize::MAX
         && enemies
@@ -7505,18 +6361,18 @@ fn mission_target_state(mission: &Mission, enemies: &[Enemy]) -> (usize, bool) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧秒数。
-fn update_mission(game: &mut Game, _dt: f32) {
-    let reward: f32 = advance_mission_for_player(
-        &mut game.mission,
-        &game.enemies,
-        game.player.get_position(),
-        game.missions_done,
-    );
+pub(crate) fn update_mission(game: &mut Game, _dt: f32) {
+    let enemies: &Vec<Enemy> = game.get_enemies();
+    let player_at: Vec3 = game.get_player().get_position();
+    let done: u32 = game.get_missions_done();
+    let enemies_snapshot: Vec<Enemy> = enemies.clone();
+    let reward: f32 =
+        advance_mission_for_player(game.get_mut_mission(), &enemies_snapshot, player_at, done);
     if reward > 0.0 {
-        game.player.set_cash_add(reward);
-        game.missions_done += 1;
+        game.get_mut_player().set_cash_add(reward);
+        game.set_missions_done(1);
         let notice: String = format!("{NOTICE_MISSION_DONE}{CASH_SIGN}{reward}");
-        game.player.set_notice(notice);
+        game.get_mut_player().set_notice(notice);
     }
 }
 
@@ -7536,7 +6392,7 @@ fn update_mission(game: &mut Game, _dt: f32) {
 /// # Returns
 ///
 /// - `f32` - 任务完成时的报酬,否则 `0.0`。
-fn advance_mission_for_player(
+pub(crate) fn advance_mission_for_player(
     mission: &mut Mission,
     enemies: &[Enemy],
     player_at: Vec3,
@@ -7545,7 +6401,7 @@ fn advance_mission_for_player(
     let (target_index, target_dead): (usize, bool) = mission_target_state(mission, enemies);
     advance_mission(
         mission,
-        enemies,
+        &enemies,
         player_at,
         target_index,
         target_dead,
@@ -7558,22 +6414,22 @@ fn advance_mission_for_player(
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn toggle_mission(game: &mut Game) {
-    if game.mission.is_active() {
+pub(crate) fn toggle_mission(game: &mut Game) {
+    if game.get_mission().is_active() {
         return;
     }
-    let player_at: Vec3 = game.player.get_position();
+    let player_at: Vec3 = game.get_player().get_position();
     let blueprints: Vec<(&'static str, u32, Vec3)> = mission_blueprints();
-    let Some(entry) = blueprints.get(game.missions_done as usize % blueprints.len()) else {
+    let Some(entry) = blueprints.get(game.get_missions_done() as usize % blueprints.len()) else {
         return;
     };
     let (title, stage, at) = *entry;
     if flat_distance(at, player_at) > MISSION_ACCEPT_RANGE {
         return;
     }
-    game.mission.accept(title, stage, at);
+    game.get_mut_mission().accept(title, stage, at);
     let notice: String = format!("{NOTICE_MISSION_START}{title}");
-    game.player.set_notice(notice);
+    game.get_mut_player().set_notice(notice);
 }
 
 /// 点到线段的最短距离(米)。
@@ -7591,7 +6447,7 @@ fn toggle_mission(game: &mut Game) {
 /// # Returns
 ///
 /// - `f32` - 点到线段的最短距离(米)。
-fn point_to_segment_distance(point: Vec2, from: Vec2, to: Vec2) -> f32 {
+pub(crate) fn point_to_segment_distance(point: Vec2, from: Vec2, to: Vec2) -> f32 {
     let span_x: f32 = to[0] - from[0];
     let span_z: f32 = to[1] - from[1];
     let length_sq: f32 = span_x * span_x + span_z * span_z;
@@ -7612,11 +6468,11 @@ fn point_to_segment_distance(point: Vec2, from: Vec2, to: Vec2) -> f32 {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧秒数。
-fn step_peds(game: &mut Game, dt: f32) {
-    let player_at: Vec3 = game.player.get_position();
+pub(crate) fn step_peds(game: &mut Game, dt: f32) {
+    let player_at: Vec3 = game.get_player().get_position();
     // 玩家开的车(如果有)的坐标与速度,用来判定「撞到行人」。
-    let (car_at, car_speed) = match game.player.get_vehicle() {
-        Some(vehicle) => match game.traffic.get_cars_ref().get(vehicle) {
+    let (car_at, car_speed) = match game.get_player().get_vehicle() {
+        Some(vehicle) => match game.get_traffic().get_cars_ref().get(vehicle) {
             Some(car) => (car.get_position(), car.get_speed()),
             None => ([0.0, 0.0, 0.0], 0.0),
         },
@@ -7626,14 +6482,17 @@ fn step_peds(game: &mut Game, dt: f32) {
     // 谁去找谁聊天 —— 社交是群体行为,必须在个体步进之后。
     // 本帧车走过的**线段**(上一帧位置 → 本帧位置)。24 m/s 下一帧走 0.4 m,
     // 而 60 fps 之外的长帧能走到 1 m 以上 —— 只看当前点会漏掉整段擦碰。
-    let car_from: Vec2 = if game.player.get_vehicle().is_some() {
-        game.previous_step_xz
+    let car_from: Vec2 = if game.get_player().get_vehicle().is_some() {
+        game.get_previous_step_xz()
     } else {
         [car_at[0], car_at[2]]
     };
     let car_to: Vec2 = [car_at[0], car_at[2]];
-    for ped in &mut game.peds {
-        ped.step(dt, &game.world, player_at, game.player.get_driving());
+    let ped_world: CollisionWorld = game.get_world_ref().clone();
+    let ped_driving: bool = game.get_player().get_driving();
+    let mut runover_heat: f32 = 0.0;
+    for ped in game.get_mut_peds().iter_mut() {
+        ped.step(dt, &ped_world, player_at, ped_driving);
         // 撞飞判定:车在动,而且行人就在车身附近。
         if car_speed > PED_RUNOVER_MIN_SPEED {
             let here: Vec3 = ped.get_position();
@@ -7647,21 +6506,27 @@ fn step_peds(game: &mut Game, dt: f32) {
                     dz / length * PED_RUNOVER_SPEED,
                 ];
                 ped.knock_down(impulse);
-                game.wanted.add_heat(WANTED_PER_RUNOVER);
+                runover_heat += WANTED_PER_RUNOVER;
             }
         }
     }
+    // the loop iterator holds `&mut game` for its whole body, so the wanted
+    // level can only be applied once the loop is done
+    if runover_heat > 0.0 {
+        game.get_mut_wanted().add_heat(runover_heat);
+    }
     // 回收倒地的行人。
     let mut index: usize = 0;
-    while index < game.peds.len() {
-        if game.peds[index].is_gone() {
-            game.peds.swap_remove(index);
+    while index < game.get_peds().len() {
+        if game.get_peds()[index].is_gone() {
+            game.get_mut_peds().swap_remove(index);
         } else {
             index += 1;
         }
     }
-    if game.ped_batches.len() > game.peds.len() {
-        game.ped_batches.truncate(game.peds.len());
+    let ped_count: usize = game.get_peds().len();
+    if game.get_ped_batches().len() > ped_count {
+        game.get_mut_ped_batches().truncate(ped_count);
     }
 }
 
@@ -7671,26 +6536,27 @@ fn step_peds(game: &mut Game, dt: f32) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧秒数。
-fn step_death(game: &mut Game, dt: f32) {
-    game.hurt.advance(dt);
-    if game.hurt.get_respawn() > 0.0 {
+pub(crate) fn step_death(game: &mut Game, dt: f32) {
+    game.get_hurt().advance(dt);
+    if game.get_hurt().get_respawn() > 0.0 {
         return;
     }
     // 重生:在最近的医院点复活,扣钱,清通缉。
     // Y 归零:医院都在地面上,不能把玩家复活在二楼楼板上(或者半空里)。
-    let spot: Vec3 = nearest_hospital(game.player.get_position());
-    let resolved: Vec2 = game.world.resolve([spot[0], spot[2]]);
-    game.player
+    let spot: Vec3 = nearest_hospital(game.get_player().get_position());
+    let resolved: Vec2 = game.get_world().resolve([spot[0], spot[2]]);
+    game.get_mut_player()
         .set_position([resolved[0], GROUND_LEVEL, resolved[1]]);
-    game.player.set_vertical_velocity(0.0);
-    game.player.set_grounded(true);
-    game.player.set_health(PLAYER_MAX_HEALTH);
-    game.player.set_armor(0.0);
-    let loss: f32 = game.player.get_cash() * DEATH_CASH_LOSS;
-    game.player.set_cash_add(-loss);
-    game.wanted = Wanted::new();
-    game.hurt.revive();
-    game.player.set_notice(String::from(NOTICE_WASTED));
+    game.get_mut_player().set_vertical_velocity(0.0);
+    game.get_mut_player().set_grounded(true);
+    game.get_mut_player().set_health(PLAYER_MAX_HEALTH);
+    game.get_mut_player().set_armor(0.0);
+    let loss: f32 = game.get_player().get_cash() * DEATH_CASH_LOSS;
+    game.get_mut_player().set_cash_add(-loss);
+    game.set_wanted(Wanted::new());
+    game.get_hurt().revive();
+    game.get_mut_player()
+        .set_notice(String::from(NOTICE_WASTED));
 }
 
 /// 医院点:玩家死亡后在这里重生。
@@ -7700,7 +6566,7 @@ fn step_death(game: &mut Game, dt: f32) {
 /// # Returns
 ///
 /// - `Vec<Vec3>` - 医院点的世界坐标。
-fn hospital_spots() -> Vec<Vec3> {
+pub(crate) fn hospital_spots() -> Vec<Vec3> {
     let mut out: Vec<Vec3> = Vec::new();
     for spot in HOSPITAL_SPOTS {
         out.push(*spot);
@@ -7717,7 +6583,7 @@ fn hospital_spots() -> Vec<Vec3> {
 /// # Returns
 ///
 /// - `Vec3` - 最近的医院坐标。
-fn nearest_hospital(from: Vec3) -> Vec3 {
+pub(crate) fn nearest_hospital(from: Vec3) -> Vec3 {
     let spots: Vec<Vec3> = hospital_spots();
     let mut best: Vec3 = spots[0];
     let mut best_distance: f32 = f32::MAX;
@@ -7737,17 +6603,19 @@ fn nearest_hospital(from: Vec3) -> Vec3 {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `usize` - 抢到的车的索引。
-fn report_jacking(game: &mut Game, index: usize) {
-    let Some(car) = game.traffic.get_cars_ref().get(index) else {
+pub(crate) fn report_jacking(game: &mut Game, index: usize) {
+    let Some(car) = game.get_traffic().get_cars_ref().get(index) else {
         return;
     };
-    let stolen_police: bool = car.asset == CAR_POLICE;
-    game.wanted
+    let stolen_police: bool = *car.get_asset() == CAR_POLICE;
+    game.get_mut_wanted()
         .add_heat(WANTED_PER_JACK + if stolen_police { WANTED_PER_JACK } else { 0.0 });
     if stolen_police {
-        game.player.set_notice(String::from(NOTICE_STOLE_POLICE));
+        game.get_mut_player()
+            .set_notice(String::from(NOTICE_STOLE_POLICE));
     } else {
-        game.player.set_notice(String::from(NOTICE_JACKED));
+        game.get_mut_player()
+            .set_notice(String::from(NOTICE_JACKED));
     }
 }
 
@@ -7765,30 +6633,43 @@ fn report_jacking(game: &mut Game, index: usize) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `&HashMap<String, usize>` - 资产 id → 场景 mesh 索引。
-fn spawn_combat_batches(game: &mut Game, index_map: &HashMap<String, usize>) {
-    game.enemy_batches.clear();
-    for enemy in &game.enemies {
-        let asset: &'static str = enemy_asset(enemy.get_faction());
-        let Some(mesh_index) = index_map.get(asset) else {
-            game.enemy_batches.push(usize::MAX);
+pub(crate) fn spawn_combat_batches(game: &mut Game, index_map: &HashMap<String, usize>) {
+    game.get_mut_enemy_batches().clear();
+    let enemy_assets: Vec<&'static str> = game
+        .get_enemies()
+        .iter()
+        .map(|enemy: &Enemy| enemy_asset(enemy.get_faction()))
+        .collect();
+    for asset in &enemy_assets {
+        let slot: Option<usize> = index_map.get(*asset).copied();
+        let Some(mesh_index) = slot else {
+            game.get_mut_enemy_batches().push(usize::MAX);
             continue;
         };
-        let batch: usize = find_or_create_batch(&mut game.scene, *mesh_index);
-        game.enemy_batches.push(batch);
+        let batch: usize = find_or_create_batch(game.get_mut_scene(), mesh_index);
+        game.get_mut_enemy_batches().push(batch);
     }
     // 手持武器:一个批次,每帧换一次实例矩阵(跟着角色手部走)。
-    game.weapon_batch = match index_map.get(game.arsenal.get_weapon().asset()) {
-        Some(mesh_index) => find_or_create_batch(&mut game.scene, *mesh_index),
+    let weapon_asset: &'static str = game.get_arsenal().get_weapon().asset();
+    let weapon_slot: Option<usize> = index_map.get(weapon_asset).copied();
+    let weapon_batch: usize = match weapon_slot {
+        Some(mesh_index) => find_or_create_batch(game.get_mut_scene(), mesh_index),
         None => usize::MAX,
     };
-    game.ped_batches.clear();
-    for ped in &game.peds {
-        let Some(mesh_index) = index_map.get(ped.get_model()) else {
-            game.ped_batches.push(usize::MAX);
+    game.set_weapon_batch(weapon_batch);
+    game.get_mut_ped_batches().clear();
+    let ped_models: Vec<&'static str> = game
+        .get_peds()
+        .iter()
+        .map(|ped: &Pedestrian| *ped.get_model())
+        .collect();
+    for model in &ped_models {
+        let Some(mesh_index) = index_map.get(&**model).copied() else {
+            game.get_mut_ped_batches().push(usize::MAX);
             continue;
         };
-        let batch: usize = find_or_create_batch(&mut game.scene, *mesh_index);
-        game.ped_batches.push(batch);
+        let batch: usize = find_or_create_batch(game.get_mut_scene(), mesh_index);
+        game.get_mut_ped_batches().push(batch);
     }
 }
 
@@ -7804,7 +6685,7 @@ fn spawn_combat_batches(game: &mut Game, index_map: &HashMap<String, usize>) {
 /// # Returns
 ///
 /// - `&'static str` - 资产 id。
-fn enemy_asset(faction: Faction) -> &'static str {
+pub(crate) fn enemy_asset(faction: Faction) -> &'static str {
     match faction {
         Faction::Police => PED_SUIT,
         Faction::Thug => PED_STREETWEAR,
@@ -7817,12 +6698,12 @@ fn enemy_asset(faction: Faction) -> &'static str {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 伪随机相位。
-fn populate_combatants(game: &mut Game, phase: f32) {
-    let here: Vec3 = game.player.get_position();
+pub(crate) fn populate_combatants(game: &mut Game, phase: f32) {
+    let here: Vec3 = game.get_player().get_position();
     let thugs: Vec<Enemy> = spawn_thugs(here, THUG_COUNT, phase);
-    game.enemies = thugs;
+    game.set_enemies(thugs);
     let peds: Vec<Pedestrian> = spawn_peds(here, PED_COUNT, phase);
-    game.peds = peds;
+    game.set_peds(peds);
 }
 
 /// 把场上所有动态实体过一遍**统一碰撞层**。
@@ -7856,14 +6737,14 @@ fn populate_combatants(game: &mut Game, phase: f32) {
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn resolve_dynamic_bodies(game: &mut Game) {
+pub(crate) fn resolve_dynamic_bodies(game: &mut Game) {
     let driven: Option<usize> = game
         .player
         .get_vehicle()
-        .filter(|i: &usize| *i < game.traffic.get_cars_ref().len());
+        .filter(|i: &usize| *i < game.get_traffic().get_cars_ref().len());
     let mut bodies: Vec<DynamicBody> = Vec::new();
     // 槽位 0 恒为玩家自己;在车里时那一格的碰撞体是车。
-    let player_at: Vec3 = game.player.get_position();
+    let player_at: Vec3 = game.get_player().get_position();
     // 车用**有向盒**足迹([`CAR_FOOTPRINT`] + 真实 yaw),不再用 1.25 m 的
     // 圆:`resolve_all` 会拿它跟静态形状再分离一次,用圆的话 `drive` 刚
     // 停在 2.283 m 的车会被这一层缩回 1.25 m,车头重新插进墙里。
@@ -7872,7 +6753,7 @@ fn resolve_dynamic_bodies(game: &mut Game) {
     };
     match driven {
         Some(index) => {
-            if let Some(car) = game.traffic.get_cars_ref().get(index) {
+            if let Some(car) = game.get_traffic().get_cars_ref().get(index) {
                 bodies.push(car_body(car.get_position(), car.get_yaw()));
             }
         }
@@ -7885,13 +6766,13 @@ fn resolve_dynamic_bodies(game: &mut Game) {
             ));
         }
     }
-    for (index, car) in game.traffic.get_cars_ref().iter().enumerate() {
+    for (index, car) in game.get_traffic().get_cars_ref().iter().enumerate() {
         if driven == Some(index) {
             continue;
         }
         bodies.push(car_body(car.get_position(), car.get_yaw()));
     }
-    for enemy in &game.enemies {
+    for enemy in game.get_enemies() {
         let at: Vec3 = enemy.get_position();
         bodies.push(DynamicBody::new(
             BodyKind::Enemy,
@@ -7900,7 +6781,7 @@ fn resolve_dynamic_bodies(game: &mut Game) {
             ENEMY_MASS,
         ));
     }
-    for ped in &game.peds {
+    for ped in game.get_peds() {
         let at: Vec3 = ped.get_position();
         bodies.push(DynamicBody::new(
             BodyKind::Pedestrian,
@@ -7912,7 +6793,7 @@ fn resolve_dynamic_bodies(game: &mut Game) {
     if bodies.len() < 2 {
         return;
     }
-    let resolved: Vec<Vec2> = game.world.resolve_all(&bodies);
+    let resolved: Vec<Vec2> = game.get_world().resolve_all(&bodies);
     // 本帧真正「自己在动」的实体:位置相对**本帧起点**发生了变化。
     //
     // 分开的静态层修正(把人从墙里推出来)必须无条件保留 —— 那是解算
@@ -7924,7 +6805,7 @@ fn resolve_dynamic_bodies(game: &mut Game) {
     // 判据用 `driven` 分支之外的「本帧输入速度」:玩家有速度就接受让位,
     // 没有速度就不接受(静态层已经处理了墙,行人自己会走开)。
     let player_speed: f32 = {
-        let v: Vec2 = game.player.get_velocity();
+        let v: Vec2 = game.get_player().get_velocity();
         (v[0] * v[0] + v[1] * v[1]).sqrt()
     };
     let player_accepts_push: bool = driven.is_some() || player_speed > PLAYER_PUSH_MIN_SPEED;
@@ -7933,7 +6814,9 @@ fn resolve_dynamic_bodies(game: &mut Game) {
     // 所以 `cursor` 直接从 1 起(不回写的话从 0 起会错开一位)。
     let mut cursor: usize = 1;
     if let Some(index) = driven {
-        if let (Some(slot), Some(car)) = (resolved.first(), game.traffic.get_car_mut(index)) {
+        if let (Some(slot), Some(car)) =
+            (resolved.first(), game.get_mut_traffic().get_car_mut(index))
+        {
             let at: Vec3 = car.get_position();
             car.set_position([slot[0], at[1], slot[1]]);
         }
@@ -7947,9 +6830,10 @@ fn resolve_dynamic_bodies(game: &mut Game) {
         } else {
             [player_at[0], player_at[2]]
         };
-        game.player.set_position([keep[0], player_at[1], keep[1]]);
+        game.get_mut_player()
+            .set_position([keep[0], player_at[1], keep[1]]);
     }
-    for (index, car) in game.traffic.get_cars_mut().iter_mut().enumerate() {
+    for (index, car) in game.get_mut_traffic().get_cars_mut().iter_mut().enumerate() {
         if driven == Some(index) {
             continue;
         }
@@ -7959,14 +6843,14 @@ fn resolve_dynamic_bodies(game: &mut Game) {
         }
         cursor += 1;
     }
-    for enemy in game.enemies.iter_mut() {
+    for enemy in game.get_mut_enemies().iter_mut() {
         if let Some(slot) = resolved.get(cursor) {
             let at: Vec3 = enemy.get_position();
             enemy.set_position([slot[0], at[1], slot[1]]);
         }
         cursor += 1;
     }
-    for ped in game.peds.iter_mut() {
+    for ped in game.get_mut_peds().iter_mut() {
         if let Some(slot) = resolved.get(cursor) {
             let at: Vec3 = ped.get_position();
             ped.set_position([slot[0], at[1], slot[1]]);
@@ -8002,7 +6886,7 @@ fn resolve_dynamic_bodies(game: &mut Game) {
 ///
 /// - `&mut [Pedestrian]` - 本帧所有市民(可变切片)。
 /// - `f32` - 本帧秒数。
-fn update_ped_social(peds: &mut [Pedestrian], dt: f32) {
+pub(crate) fn update_ped_social(peds: &mut [Pedestrian], dt: f32) {
     let count: usize = peds.len();
     if count < PED_GATHER_MIN_CROWD {
         return;
@@ -8121,7 +7005,13 @@ fn update_ped_social(peds: &mut [Pedestrian], dt: f32) {
 /// - `usize` - 这个人在圈里的序号(决定站位角)。
 /// - `Vec2` - 圈子圆心。
 /// - `f32` - 本次扎堆的总时长(秒)。
-fn join_talk(peds: &mut [Pedestrian], index: usize, slot: usize, center: Vec2, total: f32) {
+pub(crate) fn join_talk(
+    peds: &mut [Pedestrian],
+    index: usize,
+    slot: usize,
+    center: Vec2,
+    total: f32,
+) {
     let Some(ped) = peds.get_mut(index) else {
         return;
     };
@@ -8173,7 +7063,7 @@ fn join_talk(peds: &mut [Pedestrian], index: usize, slot: usize, center: Vec2, t
 /// # Panics
 ///
 /// 不会 panic。
-fn ped_bob(ped: &Pedestrian) -> f32 {
+pub(crate) fn ped_bob(ped: &Pedestrian) -> f32 {
     (ped.get_gait_phase() * 2.0).cos() * PED_BOB_HEIGHT * ped.get_gait_amount()
 }
 
@@ -8185,21 +7075,21 @@ fn ped_bob(ped: &Pedestrian) -> f32 {
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn sync_combat_instances(game: &mut Game) {
-    let here: Vec3 = game.player.get_position();
-    for index in 0..game.enemies.len() {
-        let Some(batch) = game.enemy_batches.get(index).copied() else {
+pub(crate) fn sync_combat_instances(game: &mut Game) {
+    let here: Vec3 = game.get_player().get_position();
+    for index in 0..game.get_enemies().len() {
+        let Some(batch) = game.get_enemy_batches().get(index).copied() else {
             continue;
         };
         if batch == usize::MAX {
             continue;
         }
-        let Some(scene_batch) = game.scene.batches.get_mut(batch) else {
+        let enemy: Enemy = game.get_enemies()[index].clone();
+        let at: Vec3 = enemy.get_position();
+        let Some(scene_batch) = game.get_mut_scene().get_mut_batches().get_mut(batch) else {
             continue;
         };
-        scene_batch.instances.clear();
-        let enemy: &Enemy = &game.enemies[index];
-        let at: Vec3 = enemy.get_position();
+        scene_batch.get_mut_instances().clear();
         if flat_distance(at, here) > ENEMY_RENDER_RANGE {
             continue;
         }
@@ -8209,7 +7099,7 @@ fn sync_combat_instances(game: &mut Game) {
         } else {
             (enemy.get_death_timer() / DEATH_FADE_TIME).clamp(0.0, 1.0)
         };
-        let tint: Vec3 = enemy_tint(enemy);
+        let tint: Vec3 = enemy_tint(&enemy);
         let model: Mat4 = body_matrix(at, enemy.get_yaw(), sink);
         scene_batch
             .instances
@@ -8217,50 +7107,48 @@ fn sync_combat_instances(game: &mut Game) {
     }
     // ---- 手持武器:贴在角色右手,朝向 = 瞄准方向 ----
     {
-        let batch: usize = game.weapon_batch;
+        let batch: usize = game.get_weapon_batch();
+        let driving: bool = game.get_player().get_driving();
+        let at: Vec3 = game.get_player().get_position();
+        let aim: Vec2 = game.get_arsenal().get_aim();
         if batch != usize::MAX
-            && let Some(scene_batch) = game.scene.batches.get_mut(batch)
+            && !driving
+            && let Some(scene_batch) = game.get_mut_scene().get_mut_batches().get_mut(batch)
         {
-            scene_batch.instances.clear();
-            let driving: bool = game.player.get_driving();
-            if !driving {
-                let at: Vec3 = game.player.get_position();
-                let aim: Vec2 = game.arsenal.get_aim();
-                let yaw: f32 = -aim[1].atan2(aim[0]);
-                // 枪口位置:角色右前方,按瞄准方向偏移。
-                let right: Vec2 = [aim[1], -aim[0]];
-                let at2: Vec3 = [
-                    at[0] + right[0] * WEAPON_SIDE_OFFSET + aim[0] * WEAPON_FWD_OFFSET,
-                    at[1] + WEAPON_HEIGHT,
-                    at[2] + right[1] * WEAPON_SIDE_OFFSET + aim[1] * WEAPON_FWD_OFFSET,
-                ];
-                let model: Mat4 = body_matrix(at2, yaw, WEAPON_SCALE);
-                scene_batch
-                    .instances
-                    .push(Instance::from_matrix(model, TINT_WEAPON));
-            }
+            let yaw: f32 = -aim[1].atan2(aim[0]);
+            // 枪口位置:角色右前方,按瞄准方向偏移。
+            let right: Vec2 = [aim[1], -aim[0]];
+            let at2: Vec3 = [
+                at[0] + right[0] * WEAPON_SIDE_OFFSET + aim[0] * WEAPON_FWD_OFFSET,
+                at[1] + WEAPON_HEIGHT,
+                at[2] + right[1] * WEAPON_SIDE_OFFSET + aim[1] * WEAPON_FWD_OFFSET,
+            ];
+            let model: Mat4 = body_matrix(at2, yaw, WEAPON_SCALE);
+            scene_batch
+                .get_mut_instances()
+                .push(Instance::from_matrix(model, TINT_WEAPON));
         }
     }
-    for index in 0..game.peds.len() {
-        let Some(batch) = game.ped_batches.get(index).copied() else {
+    for index in 0..game.get_peds().len() {
+        let Some(batch) = game.get_ped_batches().get(index).copied() else {
             continue;
         };
         if batch == usize::MAX {
             continue;
         }
-        let Some(scene_batch) = game.scene.batches.get_mut(batch) else {
+        let ped: Pedestrian = game.get_peds()[index].clone();
+        let at: Vec3 = ped.get_position();
+        let Some(scene_batch) = game.get_mut_scene().get_mut_batches().get_mut(batch) else {
             continue;
         };
-        scene_batch.instances.clear();
-        let ped: &Pedestrian = &game.peds[index];
-        let at: Vec3 = ped.get_position();
+        scene_batch.get_mut_instances().clear();
         if flat_distance(at, here) > PED_RENDER_RANGE {
             continue;
         }
         // 行人不做逐部件骨架(那要 13 个批次 × 18 个行人),整具一个矩阵:
         // 走路时靠 Y 轴的轻微上下起伏表达「在走」。相位为什么必须这样选,
         // 见 [`ped_bob`]。
-        let bob: f32 = ped_bob(ped);
+        let bob: f32 = ped_bob(&ped);
         let lift: Vec3 = [at[0], at[1] + bob, at[2]];
         let model: Mat4 = body_matrix(lift, ped.get_yaw(), 1.0);
         let tint: Vec3 = if ped.is_down() {
@@ -8283,7 +7171,7 @@ fn sync_combat_instances(game: &mut Game) {
 /// # Returns
 ///
 /// - `Vec3` - 色调乘子。
-fn enemy_tint(enemy: &Enemy) -> Vec3 {
+pub(crate) fn enemy_tint(enemy: &Enemy) -> Vec3 {
     if enemy.get_flash() > 0.0 {
         return TINT_ENEMY_HURT;
     }
@@ -8307,9 +7195,9 @@ fn enemy_tint(enemy: &Enemy) -> Vec3 {
 /// # Returns
 ///
 /// - `f32` - `1.0` / `-1.0` / `0.0`。
-fn axis(input: &InputState, positive: &str, negative: &str) -> f32 {
-    let forward: f32 = if input.held(positive) { 1.0 } else { 0.0 };
-    let backward: f32 = if input.held(negative) { 1.0 } else { 0.0 };
+pub(crate) fn axis(input: &InputState, positive: &str, negative: &str) -> f32 {
+    let forward: f32 = if input.get_held(positive) { 1.0 } else { 0.0 };
+    let backward: f32 = if input.get_held(negative) { 1.0 } else { 0.0 };
     forward - backward
 }
 
@@ -8322,7 +7210,7 @@ fn axis(input: &InputState, positive: &str, negative: &str) -> f32 {
 /// # Returns
 ///
 /// - `bool` - 是方向盘键时为真。
-fn is_steer_key(code: &str) -> bool {
+pub(crate) fn is_steer_key(code: &str) -> bool {
     let steer: bool = code == KEYA || code == KEYD || code == ARROWLEFT || code == ARROWRIGHT;
     steer
 }
@@ -8338,7 +7226,7 @@ fn is_steer_key(code: &str) -> bool {
 /// # Returns
 ///
 /// - `f32` - 舵角。
-fn steer_sign(code: &str) -> f32 {
+pub(crate) fn steer_sign(code: &str) -> f32 {
     let right: bool = code == KEYD || code == ARROWRIGHT;
     if right { 1.0 } else { -1.0 }
 }
@@ -8357,22 +7245,24 @@ fn steer_sign(code: &str) -> f32 {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧的秒数增量。
-fn update_camera(game: &mut Game, delta: f32) {
-    if !game.third_person {
+pub(crate) fn update_camera(game: &mut Game, delta: f32) {
+    if !game.get_third_person() {
         return;
     }
-    let anchor: Vec3 = game.player.get_position();
+    let anchor: Vec3 = game.get_player().get_position();
     let blend: f32 = 1.0 - (-FOLLOW_DAMPING * delta).exp();
-    let mut next: Vec3 = game.follow_target;
+    let mut next: Vec3 = game.get_follow_target();
     next[0] += (anchor[0] - next[0]) * blend;
     next[1] += (FOLLOW_HEIGHT - next[1]) * blend;
     next[2] += (anchor[2] - next[2]) * blend;
-    game.follow_target = next;
-    game.camera.get_target_mut().copy_from_slice(&next);
+    game.set_follow_target(next);
+    game.get_mut_camera()
+        .get_target_mut()
+        .copy_from_slice(&next);
     // 跟随距离始终夹在第三人称区间内。拖拽 / 捏合 / 双击都可能把
     // distance 推到离谱的值,这里兜底一次,保证镜头始终是「跟在
     // 角色背后几米」的第三人称,而不是飞远的自由相机。
-    game.camera
+    game.get_mut_camera()
         .clamp_follow_distance(FOLLOW_DISTANCE_MIN, FOLLOW_DISTANCE_MAX);
     // ---- 遮挡回避 ----
     // `desired_distance` 是玩家滚轮设定的「想要多远」,`distance` 是
@@ -8385,9 +7275,11 @@ fn update_camera(game: &mut Game, delta: f32) {
     // `None` = 视野里没有遮挡,相机弹回 `wanted`。
     // 走室内版本:玩家站进样板楼时,挡在镜头和角色之间的是隔墙和门垛,
     // 它们不在 `CollisionWorld` 里,只查外部世界会直接穿墙。
-    let hit: Option<f32> =
-        game.camera
-            .resolve_occlusion_interior(&game.world, &game.interiors, wanted);
+    let hit: Option<f32> = game.get_camera().resolve_occlusion_interior(
+        &game.get_world(),
+        &game.get_interiors(),
+        wanted,
+    );
     let allowed: f32 = hit.unwrap_or(wanted);
     // **室内允许压到贴脸,室外不许。** `approach_distance` 收尾把距离
     // `clamp` 到 `OCCLUSION_MIN_DISTANCE`(2.2 m),而玩家贴着室内墙面站
@@ -8397,11 +7289,11 @@ fn update_camera(game: &mut Game, delta: f32) {
     let inside: bool = game
         .interiors
         .support_height(
-            [game.follow_target[0], game.follow_target[2]],
-            game.follow_target[1],
+            [game.get_follow_target()[0], game.get_follow_target()[2]],
+            game.get_follow_target()[1],
         )
         .is_some();
-    game.camera.approach_distance_within(
+    game.get_mut_camera().approach_distance_within(
         allowed,
         FOLLOW_DISTANCE_MAX,
         delta,
@@ -8414,22 +7306,23 @@ fn update_camera(game: &mut Game, delta: f32) {
         },
     );
     // 地面不在碰撞世界里,单独夹一次眼点高度。
-    game.camera.lift_above_ground();
+    game.get_mut_camera().lift_above_ground();
     // 夹完高度之后再兜一次底:俯角一旦为负,眼点会落到地面以下,而
     // 地面是整张 `y = 0` 的网格 —— 从地下看出去整屏只有一片地面色 /
     // 天空色,角色和街景全被地面挡住。把它收进「相机在角色上方」的
     // 区间,保证任何拖拽 / 触控组合下镜头都在地面之上。
-    game.camera.clamp_follow_pitch();
+    game.get_mut_camera().clamp_follow_pitch();
     // 回报状态:调试通道读 `occluded` / `eye_clearance` 就能证明回避真的
     // 触发了(距离缩短),而不是只调了默认距离。
-    game.camera.occluded = hit.is_some();
-    let eye: Vec3 = game.camera.eye();
-    let clearance: f32 = game.world.nearest_surface_distance([eye[0], eye[2]]);
-    game.camera.eye_clearance = if eye[1] < CAMERA_MIN_HEIGHT {
-        0.0
-    } else {
-        clearance
-    };
+    game.get_mut_camera().set_occluded(hit.is_some());
+    let eye: Vec3 = game.get_camera().eye();
+    let clearance: f32 = game.get_world().nearest_surface_distance([eye[0], eye[2]]);
+    game.get_mut_camera()
+        .set_eye_clearance(if eye[1] < CAMERA_MIN_HEIGHT {
+            0.0
+        } else {
+            clearance
+        });
 }
 
 /// 检查玩家是否踩到拾取物,命中就结算。
@@ -8437,11 +7330,11 @@ fn update_camera(game: &mut Game, delta: f32) {
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn collect_pickups(game: &mut Game) {
-    let here: Vec3 = game.player.get_position();
+pub(crate) fn collect_pickups(game: &mut Game) {
+    let here: Vec3 = game.get_player().get_position();
     let mut gained: Vec<usize> = Vec::new();
-    for index in 0..game.traffic.get_pickups_ref().len() {
-        let Some(pickup) = game.traffic.get_pickups_ref().get(index) else {
+    for index in 0..game.get_traffic().get_pickups_ref().len() {
+        let Some(pickup) = game.get_traffic().get_pickups_ref().get(index) else {
             continue;
         };
         if pickup.get_taken() {
@@ -8455,38 +7348,25 @@ fn collect_pickups(game: &mut Game) {
         }
     }
     for index in gained {
-        let Some(pickup) = game.traffic.get_pickup_mut(index) else {
-            continue;
+        let asset: &'static str = match game.get_mut_traffic().get_pickup_mut(index) {
+            Some(pickup) => pickup.get_asset(),
+            None => continue,
         };
         // 护甲 / 弹药以前只是加钱,现在真的进战斗系统。
-        let asset: &'static str = pickup.asset;
-        apply_pickup(&mut game.player, pickup);
         apply_combat_pickup(game, asset);
-        game.player.set_collected_push(index);
+        let picked: Option<Pickup> = game.get_mut_traffic().get_pickup_mut(index).cloned();
+        if let Some(mut picked) = picked {
+            apply_pickup(game.get_mut_player(), &mut picked);
+        }
+        game.get_mut_player().set_collected_push(index);
         // 拾走了就不该还在地上:把该批次的实例清零。
-        if let Some(batch) = game.pickup_batches.get(index)
-            && let Some(scene_batch) = game.scene.batches.get_mut(*batch)
+        let pickup_batch: Option<usize> = game.get_pickup_batches().get(index).copied();
+        if let Some(batch) = pickup_batch
+            && let Some(scene_batch) = game.get_mut_scene().get_mut_batches().get_mut(batch)
         {
-            scene_batch.instances.clear();
+            scene_batch.get_mut_instances().clear();
         }
     }
-}
-
-/// 一颗正在空中飞的手雷。
-///
-/// 抛投物必须**有自己的位置和计时**,而不是「按 G 立刻对射程内的
-/// 敌人造成一次伤害」:后者是范围攻击,不是投掷。手雷有 1.1 s 的滞空,
-/// 玩家在这段时间里还能跑开 —— 掩体因此有意义。
-#[derive(Clone, Copy, Debug)]
-struct Grenade {
-    /// 当前世界坐标(脚底高度)。
-    position: Vec3,
-    /// 水平速度(XZ,米/秒)。
-    velocity: Vec2,
-    /// 垂直速度(米/秒,向上为正)。
-    vertical_velocity: f32,
-    /// 已经飞了多久(秒),到 [`GRENADE_FLIGHT_TIME`] 就炸。
-    age: f32,
 }
 
 /// 处理 G 键:手里有手雷就投一颗,顺带把当前武器切成手雷。
@@ -8502,26 +7382,28 @@ struct Grenade {
 /// # Returns
 ///
 /// - `bool` - 本次是否真的投出了一颗。
-fn throw_grenade(game: &mut Game) -> bool {
-    if game.player.get_vehicle().is_some() {
-        game.player.set_notice(String::from(NOTICE_NO_GRENADE));
+pub(crate) fn throw_grenade(game: &mut Game) -> bool {
+    if game.get_player().get_vehicle().is_some() {
+        game.get_mut_player()
+            .set_notice(String::from(NOTICE_NO_GRENADE));
         return false;
     }
-    if game.arsenal.get_weapon() != Weapon::Grenade {
-        game.arsenal.set_weapon(Weapon::Grenade);
+    if game.get_arsenal().get_weapon() != Weapon::Grenade {
+        game.get_mut_arsenal().set_weapon(Weapon::Grenade);
         rebind_weapon_batch(game);
     }
-    if game.arsenal.get_grenade_tubes() == 0 {
-        game.player.set_notice(String::from(NOTICE_NO_GRENADE));
+    if game.get_arsenal().get_grenade_tubes() == 0 {
+        game.get_mut_player()
+            .set_notice(String::from(NOTICE_NO_GRENADE));
         return false;
     }
-    if !game.arsenal.take_grenade() {
+    if !game.get_mut_arsenal().take_grenade() {
         return false;
     }
-    let here: Vec3 = game.player.get_position();
-    let aim: Vec2 = game.arsenal.get_aim();
+    let here: Vec3 = game.get_player().get_position();
+    let aim: Vec2 = game.get_arsenal().get_aim();
     let (sin_pitch, cos_pitch): (f32, f32) = GRENADE_THROW_PITCH.sin_cos();
-    game.live_grenades.push(Grenade {
+    game.get_mut_live_grenades().push(Grenade {
         position: [here[0], here[1] + AIM_CHEST_HEIGHT, here[2]],
         velocity: [
             aim[0] * GRENADE_THROW_SPEED * cos_pitch,
@@ -8530,9 +7412,10 @@ fn throw_grenade(game: &mut Game) -> bool {
         vertical_velocity: GRENADE_THROW_SPEED * sin_pitch,
         age: 0.0,
     });
-    game.arsenal
+    game.get_mut_arsenal()
         .set_cooldown(Weapon::Grenade.fire_rate() * GRENADE_COOLDOWN);
-    game.player.set_notice(String::from(NOTICE_GRENADE_THROWN));
+    game.get_mut_player()
+        .set_notice(String::from(NOTICE_GRENADE_THROWN));
     true
 }
 
@@ -8542,49 +7425,49 @@ fn throw_grenade(game: &mut Game) -> bool {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧秒数。
-fn step_live_grenades(game: &mut Game, dt: f32) {
-    if game.live_grenades.is_empty() {
+pub(crate) fn step_live_grenades(game: &mut Game, dt: f32) {
+    if game.get_live_grenades().is_empty() {
         return;
     }
     let mut survivors: Vec<Grenade> = Vec::new();
     let mut blasts: Vec<Vec3> = Vec::new();
-    for mut grenade in game.live_grenades.drain(..) {
-        grenade.age += dt;
-        grenade.vertical_velocity -= GRAVITY * dt;
-        grenade.position[0] += grenade.velocity[0] * dt;
-        grenade.position[2] += grenade.velocity[1] * dt;
-        grenade.position[1] += grenade.vertical_velocity * dt;
+    let grenades: Vec<Grenade> = game.get_mut_live_grenades().drain(..).collect();
+    let world_snapshot: CollisionWorld = game.get_world_ref().clone();
+    let floor_world: FloorWorld = game.get_interiors().clone();
+    for mut grenade in grenades {
+        grenade.set_age(dt);
+        grenade.set_vertical_velocity(GRAVITY * dt);
+        grenade.get_position()[0] += grenade.get_velocity()[0] * dt;
+        grenade.get_position()[2] += grenade.get_velocity()[1] * dt;
+        grenade.get_position()[1] += grenade.get_vertical_velocity() * dt;
         // 撞到静态几何就停在撞点 —— 手雷不该穿墙。
+        let grenade_at: Vec3 = grenade.get_position();
         if let Some((distance, normal)) = crate::collision::ray_to_shapes(
-            &game.world,
-            grenade.position,
+            &world_snapshot,
+            grenade.get_position(),
             [
-                grenade.velocity[0],
-                grenade.vertical_velocity,
-                grenade.velocity[1],
+                grenade.get_velocity()[0],
+                grenade.get_vertical_velocity(),
+                grenade.get_velocity()[1],
             ],
         ) && distance < 0.35
         {
-            grenade.position[0] -= normal[0] * distance;
-            grenade.position[2] -= normal[1] * distance;
-            grenade.velocity = [0.0, 0.0];
-            grenade.vertical_velocity = 0.0;
+            grenade.get_position()[0] -= normal[0] * distance;
+            grenade.get_position()[2] -= normal[1] * distance;
+            grenade.set_velocity([0.0, 0.0]);
+            grenade.set_vertical_velocity(0.0);
         }
-        let floor: f32 = game
-            .interiors
-            .support_height(
-                [grenade.position[0], grenade.position[2]],
-                grenade.position[1],
-            )
+        let floor: f32 = floor_world
+            .support_height([grenade_at[0], grenade_at[2]], grenade.get_position()[1])
             .unwrap_or(GROUND_LEVEL);
-        if grenade.position[1] <= floor || grenade.age >= GRENADE_FLIGHT_TIME {
-            grenade.position[1] = grenade.position[1].max(floor);
-            blasts.push(grenade.position);
+        if grenade.get_position()[1] <= floor || grenade.get_age() >= GRENADE_FLIGHT_TIME {
+            grenade.get_position()[1] = grenade.get_position()[1].max(floor);
+            blasts.push(grenade.get_position());
             continue;
         }
         survivors.push(grenade);
     }
-    game.live_grenades = survivors;
+    game.set_live_grenades(survivors);
     for at in blasts {
         explode_at(game, at);
     }
@@ -8596,31 +7479,31 @@ fn step_live_grenades(game: &mut Game, dt: f32) {
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `Vec3` - 爆心世界坐标。
-fn explode_at(game: &mut Game, at: Vec3) {
-    game.hitmarker = HITMARKER_TIME;
-    for index in 0..game.enemies.len() {
-        if !game.enemies[index].is_alive() {
+pub(crate) fn explode_at(game: &mut Game, at: Vec3) {
+    game.set_hitmarker(HITMARKER_TIME);
+    for index in 0..game.get_enemies().len() {
+        if !game.get_enemies()[index].is_alive() {
             continue;
         }
-        let distance: f32 = flat_distance(at, game.enemies[index].get_position());
+        let distance: f32 = flat_distance(at, game.get_enemies()[index].get_position());
         if distance > GRENADE_BLAST_RADIUS {
             continue;
         }
         // 线性衰减到 0:贴着炸满伤 [`GRENADE_DAMAGE`],边缘刚好 0。
         let fall: f32 = 1.0 - distance / GRENADE_BLAST_RADIUS;
-        let killed: bool = game.enemies[index].damage(GRENADE_DAMAGE * fall);
-        game.did_hit = true;
-        game.wanted.add_heat(WANTED_PER_HIT);
+        let killed: bool = game.get_mut_enemies()[index].damage(GRENADE_DAMAGE * fall);
+        game.set_did_hit(true);
+        game.get_mut_wanted().add_heat(WANTED_PER_HIT);
         if killed {
-            game.kills += 1;
+            game.set_kills(1);
             let drop: f32 = ENEMY_CASH_DROP;
-            game.player.set_cash_add(drop);
+            game.get_mut_player().set_cash_add(drop);
         }
     }
-    let to_player: f32 = flat_distance(at, game.player.get_position());
+    let to_player: f32 = flat_distance(at, game.get_player().get_position());
     if to_player <= GRENADE_BLAST_RADIUS {
         let fall: f32 = 1.0 - to_player / GRENADE_BLAST_RADIUS;
-        let _: f32 = apply_damage(&mut game.player, GRENADE_DAMAGE * fall * 0.5);
+        let _: f32 = apply_damage(game.get_mut_player(), GRENADE_DAMAGE * fall * 0.5);
     }
 }
 
@@ -8639,28 +7522,29 @@ fn explode_at(game: &mut Game, at: Vec3) {
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn toggle_camera_mode(game: &mut Game) {
-    game.third_person = !game.third_person;
-    let yaw: f32 = game.player.get_yaw();
-    if game.third_person {
-        game.camera.set_desired_distance(FOLLOW_DISTANCE);
-        game.camera.set_distance(FOLLOW_DISTANCE);
-        game.camera.set_pitch(FOLLOW_PITCH);
-        game.follow_target = game.player.get_position();
-        game.camera.set_yaw(yaw);
+pub(crate) fn toggle_camera_mode(game: &mut Game) {
+    game.set_third_person(!game.get_third_person());
+    let yaw: f32 = game.get_player().get_yaw();
+    if game.get_third_person() {
+        game.get_mut_camera().set_desired_distance(FOLLOW_DISTANCE);
+        game.get_mut_camera().set_distance(FOLLOW_DISTANCE);
+        game.get_mut_camera().set_pitch(FOLLOW_PITCH);
+        game.set_follow_target(game.get_player().get_position());
+        game.get_mut_camera().set_yaw(yaw);
     } else {
         // 第一人称:焦点就是角色的眼睛,距离 0,所以拖鼠标转的是**视线**
         // 而不是「绕着角色转」——这正是第一人称的直觉。
-        game.camera.set_desired_distance(FIRST_PERSON_DISTANCE);
-        game.camera.set_distance(FIRST_PERSON_DISTANCE);
-        game.camera.set_pitch(FIRST_PERSON_PITCH);
-        let here: Vec3 = game.player.get_position();
-        game.camera
+        game.get_mut_camera()
+            .set_desired_distance(FIRST_PERSON_DISTANCE);
+        game.get_mut_camera().set_distance(FIRST_PERSON_DISTANCE);
+        game.get_mut_camera().set_pitch(FIRST_PERSON_PITCH);
+        let here: Vec3 = game.get_player().get_position();
+        game.get_mut_camera()
             .set_target([here[0], here[1] + FIRST_PERSON_HEIGHT, here[2]]);
-        game.follow_target = game.camera.get_target();
-        game.camera.set_yaw(yaw);
+        game.set_follow_target(game.get_camera().get_target());
+        game.get_mut_camera().set_yaw(yaw);
     }
-    let pitch: f32 = game.camera.get_pitch();
+    let pitch: f32 = game.get_camera().get_pitch();
     let _: f32 = pitch;
 }
 
@@ -8673,23 +7557,23 @@ fn toggle_camera_mode(game: &mut Game) {
 /// # Arguments
 ///
 /// - `&GameHandles` - 事件句柄。
-fn sync_map_visibility(handles: &GameHandles) {
+pub(crate) fn sync_map_visibility(handles: &GameHandles) {
     let (open, position, cash, stars): (bool, Vec3, f32, u32) = {
-        let game: Ref<Game> = handles.game.borrow();
+        let game: Ref<Game> = handles.get_game().borrow();
         (
-            game.map_open,
-            game.player.get_position(),
-            game.player.get_cash(),
-            game.wanted.get_stars(),
+            game.get_map_open(),
+            game.get_player().get_position(),
+            game.get_player().get_cash(),
+            game.get_wanted().get_stars(),
         )
     };
-    if let Some(panel) = &handles.map_panel {
+    if let Some(panel) = &handles.get_map_panel() {
         let _: Result<(), euv::wasm_bindgen::JsValue> = panel.set_attribute(
             ATTR_STYLE,
             if open { STYLE_MAP_PANEL } else { DISPLAY_NONE },
         );
     }
-    if let Some(detail) = &handles.map_detail {
+    if let Some(detail) = &handles.get_map_detail() {
         detail.set_text_content(Some(&format!(
             "{MAP_HINT} · x {:.1} · z {:.1} · ${cash} · {}",
             position[0], position[2], stars
@@ -8706,10 +7590,10 @@ fn sync_map_visibility(handles: &GameHandles) {
 /// # Returns
 ///
 /// - `bool` - 本帧是否发生了上车 / 下车(用于刷新 HUD 提示)。
-fn toggle_vehicle(game: &mut Game) -> bool {
-    match game.player.get_vehicle() {
+pub(crate) fn toggle_vehicle(game: &mut Game) -> bool {
+    match game.get_player().get_vehicle() {
         Some(index) => {
-            let Some(car) = game.traffic.get_car_mut(index) else {
+            let Some(car) = game.get_mut_traffic().get_car_mut(index) else {
                 return false;
             };
             car.set_driven(false);
@@ -8722,26 +7606,27 @@ fn toggle_vehicle(game: &mut Game) -> bool {
             let resolved: Vec2 = game
                 .world
                 .resolve([position[0] + side[0], position[2] + side[1]]);
-            game.player
+            game.get_mut_player()
                 .set_position([resolved[0], GROUND_LEVEL, resolved[1]]);
-            game.player.set_vertical_velocity(0.0);
-            game.player.set_grounded(true);
-            game.player.set_vehicle(None);
-            game.player.set_notice(String::from(NOTICE_EXIT));
+            game.get_mut_player().set_vertical_velocity(0.0);
+            game.get_mut_player().set_grounded(true);
+            game.get_mut_player().set_vehicle(None);
+            game.get_mut_player().set_notice(String::from(NOTICE_EXIT));
             true
         }
         None => {
-            let here: Vec3 = game.player.get_position();
-            let Some(index) = nearest_car(&game.traffic, here) else {
-                game.player.set_notice(String::from(NOTICE_NO_CAR));
+            let here: Vec3 = game.get_player().get_position();
+            let Some(index) = nearest_car(&game.get_traffic(), here) else {
+                game.get_mut_player()
+                    .set_notice(String::from(NOTICE_NO_CAR));
                 return false;
             };
-            if let Some(car) = game.traffic.get_car_mut(index) {
+            if let Some(car) = game.get_mut_traffic().get_car_mut(index) {
                 car.set_driven(true);
             }
             report_jacking(game, index);
-            game.player.set_vehicle(Some(index));
-            game.player.set_notice(String::from(NOTICE_ENTER));
+            game.get_mut_player().set_vehicle(Some(index));
+            game.get_mut_player().set_notice(String::from(NOTICE_ENTER));
             true
         }
     }
@@ -8755,16 +7640,16 @@ fn toggle_vehicle(game: &mut Game) -> bool {
 /// - `&HashMap<String, usize>` - 资产 id → 场景 mesh 索引。
 /// - `&MeshAsset` - `ped_suit` 的完整资产(用于切 part)。
 /// - `&HashMap<String, MeshAsset>` - 车辆资产(用于切出可转车轮)。
-fn spawn_player_traffic_pickups(
+pub(crate) fn spawn_player_traffic_pickups(
     game: &mut Game,
     index_map: &HashMap<String, usize>,
     ped: &MeshAsset,
     car_assets: &HashMap<String, MeshAsset>,
 ) {
     // 玩家骨架:每个 part 一个独立 mesh + 独立批次。
-    game.player_batches.clear();
+    game.get_mut_player_batches().clear();
     for part_name in PLAYER_PARTS {
-        let batch: usize = push_player_part(&mut game.scene, ped, part_name);
+        let batch: usize = push_player_part(game.get_mut_scene(), ped, part_name);
         if batch == usize::MAX {
             continue;
         }
@@ -8777,7 +7662,7 @@ fn spawn_player_traffic_pickups(
         } else {
             joint_pivot(parent, part_local_bounds(ped, parent))
         };
-        game.player_batches.push(PlayerLimbBatch {
+        game.get_mut_player_batches().push(PlayerLimbBatch {
             part: (*part_name).to_string(),
             pivot,
             root_pivot,
@@ -8789,10 +7674,10 @@ fn spawn_player_traffic_pickups(
     //
     // 车轮批次要按车资产切网格,而网格必须**每辆车型切一次**(不同车型的
     // 轮子尺寸不同),所以缓存键是「资产 id」而不是「车实例」。
-    game.car_batches.clear();
-    for index in 0..game.traffic.get_cars_ref().len() {
-        let asset: &'static str = match game.traffic.get_cars_ref().get(index) {
-            Some(car) => car.asset,
+    game.get_mut_car_batches().clear();
+    for index in 0..game.get_traffic().get_cars_ref().len() {
+        let asset: &'static str = match game.get_traffic().get_cars_ref().get(index) {
+            Some(car) => car.get_asset(),
             None => continue,
         };
         let Some(mesh_index) = index_map.get(asset) else {
@@ -8813,8 +7698,10 @@ fn spawn_player_traffic_pickups(
         //
         // 姿态独立(每辆车一个 model matrix)是批次的职责,静态道具之所以能共用
         // 批次,是因为它们的矩阵是构造时就固定好的、之后没人重写。
-        let batch: usize = game.scene.push_batch_with_cull(*mesh_index, true, false);
-        game.car_batches.push(batch);
+        let batch: usize = game
+            .get_mut_scene()
+            .push_batch_with_cull(*mesh_index, true, false);
+        game.get_mut_car_batches().push(batch);
         // 车轮:每辆车四个轮子各一个批次。
         //
         // 切网格的键是**车型**而不是车实例 —— 四个轮子的网格完全相同
@@ -8824,24 +7711,26 @@ fn spawn_player_traffic_pickups(
         };
         // 同一车型的车**共用**切好的 mesh,但每辆车仍然要建自己的批次 ——
         // 批次持有 model matrix,不同车的轮子位置不同。
-        let meshes: Vec<usize> = match game.car_wheel_meshes.get(asset) {
+        let meshes: Vec<usize> = match game.get_car_wheel_meshes().get(asset) {
             Some(existing) => existing.clone(),
             None => {
                 let mut built: Vec<usize> = Vec::new();
                 for slot in 0..4 {
-                    let mesh: usize = push_car_wheel(&mut game.scene, car_asset, slot);
+                    let mesh: usize = push_car_wheel(game.get_mut_scene(), car_asset, slot);
                     if mesh != usize::MAX {
                         built.push(mesh);
                     }
                 }
-                game.car_wheel_meshes
+                game.get_mut_car_wheel_meshes()
                     .insert(asset.to_string(), built.clone());
                 built
             }
         };
         for (slot, mesh) in meshes.iter().enumerate() {
-            let wheel_batch: usize = game.scene.push_batch_with_cull(*mesh, true, false);
-            game.car_wheel_batches.push(CarWheelBatch {
+            let wheel_batch: usize = game
+                .get_mut_scene()
+                .push_batch_with_cull(*mesh, true, false);
+            game.get_mut_car_wheel_batches().push(CarWheelBatch {
                 car: index,
                 slot,
                 mount: crate::traffic::WHEEL_MOUNTS[slot],
@@ -8851,45 +7740,46 @@ fn spawn_player_traffic_pickups(
     }
 
     // 拾取物:每个拾取物一个批次(自转相位独立)。
-    game.pickup_batches.clear();
-    for index in 0..game.traffic.get_pickups_ref().len() {
-        let asset: &'static str = match game.traffic.get_pickups_ref().get(index) {
-            Some(pickup) => pickup.asset,
+    game.get_mut_pickup_batches().clear();
+    for index in 0..game.get_traffic().get_pickups_ref().len() {
+        let asset: &'static str = match game.get_traffic().get_pickups_ref().get(index) {
+            Some(pickup) => pickup.get_asset(),
             None => continue,
         };
         let Some(mesh_index) = index_map.get(asset) else {
             continue;
         };
-        let batch: usize = find_or_create_batch(&mut game.scene, *mesh_index);
-        game.pickup_batches.push(batch);
+        let batch: usize = find_or_create_batch(game.get_mut_scene(), *mesh_index);
+        game.get_mut_pickup_batches().push(batch);
     }
 
     // 碰撞世界:从资产 bounds 自动推导。
+    let asset_bounds: HashMap<String, Bounds> = game.get_asset_bounds().clone();
     build_collision_world(
-        &mut game.world,
-        &game.asset_bounds,
+        game.get_mut_world(),
+        &asset_bounds,
         spawn_point()[0],
         spawn_point()[2],
     );
     // 室内碰撞世界:两栋可进入样板楼的楼板 / 隔墙 / 楼梯 / 外墙。
-    build_showcase_interiors(&mut game.interiors);
+    build_showcase_interiors(&mut game.get_mut_interiors());
 
     // 验收脚本要的「最近一栋楼」:街区布局是程序化生成的,写死一个
     // 魔法坐标早晚会推到空地上,所以在这里对着同一份 `build_city_buildings()`
     // 算一次存下来 —— 之后每帧只是读它,不会重复分配。
-    let player_at: Vec3 = game.player.get_position();
+    let player_at: Vec3 = game.get_player().get_position();
     let mut best_distance: f32 = f32::MAX;
     let mut nearest: Option<[f32; 2]> = None;
     for placement in build_city_buildings(0.0, 0.0) {
-        let dx: f32 = placement.position[0] - player_at[0];
-        let dz: f32 = placement.position[1] - player_at[2];
+        let dx: f32 = placement.get_position()[0] - player_at[0];
+        let dz: f32 = placement.get_position()[1] - player_at[2];
         let distance: f32 = dx * dx + dz * dz;
         if distance < best_distance {
             best_distance = distance;
-            nearest = Some([placement.position[0], placement.position[1]]);
+            nearest = Some([placement.get_position()[0], placement.get_position()[1]]);
         }
     }
-    game.nearest_building = nearest;
+    game.set_nearest_building(nearest);
 }
 
 /// 把玩家骨架、车队与拾取物的实例矩阵写回场景批次。
@@ -8897,35 +7787,45 @@ fn spawn_player_traffic_pickups(
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
-fn sync_dynamic_instances(game: &mut Game) {
-    let driving: bool = game.player.get_driving();
-    let origin: Vec3 = game.player.get_position();
-    let yaw: f32 = game.player.get_yaw();
-    let phase: f32 = game.player.get_gait_phase();
-    let amount: f32 = game.player.get_gait_amount();
+pub(crate) fn sync_dynamic_instances(game: &mut Game) {
+    let driving: bool = game.get_player().get_driving();
+    let origin: Vec3 = game.get_player().get_position();
+    let yaw: f32 = game.get_player().get_yaw();
+    let phase: f32 = game.get_player().get_gait_phase();
+    let amount: f32 = game.get_player().get_gait_amount();
 
     // 玩家骨架:四肢按步态相位摆动;上车时整批隐藏。
     //
     // 每节 limb 走 `limb_chain_matrix`:根关节(肩 / 胯)先转,末端关节
     // (肘 / 膝)再在**已经转过根关节**的坐标系里多转一点。少了这一步,
     // 大腿摆动时小腿会原地不动 —— 就是「四肢不协调」。
-    for limb in game.player_batches.clone() {
-        let Some(scene_batch) = game.scene.batches.get_mut(limb.batch) else {
+    for limb in game.get_player_batches().clone() {
+        let Some(scene_batch) = game
+            .get_mut_scene()
+            .get_mut_batches()
+            .get_mut(limb.get_batch())
+        else {
             continue;
         };
-        scene_batch.instances.clear();
+        scene_batch.get_mut_instances().clear();
         if driving {
             continue;
         }
-        let swing: f32 = limb_swing(&limb.part, phase, amount);
-        let parent: &str = limb_parent(&limb.part);
+        let swing: f32 = limb_swing(&limb.get_part(), phase, amount);
+        let parent: &str = limb_parent(&limb.get_part());
         let root_swing: f32 = if parent.is_empty() {
             0.0
         } else {
             limb_swing(parent, phase, amount)
         };
-        let model: Mat4 =
-            limb_chain_matrix(origin, yaw, limb.root_pivot, limb.pivot, root_swing, swing);
+        let model: Mat4 = limb_chain_matrix(
+            origin,
+            yaw,
+            limb.get_root_pivot(),
+            limb.get_pivot(),
+            root_swing,
+            swing,
+        );
 
         scene_batch
             .instances
@@ -8933,16 +7833,16 @@ fn sync_dynamic_instances(game: &mut Game) {
     }
 
     // 车队:位置与朝向都来自交通系统。
-    for index in 0..game.traffic.get_cars_ref().len() {
-        let Some(car) = game.traffic.get_cars_ref().get(index) else {
+    for index in 0..game.get_traffic().get_cars_ref().len() {
+        let Some(car) = game.get_traffic().get_cars_ref().get(index) else {
             continue;
         };
         let (position, car_yaw) = (car.get_position(), car.get_yaw());
-        let Some(batch) = game.car_batches.get(index) else {
+        let Some(batch) = game.get_car_batches().get(index).copied() else {
             continue;
         };
-        if let Some(scene_batch) = game.scene.batches.get_mut(*batch) {
-            scene_batch.instances.clear();
+        if let Some(scene_batch) = game.get_mut_scene().get_mut_batches().get_mut(batch) {
+            scene_batch.get_mut_instances().clear();
             scene_batch
                 .instances
                 .push(Instance::new(position, car_yaw, 1.0, [1.0, 1.0, 1.0]));
@@ -8950,18 +7850,22 @@ fn sync_dynamic_instances(game: &mut Game) {
     }
 
     // 车轮:跟着车身走,并绕自己的轮心自转。
-    for wheel in &game.car_wheel_batches {
-        let Some(car) = game.traffic.get_cars_ref().get(wheel.car) else {
+    for wheel in game.get_car_wheel_batches() {
+        let Some(car) = game.get_traffic().get_cars_ref().get(wheel.get_car()) else {
             continue;
         };
         let model: Mat4Data = car_wheel_model(
             car.get_position(),
             car.get_yaw(),
-            wheel.mount,
+            wheel.get_mount(),
             car.get_wheel_spin(),
         );
-        if let Some(scene_batch) = game.scene.batches.get_mut(wheel.batch) {
-            scene_batch.instances.clear();
+        if let Some(scene_batch) = game
+            .get_mut_scene()
+            .get_mut_batches()
+            .get_mut(wheel.get_batch())
+        {
+            scene_batch.get_mut_instances().clear();
             scene_batch
                 .instances
                 .push(Instance::from_model(model, [1.0, 1.0, 1.0]));
@@ -8969,17 +7873,17 @@ fn sync_dynamic_instances(game: &mut Game) {
     }
 
     // 拾取物:绕 Y 自转。
-    for index in 0..game.traffic.get_pickups_ref().len() {
-        let Some(pickup) = game.traffic.get_pickups_ref().get(index) else {
+    for index in 0..game.get_traffic().get_pickups_ref().len() {
+        let Some(pickup) = game.get_traffic().get_pickups_ref().get(index) else {
             continue;
         };
         let (position, spin, taken) =
             (pickup.get_position(), pickup.get_spin(), pickup.get_taken());
-        let Some(batch) = game.pickup_batches.get(index) else {
+        let Some(batch) = game.get_pickup_batches().get(index).copied() else {
             continue;
         };
-        if let Some(scene_batch) = game.scene.batches.get_mut(*batch) {
-            scene_batch.instances.clear();
+        if let Some(scene_batch) = game.get_mut_scene().get_mut_batches().get_mut(batch) {
+            scene_batch.get_mut_instances().clear();
             if !taken {
                 scene_batch
                     .instances
@@ -9001,7 +7905,7 @@ fn sync_dynamic_instances(game: &mut Game) {
 /// # Returns
 ///
 /// - `u32` - 计数结果。
-fn step_and_render(
+pub(crate) fn step_and_render(
     game: &mut Game,
     elapsed: f32,
     accumulator: &mut f32,
@@ -9009,16 +7913,16 @@ fn step_and_render(
     height: u32,
 ) -> u32 {
     // ---- dt 钳位 ----
-    let delta: f32 = (elapsed - game.frame_time).clamp(0.0, MAX_FRAME_TIME);
+    let delta: f32 = (elapsed - game.get_frame_time()).clamp(0.0, MAX_FRAME_TIME);
     // 瞬时帧率喂给画质状态机。`delta` 是 `rAF` 的真实间隔,但被
     // MAX_FRAME_TIME 钳过 —— 用未钳的 `elapsed - frame_time` 才准,
     // 否则标签页切回时那一次会算出 4 fps 并触发降档。
-    let raw_delta: f32 = elapsed - game.frame_time;
+    let raw_delta: f32 = elapsed - game.get_frame_time();
     if raw_delta > 0.0 {
-        game.quality.sample(1.0 / raw_delta);
+        game.get_quality().sample(1.0 / raw_delta);
     }
-    game.frame_time = elapsed;
-    game.canvas_size.set((width, height));
+    game.set_frame_time(elapsed);
+    game.get_canvas_size().set((width, height));
 
     // ---- 输入 → 玩家 / 车队 / 相机 ----
     // 传送 / 注入开火请求要在逻辑步进**之前**吃掉:挂在帧尾的话这一帧
@@ -9028,7 +7932,7 @@ fn step_and_render(
     simulate(game, delta);
 
     // 相机俯仰始终收在合法区间。
-    game.camera.clamp_pitch();
+    game.get_mut_camera().clamp_pitch();
 
     // ---- 每帧一次:把玩家骨架 / 车队 / 拾取物 / 敌人 / 行人的实例写回场景批次 ----
     //
@@ -9043,7 +7947,7 @@ fn step_and_render(
     while *accumulator >= FIXED_DT && steps < 8 {
         *accumulator -= FIXED_DT;
         steps += 1;
-        game.ticks += 1;
+        game.set_ticks(game.get_ticks() + 1);
     }
 
     // ---- 把玩家骨架 / 车队 / 拾取物 / 敌人 / 行人的实例矩阵写回场景 ----
@@ -9051,75 +7955,84 @@ fn step_and_render(
     sync_combat_instances(game);
 
     // ---- 渲染 ----
-    let lighting: SceneLighting = SceneLighting::for_phase(game.input.phase);
+    let lighting: SceneLighting = SceneLighting::for_phase(game.get_input().get_phase());
     let aspect: f32 = if height == 0 {
         1.0
     } else {
         width as f32 / height as f32
     };
-    let view_proj: crate::camera::Mat4 = game.camera.view_projection(aspect);
+    let view_proj: crate::camera::Mat4 = game.get_camera().view_projection(aspect);
     // 近处剔除半径跟模式走:自由观察的机位在 200 m 外,26 m 剔的是
     // 「糊在镜头上」的行道树;第三人称眼点只有 7 m,同样的 26 m 会把
     // 整条街剔光(画面只剩地面和天空)。遮挡由相机的球体探针负责。
-    let near_cull: f32 = if game.third_person {
+    let near_cull: f32 = if game.get_third_person() {
         NEAR_CULL_RADIUS_FOLLOW
     } else {
         NEAR_CULL_RADIUS
     };
     // 验收探针:把几个已知世界点投到屏幕坐标,用来判断「几何没画」
     // 还是「画了但在视锥外」。
-    let px0: f32 = game.player.get_position()[0];
-    let pz0: f32 = game.player.get_position()[2];
-    game.probe = [
-        [px0, 0.0, pz0],
-        [px0 + 20.0, 0.0, pz0],
-        [px0, 0.0, pz0 - 60.0],
-        [px0, 8.0, pz0 - 40.0],
-    ]
-    .iter()
-    .map(|pt: &Vec3| {
-        game.camera
-            .world_to_screen(*pt, width as f32, height as f32)
-            .map(|(x, y, _): (f32, f32, f32)| [x, y])
-    })
-    .collect();
+    let px0: f32 = game.get_player().get_position()[0];
+    let pz0: f32 = game.get_player().get_position()[2];
+    game.set_probe(
+        [
+            [px0, 0.0, pz0],
+            [px0 + 20.0, 0.0, pz0],
+            [px0, 0.0, pz0 - 60.0],
+            [px0, 8.0, pz0 - 40.0],
+        ]
+        .iter()
+        .map(|pt: &Vec3| {
+            game.get_camera()
+                .world_to_screen(*pt, width as f32, height as f32)
+                .map(|(x, y, _): (f32, f32, f32)| [x, y])
+        })
+        .collect(),
+    );
     let mut triangles: u32 = 0;
-    if let Some(renderer) = game.renderer.as_mut() {
-        let result: Result<u32, String> = match renderer {
+    // take the backend out so the frame can read `game` while it draws,
+    // then put it back -- the fallback below may replace it outright
+    if let Some(mut backend) = game.get_mut_renderer().take() {
+        let result: Result<u32, String> = match &mut backend {
             // ⚠️ 注意:HUD 上那个 `{N} tris` 是 `scene.total_triangles`,
             // 一个**静态常量** —— WebGL2 和 WebGPU 都会显示同一个数,哪怕
             // 某个后端一帧都没画出来。所以验收必须看这里这个「本帧真的
             // 提交了多少三角形」的 `gpu_submitted`。
             Renderer::WebGpu(gpu) => gpu.render(crate::webgpu::RenderParams {
-                scene: &game.scene,
+                scene: &game.get_scene(),
                 view_proj: &view_proj,
                 lighting: &lighting,
-                eye: game.camera.eye(),
+                eye: game.get_camera().eye(),
                 width,
                 height,
                 near_cull_radius: near_cull,
                 // 阴影 frustum 跟**玩家**而不是相机眼点 —— 与下面
                 // WebGL2 那个调用传的 `game.player.get_position()` 同源。
-                shadow_focus: game.player.get_position(),
+                shadow_focus: game.get_player().get_position(),
             }),
             Renderer::WebGl(webgl) => webgl.render(
-                &game.scene,
+                &game.get_scene(),
                 &view_proj,
-                &game.camera.view_matrix(),
+                &game.get_camera().view_matrix(),
                 &lighting,
-                game.camera.eye(),
+                game.get_camera().eye(),
                 width,
                 height,
                 near_cull,
-                game.camera.fov_y,
+                game.get_camera().get_fov_y(),
                 FAR_PLANE,
-                game.frame_time,
-                game.player.get_position(),
-                game.quality.tier(),
+                game.get_frame_time(),
+                game.get_player().get_position(),
+                game.get_quality().tier(),
             ),
-            Renderer::Software(software) => {
-                Ok(software.render(&game.scene, &game.camera, &lighting, width, height, 40_000))
-            }
+            Renderer::Software(software) => Ok(software.render(
+                &game.get_scene(),
+                &game.get_camera(),
+                &lighting,
+                width,
+                height,
+                40_000,
+            )),
         };
         triangles = match result {
             Ok(value) => value,
@@ -9131,11 +8044,11 @@ fn step_and_render(
                 // 上下文 —— 而一块 canvas 只能有一个上下文类型,换不了。
                 // 因此这里只对 WebGL2 生效,WebGPU 的失败路径在
                 // `try_init_webgpu` 里(那时画布还没被 WebGL2 碰过)。
-                if let Renderer::WebGl(_) = renderer {
-                    let canvas: HtmlCanvasElement = game.canvas.clone();
+                if let Renderer::WebGl(_) = backend {
+                    let canvas: HtmlCanvasElement = game.get_canvas().clone();
                     match SoftwareRenderer::new(&canvas) {
                         Ok(software) => {
-                            game.renderer = Some(Renderer::Software(software));
+                            backend = Renderer::Software(software);
                         }
                         Err(message) => {
                             console_log(&format!("[vcw] Canvas2D fallback failed: {message}"));
@@ -9145,9 +8058,11 @@ fn step_and_render(
                 0
             }
         };
+        // put the backend back unless the error path swapped it for software
+        game.get_mut_renderer().replace(backend);
     }
-    game.gpu_submitted = triangles;
-    game.frame_count += 1;
+    game.set_gpu_submitted(triangles);
+    game.set_frame_count(1);
     triangles
 }
 
@@ -9156,7 +8071,7 @@ fn step_and_render(
 /// # Arguments
 ///
 /// - `&str` - str 的只读引用。
-fn console_log(message: &str) {
+pub(crate) fn console_log(message: &str) {
     euv::web_sys::console::log_1(&JsValue::from_str(message));
 }
 
@@ -9174,7 +8089,7 @@ fn console_log(message: &str) {
 /// # Returns
 ///
 /// - `Result<(), JsValue>` - `Reflect::set` 的结果。
-fn set_window_json(name: &str, json: &str) -> Result<(), JsValue> {
+pub(crate) fn set_window_json(name: &str, json: &str) -> Result<(), JsValue> {
     let window: web_sys::Window = web_sys::window().ok_or(JsValue::from_str(NO_WINDOW))?;
     let value: JsValue = js_sys::JSON::parse(json)?;
     js_sys::Reflect::set(&window, &JsValue::from_str(name), &value).map(|_: bool| ())
@@ -9190,31 +8105,31 @@ fn set_window_json(name: &str, json: &str) -> Result<(), JsValue> {
 /// # Arguments
 ///
 /// - `GameHandles` - 输入值。
-fn start_loop(handles: GameHandles) {
+pub(crate) fn start_loop(handles: GameHandles) {
     let callback: Rc<Cell<Option<Function>>> = Rc::new(Cell::new(None));
     let handles_for_frame: GameHandles = handles.clone();
     let callback_for_frame: Rc<Cell<Option<Function>>> = callback.clone();
     let closure: Closure<dyn FnMut(f64)> = Closure::wrap(Box::new(move |timestamp: f64| {
         let handles: GameHandles = handles_for_frame.clone();
         let elapsed: f32 = timestamp as f32 / 1000.0;
-        let width: u32 = handles.canvas.width();
-        let height: u32 = handles.canvas.height();
+        let width: u32 = handles.get_canvas().width();
+        let height: u32 = handles.get_canvas().height();
         let mut accumulator: f32 = {
-            let game: Ref<Game> = handles.game.borrow();
-            game.accumulator
+            let game: Ref<Game> = handles.get_game().borrow();
+            game.get_accumulator()
         };
         let triangles: u32 = {
-            let mut game: RefMut<Game> = handles.game.borrow_mut();
+            let mut game: RefMut<Game> = handles.get_game().borrow_mut();
             let triangles: u32 =
                 step_and_render(&mut game, elapsed, &mut accumulator, width, height);
-            game.accumulator = accumulator;
+            game.set_accumulator(accumulator);
             triangles
         };
         let hud_text: String = {
-            let game: Ref<Game> = handles.game.borrow();
+            let game: Ref<Game> = handles.get_game().borrow();
             format_hud(&game, triangles)
         };
-        if let Some(hud) = &handles.hud {
+        if let Some(hud) = &handles.get_hud() {
             hud.set_text_content(Some(&hud_text));
         }
         // 结构化 HUD(血条 / 弹药 / 通缉星 / 任务 / 小地图):每帧刷一次。
@@ -9222,7 +8137,12 @@ fn start_loop(handles: GameHandles) {
         // 验收通道按固定节拍刷新(约 20 Hz)。每帧都做一次 `JSON::parse` +
         // `Reflect::set` 会在无 GPU 的无头浏览器里把主线程吃满,反而让
         // CDP 的 `Runtime.evaluate` 超时;10 Hz 完全够读坐标用。
-        if handles.game.borrow().frame_count.is_multiple_of(3) {
+        if handles
+            .get_game()
+            .borrow()
+            .get_frame_count()
+            .is_multiple_of(3)
+        {
             publish_debug_state(&handles, &hud_text);
         }
         // 排下一帧。
@@ -9247,7 +8167,6 @@ fn start_loop(handles: GameHandles) {
 // ===========================================================================
 // 异步加载 + 启动
 // ===========================================================================
-
 /// 解析 canvas 的像素尺寸(跟随 CSS 盒 × devicePixelRatio,上限 2×)。
 ///
 /// # Arguments
@@ -9257,7 +8176,7 @@ fn start_loop(handles: GameHandles) {
 /// # Returns
 ///
 /// - `(u32, u32)` - 计算结果。
-fn sync_canvas_size(canvas: &HtmlCanvasElement) -> (u32, u32) {
+pub(crate) fn sync_canvas_size(canvas: &HtmlCanvasElement) -> (u32, u32) {
     let mut ratio: f64 = window()
         .map(|win: Window| win.device_pixel_ratio())
         .unwrap_or(1.0)
@@ -9452,7 +8371,7 @@ pub fn boot() {
     sync_phase_ui(&handles, query_phase());
 
     // ---- 昼夜滑块 ----
-    if let Some(slider) = &handles.phase_slider {
+    if let Some(slider) = &handles.get_phase_slider() {
         let handles_for_input: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |event: Event| {
             let value: String = match event
@@ -9464,10 +8383,10 @@ pub fn boot() {
             };
             let parsed: f64 = value.parse().unwrap_or(0.0);
             let phase: DayPhase = DayPhase::from_slider(parsed);
-            let mut game: RefMut<Game> = handles_for_input.game.borrow_mut();
-            game.input.phase = phase;
+            let mut game: RefMut<Game> = handles_for_input.get_game().borrow_mut();
+            game.get_mut_input().set_phase(phase);
             drop(game);
-            if let Some(label) = &handles_for_input.phase_label {
+            if let Some(label) = &handles_for_input.get_phase_label() {
                 label.set_text_content(Some(phase.label()));
             }
         }));
@@ -9533,8 +8452,8 @@ async fn try_init_webgpu(handles: &GameHandles, canvas: &HtmlCanvasElement) {
         Ok(gpu) => {
             console_log(&format!("[vcw] renderer = {}", BACKEND_WEBGPU));
             {
-                let mut game: RefMut<Game> = handles.game.borrow_mut();
-                game.renderer = Some(Renderer::WebGpu(Box::new(gpu)));
+                let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+                game.set_renderer(Some(Renderer::WebGpu(Box::new(gpu))));
             }
             // 资产可能早就构建完了 —— 那就**现在**补传。WebGPU 的设备
             // 获取是异步的,它比资产加载慢或快都正常;两个条件
@@ -9569,7 +8488,7 @@ async fn try_init_webgpu(handles: &GameHandles, canvas: &HtmlCanvasElement) {
 /// # Returns
 ///
 /// - `()` - 结果只体现在 `game.renderer` 与 console 上。
-fn install_legacy_backend(handles: &GameHandles, canvas: &HtmlCanvasElement) {
+pub(crate) fn install_legacy_backend(handles: &GameHandles, canvas: &HtmlCanvasElement) {
     let (renderer, backend_note): (Option<Renderer>, String) = match WebGlRenderer::new(canvas) {
         Ok(webgl) => (
             Some(Renderer::WebGl(Box::new(webgl))),
@@ -9595,8 +8514,8 @@ fn install_legacy_backend(handles: &GameHandles, canvas: &HtmlCanvasElement) {
     };
     console_log(&format!("[vcw] renderer = {backend_note}"));
     if let Some(value) = renderer {
-        let mut game: RefMut<Game> = handles.game.borrow_mut();
-        game.renderer = Some(value);
+        let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+        game.set_renderer(Some(value));
     }
 }
 
@@ -9609,21 +8528,21 @@ fn install_legacy_backend(handles: &GameHandles, canvas: &HtmlCanvasElement) {
 /// # Returns
 ///
 /// - `()` - 结果只体现在 console 上。
-fn upload_pending_meshes(handles: &GameHandles) {
+pub(crate) fn upload_pending_meshes(handles: &GameHandles) {
     let mut failures: usize = 0;
     let mut meshes: usize = 0;
     // 和 `load_assets_and_build` 里那次上传用同一条「先把 renderer
     // `take()` 出来,借完再放回去」的路:`upload_mesh` 需要 `&mut renderer`,
     // 而 mesh 数据住在 `game.scene` 里,两个都在同一个 `RefCell` 后面,
     // 同时借会 panic。
-    let taken: Option<Renderer> = handles.game.borrow_mut().renderer.take();
+    let taken: Option<Renderer> = handles.get_game().borrow_mut().get_mut_renderer().take();
     let Some(mut renderer): Option<Renderer> = taken else {
         return;
     };
-    let built: bool = handles.game.borrow().assets_built;
-    let mesh_count: usize = handles.game.borrow().scene.meshes.len();
+    let built: bool = handles.get_game().borrow().get_assets_built();
+    let mesh_count: usize = handles.get_game().borrow().get_scene().get_meshes().len();
     if !built || mesh_count == 0 {
-        handles.game.borrow_mut().renderer = Some(renderer);
+        handles.get_game().borrow_mut().set_renderer(Some(renderer));
         return;
     }
     // 已经有 mesh 的后端**不要**重传:GPU 表的下标必须与
@@ -9634,9 +8553,9 @@ fn upload_pending_meshes(handles: &GameHandles) {
         Renderer::Software(_) => false,
     };
     if needs_upload {
-        let game_ref: Ref<'_, Game> = handles.game.borrow();
-        meshes = game_ref.scene.meshes.len();
-        for (index, mesh) in game_ref.scene.meshes.iter().enumerate() {
+        let game_ref: Ref<'_, Game> = handles.get_game().borrow();
+        meshes = game_ref.get_scene().get_meshes().len();
+        for (index, mesh) in game_ref.get_scene().get_meshes().iter().enumerate() {
             let outcome: Result<usize, String> = match &mut renderer {
                 Renderer::WebGpu(gpu) => gpu.upload_mesh(mesh),
                 Renderer::WebGl(webgl) => webgl.upload_mesh(mesh),
@@ -9647,7 +8566,7 @@ fn upload_pending_meshes(handles: &GameHandles) {
                 if failures <= MESH_UPLOAD_ERROR_LIMIT {
                     console_log(&format!(
                         "[vcw] deferred upload_mesh FAILED for mesh {index} ({} verts): {error}",
-                        mesh.vertices.len()
+                        mesh.get_vertices().len()
                     ));
                 }
             }
@@ -9656,7 +8575,7 @@ fn upload_pending_meshes(handles: &GameHandles) {
     // 上面的 `game_ref` 是块内借用,到这里已经随块结束 —— 千万别
     // `drop(handles.game.borrow())`:那是拿**引用**去 drop,什么也没做,
     // 下一行 `borrow_mut()` 照样 panic。
-    handles.game.borrow_mut().renderer = Some(renderer);
+    handles.get_game().borrow_mut().set_renderer(Some(renderer));
     if failures > 0 {
         console_log(&format!(
             "[vcw] {failures} of {meshes} meshes failed deferred upload"
@@ -9694,9 +8613,9 @@ async fn load_assets_and_build(handles: GameHandles) {
     };
     let mut by_id: HashMap<String, ManifestEntry> = HashMap::new();
     let mut categories: Vec<String> = Vec::new();
-    for entry in manifest.assets {
-        categories.push(entry.category.clone());
-        by_id.insert(entry.id.clone(), entry);
+    for entry in manifest.get_assets() {
+        categories.push(entry.get_category().clone());
+        by_id.insert(entry.get_id().clone(), entry.clone());
     }
     categories.sort_unstable();
     categories.dedup();
@@ -9726,7 +8645,7 @@ async fn load_assets_and_build(handles: GameHandles) {
             );
             continue;
         };
-        let url: String = format!("{ASSETS_BASE}{}", entry.file);
+        let url: String = format!("{ASSETS_BASE}{}", entry.get_file());
         match fetch_text(&url).await {
             Ok(text) => {
                 // 解析一次:既要注册进场景,又要留下 `bounds` 给碰撞世界推导,
@@ -9848,10 +8767,10 @@ async fn load_assets_and_build(handles: GameHandles) {
     // manifest 自报的资产总数(`Manifest::asset_count`)与实际索引到的数量
     // 对照:不一致说明 manifest 里有条目没被场景蓝图引用(资源白拿),
     // 或者有条目文件缺失。两者都不是致命错误,记一条日志便于排查。
-    if manifest.asset_count != 0 && manifest.asset_count != asset_count {
+    if manifest.get_asset_count() != 0 && manifest.get_asset_count() != asset_count {
         console_log(&format!(
             "[vcw] manifest lists {} assets, scene uses {asset_count}",
-            manifest.asset_count
+            manifest.get_asset_count()
         ));
     }
     console_log(&format!(
@@ -9865,22 +8784,22 @@ async fn load_assets_and_build(handles: GameHandles) {
     // 之后,那些批次会被整份旧场景覆盖掉 —— 屏幕上只剩 build_scene 铺的
     // 静态楼和树,角色和车一个都看不见(调试钩子报 `batch count: 0`)。
     let instance_count: usize = scene.instance_count();
-    let triangle_count: usize = scene.total_triangles;
+    let triangle_count: usize = scene.get_total_triangles();
     {
-        let mut game: RefMut<Game> = handles.game.borrow_mut();
-        game.scene = scene;
-        game.ground_batch = ground_batch;
-        game.water_batch = water_batch;
-        game.static_batch_count = static_batch_count;
-        game.asset_index = index_map.clone();
-        game.streamed_center = [spawn_point()[0], spawn_point()[2]];
-        game.loaded_assets = index_map.len();
-        game.total_assets = total;
-        game.load_error = if failed.is_empty() {
+        let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+        game.set_scene(scene);
+        game.set_ground_batch(ground_batch);
+        game.set_water_batch(water_batch);
+        game.set_static_batch_count(static_batch_count);
+        game.set_asset_index(index_map.clone());
+        game.set_streamed_center([spawn_point()[0], spawn_point()[2]]);
+        game.set_loaded_assets(index_map.len());
+        game.set_total_assets(total);
+        game.set_load_error(if failed.is_empty() {
             None
         } else {
             Some(format!("{} assets failed", failed.len()))
-        };
+        });
     }
 
     // 5) 玩家骨架 + 交通车队 + 拾取物 + 碰撞世界。
@@ -9888,8 +8807,8 @@ async fn load_assets_and_build(handles: GameHandles) {
     // 必须在 build_scene 之后、GPU 上传之后做:骨架批次是 build_scene 之后
     // 新增的批次,资产 bounds 要用来推导碰撞体。
     {
-        let mut game: RefMut<Game> = handles.game.borrow_mut();
-        game.asset_bounds = asset_bounds.clone();
+        let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+        game.set_asset_bounds(asset_bounds.clone());
         // 车道 X 用 `lane_x()` 从 `street_axis()` 现算一遍,和蓝图里的字面值
         // 互相校验:如果街道网格改了而蓝图没改,这里能立刻发现。
         console_log(&format!(
@@ -9908,11 +8827,11 @@ async fn load_assets_and_build(handles: GameHandles) {
         console_log(&format!(
             "[vcw] traffic loop half-length {TRAFFIC_HALF} m, {out_of_range} lane(s) out of range"
         ));
-        game.traffic.populate(&lanes, PICKUP_PLACEMENTS);
+        game.get_mut_traffic().populate(&lanes, PICKUP_PLACEMENTS);
         // 战斗单位必须在 `upload_mesh` **之前**建好批次:它们要往
         // `scene.meshes` 之外只加批次(共用已上传的行人 mesh),但批次
         // 索引必须在那一次上传之前就定下来。
-        game.index_map = index_map.clone();
+        game.set_index_map(index_map.clone());
         populate_combatants(&mut game, 0.37);
         spawn_combat_batches(&mut game, &index_map);
         if let Some(ped) = ped_suit.as_ref() {
@@ -9920,10 +8839,10 @@ async fn load_assets_and_build(handles: GameHandles) {
         }
         console_log(&format!(
             "[vcw] player rig: {} limb batches, {} cars, {} pickups, {} colliders",
-            game.player_batches.len(),
-            game.traffic.get_cars_ref().len(),
-            game.traffic.get_pickups_ref().len(),
-            game.world.get_shapes().len()
+            game.get_player_batches().len(),
+            game.get_traffic().get_cars_ref().len(),
+            game.get_traffic().get_pickups_ref().len(),
+            game.get_world().get_shapes().len()
         ));
         // 上车 / 下车之后新增的批次也要上传。
         // 新增的骨架批次自带新 mesh,必须补一次上传。`upload_mesh` 需要
@@ -9941,13 +8860,13 @@ async fn load_assets_and_build(handles: GameHandles) {
         // 报错,连 `tris` 计数还是 482420,因为没上传的 mesh 压根没有 VAO,
         // `draw_batch` 查不到就静默跳过。这里把每个失败都打进 console,
         // 让症状和原因对得上。
-        game.assets_built = true;
+        game.set_assets_built(true);
         // renderer 可能还没有(WebGPU 还在 await requestDevice)。
         // 下面这段只负责「此刻已经就位的那个 renderer」;迟到的那个
         // 由 `upload_pending_meshes` 补传(它装好时会补调一次)。
-        if let Some(mut renderer) = game.renderer.take() {
+        if let Some(mut renderer) = game.get_mut_renderer().take() {
             let mut upload_failures: usize = 0;
-            for (index, mesh) in game.scene.meshes.iter().enumerate() {
+            for (index, mesh) in game.get_scene().get_meshes().iter().enumerate() {
                 // 两条 GPU 路径的「GPU 表下标 == Scene::meshes 下标」约束
                 // 完全相同,所以上传循环共用,只有 WebGL2 那两个验收探针
                 // (`oob` / `lastIndexCount`)是它独有的。
@@ -9961,7 +8880,7 @@ async fn load_assets_and_build(handles: GameHandles) {
                     if upload_failures <= MESH_UPLOAD_ERROR_LIMIT {
                         console_log(&format!(
                             "[vcw] upload_mesh FAILED for mesh {index} ({} verts): {error}",
-                            mesh.vertices.len()
+                            mesh.get_vertices().len()
                         ));
                     }
                 }
@@ -9969,16 +8888,16 @@ async fn load_assets_and_build(handles: GameHandles) {
             if upload_failures > 0 {
                 console_log(&format!(
                     "[vcw] {upload_failures} of {} meshes failed to upload",
-                    game.scene.meshes.len()
+                    game.get_scene().get_meshes().len()
                 ));
             } else {
                 console_log(&format!(
                     "[vcw] uploaded {} meshes, {} limb batches in the scene",
-                    game.scene.meshes.len(),
-                    game.player_batches.len()
+                    game.get_scene().get_meshes().len(),
+                    game.get_player_batches().len()
                 ));
             }
-            game.renderer = Some(renderer);
+            game.set_renderer(Some(renderer));
         }
     }
 
@@ -10003,15 +8922,15 @@ async fn load_assets_and_build(handles: GameHandles) {
 ///
 /// - `&GameHandles` - GameHandles 的只读引用。
 /// - `String` - 输入值。
-fn finish_with_fallback(handles: &GameHandles, message: String) {
+pub(crate) fn finish_with_fallback(handles: &GameHandles, message: String) {
     set_progress(96.0, FALLING_BACK_TO_BUILT_IN_SCENE);
     let scene: Scene = build_fallback_scene();
     {
-        let mut game: RefMut<Game> = handles.game.borrow_mut();
-        game.using_fallback = true;
-        game.load_error = Some(message.clone());
-        game.scene = scene;
-        game.loaded_assets = 0;
+        let mut game: RefMut<Game> = handles.get_game().borrow_mut();
+        game.set_using_fallback(true);
+        game.set_load_error(Some(message.clone()));
+        game.set_scene(scene);
+        game.set_loaded_assets(0);
     }
     set_progress(100.0, READY_BUILT_IN_FALLBACK_SCENE);
     hide_loading();
@@ -10030,7 +8949,6 @@ async fn yield_to_browser() {
 // ===========================================================================
 // 静态 UI 树(唯一一棵 html! 树,只渲染一次)
 // ===========================================================================
-
 /// 应用根视图。
 ///
 /// **只用一次 html!**。这里不调用任何 euv hook(`App::use_signal` 等),
@@ -10114,8 +9032,7 @@ pub fn app_root() -> VirtualNode {
 
 #[cfg(test)]
 mod tests {
-    use super::{PED_MASS, PLAYER_MASS, PLAYER_PUSH_DEADZONE, PLAYER_PUSH_MIN_SPEED};
-
+    use super::*;
     /// 零输入时玩家必须原地不动 —— 动态层的人群让位不构成位移。
     ///
     /// 回归(2026-10-12 浏览器实测):不按任何键,玩家以恒定
@@ -10127,7 +9044,7 @@ mod tests {
     /// 的分离向量也每帧相同,逐帧累加成单向棘轮。静态层的推离(把
     /// 人从墙里救出来)是解算结果,必须保留;被门槛掉的只是人群让位。
     #[test]
-    fn t_stationary_player_is_not_pushed_by_the_crowd() {
+    pub(crate) fn t_stationary_player_is_not_pushed_by_the_crowd() {
         let world: CollisionWorld = CollisionWorld::new();
         let radius: f32 = PLAYER_RADIUS;
         // 四个行人紧贴玩家,重现街角人群的接触半径。
@@ -10174,33 +9091,17 @@ mod tests {
             "stationary player drifted {drift:.6} m over 8 frames"
         );
     }
-    use crate::{FRAC_PI_2, Ordering};
-    use std::collections::HashMap;
 
-    use super::{
-        ARROWDOWN, ARROWLEFT, ARROWRIGHT, ARROWUP, CAR_HIT_RADIUS, Camera, DIR_LEFT, DIR_RIGHT,
-        Enemy, FOLLOW_FOV, Faction, Instance, KEYA, KEYD, KEYS, KEYW, LOOK_YAW_SENSITIVITY,
-        MISSION_GOTO, MISSION_KILL, MISSION_TITLE_A, Mat4, MeshAssetGpu, Mission,
-        PED_ALERT_CAR_SCALE, PED_ALERT_RADIUS, PED_COUNT, PED_FLEE_SPEED, PED_RADIUS,
-        RUN_OVER_WALK_MIN, Scene, SceneBatch, T_AD_AND_ARROW_DO_NOT_CANCEL,
-        T_ARROW_DOES_NOT_MOVE_ON_FOOT, T_ARROW_STEER_SIGNS_OPPOSED, T_ARROW_STEERS_WHILE_DRIVING,
-        T_FOOT_POSITION_UNCHANGED, T_MOUSE_RIGHT_PANS_RIGHT, T_RUN_FASTER_THAN_WALK,
-        T_RUN_SPEED_PICK, T_WALK_SPEED_PICK, THUG_COUNT, advance_mission,
-        advance_mission_for_player, apply_look_delta, car_wheel_model, flat_distance,
-        mission_target_state, point_to_segment_distance, rebuild_static_batches,
-        repopulate_combatants_at, spawn_peds, spawn_thugs, traffic_lanes,
-    };
-
-    const SLOT_CONTENT_STEP: &str = "step";
-    const SLOT_CONTENT_KIND: &str = "kind";
-    const SLOT_CONTENT_VANISHED: &str = "vanished";
-    const SLOT_CONTENT_SWAPPED: &str = "swapped";
-    const SLOT_CONTENT_TOTAL: &str = "total";
+    pub(crate) const SLOT_CONTENT_STEP: &str = "step";
+    pub(crate) const SLOT_CONTENT_KIND: &str = "kind";
+    pub(crate) const SLOT_CONTENT_VANISHED: &str = "vanished";
+    pub(crate) const SLOT_CONTENT_SWAPPED: &str = "swapped";
+    pub(crate) const SLOT_CONTENT_TOTAL: &str = "total";
     /// 一个世界点投影后的屏幕 NDC x(未做像素映射)。
     ///
     /// 相机后方(`w <= 0`)返回 `NaN`,让「测不出方向」这件事在断言里
     /// 显式失败,而不是悄悄当成 0 参与比较。
-    fn projected_ndc_x(camera: &Camera, point: Vec3) -> f32 {
+    pub(crate) fn projected_ndc_x(camera: &Camera, point: Vec3) -> f32 {
         let vp: Mat4 = camera.view_projection(1.0);
         let clip: [f32; 4] = vp.transform_vec4([point[0], point[1], point[2], 1.0]);
         if clip[3] <= f32::EPSILON {
@@ -10210,12 +9111,12 @@ mod tests {
     }
 
     /// 一个轮子局部点在车轮矩阵下的世界 X。
-    fn wheel_world_x(mat: Mat4Data, local: Vec3) -> f32 {
+    pub(crate) fn wheel_world_x(mat: Mat4Data, local: Vec3) -> f32 {
         mat[0] * local[0] + mat[4] * local[1] + mat[8] * local[2] + mat[12]
     }
 
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值(与 `camera.rs` 同形)。
-    fn fill(template: &str, args: &[(&str, &str)]) -> String {
+    pub(crate) fn fill(template: &str, args: &[(&str, &str)]) -> String {
         let mut out: String = template.to_string();
         let mut index: usize = 0;
         while index < args.len() {
@@ -10225,48 +9126,6 @@ mod tests {
         out
     }
 
-    use super::FIXED_DT;
-    use crate::collision::CollisionWorld;
-    use crate::combat::Pedestrian;
-    use crate::r#config::{
-        AXIS_STRAFE, BLDG_AQUA_ARCADE, BLDG_DECO_PINK, BLDG_LILAC_TOWER, CAR_SEDAN,
-        E_FIXTURE_ASSET_JSON, E_FIXTURE_NO_DECLARED_BOUNDS, E_FIXTURE_SOLID_BOUNDS_UNREGISTERED,
-        FIXTURE_BLDG_AQUA_ARCADE_JSON, FIXTURE_BLDG_LILAC_TOWER_JSON, FIXTURE_CAR_POLICE_JSON,
-        FIXTURE_CAR_SEDAN_JSON, FIXTURE_CAR_TAXI_JSON, FIXTURE_PROP_STREETLIGHT_JSON,
-        FIXTURE_PROP_TRAFFICLIGHT_JSON, GRAVITY, GROUND_LEVEL, GROUND_SNAP_SKIN, JUMP_VELOCITY,
-        KEY_BATCH, PED_SUIT, PED_TALK_SLOT_STEP, PISTOL_MAGAZINE, PLAYER_BODY_HEIGHT, PROP_BENCH,
-        PROP_NEWSSTAND, PROP_PHONE_BOOTH, PROP_STREETLIGHT, PROP_TRAFFICLIGHT, RELOAD_TIME,
-        SLOT_FORMER_RELOAD_KEY, SLOT_RELOAD_KEY, SLOT_SILHOUETTE_CAR, SLOT_SILHOUETTE_DELTA,
-        T_AIR_WALL_ON_THE_SIDEWALK, T_AIR_WALL_PROBE_FOUND_NO_SPOTS, T_C_NO_LONGER_RELOADS,
-        T_CAR_BODY_BATCH_MISSING, T_CAR_BODY_BATCH_NOT_TAIL, T_CAR_BODY_BATCH_SHARED,
-        T_JUMP_CLEARS_A_LEDGE, T_JUMP_LANDS_STANDING, T_JUMP_ONLY_FROM_GROUND,
-        T_JUMP_RISES_BEFORE_FALLING, T_PALM_ON_ROADWAY, T_PALM_ROW_IS_UNIFORM,
-        T_PEDS_DISTINCT_SLOTS, T_PEDS_DOWNED_NO_CHAT, T_PEDS_GATHER_AND_TALK, T_PEDS_TALK_ENDS,
-        T_RELOAD_CONSUMES_RESERVE, T_RELOAD_KEY_IS_GTA_R, T_RELOAD_NOT_REPEATABLE,
-        T_RELOAD_R_REFILLS_MAGAZINE, T_RELOAD_R_STARTS_RELOAD, T_ROUTE_LEG_DIAGONAL,
-        T_SHOWCASE_AXIS_ON_ROAD, T_SHOWCASE_CEILING_PUSHED, T_SHOWCASE_DESCENT_NO_CLIMB,
-        T_SHOWCASE_DESCENT_REACHES_GROUND, T_SHOWCASE_DOOR_CENTER_BLOCKED, T_SHOWCASE_DOOR_INSIDE,
-        T_SHOWCASE_DOOR_NO_SLAB, T_SHOWCASE_DOOR_NOT_FACING, T_SHOWCASE_DOOR_ON_OUTER_WALL,
-        T_SHOWCASE_DOOR_OUTSIDE_BLOCKED, T_SHOWCASE_DOORS_FACE_EACH_OTHER,
-        T_SHOWCASE_DOORWAY_2D_BLOCKED, T_SHOWCASE_FOOTPRINT_CLEAR, T_SHOWCASE_FRONT_FACING,
-        T_SHOWCASE_LANDING_COVERS_RUN, T_SHOWCASE_LANE_BLOCKED, T_SHOWCASE_NO_WALL_AHEAD,
-        T_SHOWCASE_OVERLAPS_ORDINARY, T_SHOWCASE_PARTITION_LANE, T_SHOWCASE_PARTITION_LET_THROUGH,
-        T_SHOWCASE_PIER_LET_PLAYER_THROUGH, T_SHOWCASE_PUSHED_INTO_WALL,
-        T_SHOWCASE_RISE_GE_TOLERANCE, T_SHOWCASE_ROUTE_WALKABLE, T_SHOWCASE_SPRINT_PENETRATES_WALL,
-        T_SHOWCASE_SPRINT_TUNNELS_WALL, T_SHOWCASE_STAIR_REACHES_TOP,
-        T_SHOWCASE_STAIR_RISE_SHALLOW, T_SHOWCASE_STAIR_TOP_LEVEL, T_SHOWCASE_SUBSTEP_NOT_NO_OP,
-        T_SHOWCASE_TOLERANCE_TOO_BIG, T_SHOWCASE_TOLERANCE_TWO_RISES, T_SHOWCASE_TWO_OVERLAP,
-        T_SHOWCASE_WALK_LOSES_SLIDE, T_SHOWCASE_WALKER_DIRECTION, T_SHOWCASE_WALKER_REACHES_TOP,
-        T_SIDE_FRAMES_ABOVE_ROOF, T_SIDE_FRAMES_BOUNDS_BLOWN, T_SIDE_FRAMES_MISSING,
-        T_SIDE_FRAMES_UNDERGROUND, T_SILHOUETTE_TOO_SIMILAR, T_SOLID_BOUNDS_DELETED_A_REAL_WALL,
-        T_SOLID_BOUNDS_FIXTURE_TOO_WEAK, T_SOLID_BOUNDS_GREW_PAST_ASSET_BOUNDS,
-        T_SOLID_BOUNDS_STILL_AN_AIR_WALL, T_SOLID_BOUNDS_X_WIDTH, T_STATIC_LEN_ASSUMED_CONSTANT,
-        T_STREAM_CONTENT_MUST_NOT_SWAP, T_STREAM_CONTENT_MUST_NOT_VANISH, T_STREET_SLOT_ON_GRID,
-        T_STREET_SLOT_WORLD_ANCHORED, T_VERTICAL_REST_ON_FLOOR, T_WHEEL_AXLE_STILL,
-        T_WHEEL_CENTRE_FIXED, T_WHEEL_ROLLS_FORWARD, T_WHEEL_SPIN_MOVES_RIM, TERMINAL_VELOCITY,
-    };
-    use crate::player::Player;
-    use crate::r#type::{Mat4Data, Vec3};
     /// 只跑社交那一层,跳过走路 / 碰撞 —— 社交测试要的是「谁跟谁凑一局」
     /// 这个决定,不是他们有没有真的走到位。
     ///
@@ -10281,7 +9140,7 @@ mod tests {
     ///
     /// 巡航点甩远是为了让测试只看见「社交」这一个变量:如果目标点就在
     /// 脚下,行人永远「已到达」,聊天与否会跟巡航逻辑缠在一起。
-    fn ped_pair(ax: f32, az: f32, bx: f32, bz: f32) -> Vec<Pedestrian> {
+    pub(crate) fn ped_pair(ax: f32, az: f32, bx: f32, bz: f32) -> Vec<Pedestrian> {
         [[ax, az], [bx, bz]]
             .iter()
             .map(|at: &[f32; 2]| {
@@ -10296,27 +9155,10 @@ mod tests {
             .collect()
     }
 
-    use crate::game::{
-        BLOCK_VIEW_RADIUS, BlockLayout, BuildingPlacement, GROUND_SPAN, MINIMAP_RANGE, MeshAsset,
-        MeshPart, PALM_PITCH_MAX, PLAYER_RADIUS, Placement, PropPlacement, SHOWCASE_DOOR_HALF,
-        SHOWCASE_GROUND_TOP, SHOWCASE_STAIR_LEAD, SHOWCASE_STAIR_RISE, SHOWCASE_STAIR_RUN,
-        SHOWCASE_STAIR_STEPS, SHOWCASE_STAIR_WIDTH, SHOWCASE_UPPER_TOP, SHOWCASE_WALL_THICKNESS,
-        SIDEWALK_WIDTH, STREAM_REBUILD_STEP, STREAM_SNAPSHOT_PAD, STREET_HALF_WIDTH, STREET_PITCH,
-        ShowcaseSpec, ShowcaseSpecs, WORLD_HALF, blocks_near, build_city_buildings,
-        build_city_palms, build_city_peds, build_city_props, build_city_signs,
-        build_collision_world, build_ground_near, build_showcase_interiors, build_water_near,
-        collider_bounds, map_street_lines, on_roadway, push_box, showcase_placements,
-        showcase_specs, stream_needs_rebuild, street_axis, street_indices_in, street_slots,
-    };
-    use crate::interior::{Floor, FloorWorld, STEP_UP_TOLERANCE};
-    use crate::mesh::Bounds;
-    use crate::player::{RUN_SPEED, WALK_SPEED};
-    use crate::r#type::Vec2;
-
     /// 两栋样板楼楼板 + 楼梯的期望顶面高度之和(级高 × 级数)。
-    const STAIR_TOTAL: f32 = SHOWCASE_STAIR_RISE * SHOWCASE_STAIR_STEPS as f32;
+    pub(crate) const STAIR_TOTAL: f32 = SHOWCASE_STAIR_RISE * SHOWCASE_STAIR_STEPS as f32;
 
-    fn world() -> FloorWorld {
+    pub(crate) fn world() -> FloorWorld {
         let mut w: FloorWorld = FloorWorld::new();
         build_showcase_interiors(&mut w);
         w
@@ -10328,24 +9170,24 @@ mod tests {
     /// 测试用本地坐标描述「门洞在正前方」「楼梯贴着 +X 墙」这些**与朝向
     /// 无关**的事实,再旋到世界。这样两栋楼朝向相反(`+π/2` 与 `−π/2`)
     /// 时测试仍然成立 —— 之前测试写死世界 +Z 是门面,朝向一改就全错。
-    fn to_world(index: usize, local: Vec2) -> Vec2 {
+    pub(crate) fn to_world(index: usize, local: Vec2) -> Vec2 {
         super::showcase_to_world(index, local)
     }
 
     /// 本地 XZ 的**行向量**(切向),即门洞的左右方向。
-    fn local_side(index: usize) -> Vec2 {
+    pub(crate) fn local_side(index: usize) -> Vec2 {
         let specs: ShowcaseSpecs = showcase_specs();
         let (sin_yaw, cos_yaw): (f32, f32) = specs[index].yaw.sin_cos();
         [cos_yaw, -sin_yaw]
     }
 
     /// 门洞中心的世界坐标(本地 `z = span.z / 2`)。
-    fn doorway(index: usize) -> Vec2 {
+    pub(crate) fn doorway(index: usize) -> Vec2 {
         super::showcase_door_center(index)
     }
 
     /// 门洞法线的世界方向(本地 +Z 旋到世界)。
-    fn front_normal(index: usize) -> Vec2 {
+    pub(crate) fn front_normal(index: usize) -> Vec2 {
         super::showcase_front_normal(index)
     }
 
@@ -10369,18 +9211,18 @@ mod tests {
     }
 
     /// 楼梯中线上的某一点的本地 XZ:楼梯贴着本地 +X 内墙。
-    fn stair_point(index: usize, local_z: f32) -> Vec2 {
+    pub(crate) fn stair_point(index: usize, local_z: f32) -> Vec2 {
         super::showcase_stair_point(index, local_z)
     }
 
     /// 楼梯最上一级的本地 Z(那一级的**前沿**,即顶面最高处)。
-    fn stair_top_local_z(index: usize) -> f32 {
+    pub(crate) fn stair_top_local_z(index: usize) -> f32 {
         let span: Vec2 = showcase_specs()[index].span;
         span[1] * 0.5 - SHOWCASE_STAIR_LEAD
     }
 
     #[test]
-    fn doorway_is_the_only_gap_in_the_front_facade() {
+    pub(crate) fn doorway_is_the_only_gap_in_the_front_facade() {
         for index in 0..2 {
             let w: FloorWorld = world();
             let front: Vec2 = doorway(index);
@@ -10439,7 +9281,7 @@ mod tests {
     }
 
     #[test]
-    fn doors_face_the_open_ground_between_them() {
+    pub(crate) fn doors_face_the_open_ground_between_them() {
         // 两栋楼分居出生点道路的两侧,门必须都朝着中间的空地 —— 玩家
         // 往街区里走就能同时看见两个开口,不用满城找。这里断言的是
         // 「门法线指向另一栋楼」,不是某一个具体方向:摆放一改(比如
@@ -10470,7 +9312,7 @@ mod tests {
     }
 
     #[test]
-    fn exterior_walls_never_let_the_player_sit_inside_them() {
+    pub(crate) fn exterior_walls_never_let_the_player_sit_inside_them() {
         // 从街上朝门垛走。分离之后人**不落在墙里** —— 至于被推向哪一侧
         // 是「圆心 → 最近面」的正常结果,站在墙外的人本来就该被推得更靠外。
         // 这里守的不变量是「永不穿墙」,而不是某个方向。
@@ -10505,7 +9347,7 @@ mod tests {
     }
 
     #[test]
-    fn walking_up_the_stair_reaches_the_upper_floor() {
+    pub(crate) fn walking_up_the_stair_reaches_the_upper_floor() {
         // 纯几何校验:楼梯最顶一级必须与二层楼板面齐平,否则玩家走上
         // 楼梯会停在半空或者要再跳一下。
         assert!(
@@ -10550,7 +9392,7 @@ mod tests {
     /// 路点直接顶在墙上。两者都不会让任何单测变红 —— 端到端那条全程用
     /// 本地坐标做判定,根本不经过世界变换。只能在这个层面查。
     #[test]
-    fn the_showcase_walk_route_has_no_duplicate_or_adjacent_points() {
+    pub(crate) fn the_showcase_walk_route_has_no_duplicate_or_adjacent_points() {
         for index in 0..2 {
             let route: Vec<[f32; 2]> = super::showcase_walk_route(index);
             assert!(
@@ -10585,7 +9427,7 @@ mod tests {
     /// 会正好卡在外墙与内墙之间的夹缝里 —— 浏览器实测玩家进了门洞就在
     /// 原地打转,往里推不动、往外被弹回。
     #[test]
-    fn the_showcase_doorway_sits_on_the_outer_wall() {
+    pub(crate) fn the_showcase_doorway_sits_on_the_outer_wall() {
         for index in 0..2 {
             let spec: &ShowcaseSpec = &showcase_specs()[index];
             let door: Vec2 = super::showcase_door_center(index);
@@ -10602,7 +9444,7 @@ mod tests {
     }
 
     #[test]
-    fn simulated_walker_climbs_to_the_upper_storey() {
+    pub(crate) fn simulated_walker_climbs_to_the_upper_storey() {
         // 用与 `step_vertical` 完全相同的积分顺序跑一遍真实的水平速度:
         // 从门前往楼里走 4.6 m/s,最后必须站在二层楼板面上。
         for index in 0..2 {
@@ -10675,7 +9517,7 @@ mod tests {
     /// 2. **逐级降到地面** —— 走完整段梯段后 y 真的落到首层。
     /// 3. **全程不出现抬升** —— 下楼途中 dy 一旦 > 0,那是往回爬。
     #[test]
-    fn the_upper_floor_leaves_the_stair_run_open() {
+    pub(crate) fn the_upper_floor_leaves_the_stair_run_open() {
         let w: FloorWorld = world();
         let dt: f32 = 1.0 / 60.0;
         let stride: f32 = WALK_SPEED * dt;
@@ -10751,7 +9593,7 @@ mod tests {
     ///
     /// 梯段 10 级 × 0.45 m = 4.5 m,每帧 `WALK_SPEED / 60 = 0.077 m`,
     /// 至少 60 帧;取 100 留出余量,走过头之后脚下是首层地板(判据仍成立)。
-    const DESCENT_BUDGET: usize = 100;
+    pub(crate) const DESCENT_BUDGET: usize = 100;
 
     /// 冲刺一帧的真实水平位移(米)—— 长帧穿透缺陷只在这个步长下成立。
     ///
@@ -10761,13 +9603,13 @@ mod tests {
     /// 大于门垛 0.20 m 也照样穿透,但判据必须钉在最快档上 —— 只在慢档
     /// 验过的碰撞修复会在低帧率下失效,这是本项目反复吃过的亏
     /// (楼梯下楼缺陷就是 60 fps 全绿、软件渲染下才炸)。
-    const SPRINT_FRAME_STRIDE: f32 = 1.1269;
+    pub(crate) const SPRINT_FRAME_STRIDE: f32 = 1.1269;
 
     /// 60 fps 步行一帧的水平位移(米):任何修复在这条步长下都必须是 no-op。
-    const WALK_FRAME_STRIDE: f32 = WALK_SPEED * FIXED_DT;
+    pub(crate) const WALK_FRAME_STRIDE: f32 = WALK_SPEED * FIXED_DT;
 
     /// 冲刺冲向前墙时跑够多少帧就够判定了:实测 15 帧穿透 15.25 m。
-    const SPRINT_TUNNEL_BUDGET: usize = 20;
+    pub(crate) const SPRINT_TUNNEL_BUDGET: usize = 20;
 
     /// 从 `from` 沿 `normal` 前进时,撞上的**第一段墙**的世界包围盒。
     ///
@@ -10789,7 +9631,7 @@ mod tests {
     ///
     /// - `Option<(Vec3, Vec3)>` - 最近那段墙的 `(min, max)`;沿途没有墙时
     ///   为 `None`(调用方据此跳过断言,而不是拿一个魔数当阈值)。
-    fn wall_box_ahead(w: &FloorWorld, from: Vec2, normal: Vec2) -> Option<(Vec3, Vec3)> {
+    pub(crate) fn wall_box_ahead(w: &FloorWorld, from: Vec2, normal: Vec2) -> Option<(Vec3, Vec3)> {
         let mut best: Option<(f32, Vec3, Vec3)> = None;
         for floor in w.get_floors() {
             let (min, max): (Vec3, Vec3) = match floor {
@@ -10851,7 +9693,7 @@ mod tests {
     /// # Returns
     ///
     /// - `f32` - 沿 `normal` 到墙面入射端的距离(米)。
-    fn wall_face(from: Vec2, normal: Vec2, box_min: Vec3, box_max: Vec3) -> f32 {
+    pub(crate) fn wall_face(from: Vec2, normal: Vec2, box_min: Vec3, box_max: Vec3) -> f32 {
         if normal[0].abs() >= normal[1].abs() {
             let near: f32 = if normal[0] > 0.0 {
                 box_min[0]
@@ -10889,7 +9731,7 @@ mod tests {
     /// 不符,于是测试绿了一整个缺陷期)。这里问的就是
     /// `build_showcase_interiors` 的产物,改修复前后必然一红一绿。
     #[test]
-    fn sprinting_into_a_thin_interior_wall_is_blocked() {
+    pub(crate) fn sprinting_into_a_thin_interior_wall_is_blocked() {
         for index in 0..2 {
             let w: FloorWorld = world();
             // 两条路线都朝本地 +Z(门洞那一侧)冲,各自命中一段薄墙:
@@ -10983,7 +9825,7 @@ mod tests {
     /// 让这条测试只依赖 `build_showcase_interiors` 的真实室内几何,不去重
     /// 抄 1800+ 个 shape 的城市碰撞体。
     #[test]
-    fn sprinting_through_a_full_frame_into_a_thin_wall_is_blocked() {
+    pub(crate) fn sprinting_through_a_full_frame_into_a_thin_wall_is_blocked() {
         for index in 0..2 {
             let w: FloorWorld = world();
             let static_world: CollisionWorld = CollisionWorld::new();
@@ -11046,7 +9888,7 @@ mod tests {
     /// # Returns
     ///
     /// - `bool` - 严格落在盒内为 `true`。
-    fn inside_box(point: Vec2, box_min: Vec3, box_max: Vec3, skin: f32) -> bool {
+    pub(crate) fn inside_box(point: Vec2, box_min: Vec3, box_max: Vec3, skin: f32) -> bool {
         point[0] > box_min[0] + skin
             && point[0] < box_max[0] - skin
             && point[1] > box_min[2] + skin
@@ -11063,7 +9905,7 @@ mod tests {
     ///
     /// 只在冲刺下测过的修复,完全可能把正常帧率的手感改坏而没人发现。
     #[test]
-    fn the_interior_sweep_is_a_no_op_at_sixty_fps() {
+    pub(crate) fn the_interior_sweep_is_a_no_op_at_sixty_fps() {
         let stride: f32 = WALK_FRAME_STRIDE;
         let steps: usize =
             ((stride / crate::interior::INTERIOR_SLIDE_SUBSTEP).ceil() as usize).max(1);
@@ -11088,7 +9930,7 @@ mod tests {
     /// 只钉住前者的话,一个把整帧位移整个砍掉的修法也能让它变绿 —— 而
     /// 那是「卡死在墙上」,不是墙。判据是切向分量拿到**至少一半**位移。
     #[test]
-    fn walking_along_the_showcase_front_wall_keeps_sliding() {
+    pub(crate) fn walking_along_the_showcase_front_wall_keeps_sliding() {
         for index in 0..2 {
             let w: FloorWorld = world();
             let normal: Vec2 = front_normal(index);
@@ -11137,7 +9979,7 @@ mod tests {
     /// 测试全绿。这里把 门外 → 门洞 → 隔墙过道 → 第一级 → 楼梯顶 →
     /// 二层楼板 串成一条路线跑完整积分,任何一段断了都会失败。
     #[test]
-    fn a_player_can_walk_from_the_doorway_to_the_top_of_the_stair() {
+    pub(crate) fn a_player_can_walk_from_the_doorway_to_the_top_of_the_stair() {
         let w: FloorWorld = world();
         let dt: f32 = 1.0 / 60.0;
         for index in 0..2 {
@@ -11270,7 +10112,7 @@ mod tests {
 
     /// 车轮矩阵:静止时轮心必须落在车的安装位上。
     #[test]
-    fn wheel_model_places_the_axle_at_its_mount() {
+    pub(crate) fn wheel_model_places_the_axle_at_its_mount() {
         let mounts: [[f32; 3]; 4] = crate::traffic::WHEEL_MOUNTS;
         for mount in mounts {
             let model: Mat4Data = car_wheel_model([10.0, 0.0, -5.0], 0.0, mount, 0.0);
@@ -11301,7 +10143,7 @@ mod tests {
     /// 这是「地图太小」的直接断言 —— 只要 `street_axis` 还停在
     /// `[-90, -30, 30, 90]`,走到 500 m 外就只剩虚空。
     #[test]
-    fn the_street_grid_extends_far_past_the_old_city_bounds() {
+    pub(crate) fn the_street_grid_extends_far_past_the_old_city_bounds() {
         // 半条街的倍数在很远的地方依然是街道轴线。
         for index in [-1000i32, -37, 0, 11, 250] {
             let axis: f32 = street_axis(index);
@@ -11337,8 +10179,7 @@ mod tests {
     /// 世界点投影到屏幕,看它们的 `ndc_x` 往哪边动。左右两个点位移
     /// 应当**同向且等值**(等值说明是纯旋转而不是平移)。
     #[test]
-    fn mouse_right_pans_the_view_to_the_right() {
-        use crate::r#type::Vec3;
+    pub(crate) fn mouse_right_pans_the_view_to_the_right() {
         let target: Vec3 = [0.0, 0.0, 0.0];
         let mut camera: Camera = Camera::new();
         camera.set_target(target);
@@ -11410,7 +10251,7 @@ mod tests {
     /// 2. `spin` 增大时轮底沿车体**后退** —— 车往 `+X` 前进时接触点
     ///    必须相对车体向 `-X` 退,否则轮子是倒着转或者压根没转。
     #[test]
-    fn wheels_roll_forward_about_the_real_axle() {
+    pub(crate) fn wheels_roll_forward_about_the_real_axle() {
         // 轮心取自 car_coupe 的前右轮(本地 (1.265, 0.32, 0.77))。
         let mount: Vec3 = [1.265, 0.32, 0.77];
         let origin: Vec3 = [0.0, 0.0, 0.0];
@@ -11437,7 +10278,7 @@ mod tests {
 
     /// 远离原点的位置照样能生成城市内容。
     #[test]
-    fn blocks_and_buildings_generate_far_from_the_origin() {
+    pub(crate) fn blocks_and_buildings_generate_far_from_the_origin() {
         for center in [[0.0f32, 0.0f32], [3000.0, 3000.0], [-4500.0, 1200.0]] {
             let blocks: Vec<BlockLayout> = blocks_near(center[0], center[1], BLOCK_VIEW_RADIUS);
             assert!(!blocks.is_empty(), "({}) 附近必须有街区", center[0]);
@@ -11462,7 +10303,7 @@ mod tests {
 
     /// 地面与水面跟着玩家走,不是钉在世界原点。
     #[test]
-    fn streamed_surfaces_follow_the_player() {
+    pub(crate) fn streamed_surfaces_follow_the_player() {
         let (origin, far): (MeshAsset, MeshAsset) =
             (build_ground_near(0.0, 0.0), build_ground_near(3000.0, 0.0));
         // 两块地面必然不同 —— 不跟随玩家的话它们会逐字节相同。
@@ -11483,7 +10324,7 @@ mod tests {
     /// 出生点半径 28 m 内。实测把车开到 `z = 651`,最近行人 **563 m**,
     /// 整条街空无一人。
     #[test]
-    fn npcs_follow_the_streamed_blocks() {
+    pub(crate) fn npcs_follow_the_streamed_blocks() {
         let block: Vec3 = [0.0, 0.0, 600.0];
         let mut peds: Vec<Pedestrian> = spawn_peds([0.0, 0.0, 0.0], PED_COUNT, 0.37);
         let mut enemies: Vec<Enemy> = spawn_thugs([0.0, 0.0, 0.0], THUG_COUNT, 0.37);
@@ -11530,7 +10371,7 @@ mod tests {
 
     /// 流式判定:玩家走满一格街道才重建,原地站着不重建。
     #[test]
-    fn streaming_rebuilds_only_after_a_full_street_of_travel() {
+    pub(crate) fn streaming_rebuilds_only_after_a_full_street_of_travel() {
         let center: Vec2 = [0.0, 0.0];
         assert!(
             !stream_needs_rebuild([0.0, 0.0], center),
@@ -11582,11 +10423,15 @@ mod tests {
     ///    线旁边最多 13.6 m(路沿 + 人行道 + 沿线点缀)。不预留这一圈的话,
     ///    边界那一档站位(实测 15 个 z ≈ -270 的道具)仍然会被误判。
     #[test]
-    fn streamed_rebuild_leaves_the_visible_world_unchanged() {
+    pub(crate) fn streamed_rebuild_leaves_the_visible_world_unchanged() {
         /// 两个窗口共同覆盖、且离边界留足摆件偏移余量的半径(米)。
-        const INSIDE: f32 = BLOCK_VIEW_RADIUS - STREAM_REBUILD_STEP * 0.5 - STREAM_SNAPSHOT_PAD;
+        pub(crate) const INSIDE: f32 =
+            BLOCK_VIEW_RADIUS - STREAM_REBUILD_STEP * 0.5 - STREAM_SNAPSHOT_PAD;
         /// 按 0.25 m 位置桶索引的「资产 @ 位置」,只保留共同覆盖区内的。
-        fn snapshot(v: Vec<(String, [f32; 3])>, mid: (f32, f32)) -> HashMap<(i32, i32), String> {
+        pub(crate) fn snapshot(
+            v: Vec<(String, [f32; 3])>,
+            mid: (f32, f32),
+        ) -> HashMap<(i32, i32), String> {
             v.into_iter()
                 .filter(|(_, p): &(String, [f32; 3])| {
                     (p[0] - mid.0).abs().max((p[2] - mid.1).abs()) <= INSIDE
@@ -11709,7 +10554,7 @@ mod tests {
     /// 同一个世界坐标在任意窗口下都拿到同一个站位号。旧写法从 `strip_lo`
     /// 起步连加,窗口一动站位就整体错位。
     #[test]
-    fn street_slots_are_world_anchored() {
+    pub(crate) fn street_slots_are_world_anchored() {
         for step in [19.0f32, 30.0, 44.0, 52.0, PALM_PITCH_MAX] {
             let lo: f32 = -300.0;
             let hi: f32 = 300.0;
@@ -11764,7 +10609,7 @@ mod tests {
     /// 边;现在它跟着生成中心平移,所以「中心在 3000 m 处」和「中心在
     /// 0 处」生成出来的东西一样多、一样可用。
     #[test]
-    fn streamed_ground_and_water_build_far_from_the_origin() {
+    pub(crate) fn streamed_ground_and_water_build_far_from_the_origin() {
         for (x, z) in [(0.0f32, 0.0f32), (3000.0, 3000.0), (-6000.0, 1500.0)] {
             let ground: MeshAsset = build_ground_near(x, z);
             let water: MeshAsset = build_water_near(x, z);
@@ -11810,7 +10655,7 @@ mod tests {
     /// 不在滚动平面里(实测位移恒为 0)。所以这里改成断言 Z 不变、
     /// X / Y 在 (cos, sin) 平面里转。
     #[test]
-    fn wheel_spin_rotates_the_axle() {
+    pub(crate) fn wheel_spin_rotates_the_axle() {
         let mount: [f32; 3] = crate::traffic::WHEEL_MOUNTS[0];
         let rest: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, 0.0);
         let turned: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, FRAC_PI_2);
@@ -11857,7 +10702,7 @@ mod tests {
 
     /// 车身转向:同一个安装位在不同车身朝向下必须落在不同世界位置。
     #[test]
-    fn wheel_follows_the_body_yaw() {
+    pub(crate) fn wheel_follows_the_body_yaw() {
         let mount: [f32; 3] = crate::traffic::WHEEL_MOUNTS[0];
         let east: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, 0.0);
         let north: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], -FRAC_PI_2, mount, 0.0);
@@ -11870,7 +10715,7 @@ mod tests {
     }
 
     #[test]
-    fn upper_slab_does_not_push_a_player_standing_below_it() {
+    pub(crate) fn upper_slab_does_not_push_a_player_standing_below_it() {
         let w: FloorWorld = world();
         for index in 0..2 {
             // 房间正中,脚踩首层楼板、头在二层楼板之下。
@@ -11886,7 +10731,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_splits_the_ground_floor_into_two_rooms() {
+    pub(crate) fn partition_splits_the_ground_floor_into_two_rooms() {
         // 隔墙必须真的挡人(首层分成两间),而且留出通往楼梯的过道。
         for index in 0..2 {
             let w: FloorWorld = world();
@@ -11939,7 +10784,7 @@ mod tests {
 
     /// 一个零三角形的网格 —— 批次结构测试只需要 `mesh_index` 的身份,
     /// 不需要真的几何。
-    fn empty_gpu_mesh() -> MeshAssetGpu {
+    pub(crate) fn empty_gpu_mesh() -> MeshAssetGpu {
         MeshAssetGpu {
             vertices: Vec::new(),
             indices: Vec::new(),
@@ -11949,7 +10794,7 @@ mod tests {
     }
 
     #[test]
-    fn traffic_drives_through_a_junction_in_the_real_city() {
+    pub(crate) fn traffic_drives_through_a_junction_in_the_real_city() {
         // 回归:用**真实城市道具**当碰撞世界,让一辆车从街道 1 的南向车道
         // 一路开到路口再往前。实测浏览器里有 4 辆车永久停在 z≈-2.4 / -6.7
         // (正好在 z=0 路口两侧),speed 却读出 11.5 —— 每帧位移都被碰撞吃掉。
@@ -11996,10 +10841,10 @@ mod tests {
     }
 
     /// 车身侧影沿车长的采样(只看车身件,不算车顶灯牌之类附件)。
-    fn vehicle_side_profile(asset: &MeshAsset, bins: usize) -> Vec<f32> {
+    pub(crate) fn vehicle_side_profile(asset: &MeshAsset, bins: usize) -> Vec<f32> {
         // 附件(车顶灯、涂装、货斗)不算车身 —— 正是它们让出租车和警车
         // 在旧版本里「看起来一样」,而附件不参与剪影判定。
-        const ATTACHMENTS: [&str; 10] = [
+        pub(crate) const ATTACHMENTS: [&str; 10] = [
             "livery",
             "sign_mount",
             "taxi_sign",
@@ -12049,8 +10894,8 @@ mod tests {
     /// **逐站相同**(实测平均 |Δ| = 0.0000)—— 只有车顶灯牌和涂装不同,
     /// 街上远看就是同一辆车。灯牌不会改变轮廓读数。
     #[test]
-    fn the_taxi_and_the_police_car_are_not_recoloured_sedans() {
-        const BINS: usize = 16;
+    pub(crate) fn the_taxi_and_the_police_car_are_not_recoloured_sedans() {
+        pub(crate) const BINS: usize = 16;
         let sedan: MeshAsset =
             super::parse_asset(CAR_SEDAN, FIXTURE_CAR_SEDAN_JSON).expect(E_FIXTURE_ASSET_JSON);
         let base: Vec<f32> = vehicle_side_profile(&sedan, BINS);
@@ -12080,7 +10925,7 @@ mod tests {
     }
 
     #[test]
-    fn the_minimap_draws_the_streets_the_player_is_actually_on() {
+    pub(crate) fn the_minimap_draws_the_streets_the_player_is_actually_on() {
         // 回归:小地图的街道轴线原先写死成 `[-90, -30, 30, 90]`(30 m 间距),
         // 而世界早就是 60 m 一格 —— 两者**零重合**。玩家踩在 60 m 那条街上,
         // 小地图上却空空如也,画出来的全是并不存在的 ±30 / ±90。
@@ -12116,7 +10961,7 @@ mod tests {
     }
 
     /// 资产某一部分的轴向包围盒。
-    fn part_bounds(asset: &MeshAsset, part: &str) -> crate::mesh::Bounds {
+    pub(crate) fn part_bounds(asset: &MeshAsset, part: &str) -> crate::mesh::Bounds {
         let found: &crate::mesh::MeshPart = asset
             .parts
             .iter()
@@ -12138,7 +10983,7 @@ mod tests {
     }
 
     #[test]
-    fn the_birds_beak_points_forward_out_of_its_head() {
+    pub(crate) fn the_birds_beak_points_forward_out_of_its_head() {
         // 回归:喙原来是**竖着**立的 —— `cone` 默认沿 Z 轴,可这只鸟朝前
         // 是 -Y,少传一个 `axis="Y"`,喙就成了头顶上支棱的一根短刺。
         //
@@ -12182,7 +11027,7 @@ mod tests {
     }
 
     #[test]
-    fn the_surfboard_fin_hangs_under_the_deck() {
+    pub(crate) fn the_surfboard_fin_hangs_under_the_deck() {
         // 回归:鳍原来有一截**穿出板面**。`_rbox` 第三个数是整段高度
         // 0.16(半高 0.08),绕 Y 再转 -16°,最高角落到 z = +0.073,
         // 而该处板底在 z ≈ -0.024 —— 于是板顶上凭空支棱出一片鳍。
@@ -12245,7 +11090,7 @@ mod tests {
     }
 
     #[test]
-    fn the_ground_does_not_flip_when_it_re_anchors() {
+    pub(crate) fn the_ground_does_not_flip_when_it_re_anchors() {
         // 回归:地面的棋盘格着色原先用**格子下标** `(i + j) % 2` / `i % 4`
         // 决定,而不是世界坐标。地面每跨一个流式格子重新落位时 origin 平移
         // 一格,所有下标整体 +1,于是整块地面的沥青 / 人行道配色在原地
@@ -12296,12 +11141,12 @@ mod tests {
     }
 
     #[test]
-    fn lane_axis_matches_the_city_grid() {
+    pub(crate) fn lane_axis_matches_the_city_grid() {
         // traffic.rs 不能依赖 game(单向依赖,否则成环),所以街道网格的
         // 两个数字各存了一份。这条测试就是那份重复的**唯一担保**:任何一边
         // 单独改动而另一边没跟上,这里立刻变红。
         assert_eq!(
-            crate::traffic::STREET_PITCH,
+            STREET_PITCH,
             super::STREET_PITCH,
             "traffic::STREET_PITCH 与 game 的街道网格间距脱节,车会开在错位的街上"
         );
@@ -12313,7 +11158,7 @@ mod tests {
     }
 
     #[test]
-    fn traffic_lanes_sit_on_the_roadway() {
+    pub(crate) fn traffic_lanes_sit_on_the_roadway() {
         // 车道 X 必须落在**沥青面**上 —— 也就是离某条街道中轴线
         // `STREET_HALF_WIDTH` 以内。原先这些坐标写死成 `30 ± 3.5`
         // (= ±26.5 / ±33.5),而 `STREET_PITCH` 之后改成了 60 m,于是它们
@@ -12357,7 +11202,7 @@ mod tests {
     }
 
     #[test]
-    fn every_car_gets_its_own_body_batch() {
+    pub(crate) fn every_car_gets_its_own_body_batch() {
         // 车身批次必须**每辆车一个**,不能按 `mesh_index` 共用。
         //
         // 车队蓝图里 10 辆车只有 5 种车型。之前车身走
@@ -12440,7 +11285,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_rebuild_keeps_the_dynamic_batches() {
+    pub(crate) fn streamed_rebuild_keeps_the_dynamic_batches() {
         // `rebuild_static_batches` 换静态段时,必须把尾插在后面的动态段
         // (玩家骨架 / 车身 / 车轮 / 拾取物)**原样接回去**。之前它直接
         // `truncate(static_batch_count)`,把动态段一起截掉,而且没有重建 ——
@@ -12519,7 +11364,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_rebuild_reports_a_varying_static_length() {
+    pub(crate) fn streamed_rebuild_reports_a_varying_static_length() {
         // 静态段长度 = 新中心周围真正用到的不同 mesh 数,不是常量。如果修复
         // 依赖「静态段长度不变」,那下一次重建就会按旧长度切,等于把同一个
         // bug 换个偏移再犯。这里钉住「长度真的会变」这个前提,让上面那条
@@ -12566,7 +11411,7 @@ mod tests {
     }
 
     #[test]
-    fn no_palm_stands_on_the_roadway() {
+    pub(crate) fn no_palm_stands_on_the_roadway() {
         // `street_strips` 只保证棕榈相对**它自己那条街**的横向偏移,而
         // 沿街那一维是自由走的 `step + along_jitter` —— 每隔
         // `STREET_PITCH` 米就会撞上一次垂直街道的轴线,于是每隔 60 m 就
@@ -12599,7 +11444,7 @@ mod tests {
     }
 
     #[test]
-    fn palm_lateral_offsets_stay_scattered_inside_the_sidewalk() {
+    pub(crate) fn palm_lateral_offsets_stay_scattered_inside_the_sidewalk() {
         // 修「路口不种树」不能顺手把横向抖动清零 —— 那会退回上一轮修好的
         // 「复制粘贴的一直线」。安全带是 `[STREET_HALF_WIDTH,
         // STREET_HALF_WIDTH + SIDEWALK_WIDTH]`,3.6 m 宽,里面的取值必须
@@ -12629,7 +11474,7 @@ mod tests {
     }
 
     #[test]
-    fn both_showcases_are_placed_off_the_roadway() {
+    pub(crate) fn both_showcases_are_placed_off_the_roadway() {
         for spec in showcase_specs().iter() {
             // 用**旋转后**的世界半尺寸判:yaw = ±90° 时 span / half 的
             // X、Z 分量会互换,拿本地的半跨去比就会判错。
@@ -12660,7 +11505,7 @@ mod tests {
     }
 
     #[test]
-    fn showcase_footprints_do_not_overlap_ordinary_buildings() {
+    pub(crate) fn showcase_footprints_do_not_overlap_ordinary_buildings() {
         // 样板楼与程序化楼各推一个「外接 AABB」,必须互不相交。
         // 两者都进同一条 `CollisionWorld`,重叠会让玩家卡在两栋楼的
         // 夹缝里,车也会被隐形墙顶死。
@@ -12693,7 +11538,7 @@ mod tests {
     }
 
     #[test]
-    fn showcase_batches_never_duplicate_a_mesh_index() {
+    pub(crate) fn showcase_batches_never_duplicate_a_mesh_index() {
         // `WebGlRenderer::upload_mesh` 是 push 语义:一个 mesh 只能上传
         // 一次。这条测试守住「样板楼各自用 `find_or_create_batch` 而不是
         // 各自新建批次」这个不变量 —— 双传会让所有后续批次下标错位。
@@ -12709,7 +11554,7 @@ mod tests {
     }
 
     #[test]
-    fn collision_world_excludes_the_showcases() {
+    pub(crate) fn collision_world_excludes_the_showcases() {
         // 样板楼不能进二维碰撞世界,否则门洞外面会有一堵隐形墙。
         let mut bounds: HashMap<String, Bounds> = HashMap::new();
         for spec in showcase_specs() {
@@ -12741,7 +11586,7 @@ mod tests {
     }
 
     #[test]
-    fn solid_bounds_drops_geometry_that_only_exists_above_head() {
+    pub(crate) fn solid_bounds_drops_geometry_that_only_exists_above_head() {
         let streetlight: MeshAsset =
             super::parse_asset(PROP_STREETLIGHT, FIXTURE_PROP_STREETLIGHT_JSON)
                 .expect(E_FIXTURE_ASSET_JSON);
@@ -12762,14 +11607,14 @@ mod tests {
         assert!(
             streetlight
                 .get_bounds()
-                .is_some_and(|b: &Bounds| b.get_max()[0] - b.get_min()[0] > 2.0),
+                .is_some_and(|b: Bounds| b.get_max()[0] - b.get_min()[0] > 2.0),
             "{}",
             T_SOLID_BOUNDS_FIXTURE_TOO_WEAK
         );
     }
 
     #[test]
-    fn solid_bounds_keeps_a_wall_that_has_no_vertex_in_the_body_band() {
+    pub(crate) fn solid_bounds_keeps_a_wall_that_has_no_vertex_in_the_body_band() {
         let arcade: MeshAsset = super::parse_asset(BLDG_AQUA_ARCADE, FIXTURE_BLDG_AQUA_ARCADE_JSON)
             .expect(E_FIXTURE_ASSET_JSON);
         let mut registered: HashMap<String, Bounds> = HashMap::new();
@@ -12778,10 +11623,7 @@ mod tests {
             .get(BLDG_AQUA_ARCADE)
             .cloned()
             .expect(E_FIXTURE_SOLID_BOUNDS_UNREGISTERED);
-        let declared: Bounds = arcade
-            .get_bounds()
-            .cloned()
-            .expect(E_FIXTURE_NO_DECLARED_BOUNDS);
+        let declared: Bounds = arcade.try_get_bounds().expect(E_FIXTURE_NO_DECLARED_BOUNDS);
         let width: f32 = solid.get_max()[0] - solid.get_min()[0];
         let declared_width: f32 = declared.get_max()[0] - declared.get_min()[0];
         assert!(
@@ -12803,13 +11645,10 @@ mod tests {
     /// 只断言几何,不比对视觉:窗框最高的点必须落在楼高之内,且整体
     /// 高于 0(不是埋在地下)。
     #[test]
-    fn side_window_frames_climb_the_building_instead_of_sinking_under_it() {
+    pub(crate) fn side_window_frames_climb_the_building_instead_of_sinking_under_it() {
         let asset: MeshAsset = super::parse_asset(BLDG_LILAC_TOWER, FIXTURE_BLDG_LILAC_TOWER_JSON)
             .expect(E_FIXTURE_ASSET_JSON);
-        let declared: Bounds = asset
-            .get_bounds()
-            .cloned()
-            .expect(E_FIXTURE_NO_DECLARED_BOUNDS);
+        let declared: Bounds = asset.try_get_bounds().expect(E_FIXTURE_NO_DECLARED_BOUNDS);
         let height: f32 = declared.get_max()[1] - declared.get_min()[1];
         let mut frames: Vec<f32> = Vec::new();
         collect_part_y_extent(&asset, "window_side_frames", &mut frames);
@@ -12844,7 +11683,7 @@ mod tests {
     }
 
     /// 收集名字带 `prefix` 的所有 Part 的 Y 极值。
-    fn collect_part_y_extent(asset: &MeshAsset, prefix: &str, out: &mut Vec<f32>) {
+    pub(crate) fn collect_part_y_extent(asset: &MeshAsset, prefix: &str, out: &mut Vec<f32>) {
         for part in &asset.parts {
             if !part.name.starts_with(prefix) {
                 continue;
@@ -12856,16 +11695,13 @@ mod tests {
     }
 
     #[test]
-    fn solid_bounds_never_exceeds_the_declared_asset_bounds() {
+    pub(crate) fn solid_bounds_never_exceeds_the_declared_asset_bounds() {
         for (id, json) in [
             (PROP_TRAFFICLIGHT, FIXTURE_PROP_TRAFFICLIGHT_JSON),
             (PROP_STREETLIGHT, FIXTURE_PROP_STREETLIGHT_JSON),
         ] {
             let asset: MeshAsset = super::parse_asset(id, json).expect(E_FIXTURE_ASSET_JSON);
-            let declared: Bounds = asset
-                .get_bounds()
-                .cloned()
-                .expect(E_FIXTURE_NO_DECLARED_BOUNDS);
+            let declared: Bounds = asset.try_get_bounds().expect(E_FIXTURE_NO_DECLARED_BOUNDS);
             let mut registered: HashMap<String, Bounds> = HashMap::new();
             collider_bounds(&mut registered, id, &asset);
             let solid: Bounds = registered
@@ -12884,7 +11720,7 @@ mod tests {
         }
     }
 
-    fn sidewalk_lights_world(declared: bool) -> CollisionWorld {
+    pub(crate) fn sidewalk_lights_world(declared: bool) -> CollisionWorld {
         let mut bounds: HashMap<String, Bounds> = HashMap::new();
         for (id, json) in [
             (PROP_TRAFFICLIGHT, FIXTURE_PROP_TRAFFICLIGHT_JSON),
@@ -12892,10 +11728,8 @@ mod tests {
         ] {
             let asset: MeshAsset = super::parse_asset(id, json).expect(E_FIXTURE_ASSET_JSON);
             if declared {
-                let box_bounds: Bounds = asset
-                    .get_bounds()
-                    .cloned()
-                    .expect(E_FIXTURE_NO_DECLARED_BOUNDS);
+                let box_bounds: Bounds =
+                    asset.try_get_bounds().expect(E_FIXTURE_NO_DECLARED_BOUNDS);
                 bounds.insert(String::from(id), box_bounds);
             } else {
                 collider_bounds(&mut bounds, id, &asset);
@@ -12920,7 +11754,7 @@ mod tests {
         world
     }
 
-    fn sidewalk_spots() -> Vec<Vec2> {
+    pub(crate) fn sidewalk_spots() -> Vec<Vec2> {
         let mut out: Vec<Vec2> = Vec::new();
         for line in street_indices_in(-1.0, 1.0) {
             let axis: f32 = street_axis(line);
@@ -12948,7 +11782,7 @@ mod tests {
     }
 
     #[test]
-    fn no_streetlight_or_traffic_light_arm_blocks_the_sidewalk() {
+    pub(crate) fn no_streetlight_or_traffic_light_arm_blocks_the_sidewalk() {
         let air_walled: CollisionWorld = sidewalk_lights_world(true);
         let fixed: CollisionWorld = sidewalk_lights_world(false);
         let spots: Vec<Vec2> = sidewalk_spots();
@@ -12995,7 +11829,7 @@ mod tests {
     /// 却一次都没判到 —— 因为车一帧走 0.4 m,长帧能走 1 m 以上,行人正好
     /// 落在两个采样点之间,从「车的当前位置」看永远是 2.3 m。
     #[test]
-    fn a_fast_car_hits_a_pedestrian_it_passed_through() {
+    pub(crate) fn a_fast_car_hits_a_pedestrian_it_passed_through() {
         let window: f32 = CAR_HIT_RADIUS + PED_RADIUS;
         // 车一帧从 (0, 0) 走到 (0, 0.4)(24 m/s @ 60 fps)。
         let from: Vec2 = [0.0, 0.0];
@@ -13040,7 +11874,7 @@ mod tests {
     /// 于是 KILL 段存了一个空索引,`update_mission` 的
     /// `index != usize::MAX` 恒为 false —— 任务永远判不出「目标已死」。
     #[test]
-    fn the_kill_stage_gets_a_real_target_when_it_starts() {
+    pub(crate) fn the_kill_stage_gets_a_real_target_when_it_starts() {
         // 三个敌人,任务点在 (10, 0, 10);真正该被打的是最近的那个 (12, 0, 10)。
         let enemies: Vec<Enemy> = vec![
             Enemy::new(Faction::Thug, [40.0, 0.0, 10.0], 0.0, 0.0),
@@ -13084,11 +11918,11 @@ mod tests {
     /// 正确做法是**什么都不做**:目标死没死由敌人表回答,`update_mission`
     /// 每帧自己判。那句 `set_target_enemy` 已经删掉了。
     #[test]
-    fn killing_the_target_completes_the_mission_stage() {
+    pub(crate) fn killing_the_target_completes_the_mission_stage() {
         let mut enemies: Vec<Enemy> = vec![Enemy::new(Faction::Thug, [10.0, 0.0, 10.0], 0.0, 0.0)];
         let mut mission: Mission = Mission::new();
         mission.accept(MISSION_TITLE_A, MISSION_KILL, [10.0, 0.0, 10.0]);
-        mission.set_target_enemy(0);
+        mission.set_target_enemy(Some(0));
         // 目标还活着时推进,不能提前发报酬。
         let early: f32 = advance_mission_for_player(&mut mission, &enemies, [10.0, 0.0, 10.0], 1);
         assert!(early == 0.0, "目标还活着不该发放报酬,实测 {early}");
@@ -13133,7 +11967,7 @@ mod tests {
     /// 逃跑方向垂直于车行方向」,算出的结论与浏览器相反(公式说能撞到,
     /// 实测零次)。几何关系一旦是相对运动,就得按帧推。
     #[test]
-    fn a_fleeing_pedestrian_is_still_reachable_by_a_car() {
+    pub(crate) fn a_fleeing_pedestrian_is_still_reachable_by_a_car() {
         let dt: f32 = 1.0 / 60.0;
         let car_speed: f32 = 24.0;
         let window: f32 = CAR_HIT_RADIUS + PED_RADIUS;
@@ -13162,7 +11996,7 @@ mod tests {
 
     /// 回归测试(第 9 条):附近有伴时,行人必须能**真的**开始聊天。
     #[test]
-    fn pedestrians_gather_and_start_talking() {
+    pub(crate) fn pedestrians_gather_and_start_talking() {
         let mut peds: Vec<Pedestrian> = ped_pair(10.0, 10.0, 11.0, 10.0);
         update_ped_social_for_test(peds.as_mut_slice(), 0.016);
         let talking: usize = peds.iter().filter(|p: &&Pedestrian| p.is_talking()).count();
@@ -13171,7 +12005,7 @@ mod tests {
 
     /// 回归测试:孤身一人的行人**不会**自己跟自己聊天。
     #[test]
-    fn a_lone_pedestrian_never_starts_talking() {
+    pub(crate) fn a_lone_pedestrian_never_starts_talking() {
         let mut peds: Vec<Pedestrian> = vec![Pedestrian::new(
             [10.0, 0.0, 10.0],
             0.0,
@@ -13185,7 +12019,7 @@ mod tests {
 
     /// 回归测试:聊满约定时长之后必须**散场**,并进入冷却。
     #[test]
-    fn a_conversation_ends_and_goes_on_cooldown() {
+    pub(crate) fn a_conversation_ends_and_goes_on_cooldown() {
         let mut peds: Vec<Pedestrian> = ped_pair(10.0, 10.0, 11.0, 10.0);
         update_ped_social_for_test(peds.as_mut_slice(), 0.016);
         assert!(peds.iter().all(|p: &Pedestrian| p.is_talking()));
@@ -13207,7 +12041,7 @@ mod tests {
 
     /// 回归测试:被撞倒的行人不参与聊天。
     #[test]
-    fn downed_pedestrians_do_not_chat() {
+    pub(crate) fn downed_pedestrians_do_not_chat() {
         let mut peds: Vec<Pedestrian> = ped_pair(10.0, 10.0, 11.0, 10.0);
         peds[0].knock_down([1.0, 0.0]);
         update_ped_social_for_test(peds.as_mut_slice(), 0.016);
@@ -13216,7 +12050,7 @@ mod tests {
 
     /// 回归测试:扎堆之后每个人的**站位角度必须不同**,否则全挤在一点。
     #[test]
-    fn each_pedestrian_takes_a_distinct_place_in_the_circle() {
+    pub(crate) fn each_pedestrian_takes_a_distinct_place_in_the_circle() {
         let mut peds: Vec<Pedestrian> = ped_pair(10.0, 10.0, 11.0, 10.2);
         peds.push(Pedestrian::new(
             [10.3, 0.0, 11.1],
@@ -13240,7 +12074,7 @@ mod tests {
     /// 积分会受步长量化影响,顶高会有 1–2 cm 抖动。这里钉住的是
     /// 「初速度对应的物理高度」这一层,和 `JUMP_VELOCITY` 的推导一致。
     #[test]
-    fn a_jump_clears_a_gta_scale_ledge() {
+    pub(crate) fn a_jump_clears_a_gta_scale_ledge() {
         let peak: f32 = JUMP_VELOCITY * JUMP_VELOCITY / (2.0 * GRAVITY);
         // 门限取 1.0 m:GTA V 街景里能被跳上去的台阶 / 矮墙在这个量级,
         // 本项目样板楼梯单级只有 0.305 m,一层隔墙 1 m 出头。
@@ -13270,7 +12104,7 @@ mod tests {
     /// `on_slab` 分支会**当帧**把 `vy` 清成 0,于是任何向上写的初速度
     /// 都被地板吃掉,人物根本没离开地面。
     #[test]
-    fn a_jump_rises_then_lands_standing() {
+    pub(crate) fn a_jump_rises_then_lands_standing() {
         let dt: f32 = FIXED_DT;
         let mut y: f32 = GROUND_LEVEL;
         let mut vy: f32 = 0.0;
@@ -13337,7 +12171,7 @@ mod tests {
 
     /// 滞空途中不得二次起跳(否则一次按键能叠出无穷高的跳)。
     #[test]
-    fn a_jump_only_starts_from_the_ground() {
+    pub(crate) fn a_jump_only_starts_from_the_ground() {
         let mut player: Player = Player::new([0.0, 0.0, 0.0], 0.0);
         assert!(player.get_grounded());
         assert!(player.set_jump_requested(true), "站着时必须能起跳");
@@ -13357,7 +12191,7 @@ mod tests {
     /// 这条是「没按键时物理保持静止」的回归 —— 起跳那段插在贴面判定
     /// 之前,如果排错了位置,站着不动也会被当成起跳。
     #[test]
-    fn the_vertical_integrator_is_still_when_standing() {
+    pub(crate) fn the_vertical_integrator_is_still_when_standing() {
         let dt: f32 = FIXED_DT;
         let mut y: f32 = GROUND_LEVEL;
         let mut vy: f32 = 0.0;
@@ -13392,7 +12226,7 @@ mod tests {
     /// **选值本身**:走路拿到 `WALK_SPEED`,按住 Shift 拿到 `RUN_SPEED`,
     /// 两者之比必须正好是 `RUN_SPEED / WALK_SPEED`。
     #[test]
-    fn walk_and_run_pick_different_speed_caps() {
+    pub(crate) fn walk_and_run_pick_different_speed_caps() {
         let wanted: f32 = if false { RUN_SPEED } else { WALK_SPEED };
         assert!(
             (wanted - WALK_SPEED).abs() < 1e-6,
@@ -13442,7 +12276,7 @@ mod tests {
     // 变量:光断言 `steer_axis()` 非零,一辆完全不改 yaw 的车也能通过。
 
     /// 造一个只按住 `codes` 的 `InputState`。
-    fn input_holding(codes: &[&str]) -> super::InputState {
+    pub(crate) fn input_holding(codes: &[&str]) -> super::InputState {
         let mut input: super::InputState = super::InputState::default();
         for code in codes {
             input.keys.insert(String::from(*code), true);
@@ -13451,7 +12285,7 @@ mod tests {
     }
 
     /// 空世界里的车,给足初速好越过 `STEER_MIN_SPEED` 的转向死区。
-    fn steer_test_car() -> crate::traffic::TrafficCar {
+    pub(crate) fn steer_test_car() -> crate::traffic::TrafficCar {
         crate::traffic::TrafficCar::new(CAR_SEDAN, 0.0, 0.0, 8.0, 1.0)
     }
 
@@ -13467,7 +12301,7 @@ mod tests {
     /// 绿着通过(原来的断言就是这样)。这里改为:车头朝向的变化在**世界
     /// 右手系**下朝哪一侧,ArrowRight 必须朝右。
     #[test]
-    fn arrow_keys_steer_the_car_while_driving() {
+    pub(crate) fn arrow_keys_steer_the_car_while_driving() {
         let world: CollisionWorld = CollisionWorld::new();
         let delta: f32 = 1.0 / 60.0;
         // 世界「右」的基准:由玩家自己的前向定义钉死,不引入新约定。
@@ -13546,7 +12380,7 @@ mod tests {
     /// 上无意识地「滑动」。这里模拟 `simulate` 的步行分支——`intent`
     /// 只由 `axis(D, A)` 与 `axis(W, S)` 组成,方向键根本不在里面。
     #[test]
-    fn arrow_keys_do_not_move_the_player_on_foot() {
+    pub(crate) fn arrow_keys_do_not_move_the_player_on_foot() {
         for code in [ARROWLEFT, ARROWRIGHT, ARROWUP, ARROWDOWN] {
             let input: super::InputState = input_holding(&[code]);
             // 步行分支的移动轴只认 WASD:这里复刻 `simulate` 的两行。
@@ -13597,7 +12431,7 @@ mod tests {
     /// 情况都钉住:A 与 ← 一致(都左)、D 与 → 一致(都右)、
     /// 交叉的 A 与 → 则由**后按**的键决定。
     #[test]
-    fn ad_and_arrow_keys_do_not_cancel_each_other() {
+    pub(crate) fn ad_and_arrow_keys_do_not_cancel_each_other() {
         // 同向:A + ArrowLeft → 满左舵;后按的箭头接管,值不变。
         let mut input: super::InputState = input_holding(&[KEYA]);
         input.claim_steer(ARROWLEFT);
@@ -13633,7 +12467,7 @@ mod tests {
     // **不用浮点等值判断弹匣**:弹匣是 `u32`,直接整数比较。
 
     /// 造一把打到「非满匣」的手枪,给换弹测试当起点。
-    fn partially_spent_pistol() -> crate::combat::Arsenal {
+    pub(crate) fn partially_spent_pistol() -> crate::combat::Arsenal {
         let mut arsenal: crate::combat::Arsenal = crate::combat::Arsenal::new();
         // 6 发 —— 和验收时 HUD 实测到的那个数一致。
         arsenal.set_pistol_ammo(6);
@@ -13646,7 +12480,7 @@ mod tests {
     /// 回归锁:没有它,有人把换弹改回 C 键时下面那些行为测试可能照样
     /// 绿(因为它们直接调 `reload()`),而实机按键又是坏的。
     #[test]
-    fn reload_key_is_the_gta_r_key() {
+    pub(crate) fn reload_key_is_the_gta_r_key() {
         assert_eq!(
             super::KEY_RELOAD,
             SLOT_RELOAD_KEY,
@@ -13657,7 +12491,7 @@ mod tests {
 
     /// 按 R 换弹:计时推起来 → 跑完 → 弹匣真的回升。
     #[test]
-    fn r_starts_a_reload_that_actually_refills_the_magazine() {
+    pub(crate) fn r_starts_a_reload_that_actually_refills_the_magazine() {
         let mut arsenal: crate::combat::Arsenal = partially_spent_pistol();
         let before: u32 = arsenal.get_magazine();
         assert_eq!(before, 6);
@@ -13689,7 +12523,7 @@ mod tests {
 
     /// 换弹从备弹里扣,不是凭空造子弹。
     #[test]
-    fn reload_does_not_mint_rounds_out_of_nothing() {
+    pub(crate) fn reload_does_not_mint_rounds_out_of_nothing() {
         let mut arsenal: crate::combat::Arsenal = partially_spent_pistol();
         let reserve_before: u32 = arsenal.get_reserve();
         let loaded: u32 = PISTOL_MAGAZINE - arsenal.get_magazine();
@@ -13712,7 +12546,7 @@ mod tests {
     /// 这一条按任务要求钉死「C 不再是换弹键」。GTA V 里 C 是进车 /
     /// 蹲伏,本项目两个都没有,所以 C 是**完全未绑定**的键。
     #[test]
-    fn c_no_longer_reloads() {
+    pub(crate) fn c_no_longer_reloads() {
         // C 甚至不在按键白名单里 —— 事件层就直接放行了。
         assert!(
             !super::TRACKED_KEYS.contains(&SLOT_FORMER_RELOAD_KEY),
@@ -13741,7 +12575,7 @@ mod tests {
     /// `keydown`。`Arsenal::reload` 自己用 `reloading > 0` 兜底,所以
     /// 第二次必须被拒。
     #[test]
-    fn pressing_r_again_mid_reload_does_not_stack() {
+    pub(crate) fn pressing_r_again_mid_reload_does_not_stack() {
         let mut arsenal: crate::combat::Arsenal = partially_spent_pistol();
         assert!(arsenal.reload());
         let first: f32 = arsenal.get_reloading();
