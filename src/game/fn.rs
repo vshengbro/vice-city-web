@@ -5517,7 +5517,7 @@ pub(crate) fn simulate(game: &mut Game, delta: f32) {
     update_camera(game, delta);
     // 注入的开火只持续一帧,到期后放开。
     if game.get_hold_frames() > 0 {
-        game.set_hold_frames(1);
+        game.set_hold_frames(game.get_hold_frames() - 1);
         if game.get_hold_frames() == 0 {
             game.get_mut_input().set_fire_held(false);
         }
@@ -5971,7 +5971,7 @@ pub(crate) fn fire_weapon(game: &mut Game) {
             game.get_mut_wanted()
                 .add_heat(WANTED_PER_SHOT + WANTED_PER_HIT);
             if killed {
-                game.set_kills(1);
+                game.set_kills(game.get_kills() + 1);
                 let drop: f32 = ENEMY_CASH_DROP;
                 game.get_mut_player().set_cash_add(drop);
                 game.get_mut_player().set_notice(String::from(NOTICE_KILL));
@@ -6039,7 +6039,7 @@ pub(crate) fn ray_sphere_distance(origin: Vec3, direction: Vec3, center: Vec3, r
 ///
 /// - `&mut Game` - Game 的可变引用。
 pub(crate) fn on_enemy_killed_by_car(game: &mut Game) {
-    game.set_kills(1);
+    game.set_kills(game.get_kills() + 1);
     game.get_mut_player().set_cash_add(ENEMY_CASH_DROP);
     game.get_mut_player().set_notice(String::from(NOTICE_KILL));
 }
@@ -6219,7 +6219,7 @@ pub(crate) fn enemy_shot(game: &mut Game, index: usize) {
     {
         // 记一笔,验收探针据此确认「这一枪是被视线挡掉的」而不是
         // 别的分支提前 return 的。
-        game.set_shots_blocked_by_geometry(1);
+        game.set_shots_blocked_by_geometry(game.get_shots_blocked_by_geometry() + 1);
         return;
     }
     let center: Vec3 = [player_at[0], player_at[1] + AIM_CHEST_HEIGHT, player_at[2]];
@@ -6339,7 +6339,7 @@ pub(crate) fn update_mission(game: &mut Game, _dt: f32) {
         advance_mission_for_player(game.get_mut_mission(), &enemies_snapshot, player_at, done);
     if reward > 0.0 {
         game.get_mut_player().set_cash_add(reward);
-        game.set_missions_done(1);
+        game.set_missions_done(game.get_missions_done() + 1);
         let notice: String = format!("{NOTICE_MISSION_DONE}{CASH_SIGN}{reward}");
         game.get_mut_player().set_notice(notice);
     }
@@ -7402,8 +7402,8 @@ pub(crate) fn step_live_grenades(game: &mut Game, dt: f32) {
     let world_snapshot: CollisionWorld = game.get_world_ref().clone();
     let floor_world: FloorWorld = game.get_interiors().clone();
     for mut grenade in grenades {
-        grenade.set_age(dt);
-        grenade.set_vertical_velocity(GRAVITY * dt);
+        grenade.set_age(grenade.get_age() + dt);
+        grenade.set_vertical_velocity(grenade.get_vertical_velocity() - GRAVITY * dt);
         grenade.get_position()[0] += grenade.get_velocity()[0] * dt;
         grenade.get_position()[2] += grenade.get_velocity()[1] * dt;
         grenade.get_position()[1] += grenade.get_vertical_velocity() * dt;
@@ -7462,7 +7462,7 @@ pub(crate) fn explode_at(game: &mut Game, at: Vec3) {
         game.set_did_hit(true);
         game.get_mut_wanted().add_heat(WANTED_PER_HIT);
         if killed {
-            game.set_kills(1);
+            game.set_kills(game.get_kills() + 1);
             let drop: f32 = ENEMY_CASH_DROP;
             game.get_mut_player().set_cash_add(drop);
         }
@@ -8025,7 +8025,7 @@ pub(crate) fn step_and_render(
         game.get_mut_renderer().replace(backend);
     }
     game.set_gpu_submitted(triangles);
-    game.set_frame_count(1);
+    game.set_frame_count(game.get_frame_count() + 1);
     triangles
 }
 
