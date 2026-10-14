@@ -1,1 +1,571 @@
-{"version":2,"generator":"build_all3a.py (bpy)","up_axis":"y","unit":"metre","asset_count":99,"tri_count":642274,"categories":{"building":{"count":14,"tri_count":360960},"vehicle":{"count":9,"tri_count":38208},"watercraft":{"count":4,"tri_count":8244},"pedestrian":{"count":4,"tri_count":24952},"prop":{"count":14,"tri_count":51310},"sign":{"count":8,"tri_count":32544},"pickup":{"count":8,"tri_count":21204},"weapon":{"count":7,"tri_count":35084},"palm":{"count":3,"tri_count":15040},"nature":{"count":2,"tri_count":5690},"beach":{"count":4,"tri_count":16586},"animal":{"count":4,"tri_count":6674},"misc":{"count":6,"tri_count":18860},"marker":{"count":2,"tri_count":3428},"ground_tile":{"count":9,"tri_count":3288},"landform":{"count":1,"tri_count":202}},"assets":{"bldg_lilac_tower":78660,"bldg_white_landmark":36756,"bldg_pink_terrace":38532,"bldg_sand_midrise":23964,"bldg_aqua_arcade":36756,"bldg_deco_teal":27840,"bldg_deco_pink":27876,"bldg_cream_block":25740,"bldg_coral_hall":23964,"bldg_apricot_motel":11016,"bldg_mint_shop":7464,"bldg_teal_loft":9240,"bldg_loft_showcase":7464,"bldg_shop_showcase":5688,"car_sedan":4680,"car_taxi":5076,"car_police":5352,"car_coupe":4868,"truck_pickup":4772,"bus_city":5808,"veh_airplane":2236,"veh_jet":2912,"veh_helicopter":2504,"veh_boat":1220,"yacht_sailboat":1168,"ship_cruise":3972,"ship_destroyer":1884,"ped_suit":5904,"ped_dress":6380,"ped_overalls":6016,"ped_streetwear":6652,"prop_bench":3576,"prop_construction_barrier":4172,"prop_dumpster":3316,"prop_fire_hydrant":2412,"prop_mailbox":3004,"prop_manhole_cover":2744,"prop_newsstand":3860,"prop_palm_planter":6204,"prop_parking_meter":2768,"prop_phone_booth":4924,"prop_streetlight":3048,"prop_traffic_cone":3298,"prop_trafficlight":4644,"prop_trash_bin":3340,"sign_arcade":5036,"sign_bar":3766,"sign_club":4426,"sign_diner":3238,"sign_hotel":3650,"sign_motel":3804,"sign_pizza":4250,"sign_tropic":4374,"pickup_ammo_box":2928,"pickup_armor_vest":2992,"pickup_cash_stack":2024,"pickup_flare_pack":2988,"pickup_grenade_case":2752,"pickup_health_pack":2136,"pickup_o2_tank":2140,"pickup_rocket_round":3244,"wep_bat":4412,"wep_grenade":5576,"wep_pistol":2532,"wep_rocket_launcher":6156,"wep_shotgun":4844,"wep_smg":4248,"wep_tank":7316,"palm_tall":5102,"palm_short":4022,"palm_bushy":5916,"flower_cluster":3698,"grass_patch":1992,"beach_boardwalk_plank":1722,"beach_chair":2780,"beach_surfboard":4504,"beach_umbrella":7580,"animal_bird":1524,"animal_cat":1780,"animal_dog":2156,"animal_fish":1214,"misc_awning":4820,"misc_dumpster_pile":2724,"misc_graffiti_board":1580,"misc_helicopter":5468,"misc_helipad_marking":1272,"misc_street_phone":2996,"marker_coin_ring":2496,"marker_flame":932,"road_asphalt":108,"road_crosswalk":328,"road_drain_grate":708,"road_grass":324,"road_lane_line":152,"road_lane_line_yellow":196,"road_manhole_decal":392,"road_sand":648,"road_sidewalk":432,"terrain_mountain":202}}
+{
+  "version": 2,
+  "generator": "build_all3a.py (bpy) \u2014 reshaped for the vice-city-web loader",
+  "up_axis": "y",
+  "unit": "metre",
+  "asset_count": 99,
+  "tri_count": 642274,
+  "categories": {
+    "building": {
+      "count": 14,
+      "tri_count": 360960
+    },
+    "vehicle": {
+      "count": 9,
+      "tri_count": 38208
+    },
+    "watercraft": {
+      "count": 4,
+      "tri_count": 8244
+    },
+    "pedestrian": {
+      "count": 4,
+      "tri_count": 24952
+    },
+    "prop": {
+      "count": 14,
+      "tri_count": 51310
+    },
+    "sign": {
+      "count": 8,
+      "tri_count": 32544
+    },
+    "pickup": {
+      "count": 8,
+      "tri_count": 21204
+    },
+    "weapon": {
+      "count": 7,
+      "tri_count": 35084
+    },
+    "palm": {
+      "count": 3,
+      "tri_count": 15040
+    },
+    "nature": {
+      "count": 2,
+      "tri_count": 5690
+    },
+    "beach": {
+      "count": 4,
+      "tri_count": 16586
+    },
+    "animal": {
+      "count": 4,
+      "tri_count": 6674
+    },
+    "misc": {
+      "count": 6,
+      "tri_count": 18860
+    },
+    "marker": {
+      "count": 2,
+      "tri_count": 3428
+    },
+    "ground_tile": {
+      "count": 9,
+      "tri_count": 3288
+    },
+    "landform": {
+      "count": 1,
+      "tri_count": 202
+    }
+  },
+  "assets": [
+    {
+      "id": "animal_bird",
+      "category": "animal",
+      "file": "animal_bird.json"
+    },
+    {
+      "id": "animal_cat",
+      "category": "animal",
+      "file": "animal_cat.json"
+    },
+    {
+      "id": "animal_dog",
+      "category": "animal",
+      "file": "animal_dog.json"
+    },
+    {
+      "id": "animal_fish",
+      "category": "animal",
+      "file": "animal_fish.json"
+    },
+    {
+      "id": "beach_boardwalk_plank",
+      "category": "beach",
+      "file": "beach_boardwalk_plank.json"
+    },
+    {
+      "id": "beach_chair",
+      "category": "beach",
+      "file": "beach_chair.json"
+    },
+    {
+      "id": "beach_surfboard",
+      "category": "beach",
+      "file": "beach_surfboard.json"
+    },
+    {
+      "id": "beach_umbrella",
+      "category": "beach",
+      "file": "beach_umbrella.json"
+    },
+    {
+      "id": "bldg_apricot_motel",
+      "category": "building",
+      "file": "bldg_apricot_motel.json"
+    },
+    {
+      "id": "bldg_aqua_arcade",
+      "category": "building",
+      "file": "bldg_aqua_arcade.json"
+    },
+    {
+      "id": "bldg_coral_hall",
+      "category": "building",
+      "file": "bldg_coral_hall.json"
+    },
+    {
+      "id": "bldg_cream_block",
+      "category": "building",
+      "file": "bldg_cream_block.json"
+    },
+    {
+      "id": "bldg_deco_pink",
+      "category": "building",
+      "file": "bldg_deco_pink.json"
+    },
+    {
+      "id": "bldg_deco_teal",
+      "category": "building",
+      "file": "bldg_deco_teal.json"
+    },
+    {
+      "id": "bldg_lilac_tower",
+      "category": "building",
+      "file": "bldg_lilac_tower.json"
+    },
+    {
+      "id": "bldg_loft_showcase",
+      "category": "building",
+      "file": "bldg_loft_showcase.json"
+    },
+    {
+      "id": "bldg_mint_shop",
+      "category": "building",
+      "file": "bldg_mint_shop.json"
+    },
+    {
+      "id": "bldg_pink_terrace",
+      "category": "building",
+      "file": "bldg_pink_terrace.json"
+    },
+    {
+      "id": "bldg_sand_midrise",
+      "category": "building",
+      "file": "bldg_sand_midrise.json"
+    },
+    {
+      "id": "bldg_shop_showcase",
+      "category": "building",
+      "file": "bldg_shop_showcase.json"
+    },
+    {
+      "id": "bldg_teal_loft",
+      "category": "building",
+      "file": "bldg_teal_loft.json"
+    },
+    {
+      "id": "bldg_white_landmark",
+      "category": "building",
+      "file": "bldg_white_landmark.json"
+    },
+    {
+      "id": "bus_city",
+      "category": "vehicle",
+      "file": "bus_city.json"
+    },
+    {
+      "id": "car_coupe",
+      "category": "vehicle",
+      "file": "car_coupe.json"
+    },
+    {
+      "id": "car_police",
+      "category": "vehicle",
+      "file": "car_police.json"
+    },
+    {
+      "id": "car_sedan",
+      "category": "vehicle",
+      "file": "car_sedan.json"
+    },
+    {
+      "id": "car_taxi",
+      "category": "vehicle",
+      "file": "car_taxi.json"
+    },
+    {
+      "id": "flower_cluster",
+      "category": "nature",
+      "file": "flower_cluster.json"
+    },
+    {
+      "id": "grass_patch",
+      "category": "nature",
+      "file": "grass_patch.json"
+    },
+    {
+      "id": "marker_coin_ring",
+      "category": "marker",
+      "file": "marker_coin_ring.json"
+    },
+    {
+      "id": "marker_flame",
+      "category": "marker",
+      "file": "marker_flame.json"
+    },
+    {
+      "id": "misc_awning",
+      "category": "misc",
+      "file": "misc_awning.json"
+    },
+    {
+      "id": "misc_dumpster_pile",
+      "category": "misc",
+      "file": "misc_dumpster_pile.json"
+    },
+    {
+      "id": "misc_graffiti_board",
+      "category": "misc",
+      "file": "misc_graffiti_board.json"
+    },
+    {
+      "id": "misc_helicopter",
+      "category": "misc",
+      "file": "misc_helicopter.json"
+    },
+    {
+      "id": "misc_helipad_marking",
+      "category": "misc",
+      "file": "misc_helipad_marking.json"
+    },
+    {
+      "id": "misc_street_phone",
+      "category": "misc",
+      "file": "misc_street_phone.json"
+    },
+    {
+      "id": "palm_bushy",
+      "category": "palm",
+      "file": "palm_bushy.json"
+    },
+    {
+      "id": "palm_short",
+      "category": "palm",
+      "file": "palm_short.json"
+    },
+    {
+      "id": "palm_tall",
+      "category": "palm",
+      "file": "palm_tall.json"
+    },
+    {
+      "id": "ped_dress",
+      "category": "pedestrian",
+      "file": "ped_dress.json"
+    },
+    {
+      "id": "ped_overalls",
+      "category": "pedestrian",
+      "file": "ped_overalls.json"
+    },
+    {
+      "id": "ped_streetwear",
+      "category": "pedestrian",
+      "file": "ped_streetwear.json"
+    },
+    {
+      "id": "ped_suit",
+      "category": "pedestrian",
+      "file": "ped_suit.json"
+    },
+    {
+      "id": "pickup_ammo_box",
+      "category": "pickup",
+      "file": "pickup_ammo_box.json"
+    },
+    {
+      "id": "pickup_armor_vest",
+      "category": "pickup",
+      "file": "pickup_armor_vest.json"
+    },
+    {
+      "id": "pickup_cash_stack",
+      "category": "pickup",
+      "file": "pickup_cash_stack.json"
+    },
+    {
+      "id": "pickup_flare_pack",
+      "category": "pickup",
+      "file": "pickup_flare_pack.json"
+    },
+    {
+      "id": "pickup_grenade_case",
+      "category": "pickup",
+      "file": "pickup_grenade_case.json"
+    },
+    {
+      "id": "pickup_health_pack",
+      "category": "pickup",
+      "file": "pickup_health_pack.json"
+    },
+    {
+      "id": "pickup_o2_tank",
+      "category": "pickup",
+      "file": "pickup_o2_tank.json"
+    },
+    {
+      "id": "pickup_rocket_round",
+      "category": "pickup",
+      "file": "pickup_rocket_round.json"
+    },
+    {
+      "id": "prop_bench",
+      "category": "prop",
+      "file": "prop_bench.json"
+    },
+    {
+      "id": "prop_construction_barrier",
+      "category": "prop",
+      "file": "prop_construction_barrier.json"
+    },
+    {
+      "id": "prop_dumpster",
+      "category": "prop",
+      "file": "prop_dumpster.json"
+    },
+    {
+      "id": "prop_fire_hydrant",
+      "category": "prop",
+      "file": "prop_fire_hydrant.json"
+    },
+    {
+      "id": "prop_mailbox",
+      "category": "prop",
+      "file": "prop_mailbox.json"
+    },
+    {
+      "id": "prop_manhole_cover",
+      "category": "prop",
+      "file": "prop_manhole_cover.json"
+    },
+    {
+      "id": "prop_newsstand",
+      "category": "prop",
+      "file": "prop_newsstand.json"
+    },
+    {
+      "id": "prop_palm_planter",
+      "category": "prop",
+      "file": "prop_palm_planter.json"
+    },
+    {
+      "id": "prop_parking_meter",
+      "category": "prop",
+      "file": "prop_parking_meter.json"
+    },
+    {
+      "id": "prop_phone_booth",
+      "category": "prop",
+      "file": "prop_phone_booth.json"
+    },
+    {
+      "id": "prop_streetlight",
+      "category": "prop",
+      "file": "prop_streetlight.json"
+    },
+    {
+      "id": "prop_traffic_cone",
+      "category": "prop",
+      "file": "prop_traffic_cone.json"
+    },
+    {
+      "id": "prop_trafficlight",
+      "category": "prop",
+      "file": "prop_trafficlight.json"
+    },
+    {
+      "id": "prop_trash_bin",
+      "category": "prop",
+      "file": "prop_trash_bin.json"
+    },
+    {
+      "id": "road_asphalt",
+      "category": "ground_tile",
+      "file": "road_asphalt.json"
+    },
+    {
+      "id": "road_crosswalk",
+      "category": "ground_tile",
+      "file": "road_crosswalk.json"
+    },
+    {
+      "id": "road_drain_grate",
+      "category": "ground_tile",
+      "file": "road_drain_grate.json"
+    },
+    {
+      "id": "road_grass",
+      "category": "ground_tile",
+      "file": "road_grass.json"
+    },
+    {
+      "id": "road_lane_line",
+      "category": "ground_tile",
+      "file": "road_lane_line.json"
+    },
+    {
+      "id": "road_lane_line_yellow",
+      "category": "ground_tile",
+      "file": "road_lane_line_yellow.json"
+    },
+    {
+      "id": "road_manhole_decal",
+      "category": "ground_tile",
+      "file": "road_manhole_decal.json"
+    },
+    {
+      "id": "road_sand",
+      "category": "ground_tile",
+      "file": "road_sand.json"
+    },
+    {
+      "id": "road_sidewalk",
+      "category": "ground_tile",
+      "file": "road_sidewalk.json"
+    },
+    {
+      "id": "ship_cruise",
+      "category": "watercraft",
+      "file": "ship_cruise.json"
+    },
+    {
+      "id": "ship_destroyer",
+      "category": "watercraft",
+      "file": "ship_destroyer.json"
+    },
+    {
+      "id": "sign_arcade",
+      "category": "sign",
+      "file": "sign_arcade.json"
+    },
+    {
+      "id": "sign_bar",
+      "category": "sign",
+      "file": "sign_bar.json"
+    },
+    {
+      "id": "sign_club",
+      "category": "sign",
+      "file": "sign_club.json"
+    },
+    {
+      "id": "sign_diner",
+      "category": "sign",
+      "file": "sign_diner.json"
+    },
+    {
+      "id": "sign_hotel",
+      "category": "sign",
+      "file": "sign_hotel.json"
+    },
+    {
+      "id": "sign_motel",
+      "category": "sign",
+      "file": "sign_motel.json"
+    },
+    {
+      "id": "sign_pizza",
+      "category": "sign",
+      "file": "sign_pizza.json"
+    },
+    {
+      "id": "sign_tropic",
+      "category": "sign",
+      "file": "sign_tropic.json"
+    },
+    {
+      "id": "terrain_mountain",
+      "category": "landform",
+      "file": "terrain_mountain.json"
+    },
+    {
+      "id": "truck_pickup",
+      "category": "vehicle",
+      "file": "truck_pickup.json"
+    },
+    {
+      "id": "veh_airplane",
+      "category": "vehicle",
+      "file": "veh_airplane.json"
+    },
+    {
+      "id": "veh_boat",
+      "category": "watercraft",
+      "file": "veh_boat.json"
+    },
+    {
+      "id": "veh_helicopter",
+      "category": "vehicle",
+      "file": "veh_helicopter.json"
+    },
+    {
+      "id": "veh_jet",
+      "category": "vehicle",
+      "file": "veh_jet.json"
+    },
+    {
+      "id": "wep_bat",
+      "category": "weapon",
+      "file": "wep_bat.json"
+    },
+    {
+      "id": "wep_grenade",
+      "category": "weapon",
+      "file": "wep_grenade.json"
+    },
+    {
+      "id": "wep_pistol",
+      "category": "weapon",
+      "file": "wep_pistol.json"
+    },
+    {
+      "id": "wep_rocket_launcher",
+      "category": "weapon",
+      "file": "wep_rocket_launcher.json"
+    },
+    {
+      "id": "wep_shotgun",
+      "category": "weapon",
+      "file": "wep_shotgun.json"
+    },
+    {
+      "id": "wep_smg",
+      "category": "weapon",
+      "file": "wep_smg.json"
+    },
+    {
+      "id": "wep_tank",
+      "category": "weapon",
+      "file": "wep_tank.json"
+    },
+    {
+      "id": "yacht_sailboat",
+      "category": "watercraft",
+      "file": "yacht_sailboat.json"
+    }
+  ]
+}
