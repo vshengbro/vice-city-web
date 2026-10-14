@@ -13,72 +13,71 @@
 //! - DOM id / 事件名 / 按键码集中在此,便于与 `index.html` 对照。
 
 /// 徒手状态:按 H 收起武器的提示。
-pub const NOTICE_UNARMED: &str = "weapon holstered";
+pub(crate) const NOTICE_UNARMED: &str = "weapon holstered";
 
 /// HUD 状态条的通用样式(容器)。
-pub const STYLE_STATUS: &str = "position:absolute;left:14px;bottom:74px;width:230px;display:flex;flex-direction:column;gap:5px;pointer-events:none;font-family:ui-monospace,monospace";
+pub(crate) const STYLE_STATUS: &str = "position:absolute;left:14px;bottom:74px;width:230px;display:flex;flex-direction:column;gap:5px;pointer-events:none;font-family:ui-monospace,monospace";
 /// 生命 / 护甲条的轨道样式。
-pub const STYLE_BAR_TRACK: &str =
+pub(crate) const STYLE_BAR_TRACK: &str =
     "width:100%;height:9px;border-radius:999px;background:rgba(255,255,255,.14);overflow:hidden";
 /// 弹药 / 现金行的样式。
-pub const STYLE_STAT_ROW: &str = "display:flex;flex-direction:row;align-items:center;justify-content:space-between;font-size:11px;color:#cfe9ff;text-shadow:0 1px 3px rgba(0,0,0,.85)";
+pub(crate) const STYLE_STAT_ROW: &str = "display:flex;flex-direction:row;align-items:center;justify-content:space-between;font-size:11px;color:#cfe9ff;text-shadow:0 1px 3px rgba(0,0,0,.85)";
 /// 任务提示行的样式。
-pub const STYLE_MISSION: &str = "position:absolute;right:14px;top:56px;max-width:340px;padding:7px 11px;border-radius:6px;background:rgba(10,12,22,.62);border:1px solid rgba(125,252,255,.3);font-family:ui-monospace,monospace;font-size:12px;line-height:1.5;color:#e6f6ff;pointer-events:none;white-space:pre-line";
+pub(crate) const STYLE_MISSION: &str = "position:absolute;right:14px;top:56px;max-width:340px;padding:7px 11px;border-radius:6px;background:rgba(10,12,22,.62);border:1px solid rgba(125,252,255,.3);font-family:ui-monospace,monospace;font-size:12px;line-height:1.5;color:#e6f6ff;pointer-events:none;white-space:pre-line";
 /// 通缉星容器的样式。
-pub const STYLE_WANTED: &str = "position:absolute;right:14px;top:14px;display:flex;flex-direction:row;gap:3px;font-size:17px;line-height:1;pointer-events:none;text-shadow:0 1px 4px rgba(0,0,0,.9)";
+pub(crate) const STYLE_WANTED: &str = "position:absolute;right:14px;top:14px;display:flex;flex-direction:row;gap:3px;font-size:17px;line-height:1;pointer-events:none;text-shadow:0 1px 4px rgba(0,0,0,.9)";
 /// 单颗星的样式。
-pub const STYLE_STAR: &str = "width:19px;height:19px;display:flex;align-items:center;justify-content:center;font-size:19px;line-height:1";
+pub(crate) const STYLE_STAR: &str = "width:19px;height:19px;display:flex;align-items:center;justify-content:center;font-size:19px;line-height:1";
 /// 准星的样式(一个十字,不挡视线)。
-pub const STYLE_CROSSHAIR: &str = "position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;pointer-events:none;opacity:.85";
+pub(crate) const STYLE_CROSSHAIR: &str = "position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;pointer-events:none;opacity:.85";
 /// 准星四臂的样式。
-pub const STYLE_CROSSHAIR_ARM: &str =
+pub(crate) const STYLE_CROSSHAIR_ARM: &str =
     "position:absolute;background:rgba(125,252,255,.95);box-shadow:0 0 3px rgba(0,0,0,.9)";
 /// 命中标记的样式。
-pub const STYLE_HITMARKER: &str = "position:absolute;left:50%;top:50%;width:26px;height:26px;margin:-13px 0 0 -13px;pointer-events:none;opacity:0;transition:opacity .12s linear";
+pub(crate) const STYLE_HITMARKER: &str = "position:absolute;left:50%;top:50%;width:26px;height:26px;margin:-13px 0 0 -13px;pointer-events:none;opacity:0;transition:opacity .12s linear";
 /// 小地图 canvas 的样式。
-pub const STYLE_MINIMAP: &str = "position:absolute;right:14px;bottom:14px;width:150px;height:150px;border-radius:8px;border:1px solid rgba(125,252,255,.32);background:#0b1020;pointer-events:none";
+pub(crate) const STYLE_MINIMAP: &str = "position:absolute;right:14px;bottom:14px;width:150px;height:150px;border-radius:8px;border:1px solid rgba(125,252,255,.32);background:#0b1020;pointer-events:none";
 
 /// 车辆损坏后的色调(耐久越低越暗)。
-pub const TINT_VEHICLE_MIN: [f32; 3] = [0.55, 0.42, 0.42];
+pub(crate) const TINT_VEHICLE_MIN: [f32; 3] = [0.55, 0.42, 0.42];
 
 /// 医院 A 的 X 坐标(米)。
-pub const HOSPITAL_A_X: f32 = 8.2;
+pub(crate) const HOSPITAL_A_X: f32 = 8.2;
 /// 医院 A 的 Z 坐标(米)。
-pub const HOSPITAL_A_Z: f32 = 8.2;
+pub(crate) const HOSPITAL_A_Z: f32 = 8.2;
 /// 医院 B 的 X 坐标(米)。
-pub const HOSPITAL_B_X: f32 = -52.0;
+pub(crate) const HOSPITAL_B_X: f32 = -52.0;
 /// 医院 B 的 Z 坐标(米)。
-pub const HOSPITAL_B_Z: f32 = 52.0;
+pub(crate) const HOSPITAL_B_Z: f32 = 52.0;
 /// 医院 C 的 X 坐标(米)。
-pub const HOSPITAL_C_X: f32 = 52.0;
+pub(crate) const HOSPITAL_C_X: f32 = 52.0;
 /// 医院 C 的 Z 坐标(米)。
-pub const HOSPITAL_C_Z: f32 = -52.0;
+pub(crate) const HOSPITAL_C_Z: f32 = -52.0;
 /// 医院 D 的 X 坐标(米)。
-pub const HOSPITAL_D_X: f32 = -98.0;
+pub(crate) const HOSPITAL_D_X: f32 = -98.0;
 /// 医院 D 的 Z 坐标(米)。
-pub const HOSPITAL_D_Z: f32 = -98.0;
+pub(crate) const HOSPITAL_D_Z: f32 = -98.0;
 /// 医院 E 的 X 坐标(米)。
-pub const HOSPITAL_E_X: f32 = 98.0;
+pub(crate) const HOSPITAL_E_X: f32 = 98.0;
 /// 医院 E 的 Z 坐标(米)。
-pub const HOSPITAL_E_Z: f32 = 98.0;
+pub(crate) const HOSPITAL_E_Z: f32 = 98.0;
 
 /// 水面每个面的自发光(全黑 —— 水面的「亮」来自反射,不是自发光)。
-pub const WATER_EMISSIVE: [f32; 3] = [0.0, 0.0, 0.0];
+pub(crate) const WATER_EMISSIVE: [f32; 3] = [0.0, 0.0, 0.0];
 
 /// 单元测试断言文案:头顶的楼板不得推开玩家。
-pub const T_INTERIOR_CEILING_ABOVE: &str = "头顶的楼板不得推开玩家,实际 {inside:?}";
+pub(crate) const T_INTERIOR_CEILING_ABOVE: &str = "头顶的楼板不得推开玩家,实际 {inside:?}";
 
 /// 单元测试断言文案:门洞是唯一能穿过的缺口。
-pub const T_INTERIOR_DOORWAY_PASSES: &str = "门洞中心必须能穿过去,实际 {through:?}";
+pub(crate) const T_INTERIOR_DOORWAY_PASSES: &str = "门洞中心必须能穿过去,实际 {through:?}";
 
 /// 二层 landing 压住整条梯段时,从 landing 下楼永远下不去 —— 自 `1ff7c38`
 /// (09-29)就存在的几何缺陷。二层楼板顶面恒为 3.20,`support_height` 取
 /// 「容差内最高的一块」时它恒中选,人钉在 3.20 一步都降不下来。
-pub const T_INTERIOR_LANDING_BLOCKS_DESCENT: &str =
+pub(crate) const T_INTERIOR_LANDING_BLOCKS_DESCENT: &str =
     "二层楼板不得盖住梯段,否则走不下楼梯;landing 压住 {heights:?}";
 
 /// 下楼必须真的逐级降到地面 —— 落到地面高度才算数,悬在梯段上不算。
-
 pub(crate) const DUSK: &str = "DUSK";
 
 pub(crate) const BLDG_APRICOT_MOTEL: &str = "bldg_apricot_motel";
@@ -571,27 +570,21 @@ pub(crate) const T_RUN_SPEED_PICK: &str = "按住 Shift 必须选中 RUN_SPEED,�
 
 pub(crate) const T_RUN_FASTER_THAN_WALK: &str = "冲刺必须明显快于走路:实测比值 {ratio},下限 {min}";
 #[cfg(test)]
-
 /// 断言文案里的「走路」档位名。
 pub(crate) const MODE_WALK: &str = "walk";
 #[cfg(test)]
-
 /// 断言文案里的「冲刺」档位名。
 pub(crate) const MODE_SPRINT: &str = "sprint";
 #[cfg(test)]
-
 /// 断言文案里 `{mode}` 的占位符。
 pub(crate) const KEY_MODE: &str = "mode";
 #[cfg(test)]
-
 /// 断言文案里 `{diagonal}` 的占位符。
 pub(crate) const KEY_DIAGONAL: &str = "diagonal";
 #[cfg(test)]
-
 /// 断言文案里 `{straight}` 的占位符。
 pub(crate) const KEY_STRAIGHT: &str = "straight";
 #[cfg(test)]
-
 /// 回归测试:斜向移动不得比直线快(`|W+D| == |W|`,`Shift+W+D` 同理)。
 ///
 /// 目标参照物是 GTA V —— 那边按 W+D 不会比单按 W 快。两轴各受 `speed`
@@ -600,7 +593,6 @@ pub(crate) const KEY_STRAIGHT: &str = "straight";
 /// 区间容差而非浮点等值。
 pub(crate) const T_DIAGONAL_MATCHES_STRAIGHT: &str = "斜向移动不得比直线快:{mode} 实得 |{diagonal}| = {got:.4},|{straight}| = {want:.4}(比值 {ratio:.4})";
 #[cfg(test)]
-
 /// 回归测试:直线档位必须仍然是满速。
 ///
 /// 与斜向那条互为对照:只钉「斜向不更快」的话,把速度**整体**砍到
@@ -608,7 +600,6 @@ pub(crate) const T_DIAGONAL_MATCHES_STRAIGHT: &str = "斜向移动不得比直�
 pub(crate) const T_STRAIGHT_KEEPS_FULL_SPEED: &str =
     "{mode} 直线必须保持满速:实得 {got:.4},应为 {want:.4}";
 #[cfg(test)]
-
 /// 回归测试:半个身位的输入必须仍然是半速。
 ///
 /// 归一化最常见的实现错误是**无脑除以模长**:`(0.5, 0.5)` 模长 0.707,
@@ -617,7 +608,6 @@ pub(crate) const T_STRAIGHT_KEEPS_FULL_SPEED: &str =
 pub(crate) const T_HALF_INPUT_STAYS_HALF_SPEED: &str =
     "{mode} 半速输入不得被归一化成满速:实得 {got:.4},应为 {want:.4}(比值 {ratio:.4})";
 #[cfg(test)]
-
 /// 斜向合速度与直线合速度的容差(比值无量纲)。
 ///
 /// 归一化把 `(1, 1)` 缩到 `(0.7071, 0.7071)`,浮点余量约 1e-6;
@@ -869,60 +859,46 @@ pub(crate) const PHASE_FIELD_VALUE: &str = "value";
 /// 单元测试里故意非法的一个 `?phase=` 取值(前缀合法但整体不匹配)。
 pub(crate) const T_PHASE_QUERY_PROBE: &str = "duskish";
 #[cfg(test)]
-
 /// 单元测试断言文案:射线必须命中挡在视线中间的墙。
 pub(crate) const T_RAY_MUST_HIT: &str = "墙在射线路径上,必须命中";
 #[cfg(test)]
-
 /// 单元测试断言文案:命中距离应接近「墙距焦点 - 探针半径」。
 pub(crate) const T_RAY_DISTANCE: &str = "命中距离应接近 3 m 减去探针半径,实际 {distance}";
 #[cfg(test)]
-
 /// 单元测试断言文案:被挡时必须报告遮挡。
 pub(crate) const T_OCCLUSION_REPORTED: &str = "墙挡住了视线,必须报告遮挡";
 #[cfg(test)]
-
 /// 单元测试断言文案:遮挡时允许距离必须短于期望距离。
 pub(crate) const T_OCCLUSION_SHORTER: &str = "遮挡时允许距离必须短于期望距离,allowed={allowed}";
 #[cfg(test)]
-
 /// 单元测试断言文案:允许距离必须为正,否则相机会被推到玩家背后。
 pub(crate) const T_OCCLUSION_POSITIVE: &str =
     "允许距离必须为正,否则相机会被推到玩家背后,allowed={allowed}";
 #[cfg(test)]
-
 /// 单元测试断言文案:视线无遮挡时必须返回 `None`。
 pub(crate) const T_NO_OCCLUSION: &str = "视线无遮挡时必须返回 None,否则相机会无缘无故短一截";
 #[cfg(test)]
-
 /// 单元测试断言文案:贴墙余量必须为正。
 pub(crate) const T_SKIN_POSITIVE: &str = "贴墙余量必须为正,否则相机会贴死在墙面里";
 #[cfg(test)]
-
 /// 单元测试断言文案:贴墙余量过大等于没有回避。
 pub(crate) const T_SKIN_BOUNDED: &str = "贴墙余量过大等于没有回避,当前 {OCCLUSION_SKIN}";
 #[cfg(test)]
-
 /// 单元测试断言文案:拉近后距离必须变小。
 pub(crate) const T_PULL_IN: &str = "拉近后距离必须变小,实际 {after}";
 #[cfg(test)]
-
 /// 单元测试断言文案:单帧内不允许一步到位,否则相机会抽搐。
 pub(crate) const T_PULL_IN_SMOOTH: &str = "一帧(16 ms)不允许一步到位,否则会抽搐,实际 {after}";
 #[cfg(test)]
-
 /// 单元测试断言文案:距离硬下限必须兜住。
 pub(crate) const T_FLOOR_HELD: &str = "距离硬下限必须兜住,实际 {distance} vs 下限 {floor}";
 #[cfg(test)]
-
 /// 单元测试断言文案:遮挡消失后必须平滑回到期望距离。
 pub(crate) const T_RECOVERS: &str = "遮挡消失后必须平滑回到期望距离,实际 {distance}";
 #[cfg(test)]
-
 /// 单元测试断言文案:中心线不该打到画面侧面的墙。
 pub(crate) const T_CENTRE_MISSES: &str = "中心线不该打到侧面的墙,实际 {centre:?}";
 #[cfg(test)]
-
 /// 单元测试断言文案:侧线必须发现画面侧面的墙。
 pub(crate) const T_SIDE_HITS: &str = "侧线必须发现这堵墙,否则相机会停在楼里";
 
@@ -1248,12 +1224,11 @@ pub(crate) const BLOOM_SCALE: f32 = 0.5;
 /// 1.6 m 刚好覆盖「楼与楼之间」「车与地面之间」这种一臂宽的接触关系;
 /// 再大就会把整条街的墙根一起压暗,看起来像脏雾而不是遮蔽。
 pub(crate) const SSAO_RADIUS: f32 = 1.6;
+/// SSAO 的采样数(固定循环,不做抖动)。
+pub(crate) const SSAO_SAMPLES: i32 = 8;
 
 /// SSAO 的采样幂次(越大对比越硬)。
 pub(crate) const SSAO_POWER: f32 = 2.2;
-
-/// SSAO 的采样数(固定循环,不做抖动)。
-pub(crate) const SSAO_SAMPLES: i32 = 8;
 
 /// AO 双边模糊的半径(以半分辨率 texel 为单位)。
 pub(crate) const AO_BLUR_RADIUS: i32 = 4;
@@ -1337,7 +1312,6 @@ pub(crate) const BLOOM_THRESHOLD: f32 = 0.62;
 /// ===========================================================================
 /// 战斗 / 通缉 / 任务系统常量(本作新增)
 /// ===========================================================================
-
 // ---- DOM id ----
 
 /// 生命条填充层。
@@ -1486,8 +1460,6 @@ pub(crate) const ENEMY_SPREAD: f32 = 0.07;
 pub(crate) const ENEMY_HIT_STUN: f32 = 0.18;
 /// 敌人尸体掉落现金。
 pub(crate) const ENEMY_CASH_DROP: f32 = 60.0;
-/// 敌人碰撞半径(米)。
-pub(crate) const ENEMY_RADIUS: f32 = 0.45;
 /// 敌人最低血量:低于这个值会逃跑。
 pub(crate) const ENEMY_FLEE_HEALTH: f32 = 22.0;
 /// 逃跑的移动速度倍率。
@@ -1672,8 +1644,6 @@ pub(crate) const WANTED_FLASH_TIME: f32 = 0.9;
 pub(crate) const ENEMY_WANTED_TOTAL: u32 = 8;
 /// 行人逃跑时的速度(米/秒)。
 pub(crate) const PED_FLEE_SPEED: f32 = 5.4;
-/// 行人的碰撞半径(米)。
-pub(crate) const PED_RADIUS: f32 = 0.4;
 /// 行人转身速率(1/秒)。
 pub(crate) const PED_TURN_RATE: f32 = 9.0;
 /// 行人步态相位推进速率(rad/米)。
@@ -1940,9 +1910,6 @@ pub(crate) const SHOWCASE_UPPER_BOTTOM: f32 = 2.95;
 
 /// 样板楼二层楼板上表面高度(米),与楼梯顶端齐平。
 pub(crate) const SHOWCASE_UPPER_TOP: f32 = 3.20;
-
-/// 样板楼外墙厚度(米)。
-pub(crate) const SHOWCASE_WALL_THICKNESS: f32 = 0.25;
 
 /// 样板楼门洞的半宽(米)——门洞净宽 1.60 m。
 pub(crate) const SHOWCASE_DOOR_HALF: f32 = 0.80;
