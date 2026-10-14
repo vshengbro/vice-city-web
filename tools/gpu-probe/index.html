@@ -1,0 +1,78 @@
+<!doctype html>
+<!--
+  WebGPU vs WebGL2 最小对照探针。
+
+  刻意**不**放在 www/ 下、不复用主游戏的 index.html:那个页面的
+  wasm 是 vice_city_web,拉进来就等于在测旧后端。这里的 wasm 只有
+  gpu_probe 一个,而且整页只有一个职责 —— 把两张 canvas 的像素统计
+  写进 window.__probe 等 CDP 来读。
+
+  两个 canvas 必须同时存在:WebGPU 的 `getContext("webgpu")` 和
+  WebGL2 的 `getContext("webgl2")` 都绑定在一张 canvas 上,而
+  `WebGpuRenderer::init` 要按 selector 找 canvas。所以给两张,
+  互不干扰。
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>gpu-probe · WebGPU vs WebGL2</title>
+    <style>
+      body {
+        margin: 0;
+        background: #111;
+        color: #eee;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        display: flex;
+        gap: 24px;
+        padding: 16px;
+      }
+      figure { margin: 0; }
+      figcaption { padding: 6px 0; color: #8ab; }
+      canvas {
+        display: block;
+        /* 关键:不要用 CSS 把画布拉伸。256x256 的后备缓冲原样显示,
+           截图比对的像素坐标才与 readback 一致。 */
+        width: 256px;
+        height: 256px;
+        image-rendering: pixelated;
+        border: 1px solid #333;
+      }
+    </style>
+  </head>
+  <body>
+    <figure>
+      <figcaption>#gpu-canvas — euv-engine WebGPU</figcaption>
+      <canvas id="gpu-canvas" width="256" height="256"></canvas>
+    </figure>
+    <figure>
+      <figcaption>#raw-canvas — 原生 WebGPU(不过 euv)</figcaption>
+      <canvas id="raw-canvas" width="256" height="256"></canvas>
+    </figure>
+    <figure>
+      <figcaption>#gl-canvas — WebGL2 对照</figcaption>
+      <canvas id="gl-canvas" width="256" height="256"></canvas>
+    </figure>
+    <figure>
+      <figcaption>#bisect-canvas — 原生 WebGPU 逐步二分</figcaption>
+      <canvas id="bisect-canvas" width="256" height="256"></canvas>
+    </figure>
+
+    <script src="./raw.js"></script>
+    <script src="./bisect.js"></script>
+    <script type="module">
+      import init, { main } from "./pkg/gpu_probe.js";
+      init()
+        .then(() => {
+          // `init()` **只**负责实例化 wasm。入口 `main()` 必须显式调 ——
+          // 忘了这一步的表现是「页面加载成功、`window.__probe` 永远是
+          // undefined」,和 wasm 崩了一模一样。
+          window.__probeErr = null;
+          main();
+        })
+        .catch((e) => {
+          window.__probeErr = "wasm init failed: " + e;
+          window.__probe = { error: window.__probeErr };
+        });
+    </script>
+  </body>
+</html>

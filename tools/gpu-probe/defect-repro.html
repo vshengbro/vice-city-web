@@ -1,0 +1,162 @@
+<!doctype html>
+<!--
+  euv-engine WebGPU 缺陷的最小复现(纯 JS,不需要编译 Rust/WASM)。
+
+  这里的每一段 JS 都是**逐字**照抄 euv-engine 0.28.6 生成的 JS 调用形状,
+  对应关系写在每段的注释里(文件:行号)。目的是把「Rust 源码里的缺陷」
+  和「浏览器里真正观察到的行为」一一对上,这样 claims 就不只是
+  读代码的断言,而是可复现的实验结果。
+
+  三个待验 claim:
+    D1  impl.rs:2101  copy_texture_to_buffer 读 command_encoder 字段,
+                      而该字段自 init 起恒为 None → 静默 return
+    D2  impl.rs:2155  create_offline_render_target 把 usage 写成字符串
+                      (const.rs:602) → device.createTexture 抛 TypeError
+    D3  impl.rs:1957  take_last_error 用 cell.take() 取值,不存在
+                      unwrap_or(UNDEFINED) 吞错 → 预期被推翻
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>gpu-probe · euv-engine WebGPU 缺陷最小复现</title>
+  </head>
+  <body>
+    <pre id="out">running…</pre>
+    <script>
+      const R = {};
+
+      // euv-engine const.rs:602 —— 注意这是 &str,不是数值位掩码
+      const WEBGPU_OFFSCREEN_TEXTURE_USAGE =
+        "RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC";
+
+      // euv-engine const.rs:122,304,478 —— 规范里的真实数值
+      const USAGE_RENDER_ATTACHMENT = 0x10; // 16
+      const USAGE_COPY_SRC            = 0x01; // 1
+      const USAGE_TEXTURE_BINDING     = 0x04; // 4
+      const CORRECT_MASK = USAGE_RENDER_ATTACHMENT | USAGE_COPY_SRC | USAGE_TEXTURE_BINDING;
+
+      async function main() {
+        if (typeof navigator.gpu === "undefined") {
+          R.fatal = "no navigator.gpu (need secure context + real GPU)";
+          return;
+        }
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) { R.fatal = "requestAdapter() -> null"; return; }
+        const device = await adapter.requestDevice();
+        R.device = { vendor: (adapter.info || {}).vendor || "?" };
+
+        // ---------------------------------------------------------------
+        // D1: impl.rs:319 把 command_encoder 初始化为 None,此后整个
+        // crate 里**没有任何一处**再给它赋值(grep 已验证:impl.rs 里
+        // 只有 319 的初始化,没有 `command_encoder =` 的写)。
+        // impl.rs:2101 因此永远拿到 None,2103 直接 `return`。
+        // 这是 euv-engine 侧状态机的真实形状,用闭包模拟。
+        // ---------------------------------------------------------------
+        const renderer = { command_encoder: null }; // 对应 struct.rs:125 / impl.rs:319
+        function createCommandEncoder_buggy() { // 对应 impl.rs:579 (签名是 &self,写不回字段)
+          return device.createCommandEncoder();
+        }
+        function copyTextureToBuffer_euv(...copyArgs) { // 对应 impl.rs:2051
+          const encoder = renderer.command_encoder; // impl.rs:2101 get_command_encoder()
+          if (encoder === null) {
+            return { executed: false, why: "encoder==None → early return (impl.rs:2103)" };
+          }
+          encoder.copyTextureToBuffer(...copyArgs);
+          return { executed: true };
+        }
+
+        // 建一个合法的 COPY_SRC 纹理,证明「D1 是状态机问题、不是资源问题」
+        const tex = device.createTexture({
+          size: [4, 4, 1],
+          format: "rgba8unorm",
+          usage: USAGE_RENDER_ATTACHMENT | USAGE_COPY_SRC,
+        });
+        const buf = device.createBuffer({
+          size: 256 * 4,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        const copyArgs = [{
+          texture: tex,
+        }, {
+          buffer: buf,
+          bytesPerRow: 256,
+          rowsPerImage: 4,
+        }, [4, 4, 1]];
+
+        R.D1_euv_path = copyTextureToBuffer_euv(...copyArgs);
+        // 对照组:手工持有 encoder,同样参数应当成功
+        try {
+          const enc = createCommandEncoder_buggy();
+          enc.copyTextureToBuffer(...copyArgs);
+          device.queue.submit([enc.finish()]);
+          R.D1_control = { executed: true, why: "same call with a live encoder works" };
+        } catch (e) { R.D1_control = { executed: false, why: String(e) }; }
+
+        // ---------------------------------------------------------------
+        // D2: impl.rs:2155-2159 把 usage 写成字符串
+        // ---------------------------------------------------------------
+        function createTexture_euv(width, height, format) { // impl.rs:2134
+          const descriptor = { size: [width, height, 1], format: format,
+                               usage: WEBGPU_OFFSCREEN_TEXTURE_USAGE };
+          return device.createTexture(descriptor); // impl.rs:2166-2168,
+        }                                               // unwrap_or(UNDEFINED) 吞掉异常
+        try {
+          const t = createTexture_euv(64, 64, "rgba8unorm");
+          R.D2_euv_path = { ok: true, why: "unexpectedly accepted" };
+        } catch (e) {
+          R.D2_euv_path = { ok: false, err: String(e),
+                            errName: e && e.name,
+                            note: "euv impl.rs:2168 unwrap_or(UNDEFINED) 会把这个异常变成 UNDEFINED" };
+        }
+        // 对照组:同样的 descriptor,usage 用数值位掩码
+        try {
+          const t = device.createTexture({ size: [64, 64, 1], format: "rgba8unorm",
+                                           usage: CORRECT_MASK });
+          R.D2_control = { ok: true, usage: CORRECT_MASK,
+                           note: "同样的 size/format,只有 usage 换成数值就成功" };
+        } catch (e) { R.D2_control = { ok: false, err: String(e) }; }
+
+        // ---------------------------------------------------------------
+        // D3: claim 说 take_last_error 被 unwrap_or(UNDEFINED) 吞掉,
+        // 导致「拿不到错误」。源码 impl.rs:1957-1966 实际是 `cell.take()`,
+        // 没有 unwrap_or。
+        //
+        // 重要区分(下面 D2 的实测暴露出来的):
+        //   · **descriptor 层**错误(usage 类型不对、缺 format)→ 同步抛
+        //     TypeError,error scope **抓不到**,只有 try/catch 能看见;
+        //   · **validation 层**错误(descriptor 合法但用法非法)→ 走
+        //     pushErrorScope/popErrorScope。
+        // 所以验证「error 通道能不能拿到错误」必须用 validation 层错误。
+        // ---------------------------------------------------------------
+        device.pushErrorScope("validation");
+        // size 必须是 4 的倍数(validation 层,不是 descriptor 层)
+        try { device.createBuffer({ size: 3, usage: GPUBufferUsage.COPY_DST }); }
+        catch (e) { R.D3_note = "createBuffer 同步抛出:" + String(e); }
+        const popped = await device.popErrorScope();
+        R.D3_popErrorScope = popped
+          ? { gotError: true, name: popped.constructor && popped.constructor.name, message: popped.message }
+          : { gotError: false, note: "error scope 没抓到 —— 这才是真正的通道失效" };
+        R.D3_source_has_unwrap_or = false; // 源码核实:impl.rs:1964 是 cell.take(),无 unwrap_or
+
+        // D3b: euv 自己在 create_bind_group 前后 push/pop 的形状
+        // (impl.rs:2822 push → impl.rs:3056 pop_error_sync + console::error_1)
+        device.pushErrorScope("validation");
+        device.createTexture({ size: [8, 8, 1], format: "rgba8unorm", usage: 16 });
+        try { device.queue.submit([device.createCommandEncoder().finish()]); } catch (e) {}
+        const popped2 = await device.popErrorScope();
+        R.D3_bindGroupPattern = popped2 ? { gotError: true, message: popped2.message } : { gotError: false };
+
+        device.destroy();
+      }
+
+      main().then(() => {
+        window.__defectRepro = R;
+        document.getElementById("out").textContent = JSON.stringify(R, null, 2);
+      }).catch(e => {
+        R.fatal = String(e);
+        window.__defectRepro = R;
+        document.getElementById("out").textContent = JSON.stringify(R, null, 2);
+      });
+    </script>
+  </body>
+</html>

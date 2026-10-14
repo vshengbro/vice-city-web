@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+  `flag-sweep.sh` 专用的空白页,唯一职责是给 `navigator.gpu` 一个
+  **安全上下文**。
+
+  为什么不能直接用 `about:blank`:通过 CDP `/json/new` 开的 tab 的
+  `about:blank` 继承的是一个 **opaque origin**,不是 secure context,
+  而 `navigator.gpu` 只在 secure context 里暴露。实测 8 组 flag 全部
+  报 `NO_NAVIGATOR_GPU` —— 测的全是「这个 origin 上没有 WebGPU 接口」,
+  与 flag 无关,是个假阴性。
+
+  `http://127.0.0.1` 按 W3C secure-contexts 规范算 potentially
+  trustworthy,所以 localhost 上的任何端口都够用,不需要 HTTPS。
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>flag-sweep blank</title>
+  </head>
+  <body>
+    <!--
+      故意放一个 canvas:有的 flag 组合下 `navigator.gpu` 存在但
+      `getContext("webgpu")` 拿不到 context,这里留一个可查的点。
+    -->
+    <canvas id="probe-canvas" width="64" height="64"></canvas>
+  </body>
+</html>

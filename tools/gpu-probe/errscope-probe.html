@@ -1,0 +1,79 @@
+<!doctype html>
+<!--
+  D3 深挖:pushErrorScope/popErrorScope 这条通道到底能不能抓到错误?
+
+  上一轮(defect-repro.html)里 size=3 的 createBuffer 没有产生
+  validation error —— 需要分清是「这个调用其实合法」还是「通道坏了」。
+  这里一次试多个**已知会产生 validation error** 的调用,每个都
+  push/pop 一次,看哪几个能被抓到。
+
+  目的:给 claim #3 一个诚实结论。claim 说「take_last_error 拿不到错误」,
+  但源码 impl.rs:1957-1966 是 cell.take(),没有 unwrap_or —— 机制描述
+  就不对。那通道本身到底行不行,得实测。
+-->
+<html lang="zh-CN">
+  <head><meta charset="utf-8" /><title>error-scope 通道实测</title></head>
+  <body><pre id="out">running…</pre>
+  <script>
+    const R = {};
+    async function probe(device, name, fn) {
+      device.pushErrorScope("validation");
+      let threw = null;
+      try { await fn(); } catch (e) { threw = String(e).slice(0, 200); }
+      const popped = await device.popErrorScope();
+      R[name] = {
+        scopeCaptured: popped ? popped.message : null,
+        threwSynchronously: threw,
+        verdict: popped ? "CAUGHT" : (threw ? "THREW_ONLY" : "NOTHING"),
+      };
+    }
+    async function main() {
+      if (typeof navigator.gpu === "undefined") { R.fatal = "no navigator.gpu"; return; }
+      const a = await navigator.gpu.requestAdapter();
+      if (!a) { R.fatal = "adapter null"; return; }
+      const device = await a.requestDevice();
+      R.vendor = (a.info || {}).vendor;
+
+      // 1. 已知 validation error:size 不是 4 的倍数
+      await probe(device, "bufferSizeNotMultipleOf4", () =>
+        device.createBuffer({ size: 3, usage: GPUBufferUsage.COPY_DST }));
+
+      // 2. 已知 validation error:usage 为 0(没有任何 flag)
+      await probe(device, "textureUsageZero", () =>
+        device.createTexture({ size: [8, 8, 1], format: "rgba8unorm", usage: 0 }));
+
+      // 3. 已知 validation error:写入未开 COPY_DST 的 buffer
+      await probe(device, "writeToBufferWithoutCopyDst", () => {
+        const b = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_SRC });
+        device.queue.writeBuffer(b, 0, new Uint8Array(4)); // 缺 COPY_DST
+      });
+
+      // 4. 已知 validation error:用 bindGroupLayout 不匹配的 pipeline
+      await probe(device, "pipelineLayoutMismatch", () => {
+        const bgl = device.createBindGroupLayout({
+          entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } }] });
+        const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+        device.createRenderPipeline({
+          layout,
+          vertex: { module: device.createShaderModule({
+              code: "@vertex fn vs() -> @builtin(position) vec4f { return vec4f(0); }" }),
+                    entryPoint: "vs" },
+          fragment: { module: device.createShaderModule({
+              code: "@fragment fn fs() -> @location(0) vec4f { return vec4f(1); }" }),
+                    entryPoint: "fs", targets: [{ format: "rgba8unorm" }] },
+          primitive: { topology: "triangle-list" },
+        });
+      });
+
+      // 5. 关键对照:descriptor 层错误(同步抛)是否也能被 scope 抓到
+      await probe(device, "descriptorLayerUsageTypeError", () =>
+        device.createTexture({ size: [8, 8, 1], format: "rgba8unorm", usage: "RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC" }));
+
+      device.destroy();
+    }
+    main().then(() => { window.__errScope = R;
+      document.getElementById("out").textContent = JSON.stringify(R, null, 2); })
+      .catch(e => { R.fatal = String(e); window.__errScope = R;
+        document.getElementById("out").textContent = JSON.stringify(R, null, 2); });
+  </script></body>
+</html>

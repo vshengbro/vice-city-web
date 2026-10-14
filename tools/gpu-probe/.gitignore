@@ -1,0 +1,10 @@
+# wasm-bindgen 输出:由 `cargo build --target wasm32-unknown-unknown` +
+# `wasm-bindgen --target web --out-dir pkg` 生成,不进版本库。
+# 同 `www/pkg/` 的理由 —— 产物可以从源码确定性重建。
+pkg/
+
+# 验收脚本的截图产物,每次跑都会变。
+shots/
+
+# 探测过程中的临时 dump。
+*.log

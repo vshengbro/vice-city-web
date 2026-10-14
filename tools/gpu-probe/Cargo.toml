@@ -1,0 +1,35 @@
+[workspace]
+
+[package]
+name = "gpu_probe"
+version = "0.1.0"
+edition = "2024"
+description = "WebGPU vs WebGL2 最小可玩三角形对照探针(vice-city-web 可行性验证)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "gpu_probe"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+js-sys = "0.3"
+euv-engine = "=0.28.6"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4"
+serde = { version = "1", features = ["derive"] }
+web-sys = { version = "0.3", features = [
+  "Window",
+  "Element",
+  "console",
+  "Document",
+  "Navigator",
+  "Performance",
+  "HtmlCanvasElement",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
