@@ -4286,7 +4286,7 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
         };
         // 最近的建筑实例位置:验收脚本要拿它当「推挤目标」,而不是写死
         // 一个魔法坐标 —— 街区布局会变,写死的坐标早晚会推到空气上。
-        let bpos_json: String = json_point(Some(game.get_nearest_building()));
+        let bpos_json: String = json_point(*game.try_get_nearest_building());
         // ---- 战斗 / 通缉 / 任务 / 行人的探针:自动化验收靠这几个字段 ----
         let enemies_json: String = {
             let items: Vec<String> = game

@@ -63,3 +63,16 @@ pub use std::{
 };
 
 pub(crate) use std::{collections::HashMap, iter, sync::Mutex, sync::MutexGuard, sync::OnceLock};
+
+/// 挂载静态视图树并启动游戏循环。
+///
+/// 挂载一棵**静态** `html!` 树(canvas + 加载进度条 + HUD + 帮助),
+/// 挂载完成后游戏循环和全部输入都由裸 `web_sys` + `Closure` 驱动,
+/// VDOM 不参与每帧渲染 —— 这是 canvas 游戏的正确做法
+/// (在事件回调里调用 euv hook 会因 hook context 丢失而静默白屏)。
+#[wasm_bindgen]
+pub fn main() {
+    console_error_panic_hook::set_once();
+    App::mount(r#config::APP_SELECTOR, r#game::app_root);
+    r#game::boot();
+}
