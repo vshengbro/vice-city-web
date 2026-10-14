@@ -223,7 +223,6 @@ mod tests {
         camera.set_fov_y(FOLLOW_FOV);
         camera.set_distance(9.5);
         camera.set_desired_distance(9.5);
-
         let allowed: f32 = camera
             .resolve_occlusion(&world, camera.get_desired_distance())
             .expect(T_OCCLUSION_REPORTED);
@@ -250,7 +249,6 @@ mod tests {
         camera.set_fov_y(FOLLOW_FOV);
         camera.set_distance(9.5);
         camera.set_desired_distance(9.5);
-
         assert!(
             camera
                 .resolve_occlusion(&world, camera.get_desired_distance())

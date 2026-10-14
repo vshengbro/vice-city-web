@@ -134,10 +134,8 @@ impl WebGpuRenderer {
         let (layout, group_layout): (JsValue, JsValue) =
             self.build_pipeline_layout(&device, &shadow_group_layout)?;
         let buffers: JsValue = self.build_vertex_layout()?;
-
         let vertex_module: JsValue = create_shader_module(&device, SHADER_VERTEX)?;
         let fragment_module: JsValue = create_shader_module(&device, SHADER_FRAGMENT)?;
-
         let vertex_stage: Object = new_object();
         set(&vertex_stage, FIELD_MODULE, &vertex_module)?;
         set(
@@ -146,7 +144,6 @@ impl WebGpuRenderer {
             &JsValue::from_str(ENTRY_VERTEX),
         )?;
         set(&vertex_stage, FIELD_BUFFERS, &buffers)?;
-
         let fragment_stage: Object = new_object();
         set(&fragment_stage, FIELD_MODULE, &fragment_module)?;
         set(
@@ -154,7 +151,6 @@ impl WebGpuRenderer {
             FIELD_ENTRY_POINT,
             &JsValue::from_str(ENTRY_FRAGMENT),
         )?;
-
         let targets: JsValue = make_array();
         let color_target: Object = new_object();
         let color_format: String = self.get_format().to_string();
@@ -220,7 +216,6 @@ impl WebGpuRenderer {
             FIELD_FRONT_FACE,
             &JsValue::from_str(FRONT_FACE_CCW),
         )?;
-
         let depth_stencil: Object = new_object();
         set(
             &depth_stencil,
@@ -233,7 +228,6 @@ impl WebGpuRenderer {
             FIELD_DEPTH_COMPARE,
             &JsValue::from_str(DEPTH_COMPARE_LESS),
         )?;
-
         let descriptor: Object = new_object();
         set(&descriptor, FIELD_LAYOUT, &layout)?;
         set(&descriptor, FIELD_VERTEX, &vertex_stage)?;
@@ -245,7 +239,6 @@ impl WebGpuRenderer {
         let multisample: Object = new_object();
         set(&multisample, FIELD_COUNT, &JsValue::from_f64(1.0))?;
         set(&descriptor, FIELD_MULTISAMPLE, multisample.as_ref())?;
-
         let pipeline: JsValue = call1(&device, METHOD_CREATE_RENDER_PIPELINE, descriptor.as_ref())?;
         self.set_pipeline(pipeline);
         self.set_pipeline_layout(layout);
@@ -351,7 +344,6 @@ impl WebGpuRenderer {
         // 同一份几何缓冲,不需要第二套上传路径,所以这里直接复用。
         let buffers: JsValue = self.build_vertex_layout()?;
         let module: JsValue = create_shader_module(&device, SHADER_SHADOW_VERTEX)?;
-
         let vertex_stage: Object = new_object();
         set(&vertex_stage, FIELD_MODULE, &module)?;
         set(
@@ -360,7 +352,6 @@ impl WebGpuRenderer {
             &JsValue::from_str(ENTRY_SHADOW_VERTEX),
         )?;
         set(&vertex_stage, FIELD_BUFFERS, &buffers)?;
-
         let primitive: Object = new_object();
         set(
             &primitive,
@@ -380,7 +371,6 @@ impl WebGpuRenderer {
             FIELD_FRONT_FACE,
             &JsValue::from_str(FRONT_FACE_CCW),
         )?;
-
         let depth_stencil: Object = new_object();
         set(
             &depth_stencil,
@@ -393,7 +383,6 @@ impl WebGpuRenderer {
             FIELD_DEPTH_COMPARE,
             &JsValue::from_str(DEPTH_COMPARE_LESS),
         )?;
-
         let descriptor: Object = new_object();
         set(&descriptor, FIELD_LAYOUT, &layout)?;
         set(&descriptor, FIELD_VERTEX, &vertex_stage)?;
@@ -408,7 +397,6 @@ impl WebGpuRenderer {
         // target」。这与 WebGL2 那份 `SHADOW_FRAGMENT_SHADER`
         // (`out_color = vec4(1.0)`)的差别就在这里:GL 的 FBO 即使只
         // 挂深度附件也仍然需要一个会写颜色的片元着色器,WebGPU 不需要。
-
         let pipeline: JsValue = call1(&device, METHOD_CREATE_RENDER_PIPELINE, descriptor.as_ref())?;
         self.set_shadow_pipeline(pipeline);
         self.set_shadow_pipeline_layout(layout);
@@ -531,7 +519,6 @@ impl WebGpuRenderer {
         )?;
         set(&frame_entry, FIELD_BUFFER, frame_layout.as_ref())?;
         push_into(&entries, 2usize, frame_entry.as_ref())?;
-
         let group_descriptor: Object = new_object();
         set(&group_descriptor, FIELD_ENTRIES, &entries)?;
         call1(
@@ -579,7 +566,6 @@ impl WebGpuRenderer {
             &JsValue::from_str(FILTER_LINEAR),
         )?;
         let sampler: JsValue = call1(&device, METHOD_CREATE_SAMPLER, sampler_descriptor.as_ref())?;
-
         // ---- bind group ----
         let bind_entries: JsValue = make_array();
         let view: JsValue = create_view(&self.get_shadow_texture().clone())?;
@@ -624,7 +610,6 @@ impl WebGpuRenderer {
         )?;
         set(&frame_binding, FIELD_RESOURCE, frame_resource.as_ref())?;
         push_into(&bind_entries, 2usize, frame_binding.as_ref())?;
-
         let bind_descriptor: Object = new_object();
         set(&bind_descriptor, FIELD_LAYOUT, layout)?;
         set(&bind_descriptor, FIELD_ENTRIES, &bind_entries)?;
@@ -702,7 +687,6 @@ impl WebGpuRenderer {
             set(&attribute, FIELD_FORMAT, &JsValue::from_str(format))?;
             push_into(&instance_attributes, index as usize, attribute.as_ref())?;
         }
-
         let vertex_buffer: Object = new_object();
         set(
             &vertex_buffer,
@@ -715,7 +699,6 @@ impl WebGpuRenderer {
             &JsValue::from_str(STEP_MODE_VERTEX),
         )?;
         set(&vertex_buffer, FIELD_ATTRIBUTES, &vertex_attributes)?;
-
         let instance_buffer: Object = new_object();
         set(
             &instance_buffer,
@@ -728,7 +711,6 @@ impl WebGpuRenderer {
             &JsValue::from_str(STEP_MODE_INSTANCE),
         )?;
         set(&instance_buffer, FIELD_ATTRIBUTES, &instance_attributes)?;
-
         let layouts: JsValue = make_array();
         push_into(&layouts, 0usize, vertex_buffer.as_ref())?;
         push_into(&layouts, 1usize, instance_buffer.as_ref())?;
@@ -754,7 +736,6 @@ impl WebGpuRenderer {
             UNIFORM_SHADING_BYTES as usize,
             USAGE_UNIFORM_BUFFER,
         )?;
-
         let entries: JsValue = make_array();
         for (index, buffer) in [frame.clone(), shading.clone()].iter().enumerate() {
             // `resource` 是 **GPUBindingResource 字典**,即 `{buffer}`;
@@ -882,7 +863,6 @@ impl WebGpuRenderer {
         )?;
         let sampler: JsValue = call1(&device, METHOD_CREATE_SAMPLER, sampler_descriptor.as_ref())?;
         self.set_bloom_sampler(sampler);
-
         // ---- 每条 pass 一个 uniform buffer ----
         // 见 [`WebGpuRenderer::bloom_buffers`]:同帧往**同一个** buffer
         // 写四次,只有最后一次生效,而四份数据互不相同。
@@ -904,7 +884,6 @@ impl WebGpuRenderer {
                 String::from("bloom uniform buffer count must match BLOOM_PASS_COUNT")
             })?,
         );
-
         // ---- 两条 bind group layout ----
         let group_layout: JsValue = self.build_bloom_group_layout()?;
         let composite_layout: JsValue = self.build_bloom_composite_group_layout()?;
@@ -925,7 +904,6 @@ impl WebGpuRenderer {
         let pipeline_layout: JsValue = Self::single_group_pipeline_layout(&device, &group_layout)?;
         let composite_pipeline_layout: JsValue =
             Self::single_group_pipeline_layout(&device, &composite_layout)?;
-
         // ---- 四条 pipeline ----
         // 前三条输出到 bloom 的半分辨率目标(`rgba8unorm`),第四条输出到
         // 画布 swapchain。
@@ -1811,9 +1789,7 @@ impl WebGpuRenderer {
         // 两组后处理目标都齐了,这时再建 bind group —— 顺序反了会在第一帧
         // 就因为 AO 纹理还没建而抛错(见 `ensure_postprocess_bind_groups`)。
         self.ensure_postprocess_bind_groups()?;
-
         // ---- uniform ----
-
         let frame: [f32; 16] = frame_bytes(view_proj);
         write_buffer(
             &device,
@@ -1841,13 +1817,11 @@ impl WebGpuRenderer {
             0.0,
             f32_slice_to_bytes(&light_bytes),
         )?;
-
         // ---- pass ----
         // `createCommandEncoder()` 是**零参数**方法。给它传一个
         // `null` 会让返回值不再是 GPUCommandEncoder,于是 submit 时报
         // `Failed to convert value to 'GPUCommandBuffer'`。
         let encoder: JsValue = call0(&device, METHOD_CREATE_COMMAND_ENCODER)?;
-
         // ---- 1) 阴影 pass(纯深度)----
         //
         // 必须排在主 pass **之前**:主 pass 的片元着色器要在同一个
@@ -1902,7 +1876,6 @@ impl WebGpuRenderer {
         let shadow_triangles: u32 =
             self.draw_shadow_pass(&shadow_pass, scene, shadow_focus, lighting)?;
         call0(&shadow_pass, METHOD_END)?;
-
         // ---- 2) 主 pass ----
         // ⚠️ 颜色附件是**离屏**的主场景目标,不是 swapchain ——
         // 提取 pass 要把它采样回来算亮度,而 `getCurrentTexture()`
@@ -1930,7 +1903,6 @@ impl WebGpuRenderer {
             FIELD_STORE_OP,
             &JsValue::from_str(STORE_OP_STORE),
         )?;
-
         let depth_attachment: Object = new_object();
         let depth_view: JsValue = create_view(&self.get_depth_texture().clone())?;
         set(&depth_attachment, FIELD_VIEW, &depth_view)?;
@@ -1949,7 +1921,6 @@ impl WebGpuRenderer {
             FIELD_DEPTH_STORE_OP,
             &JsValue::from_str(STORE_OP_STORE),
         )?;
-
         let pass_descriptor: Object = new_object();
         let color_list: JsValue = make_array();
         push_into(&color_list, 0usize, color_attachment.as_ref())?;
@@ -2021,7 +1992,6 @@ impl WebGpuRenderer {
         // `writeBuffer` 写 null 会抛,而 draw 读的是陈旧布局。
         // 先无条件建一个最小容量的,再在 `draw_batch` 里按需增长。
         self.reserve_instances(super::r#const::INSTANCE_CAPACITY_FLOOR)?;
-
         // ⚠️⚠️⚠️ **整帧的实例必须一次性拼好再上传。**
         //
         // `queue.writeBuffer` 是**队列时间线**上的操作:它在 `submit`
@@ -2082,7 +2052,6 @@ impl WebGpuRenderer {
             self.draw_bloom_chain(&device, &encoder, lighting)?;
             return self.finish_frame(&device, &encoder, shadow_triangles);
         }
-
         // 一次上传整帧实例,按批次切段。
         self.reserve_instances(total)?;
         // ⚠️ **必须在 `reserve_instances` 之后绑定**:容量变大时它会
@@ -2107,13 +2076,11 @@ impl WebGpuRenderer {
             ranges.push((mesh_index, first, count));
         }
         write_buffer(&device, &instance_buffer, 0.0, f32_slice_to_bytes(&all))?;
-
         let mut triangles: u32 = shadow_triangles;
         for (mesh_index, first, count) in ranges {
             triangles += self.draw_slice(&pass, mesh_index, first, count)?;
         }
         call0(&pass, METHOD_END)?;
-
         // ---- 3) bloom:提取 → 模糊 H → 模糊 V ----
         // ---- 4) 合成:主场景 + 辉光 → swapchain ----
         //

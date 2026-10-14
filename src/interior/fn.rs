@@ -613,7 +613,6 @@ mod tests {
                 &[("{support:?}", "landing 顶面不是 3.20")]
             )
         );
-
         // ---- 判据 2 + 3:从 landing 沿 -z 下行,逐级降到地面且不回头爬。
         let dt: f32 = 1.0 / 60.0;
         let stride: f32 = WALK_SPEED_60 * dt;

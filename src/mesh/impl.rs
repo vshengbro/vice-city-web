@@ -29,12 +29,12 @@ impl Display for MeshError {
     }
 }
 
-impl From<serde_json::Error> for MeshError {
+impl From<Error> for MeshError {
     /// 把 serde_json 的解析错误包装成 `MeshError::Json`。
     ///
     /// # Arguments
     ///
-    /// - `serde_json::Error` - 原始解析错误。
+    /// - `Error` - 原始解析错误。
     ///
     /// # Returns
     ///
@@ -43,12 +43,12 @@ impl From<serde_json::Error> for MeshError {
     ///
     /// # Arguments
     ///
-    /// - `serde_json::Error` - 原始解析错误。
+    /// - `Error` - 原始解析错误。
     ///
     /// # Returns
     ///
     /// - `Self` - 对应的 `MeshError`。
-    fn from(value: serde_json::Error) -> Self {
+    fn from(value: Error) -> Self {
         MeshError::Json(value)
     }
 }

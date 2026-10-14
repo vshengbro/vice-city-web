@@ -559,7 +559,6 @@ mod tests {
             "{T_SHOE_FOLLOWS_SHIN}: 右鞋必须挂在右小腿上,实得父 {}",
             limb_parent(PART_SHOE_R)
         );
-
         // --- 2. 变换层:脚尖必须随小腿摆动 ---
         // 枢轴不写死:和渲染端一样从**资产包围盒**推出(`joint_pivot`),
         // 所以换模型时这条断言跟着变,不会钉死一份过期魔法坐标。
@@ -574,14 +573,12 @@ mod tests {
         let root_pivot: Vec3 = joint_pivot(PART_LOWER_LEG_L, shin_bounds);
         let own_pivot: Vec3 = joint_pivot(PART_SHOE_L, shoe_bounds);
         let toe: Vec3 = [0.063, 0.0, 0.378];
-
         let shin_swing: f32 = limb_swing(PART_LOWER_LEG_L, 0.9, 1.0);
         let shoe_swing: f32 = limb_swing(PART_SHOE_L, 0.9, 1.0);
         assert!(
             shin_swing.abs() > 1.0e-3,
             "{T_SHOE_FOLLOWS_SHIN}: 选的相位上小腿必须在摆(膝 {shin_swing}),否则这条断言是空的"
         );
-
         // 摆角为 0 = 站立姿态(与渲染端 `gait_amount == 0` 一致)。
         let rest: Mat4 = limb_chain_matrix([0.0, 0.0, 0.0], 0.0, root_pivot, own_pivot, 0.0, 0.0);
         let posed: Mat4 = limb_chain_matrix(
@@ -592,7 +589,6 @@ mod tests {
             shin_swing,
             shoe_swing,
         );
-
         let rest_toe: Vec3 = apply(&rest, toe);
         let posed_toe: Vec3 = apply(&posed, toe);
         let moved: f32 = ((posed_toe[0] - rest_toe[0]).powi(2)
@@ -613,7 +609,6 @@ mod tests {
             ),
             " —— 脚尖必须离开静止位置(它挂在小腿上)"
         );
-
         // **独立第二条路径**:手算 `T(knee)·Rx(knee_a)·T(-knee)` 作用在脚尖上
         // 的结果,必须与 `limb_chain_matrix` 逐分量相等。
         //
@@ -638,7 +633,6 @@ mod tests {
                 && (posed_toe[2] - hand[2]).abs() < 1.0e-4,
             "{T_SHOE_FOLLOWS_SHIN}: 脚尖必须绕**膝**摆(父 = 小腿),实得 {posed_toe:?} 应为 {hand:?}"
         );
-
         // 左右两条腿的鞋必须反相 —— 脚同相就是「两条腿一起蹦」。
         //
         // 判**相位偏移**而不是判摆角乘积:`FOOT_SWING = 0` 时两个摆角都
@@ -678,7 +672,6 @@ mod tests {
                 "{T_SHOE_FOLLOWS_SHIN}: {shoe} 的相位必须与 {leg} 一致,否则脚会跟错腿"
             );
         }
-
         // 左右相位差必须正好是 π。上面那轮循环已经取到了左右鞋的相位,
         // 这里直接比较二者的差,不再重新查表。
         let left_phase: f32 = LIMB_PLAN

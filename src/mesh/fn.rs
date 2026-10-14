@@ -126,7 +126,6 @@ pub fn expand_asset(asset: &MeshAsset) -> Result<GpuMesh, MeshError> {
     let mut min: [f32; 3] = [f32::INFINITY; 3];
     let mut max: [f32; 3] = [f32::NEG_INFINITY; 3];
     let mut saw_vertex: bool = false;
-
     for part in asset.get_parts() {
         validate_part(part)?;
         let base_color: [f32; 3] = part.get_base_color().unwrap_or([0.8, 0.8, 0.8]);
@@ -234,7 +233,6 @@ pub fn expand_asset(asset: &MeshAsset) -> Result<GpuMesh, MeshError> {
             mesh.add_triangle_count(1);
         }
     }
-
     if !saw_vertex {
         return Err(MeshError::Schema(format!(
             "asset {:?} produced zero triangles",

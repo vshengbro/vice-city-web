@@ -28,10 +28,8 @@ pub async fn acquire(canvas: &HtmlCanvasElement) -> Result<GpuContext, GpuUnavai
         None => return Err(GpuUnavailable::new(GPU_ERR_NO_DEVICE)),
     };
     let context: JsValue = canvas_context(canvas)?;
-
     // 首选格式必须在 configure 之前取:它是设备与画布之间的一次性约定。
     let format: String = preferred_format(&gpu)?;
-
     let config: Object = new_object();
     Reflect::set(&config, &JsValue::from_str(FIELD_DEVICE), &device)
         .map_err(|_: JsValue| GpuUnavailable::new(GPU_ERR_CONFIGURE_FAILED))?;
@@ -52,14 +50,12 @@ pub async fn acquire(canvas: &HtmlCanvasElement) -> Result<GpuContext, GpuUnavai
     configure
         .call1(&context, config.as_ref())
         .map_err(|_: JsValue| GpuUnavailable::new(GPU_ERR_CONFIGURE_FAILED))?;
-
     euv::web_sys::console::log_1(&JsValue::from_str(&format!(
         "[vcw-gpu-init] canvas={}x{} fmt={}",
         canvas.width(),
         canvas.height(),
         format
     )));
-
     Ok(GpuContext {
         context,
         device,
@@ -1282,7 +1278,6 @@ mod tests {
         ];
         let matrix: Mat4 = Mat4::from_column_major(source);
         let out: [f32; 16] = frame_bytes(&matrix);
-
         for column in 0..4usize {
             assert_eq!(
                 out[at(1, column)],
@@ -1312,7 +1307,6 @@ mod tests {
         ];
         let matrix: Mat4 = Mat4::from_column_major(source);
         let out: [f32; 16] = frame_bytes(&matrix);
-
         for column in 0..4usize {
             assert_eq!(out[at(0, column)], source[at(0, column)], "row 0 moved");
             assert_eq!(out[at(1, column)], source[at(1, column)], "row 1 moved");
@@ -1336,7 +1330,6 @@ mod tests {
         ];
         let matrix: Mat4 = Mat4::from_column_major(source);
         let out: [f32; 16] = frame_bytes(&matrix);
-
         // M[3][3] = -1 必须原样保留:它是「投影把 w 打成 -z」的符号。
         assert_eq!(out[at(3, 2)], -1.0, "projection sign lost");
         // M[0][2] / M[1][2] 是 clip.x / clip.y 的 z 系数,透视矩阵里
@@ -1611,7 +1604,6 @@ mod tests {
             crate::render::Instance::new([30.0, 40.0, 0.0], 0.0, 1.0, [1.0; 3]);
         let base: crate::render::Instance =
             crate::render::Instance::new([30.0, 20.0, 0.0], 0.0, 1.0, [1.0; 3]);
-
         // 两个落点:沿光线投影到 focus 所在的水平面上。
         //
         // 闭包**不能**写成 `fn(f32) -> f32` 指针类型(§5.1 要求显式标注,
@@ -1624,7 +1616,6 @@ mod tests {
         };
         let top_landing: f32 = landing(focus, light, top.get_model_ref()[13]);
         let base_landing: f32 = landing(focus, light, base.get_model_ref()[13]);
-
         // 这个用例的前提:楼顶落在视锥外,而楼底落在视锥内。
         // 两支断言都失败的话说明常量被改了,用例本身失去意义。
         assert!(
@@ -1639,7 +1630,6 @@ mod tests {
              这栋楼根本不该被考虑",
             reach()
         );
-
         // 真正要钉的那一条:**只测原点**的写法会把这栋楼剔掉。
         assert!(
             !origin_only_would_keep(&top, focus, light),
@@ -1738,7 +1728,6 @@ mod tests {
         let at_base: f32 = contact_ao_factor(y, 0.3);
         let nearby: f32 = contact_ao_factor(y, 3.0);
         let open: f32 = contact_ao_factor(y, 40.0);
-
         assert!(
             at_base < open - 0.05,
             "同高度 y={y}:离基座 0.3 m 的 {at_base:.4} 必须明显比 40 m 外的 \

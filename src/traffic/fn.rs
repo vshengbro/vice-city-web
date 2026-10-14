@@ -370,7 +370,6 @@ mod tests {
         }
         let rolling: f32 = c.get_speed();
         assert!(rolling > 0.0, "起步必须是正速度,实际 {}", rolling);
-
         let mut trace: Vec<f32> = Vec::new();
         let mut zero_frame: Option<usize> = None;
         for i in 0..240 {
@@ -416,7 +415,6 @@ mod tests {
     #[test]
     pub(crate) fn reverse_steering_keeps_working_and_is_distinguishable() {
         let world: crate::collision::CollisionWorld = empty_world();
-
         // 同一辆车、同一个舵角,分别在前进与倒车状态各转一次,比较 yaw 变化。
         let mut ahead: TrafficCar = car();
         for _ in 0..60 {
@@ -428,7 +426,6 @@ mod tests {
             ahead.drive(0.0, 1.0, 1.0 / 60.0, &world);
         }
         let turn_fwd: f32 = ahead.get_yaw() - yaw0;
-
         let mut back: TrafficCar = TrafficCar::new(CAR_SEDAN, 0.0, 0.0, 0.0, 1.0);
         for _ in 0..60 {
             back.drive(-1.0, 0.0, 1.0 / 60.0, &world);
@@ -439,7 +436,6 @@ mod tests {
             back.drive(0.0, 1.0, 1.0 / 60.0, &world);
         }
         let turn_rev: f32 = back.get_yaw() - byaw0;
-
         assert!(
             speed_rev < 0.0,
             "这一段必须在倒车状态,实际速度 {}",

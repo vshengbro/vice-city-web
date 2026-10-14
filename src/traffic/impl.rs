@@ -471,7 +471,6 @@ impl TrafficCar {
             speed
         };
         self.set_speed(next.clamp(-REVERSE_SPEED_MAX, SPEED_MAX * 1.6));
-
         // ---- 2. 转向:车身角速度 = 舵角 × 纵向速度 / 轴距 -----------
         //
         // bicycle model 的核心:偏航角速度与**速度成正比**。所以低速几乎
@@ -504,7 +503,6 @@ impl TrafficCar {
             0.0
         };
         self.set_yaw(self.get_yaw() + yaw_rate * dt);
-
         // ---- 3. 速度分解 + 侧向甩出 ------------------------------
         //
         // 世界速度 = 沿车身分量 + 侧向分量。转向使车身转过 `yaw_rate*dt`,
@@ -519,11 +517,9 @@ impl TrafficCar {
         // 侧向多出 `-speed * sin(rotated) * steer_sign`。
         let swung: f32 = speed * rotated.sin();
         let lateral: f32 = self.get_lateral() - swung;
-
         // ---- 4. 轮胎抓地:侧向速度按指数衰减回 0 -------------------
         let decay: f32 = (-LATERAL_GRIP * dt).exp();
         let lateral: f32 = lateral * decay;
-
         // ---- 5. 漂移代价:侧滑越狠,纵向掉速越快 --------------------
         //
         // 滑移比的分母用 `speed.max(1.0)`,倒车时 `speed` 为负会让分母
@@ -540,7 +536,6 @@ impl TrafficCar {
         let floor: f32 = -REVERSE_SPEED_MAX;
         self.set_speed((speed - drag).max(floor));
         self.set_lateral(lateral);
-
         // ---- 6. 积分位置:沿「纵向 + 侧向」两个分量一起走 ---------
         let forward_speed: f32 = speed * rotated.cos();
         let velocity: Vec2 = [
@@ -564,7 +559,6 @@ impl TrafficCar {
             // 反应,清零会让车一碰墙就「立正」,完全失去漂移感。
             self.set_speed(self.get_speed() * 0.25);
         }
-
         // ---- 7. 车轮转角:走过的距离 / 轮半径 ----------------------
         let travelled: f32 = (velocity[0] * velocity[0] + velocity[1] * velocity[1]).sqrt() * dt;
         self.advance_wheel_spin(travelled / WHEEL_RADIUS);

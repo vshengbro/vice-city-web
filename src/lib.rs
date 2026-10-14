@@ -48,6 +48,7 @@ pub use euv::{
 };
 
 pub use serde::Deserialize;
+pub use serde_json::{self, Error};
 
 // §1.3d dedup: these constants are defined once and re-exported, so no two
 // modules may carry a second copy of the same value.

@@ -948,7 +948,6 @@ mod tests {
         let at_base: f32 = contact_ao_factor(y, 0.3);
         let nearby: f32 = contact_ao_factor(y, 3.0);
         let open: f32 = contact_ao_factor(y, 40.0);
-
         assert!(
             at_base < open - 0.05,
             "同高度 y={y}:离基座 0.3 m 的 {at_base:.4} 必须明显比 40 m 外的 {open:.4} 更暗 —— \
@@ -1109,7 +1108,6 @@ mod tests {
             }],
         };
         let mesh: crate::mesh::GpuMesh = expand_asset(&asset).expect("probe asset expands");
-
         // 每个顶点 9 个紧凑 f32(位置/法线/颜色)。
         assert_eq!(
             mesh.get_vertices_ref().len(),
@@ -1122,14 +1120,12 @@ mod tests {
             crate::mesh::FLOATS_PER_PBR_VERTEX * 3,
             "expand_asset 每顶点必须写 8 个 PBR f32"
         );
-
         let gpu: super::MeshAssetGpu = super::build_gpu_mesh(&mesh, &[]);
         assert_eq!(
             gpu.vertices.len(),
             super::STRIDE_FLOATS * 3,
             "GPU 顶点缓冲必须是 STRIDE_FLOATS × 顶点,否则 VAO 会越界读"
         );
-
         // 最后两个 f32 必须是粗糙度 / 金属度,且落在缺省范围内。
         let rough: f32 = gpu.vertices[super::STRIDE_FLOATS - 2];
         let metal: f32 = gpu.vertices[super::STRIDE_FLOATS - 1];

@@ -1157,7 +1157,6 @@ impl WebGlRenderer {
             WebGl2RenderingContext::DYNAMIC_DRAW,
         );
         context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, None);
-
         let u_view_proj: Option<WebGlUniformLocation> =
             context.get_uniform_location(&program, U_VIEW_PROJ);
         let u_light_dir: Option<WebGlUniformLocation> =
@@ -1366,7 +1365,6 @@ impl WebGlRenderer {
             targets: PipelineTargets::default(),
         };
         let _: &WebGl2RenderingContext = gl_context.as_ref();
-
         gl_context.enable(WebGl2RenderingContext::DEPTH_TEST);
         gl_context.depth_func(WebGl2RenderingContext::LESS);
         gl_context.enable(WebGl2RenderingContext::CULL_FACE);
@@ -1405,7 +1403,6 @@ impl WebGlRenderer {
             .create_vertex_array()
             .ok_or_else(|| CREATE_VERTEX_ARRAY_FAILED.to_string())?;
         context.bind_vertex_array(Some(&vertex_array));
-
         let vertex_buffer: WebGlBuffer = context
             .create_buffer()
             .ok_or_else(|| CREATE_BUFFER_FAILED.to_string())?;
@@ -1442,7 +1439,6 @@ impl WebGlRenderer {
                 component_offset * 4,
             );
         }
-
         let index_buffer: WebGlBuffer = context
             .create_buffer()
             .ok_or_else(|| CREATE_BUFFER_FAILED.to_string())?;
@@ -1455,7 +1451,6 @@ impl WebGlRenderer {
             crate::mesh::u32_slice_to_bytes(&mesh.get_indices()),
             WebGl2RenderingContext::STATIC_DRAW,
         );
-
         // 实例属性:model matrix 的 4 个 vec4 + tint。
         context.bind_buffer(
             WebGl2RenderingContext::ARRAY_BUFFER,
@@ -1483,7 +1478,6 @@ impl WebGlRenderer {
             64,
         );
         context.vertex_attrib_divisor(8, 1);
-
         context.bind_vertex_array(None);
         let index_count: i32 = mesh.get_indices().len() as i32;
         self.get_meshes_mut().push(GlMesh {
