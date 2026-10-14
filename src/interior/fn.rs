@@ -796,7 +796,7 @@ mod tests {
         let mut z: f32 = -4.55 + 0.5 * STAIR_RUN;
         let mut y: f32 = GROUND_TOP;
         for _ in 0..24 {
-            let from: Vec2 = [5.1, z];
+            let _from: Vec2 = [5.1, z];
             z += stride;
             let to: Vec2 = [5.1, z];
             y = single_point_baseline(&w, to, y);

@@ -777,6 +777,7 @@ impl WebGpuRenderer {
     /// - `Result<(), String>` - 创建失败时的可读原因。
     /// 建 SSAO 的采样器与三条 uniform buffer。
     ///
+    ///
     /// 必须在 [`WebGpuRenderer::ensure_ao_targets`] **之前**跑:建目标
     /// 时要顺手建 bind group,而 bind group 需要这里造出来的 sampler
     /// 和 buffer 不是 `NULL`。
@@ -2442,6 +2443,7 @@ impl WebGpuRenderer {
     /// # Returns
     ///
     /// - `Result<(), String>` - 创建失败时的错误文本。
+    ///
     /// 按需建 SSAO 的四个 G-buffer / AO 目标。
     ///
     /// 尺寸变了或第一次才建。G-buffer 两张是**全分辨率**(城市 pass 的
@@ -2566,6 +2568,7 @@ impl WebGpuRenderer {
     /// 不能少任何一环。
     ///
     /// # Returns
+    ///
     ///
     /// - `Result<(), String>` - 创建失败时的错误文本。
     /// 建三条 AO pass 的 bind group。
@@ -2960,17 +2963,14 @@ impl WebGpuRenderer {
     ///
     /// # Returns
     ///
-
     /// G-buffer 的视空间法线图。
     ///
     /// # Returns
     ///
-
     /// G-buffer 的线性深度图。
     ///
     /// # Returns
     ///
-
     /// 半分辨率 AO 的 ping / pong 纹理。
     ///
     /// # Returns
@@ -2995,7 +2995,6 @@ impl WebGpuRenderer {
     ///
     /// # Returns
     ///
-
     /// 四条 bloom pipeline 各自的句柄(按值克隆一份)。
     ///
     /// ⚠️ **按值返回副本**:`GpuBloomPass` 只 `Clone` 不 `Copy`(字段是

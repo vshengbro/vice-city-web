@@ -90,7 +90,7 @@ impl TrafficCar {
     ///
     /// - `(i32, f32, i32, f32)` - `(街道索引, 车道侧, 行进轴, 车道中心)`,其中
     ///   行进轴 `0` 表示沿 Z 行驶,车道中心就是 X 坐标。
-    fn route_from_xz(x: f32, z: f32, direction: f32) -> (i32, f32, i32, f32) {
+    fn route_from_xz(x: f32, _z: f32, direction: f32) -> (i32, f32, i32, f32) {
         let street: i32 = street_index_at(x);
         // 沿 +Z 行驶靠街道**右侧**(东侧)的车道,沿 -Z 靠左侧 —— 双向
         // 车道的惯例,也是右舵国家「靠右行驶」的那一侧。

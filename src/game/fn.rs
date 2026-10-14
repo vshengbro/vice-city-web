@@ -703,7 +703,7 @@ pub(crate) fn push_showcase_interior(interiors: &mut FloorWorld, spec: &Showcase
         ]
     };
     // 一个本地轴对齐盒 → 推入室内碰撞世界。
-    let mut push: &mut dyn FnMut(Vec2, Vec2, f32, f32, bool) =
+    let push: &mut dyn FnMut(Vec2, Vec2, f32, f32, bool) =
         &mut |min_xz: Vec2, max_xz: Vec2, lo: f32, hi: f32, is_slab: bool| {
             let a: Vec3 = place(min_xz, lo);
             let b: Vec3 = place(max_xz, hi);

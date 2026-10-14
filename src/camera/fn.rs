@@ -20,7 +20,7 @@ use super::*;
 pub(crate) fn interior_ray_hit(
     interiors: &FloorWorld,
     origin: Vec3,
-    eye: Vec3,
+    _eye: Vec3,
     dir: Vec3,
     max_distance: f32,
 ) -> Option<f32> {

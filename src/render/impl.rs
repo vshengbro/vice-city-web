@@ -831,32 +831,26 @@ impl WebGlRenderer {
     ///
     /// # Returns
     ///
-
     /// 主 program 的克隆句柄。
     ///
     /// # Returns
     ///
-
     /// 泛光 program 的克隆句柄。
     ///
     /// # Returns
     ///
-
     /// 阴影 program 的克隆句柄。
     ///
     /// # Returns
     ///
-
     /// instance buffer 的克隆句柄。
     ///
     /// # Returns
     ///
-
     /// 读 `targets` 字段(增强管线的全部离屏目标)。
     ///
     /// # Returns
     ///
-
     /// 写 `targets` 字段(增强管线的全部离屏目标)。
     ///
     /// # Arguments
@@ -870,37 +864,30 @@ impl WebGlRenderer {
     ///
     /// # Returns
     ///
-
     /// AO 模糊 program 的克隆句柄。
     ///
     /// # Returns
     ///
-
     /// SSR program 的克隆句柄。
     ///
     /// # Returns
     ///
-
     /// bloom 亮度提取 program 的克隆句柄。
     ///
     /// # Returns
     ///
-
     /// bloom 模糊 program 的克隆句柄。
     ///
     /// # Returns
     ///
-
     /// 合成 program 的克隆句柄。
     ///
     /// # Returns
     ///
-
     /// G-buffer program 的克隆句柄。
     ///
     /// # Returns
     ///
-
     /// 取出复用缓冲的可变引用。
     ///
     /// # Returns
@@ -933,7 +920,6 @@ impl WebGlRenderer {
     ///
     /// # Returns
     ///
-
     /// GPU 侧资产表的可变引用(仅供 accessor 使用)。
     ///
     /// # Returns
@@ -2590,7 +2576,6 @@ impl SoftwareRenderer {
     ///
     /// # Returns
     ///
-
     /// 在 canvas 上创建 2D 上下文。
     ///
     /// # Arguments

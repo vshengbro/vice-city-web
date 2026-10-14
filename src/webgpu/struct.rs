@@ -263,6 +263,7 @@ pub struct GpuUnavailable {
 
 /// WebGPU 渲染后端。
 ///
+///
 /// 构造是**异步**的(见 [`acquire`]),但 [`WebGpuRenderer::render`]
 /// 是同步的 —— 拿到 device 之后,每帧不再需要任何 await。
 #[derive(Clone, Data, Debug)]

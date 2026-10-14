@@ -40,7 +40,6 @@ impl InputState {
     ///
     /// # Returns
     ///
-
     /// 写回「当前谁拥有方向盘」。传空串即交还控制权。
     ///
     /// # Arguments

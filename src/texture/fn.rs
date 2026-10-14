@@ -179,7 +179,6 @@ pub fn albedo_key(kind: &str) -> String {
 mod tests {
     use super::*;
     #[cfg(test)]
-
     /// Build one atlas file in the on-disk format.
     pub(crate) fn build(entries: &[(&str, usize)]) -> Vec<u8> {
         let mut data: Vec<u8> = (entries.len() as u32).to_le_bytes().to_vec();

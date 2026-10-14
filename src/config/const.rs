@@ -80,7 +80,6 @@ pub(crate) const T_INTERIOR_LANDING_BLOCKS_DESCENT: &str =
     "二层楼板不得盖住梯段,否则走不下楼梯;landing 压住 {heights:?}";
 
 /// 下楼必须真的逐级降到地面 —— 落到地面高度才算数,悬在梯段上不算。
-
 pub(crate) const DUSK: &str = "DUSK";
 
 pub(crate) const BLDG_APRICOT_MOTEL: &str = "bldg_apricot_motel";
@@ -573,27 +572,21 @@ pub(crate) const T_RUN_SPEED_PICK: &str = "按住 Shift 必须选中 RUN_SPEED,�
 
 pub(crate) const T_RUN_FASTER_THAN_WALK: &str = "冲刺必须明显快于走路:实测比值 {ratio},下限 {min}";
 #[cfg(test)]
-
 /// 断言文案里的「走路」档位名。
 pub(crate) const MODE_WALK: &str = "walk";
 #[cfg(test)]
-
 /// 断言文案里的「冲刺」档位名。
 pub(crate) const MODE_SPRINT: &str = "sprint";
 #[cfg(test)]
-
 /// 断言文案里 `{mode}` 的占位符。
 pub(crate) const KEY_MODE: &str = "mode";
 #[cfg(test)]
-
 /// 断言文案里 `{diagonal}` 的占位符。
 pub(crate) const KEY_DIAGONAL: &str = "diagonal";
 #[cfg(test)]
-
 /// 断言文案里 `{straight}` 的占位符。
 pub(crate) const KEY_STRAIGHT: &str = "straight";
 #[cfg(test)]
-
 /// 回归测试:斜向移动不得比直线快(`|W+D| == |W|`,`Shift+W+D` 同理)。
 ///
 /// 目标参照物是 GTA V —— 那边按 W+D 不会比单按 W 快。两轴各受 `speed`
@@ -602,7 +595,6 @@ pub(crate) const KEY_STRAIGHT: &str = "straight";
 /// 区间容差而非浮点等值。
 pub(crate) const T_DIAGONAL_MATCHES_STRAIGHT: &str = "斜向移动不得比直线快:{mode} 实得 |{diagonal}| = {got:.4},|{straight}| = {want:.4}(比值 {ratio:.4})";
 #[cfg(test)]
-
 /// 回归测试:直线档位必须仍然是满速。
 ///
 /// 与斜向那条互为对照:只钉「斜向不更快」的话,把速度**整体**砍到
@@ -610,7 +602,6 @@ pub(crate) const T_DIAGONAL_MATCHES_STRAIGHT: &str = "斜向移动不得比直�
 pub(crate) const T_STRAIGHT_KEEPS_FULL_SPEED: &str =
     "{mode} 直线必须保持满速:实得 {got:.4},应为 {want:.4}";
 #[cfg(test)]
-
 /// 回归测试:半个身位的输入必须仍然是半速。
 ///
 /// 归一化最常见的实现错误是**无脑除以模长**:`(0.5, 0.5)` 模长 0.707,
@@ -619,7 +610,6 @@ pub(crate) const T_STRAIGHT_KEEPS_FULL_SPEED: &str =
 pub(crate) const T_HALF_INPUT_STAYS_HALF_SPEED: &str =
     "{mode} 半速输入不得被归一化成满速:实得 {got:.4},应为 {want:.4}(比值 {ratio:.4})";
 #[cfg(test)]
-
 /// 斜向合速度与直线合速度的容差(比值无量纲)。
 ///
 /// 归一化把 `(1, 1)` 缩到 `(0.7071, 0.7071)`,浮点余量约 1e-6;
@@ -871,60 +861,46 @@ pub(crate) const PHASE_FIELD_VALUE: &str = "value";
 /// 单元测试里故意非法的一个 `?phase=` 取值(前缀合法但整体不匹配)。
 pub(crate) const T_PHASE_QUERY_PROBE: &str = "duskish";
 #[cfg(test)]
-
 /// 单元测试断言文案:射线必须命中挡在视线中间的墙。
 pub(crate) const T_RAY_MUST_HIT: &str = "墙在射线路径上,必须命中";
 #[cfg(test)]
-
 /// 单元测试断言文案:命中距离应接近「墙距焦点 - 探针半径」。
 pub(crate) const T_RAY_DISTANCE: &str = "命中距离应接近 3 m 减去探针半径,实际 {distance}";
 #[cfg(test)]
-
 /// 单元测试断言文案:被挡时必须报告遮挡。
 pub(crate) const T_OCCLUSION_REPORTED: &str = "墙挡住了视线,必须报告遮挡";
 #[cfg(test)]
-
 /// 单元测试断言文案:遮挡时允许距离必须短于期望距离。
 pub(crate) const T_OCCLUSION_SHORTER: &str = "遮挡时允许距离必须短于期望距离,allowed={allowed}";
 #[cfg(test)]
-
 /// 单元测试断言文案:允许距离必须为正,否则相机会被推到玩家背后。
 pub(crate) const T_OCCLUSION_POSITIVE: &str =
     "允许距离必须为正,否则相机会被推到玩家背后,allowed={allowed}";
 #[cfg(test)]
-
 /// 单元测试断言文案:视线无遮挡时必须返回 `None`。
 pub(crate) const T_NO_OCCLUSION: &str = "视线无遮挡时必须返回 None,否则相机会无缘无故短一截";
 #[cfg(test)]
-
 /// 单元测试断言文案:贴墙余量必须为正。
 pub(crate) const T_SKIN_POSITIVE: &str = "贴墙余量必须为正,否则相机会贴死在墙面里";
 #[cfg(test)]
-
 /// 单元测试断言文案:贴墙余量过大等于没有回避。
 pub(crate) const T_SKIN_BOUNDED: &str = "贴墙余量过大等于没有回避,当前 {OCCLUSION_SKIN}";
 #[cfg(test)]
-
 /// 单元测试断言文案:拉近后距离必须变小。
 pub(crate) const T_PULL_IN: &str = "拉近后距离必须变小,实际 {after}";
 #[cfg(test)]
-
 /// 单元测试断言文案:单帧内不允许一步到位,否则相机会抽搐。
 pub(crate) const T_PULL_IN_SMOOTH: &str = "一帧(16 ms)不允许一步到位,否则会抽搐,实际 {after}";
 #[cfg(test)]
-
 /// 单元测试断言文案:距离硬下限必须兜住。
 pub(crate) const T_FLOOR_HELD: &str = "距离硬下限必须兜住,实际 {distance} vs 下限 {floor}";
 #[cfg(test)]
-
 /// 单元测试断言文案:遮挡消失后必须平滑回到期望距离。
 pub(crate) const T_RECOVERS: &str = "遮挡消失后必须平滑回到期望距离,实际 {distance}";
 #[cfg(test)]
-
 /// 单元测试断言文案:中心线不该打到画面侧面的墙。
 pub(crate) const T_CENTRE_MISSES: &str = "中心线不该打到侧面的墙,实际 {centre:?}";
 #[cfg(test)]
-
 /// 单元测试断言文案:侧线必须发现画面侧面的墙。
 pub(crate) const T_SIDE_HITS: &str = "侧线必须发现这堵墙,否则相机会停在楼里";
 
@@ -1338,7 +1314,6 @@ pub(crate) const BLOOM_THRESHOLD: f32 = 0.62;
 /// ===========================================================================
 /// 战斗 / 通缉 / 任务系统常量(本作新增)
 /// ===========================================================================
-
 // ---- DOM id ----
 
 /// 生命条填充层。
