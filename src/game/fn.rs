@@ -1992,7 +1992,7 @@ pub(crate) fn push_parsed_asset(
     index_map: &mut HashMap<String, usize>,
     asset: &MeshAsset,
 ) -> Result<usize, String> {
-    let id: &str = &asset.get_id();
+    let id: &str = asset.get_id();
     if let Some(existing) = index_map.get(id) {
         return Ok(*existing);
     }
@@ -3193,13 +3193,13 @@ pub(crate) fn push_car_wheel(scene: &mut Scene, asset: &MeshAsset, slot: usize) 
         ///
         /// # Arguments
         ///
-        /// - `&Vec<[usize; 3]>` - 重排后的三角面表。
-        /// - `&Vec<T>` - 原始逐顶点数据(UV 或切线)。
+        /// - `&[[usize; 3]]` - 重排后的三角面表。
+        /// - `&[T]` - 原始逐顶点数据(UV 或切线)。
         ///
         /// # Returns
         ///
         /// - `Vec<T>` - 按面顺序展开的逐角数据。
-        pub(crate) fn remap_corners<T: Copy>(faces: &Vec<[usize; 3]>, values: &Vec<T>) -> Vec<T> {
+        pub(crate) fn remap_corners<T: Copy>(faces: &[[usize; 3]], values: &[T]) -> Vec<T> {
             faces
                 .iter()
                 .flat_map(|face: &[usize; 3]| face.iter().map(|i: &usize| values[*i]))
@@ -5811,7 +5811,7 @@ pub(crate) fn step_combat(game: &mut Game, dt: f32) {
     // 放后面的话这一帧的命中反馈会晚一帧才出现。
     step_live_grenades(game, dt);
     {
-        let mut hurt: HurtState = game.get_mut_hurt().clone();
+        let mut hurt: HurtState = *game.get_mut_hurt();
         regen_armor(game.get_mut_player(), &mut hurt, dt);
         game.set_hurt(hurt);
     }
@@ -7398,7 +7398,7 @@ pub(crate) fn step_live_grenades(game: &mut Game, dt: f32) {
     }
     let mut survivors: Vec<Grenade> = Vec::new();
     let mut blasts: Vec<Vec3> = Vec::new();
-    let grenades: Vec<Grenade> = game.get_mut_live_grenades().drain(..).collect();
+    let grenades: Vec<Grenade> = take(game.get_mut_live_grenades());
     let world_snapshot: CollisionWorld = game.get_world_ref().clone();
     let floor_world: FloorWorld = game.get_interiors().clone();
     for mut grenade in grenades {
@@ -11061,7 +11061,7 @@ mod tests {
                     .and_then(|part: &crate::mesh::MeshPart| {
                         part.face_colors.as_ref().and_then(|c: &Vec<[f32; 3]>| {
                             c.get(index)
-                                .map(|v: &[f32; 3]| [v[0] as f32, v[1] as f32, v[2] as f32])
+                                .map(|v: &[f32; 3]| [v[0], v[1], v[2]])
                         })
                     })
             };
@@ -12249,7 +12249,7 @@ mod tests {
                 "{}",
                 fill(
                     T_ARROW_STEERS_WHILE_DRIVING,
-                    &[("key", &format!("{code}")), ("got", &format!("{steer:.4}")),]
+                    &[("key", &code.to_string()), ("got", &format!("{steer:.4}")),]
                 )
             );
             let mut car: crate::traffic::TrafficCar = steer_test_car();

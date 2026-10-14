@@ -139,7 +139,7 @@ impl TrafficCar {
             route_street: street,
             route_side: side,
             route_axis: axis,
-            route_seed: 0x7A11_u32 ^ street as u32 ^ (direction > 0.0) as u32 as u32,
+            route_seed: 0x7A11_u32 ^ street as u32 ^ (direction > 0.0) as u32,
         }
     }
 

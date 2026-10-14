@@ -1036,7 +1036,7 @@ mod tests {
             let mut kept: usize = 0;
             for i in 0..8 {
                 let fi: f32 = i as f32 + 0.5;
-                let phi: f32 = fi * 2.39996323;
+                let phi: f32 = fi * 2.399_963_2;
                 let cos_theta: f32 = (1.0 - fi / 8.0).sqrt();
                 let sin_theta: f32 = (fi / 8.0).sqrt();
                 let dir: [f32; 3] = [phi.cos() * sin_theta, phi.sin() * sin_theta, cos_theta];

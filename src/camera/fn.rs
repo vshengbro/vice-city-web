@@ -44,10 +44,10 @@ pub(crate) fn interior_ray_hit(
                 // 顶面:楼梯每一级都是 `y = [地面, 级高]` 的实心盒,下表面
                 // 全都贴着地面,所以用下表面判时楼梯永远不挡自己,只有真正
                 // 越过头顶的二层楼板才计入。
-                if let crate::interior::Floor::Slab { min, max } = floor {
-                    if min[1] <= origin[1] + SLAB_HEADROOM {
-                        return false;
-                    }
+                if let crate::interior::Floor::Slab { min, max: _ } = floor
+                    && min[1] <= origin[1] + SLAB_HEADROOM
+                {
+                    return false;
                 }
                 // **高度必须逐采样点判,不能用整条射线的总区间。**
                 // `low` / `high` 覆盖的是「焦点高度到眼点高度」的全程,
