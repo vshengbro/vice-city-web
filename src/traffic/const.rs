@@ -1,5 +1,3 @@
-use super::*;
-
 /// 街道在 Z 轴上的可行驶半长(米)。
 ///
 /// 由 [`crate::game::traffic_half`] 从城市半边长推导,车道两端到端点 wrap。

@@ -5,6 +5,6 @@ mod r#impl;
 mod r#struct;
 
 pub(crate) use crate::{r#config::*, swap, r#type::*};
-pub(crate) use {r#const::*, r#enum::*, r#fn::*, r#impl::*, r#struct::*};
+pub(crate) use {r#const::*, r#enum::*, r#fn::*, r#struct::*};
 
 use super::*;

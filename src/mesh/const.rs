@@ -1,5 +1,3 @@
-use super::*;
-
 /// 每个顶点的 f32 数量:position(3) + normal(3) + color(3)。
 pub(crate) const FLOATS_PER_VERTEX: usize = 9;
 

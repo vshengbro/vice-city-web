@@ -12,8 +12,6 @@
 //!   一个 const 再写 `style: STYLE_ROOT`。
 //! - DOM id / 事件名 / 按键码集中在此,便于与 `index.html` 对照。
 
-use super::*;
-
 /// 徒手状态:按 H 收起武器的提示。
 pub(crate) const NOTICE_UNARMED: &str = "weapon holstered";
 

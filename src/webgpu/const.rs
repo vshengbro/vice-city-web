@@ -5,8 +5,6 @@
 //! `navigator.gpu` 的路径才会被读到,和 WebGL2 的 `u_view_proj` 之类
 //! 是两套互不相干的命名空间,混在一起会让两边都难读。
 
-use super::*;
-
 /// `COPY_DST` —— 可被 `writeBuffer` / 复制指令**写入**。
 ///
 /// ⚠️ 按 `GPUBufferUsage` 规范是 **0x0008**,不是 0x0004(那是

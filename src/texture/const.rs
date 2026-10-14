@@ -1,7 +1,5 @@
 //! 贴图图集常量:三张贴图的名字与图集边长。
 
-use super::*;
-
 /// The albedo map name — the one every textured surface is guaranteed to have.
 ///
 /// `pub(crate)`: every reader lives inside this crate (§18 wants an external

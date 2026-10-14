@@ -17,6 +17,6 @@ pub(crate) use crate::{
     take,
     r#type::*,
 };
-pub(crate) use {r#const::*, r#enum::*, r#fn::*, r#impl::*, r#struct::*, r#trait::*};
+pub(crate) use {r#const::*, r#enum::*, r#fn::*, r#struct::*, r#trait::*};
 
 use super::*;

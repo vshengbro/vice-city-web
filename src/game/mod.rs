@@ -18,6 +18,6 @@ pub(crate) use crate::{
     spawn::advance_mission, spawn::build_hideouts, spawn::deploy_police, spawn::is_hidden,
     spawn::mission_blueprints, spawn::spawn_peds, spawn::spawn_thugs, take, traffic::*, r#type::*,
 };
-pub(crate) use {r#const::*, r#fn::*, r#impl::*, r#struct::*, r#type::*};
+pub(crate) use {r#const::*, r#fn::*, r#struct::*, r#type::*};
 
 use super::*;

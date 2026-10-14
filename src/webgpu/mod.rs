@@ -12,7 +12,7 @@ pub use super::{
 
 pub use ::core::array;
 
-pub(crate) use {r#const::*, r#fn::*, r#impl::*, r#struct::*};
+pub(crate) use {r#const::*, r#fn::*, r#struct::*};
 
 pub(crate) use crate::{
     camera::{Camera, Mat4, Mat4Data},

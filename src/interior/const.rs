@@ -1,5 +1,3 @@
-use super::*;
-
 /// `resolve_interior_slide` 里判定「墙没推我」/「没有切向可留」的阈值(米)。
 ///
 /// 取 1e-3,与 `collision.rs` 的 `SLIDE_EPSILON` 同一个量级:比它再小,
