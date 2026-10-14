@@ -1,8 +1,3 @@
-/// 街道在 Z 轴上的可行驶半长(米)。
-///
-/// 由 [`crate::game::traffic_half`] 从城市半边长推导,车道两端到端点 wrap。
-pub(crate) const LOOP_HALF_LENGTH: f32 = 120.0;
-
 /// 车道中心相对街道中轴线的横向偏移(米)—— 与 `game::LANE_OFFSET_X` 同值。
 ///
 /// 路面半宽 7 m,双向车道各占一半,车道中心落在 ±3.5 m 处,正好压在
@@ -50,9 +45,6 @@ pub(crate) const STEER_RATE: f32 = 1.9;
 
 /// 车身朝向角速度随速度的下降系数(1/米):速度越高同样舵角转得越慢。
 pub(crate) const STEER_SPEED_FALLOFF: f32 = 0.11;
-
-/// 前轮最大偏角(弧度)—— 满舵时前轮相对车身偏多少。
-pub(crate) const STEER_ANGLE_MAX: f32 = 0.52;
 
 /// 侧向抓地衰减(1/秒):侧向速度每秒钟衰减到原来的 `1 - GRIP` 倍。
 ///

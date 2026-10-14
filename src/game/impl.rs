@@ -97,15 +97,6 @@ impl InputState {
 }
 
 impl Game {
-    /// 车辆批次的只读引用。
-    ///
-    /// # Returns
-    ///
-    /// - `&Vec<usize>` - 与 `&self` 同生命周期,不复制。
-    pub(crate) fn get_car_batches_ref(&self) -> &Vec<usize> {
-        &self.car_batches
-    }
-
     /// 拾取批次的只读引用。
     ///
     /// # Returns

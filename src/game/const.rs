@@ -276,12 +276,6 @@ pub(crate) const PALM_TALL_SCALE_MAX: f32 = 1.65;
 /// 又跟着 `scale` 一起放大(高个 ×1.65),把门彻底堵死。留 6 m 净距。
 pub(crate) const PALM_SHOWCASE_CLEARANCE: f32 = 6.0;
 
-/// 棕榈碰撞半径最多按缩放放大到几倍(1.0 = 固定粗细)。
-///
-/// 树干粗细随树高走合理,但不能无上限:高个 ×1.65 再乘基准半径,
-/// 靠墙的树就把过道挤没了。这里封顶。
-pub(crate) const PALM_TRUNK_SCALE_CAP: f32 = 1.25;
-
 /// 玩家出生点(世界坐标):`SPAWN_LANE_STREET` 那条街的**东侧车道**,z = 45。
 ///
 /// 选点是拿截图试出来的,踩过三个坑:

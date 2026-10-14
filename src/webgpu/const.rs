@@ -799,9 +799,6 @@ pub(crate) const SSAO_NO_GEOMETRY: f32 = 0.999;
 /// 否则前景会把背景的暗角糊过来。
 pub(crate) const SSAO_DEPTH_SIGMA: f32 = 0.06;
 
-/// SSAO 强度的下限,保证最暗处也不会压成纯黑。
-pub(crate) const SSAO_MIN_AO: f32 = 0.22;
-
 /// bloom 离屏颜色目标:`RENDER_ATTACHMENT | TEXTURE_BINDING`。
 ///
 /// 四张(scene / bright / ping / pong)都要读写两遍:被上一个 pass 写
