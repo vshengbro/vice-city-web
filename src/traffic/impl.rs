@@ -150,6 +150,7 @@ impl TrafficCar {
             wheel_spin: 0.0,
             driven: false,
             hailing_seconds: 0.0,
+            blocked: false,
             route_street: street,
             route_side: side,
             route_axis: axis,
@@ -213,6 +214,7 @@ impl TrafficCar {
             wheel_spin: 0.0,
             driven: false,
             hailing_seconds: 0.0,
+            blocked: false,
             route_street: street,
             route_side: side,
             route_axis: axis,
@@ -447,6 +449,7 @@ impl TrafficCar {
     /// - `f32` - 固定步长(秒)。
     /// - `&CollisionWorld` - 静态碰撞世界。
     pub fn route_advance(&mut self, dt: f32, world: &CollisionWorld) {
+        self.set_blocked(false);
         let direction: f32 = self.get_direction();
         self.realign_route(direction);
         let axis: i32 = self.get_lane_axis();
@@ -472,7 +475,12 @@ impl TrafficCar {
             if moved + CAR_ROUTE_EPSILON < wanted {
                 // 被完全挡住(或者一步都没走成):不推进路网状态,停在
                 // 障碍前。速度砍到零让它重新加速而不是顶着墙磨。
+                //
+                // `blocked` 必须置位:车队层的 IDM 在**之后**才回写速度,
+                // 它看不到这里发生过什么,只会看到「速度 0」,于是算出正
+                // 加速度把速度拉回 0.067,下一帧又被挡回去 —— 永远 0 位移。
                 self.set_speed(0.0);
+                self.set_blocked(true);
                 return;
             }
         }
@@ -1001,6 +1009,22 @@ impl Traffic {
         // 回写按算出来的顺序来,保证同一帧的决策顺序可复现。
         for (index, accel) in planned {
             if let Some(car) = self.get_car_mut(index) {
+                // **被静态几何挡下的车,IDM 不许把它重新加速。**
+                //
+                // `route_advance` 已经把这类车的速度砍到 0 并 `return`,那是
+                // 「前面有墙,先停下」的意思。可 IDM 看到的是「速度 0、
+                // 同向前车 49 m 外、不在红灯前」——`gap = INFINITY`、
+                // `interaction = 0`、`free = (0 / 11.5)⁴ = 0`,于是
+                // `a = A·(1 − 0 − 0) = +4 m/s²`,把速度拉回 0.067。
+                // 下一帧车又顶着同一个障碍、再被砍到 0,于是永远循环。
+                //
+                // 线上症状:探针读出 `carSpeed = 0.067`,而位置连续 80 s
+                // **精确 0.00 m** —— 位置和速度互相矛盾,速度是 IDM 刚写下的
+                // 那个还没来得及被碰撞消耗掉的中间值。
+                if car.get_blocked() {
+                    car.set_speed(0.0);
+                    continue;
+                }
                 let next: f32 = (car.get_speed() + accel * dt).max(0.0);
                 car.set_speed(next.min(SPEED_MAX));
             }

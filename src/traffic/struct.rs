@@ -56,6 +56,18 @@ pub struct TrafficCar {
     /// 不需要再存一条「世界坐标 + 直线方向」的退化车道。
     #[get(type(copy), pub(crate))]
     pub(crate) route_street: i32,
+    /// 这一帧位移被静态几何**完全吃掉**(车被挡在障碍前)。
+    ///
+    /// 必须显式记下来,而不是只看速度:被挡下时 [`Self::route_advance`]
+    /// 把速度砍到 0 就 `return`,可车队层的 IDM 在**之后**统一回写速度,
+    /// 看到「速度 0、前面没车、没红灯」就算出 `a = A·(1 − 0 − 0) = +4`,
+    /// 把速度又拉回 0.067 —— 于是下一帧再次被挡、再次被拉回。
+    ///
+    /// 线上症状就是这个:探针读出 `carSpeed = 0.067` 而位移连续 80 s
+    /// **精确 0.00 m**,位置和速度互相矛盾。`0.067` 不是车在动,是 IDM
+    /// 每帧把它从 0 拉起来又被碰撞打回去的那个中间值。
+    #[get(type(copy), pub(crate))]
+    pub(crate) blocked: bool,
     /// 车道在街道中轴线的哪一侧(`-1.0` / `+1.0`)。
     #[get(type(copy), pub(crate))]
     pub(crate) route_side: f32,
