@@ -2408,6 +2408,32 @@ pub(crate) fn stream_needs_rebuild(player: Vec2, center: Vec2) -> bool {
         || (player[1] - center[1]).abs() > STREAM_REBUILD_STEP
 }
 
+/// 流式换块时,把碰撞世界重建到新的生成中心。
+///
+/// 单独拆出来是为了让测试能断言**调用点真的会走到这里** —— P0-E 那个 bug
+/// 正是「函数本身是对的,但换块路径忘了调它」,只测 `build_collision_world`
+/// 的输出永远发现不了。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+/// - `f32` - 新街区中心的 X(米)。
+/// - `f32` - 新街区中心的 Z(米)。
+pub(crate) fn rebuild_streamed_collision_world(game: &mut Game, next_x: f32, next_z: f32) {
+    // 碰撞世界必须**跟着换块一起重建**。
+    //
+    // 原来它只在启动时建一次(`build_world_assets` 里的调用),于是玩家
+    // 走出去几百米以后,看到的楼是新流式批次里的楼,撞的却还是出生点
+    // 那些 —— 出生点那一圈的墙会凭空出现在身后,真正走到的街区里一堵
+    // 墙都没有。这和 P0-D 的推出上限是同一个问题的两端:墙不再会凭空
+    // 出现,玩家就没有理由陷进 12 m 深的楼里。
+    //
+    // 成本可接受:换块频率是一格街道(60 m),这里只是重算一遍 AABB 列表,
+    // 而且**只在真的换块时**才跑(`stream_needs_rebuild` 已经挡住了)。
+    let asset_bounds: HashMap<String, Bounds> = game.get_asset_bounds().clone();
+    build_collision_world(game.get_mut_world(), &asset_bounds, next_x, next_z);
+}
+
 /// 围绕玩家当前位置重建地面与水面网格。
 ///
 /// 场景的批次表是稳定的(实例表每帧都会重写),所以这里只换掉地面 /
@@ -5591,6 +5617,7 @@ pub(crate) fn step_streamed_surface(game: &mut Game) {
     // 任务点、撞人、社会聚集也全都在另一个街区。触发条件跟地面重建共用
     // 同一次换块(`STREAM_REBUILD_STEP` = 一格街道),不多花一次判定。
     repopulate_streamed_combatants(game, next_x, next_z);
+    rebuild_streamed_collision_world(game, next_x, next_z);
     // 地面 / 水面的顶点数据换了,GPU 缓冲必须跟着换 —— 否则玩家走出街区
     // 边界后看到的还是出生点那块地,而 CPU 侧探针报告的却是新数据。
     if let Some(mut renderer) = game.get_mut_renderer().take() {
@@ -9101,6 +9128,86 @@ mod tests {
         assert!(
             drift <= PLAYER_PUSH_DEADZONE,
             "stationary player drifted {drift:.6} m over 8 frames"
+        );
+    }
+
+    /// 静态分离**不能一帧把玩家弹过一整栋楼**。
+    ///
+    /// `push_out_*` 一步就把点送到形状表面:点在楼的几何**中心**时,推出
+    /// 距离等于该形状在这一轴上的半径。实测(本测试修复前的真实输出)
+    /// 一栋 25 x 12 m 的楼能一帧弹 **12.35 m**(合 740 m/s)—— 那就是
+    /// 「瞬移」。
+    ///
+    /// 现在 `separate_static` 用**整帧预算** `MAX_STATIC_PUSH_PER_FRAME`
+    /// 封顶:预算记在位移上而不是「推了几次」上,所以 `RESOLVE_ITERATIONS`
+    /// 乘以街区里的形状数也超不过它。
+    #[test]
+    pub(crate) fn t_static_separation_never_ejects_across_a_building() {
+        let mut world: CollisionWorld = CollisionWorld::new();
+        // 一栋和真实建筑同量级的盒子:半长 25 x 12。
+        world
+            .get_shapes_mut()
+            .push(crate::r#collision::Shape::Aabb {
+                center: [0.0, 0.0],
+                half: [25.0, 12.0],
+            });
+        // `resolve_all` 会在动态分离前后各收敛一次,所以一帧的上界是
+        // 2 × 单次预算;这里按实际实现取这个界,不再猜。
+        let per_frame: f32 = MAX_STATIC_PUSH_PER_FRAME * 2.0;
+        let mut worst: f32 = 0.0;
+        let mut worst_at: Vec2 = [0.0, 0.0];
+        for i in -22..=22 {
+            for j in -10..=10 {
+                let probe: Vec2 = [i as f32, j as f32];
+                let bodies: Vec<crate::r#collision::DynamicBody> =
+                    vec![crate::r#collision::DynamicBody::new(
+                        crate::r#collision::BodyKind::Player,
+                        probe,
+                        PLAYER_RADIUS,
+                        PLAYER_MASS,
+                    )];
+                let out: Vec2 = world.resolve_all(&bodies)[0];
+                let d: f32 = ((out[0] - probe[0]).powi(2) + (out[1] - probe[1]).powi(2)).sqrt();
+                if d > worst {
+                    worst = d;
+                    worst_at = probe;
+                }
+            }
+        }
+        println!("max static eject = {worst:.3} m  (from {worst_at:?})");
+        assert!(
+            worst <= per_frame + 1e-3,
+            "一帧把玩家推出 {worst:.3} m(从 {worst_at:?} 出发),超过上限 {per_frame:.3} m —— \
+             又变成一帧穿楼了(修复前是 12.35 m)"
+        );
+    }
+
+    /// 碰撞世界必须**跟着流式换块一起重建**。
+    ///
+    /// 原来 `build_collision_world` 只在启动时跑一次,于是玩家走出去
+    /// 几百米以后,看到的楼是新流式批次里的楼,撞的却还是出生点那些 ——
+    /// 出生点那一圈的墙凭空留在身后,真正走到的街区里一堵墙都没有。
+    ///
+    /// P0-E 的形状是「函数本身是对的,但换块路径忘了调它」,所以光测
+    /// `build_collision_world` 的输出永远发现不了 —— 我第一版就是这么
+    /// 写的,把调用点删掉它照样绿。这条测试因此盯**调用点本身**:
+    /// `step_streamed_surface` 的源码里必须出现这个调用。
+    #[test]
+    pub(crate) fn t_the_streamed_rebuild_also_refreshes_the_collision_world() {
+        let source: String =
+            crate::fs::read_to_string("src/game/fn.rs").expect("必须能读回自己的源文件");
+        // 只看 `step_streamed_surface` 的函数体,别处调用不算数。
+        let start: usize = source
+            .find("pub(crate) fn step_streamed_surface")
+            .expect("step_streamed_surface 必须还在");
+        let body: &str = source[start..]
+            .split("\npub(crate) fn ")
+            .next()
+            .expect("必须能切出函数体");
+        assert!(
+            body.contains("rebuild_streamed_collision_world(game"),
+            "step_streamed_surface 没有重建碰撞世界 —— \
+             玩家会一直撞着出生点那圈墙(P0-E)"
         );
     }
 
