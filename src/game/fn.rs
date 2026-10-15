@@ -11360,6 +11360,141 @@ mod tests {
         );
     }
 
+    /// **生产车队里不许有车整个 30 s 窗口位移精确为 0。**
+    ///
+    /// 线上(`1a6b298` 之后)仍然存在的那一台:
+    ///
+    /// ```text
+    /// car6 (-58.27,-56.50) v=0.000 hail=0.00 ax=1 dir=+1 street=-1   <-- 队首
+    /// car9 (-62.71,-56.50) v=2.091
+    /// car7 (-67.27,-56.50) v=2.091
+    /// car5 (-71.83,-56.50) v=2.091
+    /// ```
+    ///
+    /// 幽灵速度(0.067)修掉之后它诚实地读 0.000,但**位移仍然精确
+    /// 0.00 m**,后面三辆照样锁在 2.09 m/s。所以那个 bug 只是症状的一半:
+    /// 被静态几何挡住的车确实该停,可它**永远走不了**。
+    ///
+    /// 判据必须是「**精确** 0」而不是「很慢」:0.17 m / 30 s 是真的在动
+    /// (8 s 停靠 → 开走 → 再来)。之前
+    /// `the_fleet_still_flows_after_five_minutes` 的阈值放得太松,量不到它。
+    ///
+    /// 用**生产出生点**而不是手摆坐标 —— hailer 那个 bug 就是手摆十次都
+    /// 复现不出、只有 `populate` 加上时间才现形的。
+    #[test]
+    pub(crate) fn no_car_in_the_production_fleet_is_ever_exactly_stuck() {
+        let mut world: CollisionWorld = traffic_world_at(63.5, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        traffic.populate(&traffic_lanes(), &[]);
+        let dt: f32 = 1.0 / 60.0;
+        let mut last: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let mut frozen_from: Vec<Option<usize>> = vec![None; last.len()];
+        for window in 0..10usize {
+            for _frame in 0..1800 {
+                traffic.step(dt, None, &world, 0.0);
+            }
+            let now: Vec<[f32; 2]> = traffic
+                .get_cars_ref()
+                .iter()
+                .map(|car: &crate::traffic::TrafficCar| {
+                    let p: Vec3 = car.get_position();
+                    [p[0], p[2]]
+                })
+                .collect();
+            for (index, pair) in now.iter().enumerate() {
+                let moved: f32 = ((pair[0] - last[index][0]).powi(2)
+                    + (pair[1] - last[index][1]).powi(2))
+                .sqrt();
+                frozen_from[index] =
+                    frozen_from[index].or(if moved <= 1e-4 { Some(window) } else { None });
+            }
+            last = now;
+        }
+        let mut stuck: Vec<String> = Vec::new();
+        for (index, at) in frozen_from.iter().enumerate() {
+            let Some(from): Option<usize> = *at else {
+                continue;
+            };
+            let car: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[index];
+            let p: Vec3 = car.get_position();
+            stuck.push(format!(
+                "car{index} 第 {from} 窗起 ({:.2},{:.2}) v={:.3} blocked={}",
+                p[0],
+                p[2],
+                car.get_speed(),
+                car.get_blocked()
+            ));
+        }
+        assert!(
+            stuck.is_empty(),
+            "生产车队里有车整个 30 s 窗口位移精确为 0(线上 car6 的症状): {}",
+            stuck.join("; ")
+        );
+    }
+
+    /// **车队开远之后碰撞世界跟着重建,不许有车卡死。**
+    ///
+    /// 线上那个 `car6 (-58.27,-56.50)` 在本仓库里**复现不出来**:上面那条
+    /// `no_car_in_the_production_fleet_is_ever_exactly_stuck` 用生产出生点跑
+    /// 300 s,十个 30 s 窗口里没有一辆位移精确为 0。
+    ///
+    /// 两者唯一的差别是**碰撞世界随玩家重建**:
+    /// `rebuild_streamed_collision_world` 在每次换块(`STREET_PITCH = 60` m)
+    /// 时按新中心重算整个 AABB 表。线上玩家一直没动,所以世界**没**重建;
+    /// 而车已经开出去 160 m —— 它们脚下那块地是不是还有碰撞体,取决于
+    /// 出生时建的那张表。
+    ///
+    /// 这条模拟「车跑远但世界没跟着换」这个组合:让一列车沿 +X 开到
+    /// x≈700 m(远超出生点 300 m 的建造半径),要求每一辆都还在动。
+    #[test]
+    pub(crate) fn cars_far_outside_the_spawn_world_keep_driving() {
+        let world: CollisionWorld = traffic_world_at(63.5, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        for z in [-120.0f32, -90.0, -56.5, -30.0, 0.0].iter() {
+            let mut car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 40.0, 11.5, 1.0);
+            car.set_position([40.0, 0.0, *z]);
+            traffic.get_cars_mut().push(car);
+        }
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        // 200 s:11.5 m/s 足够开出去 2000 m,远超 BLOCK_VIEW_RADIUS。
+        for _frame in 0..12000 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let mut report: String = String::new();
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 = ((p[0] - 40.0).powi(2)
+                + (p[2] - [-120.0f32, -90.0, -56.5, -30.0, 0.0][index]).powi(2))
+            .sqrt();
+            report.push_str(&format!(
+                "car{index} ({:.1},{:.1}) 走了 {moved:.1}m v={:.3}; ",
+                p[0],
+                p[2],
+                car.get_speed()
+            ));
+            assert!(
+                moved >= 5.0 || car.get_blocked() || car.get_hailing_seconds() > 0.0,
+                "car{index} 在 ({:.2},{:.2}) 只走了 {moved:.2} m,速度 {:.3},blocked={} —— \
+                 它已经开出出生点的建造半径,但碰撞世界没有跟着重建",
+                p[0],
+                p[2],
+                car.get_speed(),
+                car.get_blocked()
+            );
+        }
+        println!("开出建造半径 200s: {report}");
+    }
+
     /// **车停在 (-58.27, -56.50) 动不了 —— 那个点上是不是有静态碰撞体。**
     ///
     /// 线上实测(探针加了路网状态之后):car8 `v = 0.066`、`hail = 0.00`
