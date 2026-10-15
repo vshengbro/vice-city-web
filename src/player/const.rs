@@ -1,13 +1,27 @@
 use super::*;
 
 /// 步行速度(米/秒)。
-pub(crate) const WALK_SPEED: f32 = 4.6;
+///
+/// GTA III 的角色步行在 1.4–1.8 m/s,越肩视角的观感更接近 2.2。
+/// 街块是按 GTA III 的尺度建的(`STREET_PITCH` 60 m),4.6 m/s 的
+/// 角色一秒钟蹿过半条街,街道的尺度感整个塌掉。
+pub(crate) const WALK_SPEED: f32 = 2.2;
 
 /// 奔跑速度(米/秒,按住 Shift)。
-pub(crate) const RUN_SPEED: f32 = 8.4;
+///
+/// 与 [`WALK_SPEED`] 的比值 2.27 对齐 GTA III 的一跑一走(≈1.8 → 4.0)。
+pub(crate) const RUN_SPEED: f32 = 5.0;
 
 /// 转身插值速度(1/秒):越小转身越「重」,不会瞬移式扭头。
+///
+/// 真实感来自**限速随速度下降**:跑得越快越转不动。系数见
+/// [`TURN_RATE_MIN_FACTOR`]。
 pub(crate) const TURN_RATE: f32 = 11.0;
+
+/// 满速跑动时转身速率相对 [`TURN_RATE`] 的下限系数。
+///
+/// GTA 的角色在冲刺时几乎无法原地急转,这里收到 0.45。
+pub(crate) const TURN_RATE_MIN_FACTOR: f32 = 0.45;
 
 /// 行走相位推进速率(rad / 米):每走 1 米推进约 2.6 rad,约 2.4 步。
 pub(crate) const GAIT_RATE_PER_METER: f32 = 2.6;
@@ -27,7 +41,15 @@ pub(crate) const FOOT_SWING: f32 = 0.0;
 pub(crate) const GAIT_RELAX_RATE: f32 = 6.5;
 
 /// 起步 / 停步时速度的指数趋近速率(1/秒)。
+///
+/// 只作用于**加速**:松键后的减速走 [`DECEL_RAMP`],停得比起步慢。
 pub(crate) const SPEED_RAMP: f32 = 14.0;
+
+/// 松键后速度回落的速率(1/秒)。
+///
+/// GTA 的停步有明显的滑步尾巴;起步 14.0 对减速 8.0 时,起步到 95%
+/// 约 0.21 s,松键到 95% 约 0.37 s —— 停下来比起跑慢,和 GTA 一致。
+pub(crate) const DECEL_RAMP: f32 = 8.0;
 
 /// 低于这个平面速度(米/秒)就认为「站住了」:不转身、不推进相位。
 pub(crate) const PLANAR_EPSILON: f32 = 0.05;
