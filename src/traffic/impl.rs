@@ -333,6 +333,107 @@ impl TrafficCar {
         self.route_advance(dt, world);
     }
 
+    /// IDM(Intelligent Driver Model)的纵向加速度。
+    ///
+    /// `a = a_max · [1 − (v/v₀)^δ − (s*/s)²]`
+    ///
+    /// - `v₀` 是期望速度(巡航,或红灯前的 0)。
+    /// - `s* = s0 + max(0, v·T + v·Δv / (2·√(a·b)))`,`Δv = v − v_lead`。
+    /// - `s` 是与**同向同一根车道轴上的前车**的净间距;没有前车时取
+    ///   `f32::INFINITY`,于是 `(s*/s)² = 0`,退化成自由流。
+    ///
+    /// 指数取 `IDM_DELTA = 4` 时 `s*` 在 `Δv < 0`(前车更快)时自动变大 ——
+    /// 所以被加塞时会**主动减速让出空间**,而不是顶上去。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 本车当前速度(米/秒)。
+    /// - `f32` - 期望速度(米/秒)。
+    /// - `f32` - 与前车的净间距(米);`f32::INFINITY` 表示无前车。
+    /// - `f32` - 与前车的速度差 `v − v_lead`(米/秒)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 加速度(米/秒²),已钳在 `[IDM_ACCEL_MIN, IDM_ACCEL_MAX]`。
+    pub fn idm_accel(speed: f32, desired: f32, gap: f32, delta_v: f32) -> f32 {
+        // 期望间距。`sqrt(a·b)` 只算一次。
+        let dynamic: f32 = speed * delta_v / (2.0 * (IDM_ACCEL_MAX * IDM_BRAKE_COMFORT).sqrt());
+        let wanted: f32 = IDM_MIN_GAP + (IDM_HEADWAY * speed + dynamic).max(0.0);
+        // 自由流项。`v0 <= 0`(等红灯)时这一项归零,于是 `a = a_max·[1 − (s*/s)²]`
+        // —— 前车停住就直接全力刹车,而不是慢慢逼近。
+        let free: f32 = if desired > f32::EPSILON {
+            (speed / desired).powf(IDM_DELTA)
+        } else {
+            1.0
+        };
+        // `gap <= 0` 表示已经贴上/重叠:比例项发散,直接给满刹车。
+        //
+        // 注意这里**不能**写 `gap.is_finite()`:没有前车时 `gap` 是
+        // `f32::INFINITY`,而 `INFINITY.is_finite()` 是 **false**,于是会掉进
+        // else 分支拿到 `interaction = 1.0` —— 也就是「全力刹车」。
+        // 结果是空旷路段上的车反而全在刹车。这条判据必须是「间距够大就
+        // 不产生作用」:`INFINITY > 1e-3` 成立,比值自然是 0。
+        let interaction: f32 = if gap > 1e-3 {
+            (wanted / gap).powi(2)
+        } else {
+            1.0
+        };
+        (IDM_ACCEL_MAX * (1.0 - free - interaction)).clamp(IDM_ACCEL_MIN, IDM_ACCEL_MAX)
+    }
+
+    /// 找出本车**正前方同车道**的最近一辆车,返回 (净间距, 速度差)。
+    ///
+    /// 只在**同一根车道轴**上看,而且要求前车和本车朝同一个方向走 ——
+    /// 对向车不构成跟车对象,路口横向车也不算(那是路权问题,交给
+    /// 红绿灯相位处理,不是 IDM)。
+    ///
+    /// 间距按**车头到车尾**算(减两个半车长),不是中心距:中心距在
+    /// 贴住时会是 0,`s*` 的比例项发散,车会被顶成负加速度乱抖。
+    ///
+    /// # Arguments
+    ///
+    /// - `&[TrafficCar]` - 全车队(当前车也在里面,靠索引排除自己)。
+    /// - `usize` - 本车在车队里的索引。
+    ///
+    /// # Returns
+    ///
+    /// - `(f32, f32)` - `(净间距, 速度差)`;前方没有车时净间距是
+    ///   `f32::INFINITY`。
+    pub fn leader_gap(cars: &[TrafficCar], me: usize) -> (f32, f32) {
+        let Some(front) = cars.get(me) else {
+            return (f32::INFINITY, 0.0);
+        };
+        let axis: i32 = front.get_lane_axis();
+        let direction: f32 = front.get_direction();
+        let here: Vec3 = front.get_position();
+        let mine: f32 = if axis == 0 { here[2] } else { here[0] };
+        let mut best: f32 = f32::INFINITY;
+        let mut lead_speed: f32 = 0.0;
+        for (index, other) in cars.iter().enumerate() {
+            if index == me
+                || other.get_lane_axis() != axis
+                // 对向车道不跟。
+                || other.get_direction() != direction
+            {
+                continue;
+            }
+            let at: Vec3 = other.get_position();
+            let along: f32 = if axis == 0 { at[2] } else { at[0] };
+            // 只看**前方**:同向同轴但落后于本车的不构成威胁。
+            let ahead: f32 = (along - mine) * direction;
+            if ahead <= 0.0 {
+                continue;
+            }
+            // 净间距 = 中心距 − 半车长(本车)− 半车长(前车)。
+            let clear: f32 = ahead - CAR_FOOTPRINT[0];
+            if clear < best {
+                best = clear;
+                lead_speed = other.get_speed();
+            }
+        }
+        (best, front.get_speed() - lead_speed)
+    }
+
     /// 路网积分的一步:沿当前车道走,到路口按 [`ROUTE_PICK`] 抽签转向。
     ///
     /// 这是「车怎么走路网」的全部逻辑,[`Self::step`] 只是它外面套了一层
@@ -773,6 +874,69 @@ impl Traffic {
                     continue;
                 }
                 car.step(dt, Some(index) == hailer_car, world);
+            }
+        }
+        // **跟车**在纵向积分**之后**统一做一遍。
+        //
+        // 必须分两步:`TrafficCar::step` 里的速度是各自按巡航逼近的,
+        // 谁也没看别人。IDM 需要**同一条线上前车已经算好的速度** ——
+        // 一起推进去,队列里越靠后的车看到的越是上一帧的旧速度。
+        //
+        // 顺序也有讲究:从队首(沿街坐标最靠前)往后算,于是每辆车看到的
+        // 前车速度都是**本帧**的,不会出现整条队列一起抖。
+        //
+        // `sort_key` 单独具名而不是内联闭包:闭包捕获 `self` 就不能写成
+        // `fn(usize) -> f32`,而 §5.1 要求 `let` 必须带显式类型标注。
+        //
+        // 切片借用必须**在循环外就结束**:`get_car_mut` 要 `&mut self`,
+        // 而持有 `&[TrafficCar]` 会一直占着不可变借用。所以这里先在同一个
+        // 快照上把每辆车的目标加速度全部算完,再单独回写速度。
+        //
+        // 这是 IDM 的**同步更新**(论文里的标准写法):所有车都基于同一帧的
+        // 前车状态决策,于是结果与数组顺序无关,也就不会有「同一支车队
+        // 换个下标就走出不同轨迹」的不确定性。代价是后车看到的前车速度
+        // 晚一帧 —— 1/60 s,在 `T = 1.5 s` 的时间间隔面前可以忽略。
+        let planned: Vec<(usize, f32)> = {
+            let cars: &[TrafficCar] = self.get_cars_ref();
+            let sort_key: &dyn Fn(usize) -> f32 = &|index: usize| -> f32 {
+                let car: &TrafficCar = &cars[index];
+                let at: f32 = if car.get_lane_axis() == 0 {
+                    car.get_position()[2]
+                } else {
+                    car.get_position()[0]
+                };
+                at * car.get_direction()
+            };
+            let mut order: Vec<usize> = (0..cars.len())
+                .filter(|index: &usize| !cars[*index].get_driven())
+                .collect();
+            order.sort_by(|a: &usize, b: &usize| {
+                sort_key(*b)
+                    .partial_cmp(&sort_key(*a))
+                    .unwrap_or(Ordering::Equal)
+            });
+            order
+                .into_iter()
+                .map(|index: usize| {
+                    let (gap, delta_v): (f32, f32) = TrafficCar::leader_gap(cars, index);
+                    let car: &TrafficCar = &cars[index];
+                    let desired: f32 = if Some(index) == hailer_car {
+                        0.0
+                    } else {
+                        car.get_cruise()
+                    };
+                    (
+                        index,
+                        TrafficCar::idm_accel(car.get_speed(), desired, gap, delta_v),
+                    )
+                })
+                .collect()
+        };
+        // 回写按算出来的顺序来,保证同一帧的决策顺序可复现。
+        for (index, accel) in planned {
+            if let Some(car) = self.get_car_mut(index) {
+                let next: f32 = (car.get_speed() + accel * dt).max(0.0);
+                car.set_speed(next.min(SPEED_MAX));
             }
         }
         for index in 0..self.get_pickups_ref().len() {
