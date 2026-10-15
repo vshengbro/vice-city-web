@@ -63,8 +63,25 @@ pub fn decide(
         return patrol(enemy, wander);
     }
     // 看见 + 在射程内 = 开火,但保持一个交火距离:贴脸输出低,站远了瞄不准。
+    //
+    // **站得比交火距离远时必须继续靠近。** 原来这里只处理了「太近了后撤」
+    // (`distance < ENEMY_STANDOFF` → -1.0),中间那段给的是 `sign = 0.0`,
+    // 等于 `move_to = [0, 0]` —— 敌人只要落在 `ENEMY_STANDOFF`(9 m)到
+    // `ENEMY_FIRE_RANGE`(26 m)之间就**彻底不动**:不进不退,站着挨打。
+    // 实测 12/15 个敌人卡在 `attack` 状态、最近的一个冻结在 15.7 m,
+    // `chase` 计数为 0。
+    //
+    // GTA 的开火 AI 是「逼近到交火距离 → 站定射击 → 玩家贴身则后撤」,
+    // 三段都要有,少一段就少了逼近这一段。
     if sees && distance <= ENEMY_FIRE_RANGE {
-        let sign: f32 = if distance < ENEMY_STANDOFF { -1.0 } else { 0.0 };
+        // 落在交火距离内就站定不动;在带外则朝目标方向逼近 / 后撤。
+        let sign: f32 = if distance < ENEMY_STANDOFF {
+            -1.0
+        } else if distance > ENEMY_STANDOFF {
+            1.0
+        } else {
+            0.0
+        };
         let away: Vec2 = [here[0] - player_at[0], here[2] - player_at[2]];
         let length: f32 = (away[0] * away[0] + away[1] * away[1])
             .sqrt()
@@ -212,11 +229,15 @@ pub fn apply(
 ///
 /// - `Vec2` - 带散布的 XZ 方向。
 pub fn aim_with_spread(from: Vec3, to: Vec3, wander: f32, shot_index: u32) -> Vec2 {
-    let desired: f32 = -(to[2] - from[2]).atan2(to[0] - from[0]);
+    // 角度用项目统一的 `yaw` 约定(见 [`crate::combat::face_towards`]):
+    // `desired = dx.atan2(dz)`,朝向向量 `(sin, cos)`。以前这里写的是
+    // `−dz.atan2(dx)` 配 `[cos, −sin]` —— 那套自洽,但整体偏 90°,
+    // 于是「朝玩家散布」实际朝的是玩家左侧 90°,命中率恒定偏低。
+    let desired: f32 = (to[0] - from[0]).atan2(to[2] - from[2]);
     // 用敌人数 + 枪序错开相位,避免所有人朝同一方向偏。
     let jitter: f32 = ((shot_index as f32) * 2.399_963 + wander * 3.0).sin() * ENEMY_SPREAD;
     let angle: f32 = desired + jitter;
-    [angle.cos(), -angle.sin()]
+    [angle.sin(), angle.cos()]
 }
 
 /// 敌人是否还在这一帧的模拟范围内。
