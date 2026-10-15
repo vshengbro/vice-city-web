@@ -58,14 +58,31 @@ jobs:
       # actions/upload-pages-artifact does NOT follow symlinks -- the archive
       # would ship a dangling link and every `assets/*.json` fetch would 404
       # on Pages. Replace it with a real directory of regular files.
+      #
+      # ⚠️ **`.json` alone is not enough.** Every asset json is paired with a
+      # runtime texture atlas at `assets/atlas/<stem>.bin`, fetched right after
+      # the json parses. Copying only the json shipped a site where the manifest
+      # loaded, the renderer came up, and then every texture 404'd:
+      #
+      #   [vcw] bldg_lilac_tower atlas fetch failed:
+      #         assets/atlas/bldg_lilac_tower.bin returned HTTP 404
+      #
+      # The scene then stayed at `0 tris` with no error anywhere the user could
+      # see it. Local `http.server` hid this because it *does* follow the
+      # `www/assets` symlink, so every `.bin` was present locally.
       - name: Stage assets into www
         run: |
           set -eu
           rm -f www/assets
-          mkdir -p www/assets
+          mkdir -p www/assets/atlas
           cp assets/manifest.json assets/*.json www/assets/
+          cp assets/atlas/*.bin www/assets/atlas/
           test "$(find www/assets -name '*.json' | wc -l)" -ge 70
-          echo "staged $(find www/assets -name '*.json' | wc -l) json files"
+          # Guard the atlas explicitly: the json count above stays green when
+          # this copy is dropped, and the only symptom is a silently empty scene.
+          atlas_count="$(find www/assets/atlas -name '*.bin' | wc -l)"
+          test "$atlas_count" -ge 90
+          echo "staged $(find www/assets -name '*.json' | wc -l) json files, $atlas_count atlas bins"
 
       - name: Verify bundle exists
         run: |
@@ -74,6 +91,8 @@ jobs:
           test -s www/pkg/vice_city_web.js
           test -s www/index.html
           test -s www/assets/manifest.json
+          # One atlas spot-check: a representative id the scene always loads.
+          test -s www/assets/atlas/bldg_lilac_tower.bin
           ls -la www/pkg/
 
       - name: Upload artifact
