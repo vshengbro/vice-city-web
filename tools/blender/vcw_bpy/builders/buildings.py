@@ -35,11 +35,23 @@ sized to the **wider** of the two, never their mean.
 
 Origin convention: ground-centre, resting on z=0. Every building asset is
 grounded, and `verify3a` asserts it.
+
+Rooftops
+--------
+A bare flat roof is the single loudest tell that a building is a blockout. A
+Miami deco block's skyline is not its parapet line — it is the junk standing
+above it: the water tank on its legs, the bank of AC condensers, the vent
+stacks, the antenna mast. `_rooftop_kit` puts those on every building, sized
+to the TOP band (never the base footprint, which would put a 2 m tank on a
+6 m crown or float it off a wide roof), and seeded deterministically from the
+asset id so a rebuild produces the identical roof.
 """
 
 from __future__ import annotations
 
 import math
+import random
+import zlib
 from typing import Sequence
 
 import bpy
@@ -215,6 +227,142 @@ def _window_grid(band: Band, asset_id: str, glass_mat, trim_mat, recess: float =
     return parts
 
 
+def _water_tank(asset_id: str, tag: str, x: float, y: float, z: float,
+                tank_mat, leg_mat, scale: float = 1.0) -> list:
+    """A timber water tank on a steel stand — the Miami roof signature.
+
+    Real tanks are cylindrical with a conical cap and stand 1.5-2 m clear of
+    the roof on four legs, so they throw a shadow ACROSS the roof rather than
+    sitting on it. That standoff is the whole silhouette; a tank resting
+    directly on the deck reads as a cylinder, not as roof furniture.
+    """
+    r = 0.62 * scale
+    leg_h = 1.30 * scale
+    barrel_h = 1.45 * scale
+    parts = [
+        K.cylinder(f"{asset_id}_tank_{tag}_barrel", radius=r, depth=barrel_h,
+                   vertices=14, location=(x, y, z + leg_h + barrel_h * 0.5),
+                   material=tank_mat, smooth=False),
+        K.cone(f"{asset_id}_tank_{tag}_cap", radius1=r, radius2=r * 0.18,
+               depth=0.42 * scale, vertices=14,
+               location=(x, y, z + leg_h + barrel_h + 0.21 * scale),
+               material=tank_mat, smooth=False),
+    ]
+    # four legs, inset from the barrel wall so the tank reads as held up
+    for sx, tagx in ((-1.0, "a"), (1.0, "b")):
+        for sy, tagy in ((-1.0, "c"), (1.0, "d")):
+            parts.append(K.cube(
+                f"{asset_id}_tank_{tag}_leg_{tagx}{tagy}",
+                size=(0.10 * scale, 0.10 * scale, leg_h),
+                location=(x + sx * r * 0.66, y + sy * r * 0.66,
+                          z + leg_h * 0.5),
+                material=leg_mat))
+    # a mid hoop, because a plain cylinder on sticks has no scale cue
+    parts.append(K.torus(
+        f"{asset_id}_tank_{tag}_hoop", major_radius=r + 0.02 * scale,
+        minor_radius=0.035 * scale, major_segments=14, minor_segments=6,
+        location=(x, y, z + leg_h + barrel_h * 0.55), material=leg_mat))
+    return parts
+
+
+def _ac_unit(asset_id: str, tag: str, x: float, y: float, z: float,
+             case_mat, grill_mat, scale: float = 1.0) -> list:
+    """A condenser box: casing, a recessed fan grill and two mounting feet."""
+    w, d, h = 1.25 * scale, 0.85 * scale, 0.72 * scale
+    return [
+        K.cube(f"{asset_id}_ac_{tag}_case", size=(w, d, h),
+               location=(x, y, z + h * 0.5 + 0.10 * scale),
+               material=case_mat, bevel=0.04),
+        K.cylinder(f"{asset_id}_ac_{tag}_grill", radius=min(w, d) * 0.32,
+                   depth=0.06 * scale, vertices=12,
+                   location=(x, y, z + h + 0.08 * scale),
+                   material=grill_mat, smooth=False),
+        K.cube(f"{asset_id}_ac_{tag}_foot", size=(w * 0.92, d * 0.86, 0.20 * scale),
+               location=(x, y, z + 0.10 * scale), material=grill_mat),
+    ]
+
+
+def _vent_stack(asset_id: str, tag: str, x: float, y: float, z: float,
+                pipe_mat, cap_mat, scale: float = 1.0) -> list:
+    """A plumbing vent: a vertical pipe with a rain cap on top."""
+    r = 0.13 * scale
+    h = 1.05 * scale
+    return [
+        K.cylinder(f"{asset_id}_vent_{tag}_pipe", radius=r, depth=h,
+                   vertices=10, location=(x, y, z + h * 0.5),
+                   material=pipe_mat, smooth=False),
+        K.cone(f"{asset_id}_vent_{tag}_cap", radius1=r * 1.7, radius2=r * 0.3,
+               depth=0.20 * scale, vertices=10,
+               location=(x, y, z + h + 0.10 * scale), material=cap_mat,
+               smooth=False),
+    ]
+
+
+def _antenna(asset_id: str, x: float, y: float, z: float, mast_mat,
+             height: float = 3.2) -> list:
+    """A guyed mast with two crossbars — the vertical that breaks a flat roof."""
+    parts = [
+        K.cylinder(f"{asset_id}_antenna_mast", radius=0.055, depth=height,
+                   vertices=8, location=(x, y, z + height * 0.5),
+                   material=mast_mat, smooth=False),
+    ]
+    for i, frac in enumerate((0.62, 0.84)):
+        parts.append(K.cube(
+            f"{asset_id}_antenna_bar{i}", size=(1.05 - i * 0.34, 0.05, 0.05),
+            location=(x, y, z + height * frac), material=mast_mat))
+    return parts
+
+
+def _rooftop_kit(asset_id: str, top_w: float, top_d: float, z: float,
+                 metal_mat, trim_mat, dark_mat) -> list:
+    """Populate one flat roof. Sized to the TOP footprint, never the base.
+
+    Placement is seeded from the asset id so a rebuild is byte-identical —
+    `random` without a seed would give every run a different skyline and make
+    any geometry diff meaningless. The seed is a CRC32, NOT the builtin
+    `hash()`: string hashing is salted per process (PYTHONHASHSEED), so a
+    `hash()`-seeded roof would silently differ on every single run, which is
+    worse than no determinism at all because the diff looks meaningful.
+    """
+    rng = random.Random(zlib.crc32(f"{asset_id}:roof".encode("utf-8")))
+    # keep furniture inside the parapet, with a margin so nothing overhangs
+    inset_x = max(0.6, top_w * 0.5 - 1.7)
+    inset_y = max(0.6, top_d * 0.5 - 1.7)
+    parts: list = []
+
+    # 1. a timber water tank on the taller side — the Miami signature
+    tx = rng.uniform(-inset_x * 0.55, inset_x * 0.55)
+    ty = rng.uniform(-inset_y * 0.5, inset_y * 0.5)
+    parts += _water_tank(asset_id, "a", tx, ty, z, trim_mat, metal_mat,
+                         scale=1.0)
+
+    # 2. a bank of 2-3 condensers along the opposite edge
+    n_ac = 2 if top_w < 8.0 else 3
+    for i in range(n_ac):
+        ax = -inset_x * 0.62 + (inset_x * 1.24) * (i / max(n_ac - 1, 1))
+        ay = inset_y * 0.58
+        parts += _ac_unit(asset_id, str(i), ax, ay, z, metal_mat, dark_mat,
+                          scale=0.9 + 0.18 * i)
+
+    # 3. two vent stacks
+    for i, frac in enumerate((0.30, -0.22)):
+        parts += _vent_stack(asset_id, str(i),
+                             inset_x * frac, -inset_y * 0.62, z,
+                             metal_mat, dark_mat, scale=0.9 + 0.2 * i)
+
+    # 4. one antenna mast, on a corner, tall enough to read on the skyline
+    parts += _antenna(asset_id, inset_x * 0.66, -inset_y * 0.30, z,
+                      metal_mat, height=2.4 + 1.1 * rng.random())
+
+    # 5. a low equipment curb, so the roof deck is not one flat plane
+    parts.append(K.cube(
+        f"{asset_id}_roof_curb",
+        size=(top_w * 0.44, top_d * 0.30, 0.26),
+        location=(top_w * 0.16, top_d * 0.10, z + 0.13),
+        material=trim_mat, bevel=0.03))
+    return parts
+
+
 def build_tower(
     asset_id: str,
     wall_rgb: Sequence[float],
@@ -317,6 +465,16 @@ def build_tower(
             )
             parts.append(band_neon)
 
+    # Rooftop furniture on the TOP band only. Sizing this to `width`/`depth`
+    # (the base footprint) is the mistake this call site exists to prevent:
+    # on a tower that steps in 14% twice, the crown is 0.86^2 * 0.92 = 0.68 of
+    # the base, so a base-width parapet kit overhangs the roof on all four
+    # sides and hangs in the air.
+    dark = _concrete(f"{asset_id}_roofdark", (0.30, 0.31, 0.34), roughness=0.9)
+    crown = bands[-1]
+    parts += _rooftop_kit(asset_id, crown.w, crown.d, crown.z1,
+                          metal, trim, dark)
+
     for obj in parts:
         K.ensure_uv(obj)
         K.triangulate(obj)
@@ -380,6 +538,12 @@ def build_shop(
             location=(width * 0.34, -depth * 0.5 - 0.72, height * 0.36), material=metal,
         )
         parts += [shop_glass, awning, bracket_l, bracket_r]
+
+    # Rooftop furniture sits ABOVE the parapet coping, not on the roof deck:
+    # the parapet's own top is at `height + 0.22 + 0.55/2`.
+    dark = _concrete(f"{asset_id}_roofdark", (0.30, 0.31, 0.34), roughness=0.9)
+    roof_z = height + 0.22 + 0.55 * 0.5
+    parts += _rooftop_kit(asset_id, width, depth, roof_z, metal, trim, dark)
 
     for obj in parts:
         K.ensure_uv(obj)

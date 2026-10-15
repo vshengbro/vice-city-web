@@ -88,6 +88,17 @@ def dims(doc):
     return hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]
 
 
+def triangles(doc):
+    """Triangle count, counted from the geometry rather than trusted.
+
+    `tri_count` is a summary field the exporter wrote. Counting the faces
+    costs nothing at 99 assets and turns this report into a check on the
+    exporter as well as on the sizes, so the two are never silently allowed
+    to disagree.
+    """
+    return sum(len(part.get("faces", ())) for part in doc["parts"])
+
+
 def human(x, y, z):
     """Render as the L x W x H a person would quote (height = Y)."""
     l, w = sorted((x, z), reverse=True)
@@ -99,19 +110,53 @@ def raw(x, y, z):
     return "%.2f x %.2f x %.2f" % (x, y, z)
 
 
+def load_asset(entry):
+    """Load one asset's JSON, from whichever filename the manifest names.
+
+    Commit bfac59a reshaped `manifest["assets"]` down to `{id, category, file}`
+    so the loader gets the sequence it expects, dropping the `tri_count` and
+    `bounds` this report used to read from the manifest. Those fields still
+    exist — in the PER-ASSET JSON, which is the file the game actually loads
+    and the one this script already claimed to measure. So read them from
+    there, and count triangles from the faces themselves rather than trusting
+    a summary field either file wrote.
+    """
+    doc = json.load(open(os.path.join(ASSETS, entry["file"]), encoding="utf-8"))
+    return doc
+
+
 def main() -> int:
-    man = json.load(open(os.path.join(ASSETS, "manifest.json")))
+    man = json.load(open(os.path.join(ASSETS, "manifest.json"), encoding="utf-8"))
     entries = sorted(man["assets"], key=lambda e: (e["category"], e["id"]))
 
-    print("ALL ASSETS  (%d assets, %s triangles)"
-          % (man["asset_count"], format(man["tri_count"], ",")))
+    # Load everything once: the per-asset JSON is the biggest thing in the
+    # repository and the old code re-read each file twice per asset.
+    docs = {e["id"]: load_asset(e) for e in entries}
+    total_tris = sum(triangles(d) for d in docs.values())
+
+    print("ALL ASSETS  (%d assets, %s triangles)" % (len(entries), format(total_tris, ",")))
     print()
-    print("%-24s %-10s %5s  %s" % ("id", "category", "tris", "L x W x H (m)"))
+    print("%-24s %-10s %5s %5s  %s" % ("id", "category", "tris", "parts", "L x W x H (m)"))
     print("-" * 78)
+    per_category = {}
     for e in entries:
-        d = dims(json.load(open(os.path.join(ASSETS, e["file"]))))
-        print("%-24s %-10s %5d  %s"
-              % (e["id"], e["category"], e["tri_count"], human(*d)))
+        doc = docs[e["id"]]
+        tri = triangles(doc)
+        cat = per_category.setdefault(e["category"], {"count": 0, "triangles": 0})
+        cat["count"] += 1
+        cat["triangles"] += tri
+        print("%-24s %-10s %5d %5d  %s"
+              % (e["id"], e["category"], tri, doc["part_count"], human(*dims(doc))))
+
+    print()
+    print("PER-CATEGORY")
+    print("-" * 78)
+    print("%-16s %7s %10s %10s" % ("category", "assets", "triangles", "avg tris"))
+    for name in sorted(per_category):
+        row = per_category[name]
+        print("%-16s %7d %10d %10d"
+              % (name, row["count"], row["triangles"],
+                 row["triangles"] // row["count"]))
 
     print()
     print("PROPORTION CHECK vs real-world reference sizes")
@@ -123,7 +168,7 @@ def main() -> int:
         if not spec:
             continue
         el, ew, eh, tol = spec
-        d = dims(json.load(open(os.path.join(ASSETS, e["file"]))))
+        d = dims(docs[e["id"]])
         # A zero in the expected axis means "not constrained" (e.g. a palm's
         # crown spread is whatever the fronds happen to span).
         # Compare the RAW, axis-ordered extents: a spec says "0.74 along Z"

@@ -213,10 +213,22 @@ def _neon_stroke(
     """One run of bent glass between two sign-face points.
 
     `P.neon_tube` bakes its own transform, so it is asked for an X-axis tube
-    sitting on the world origin; the part is then swung about world Z by the
+    sitting on the world origin; the part is then swung about world Y by the
     stroke angle and finally pushed out to its place on the panel. The glass
     is therefore a real emissive cylinder of real diameter at any angle —
     axis-locked or diagonal — which is the whole point.
+
+    **The swing axis is Y, not Z, and that is load-bearing.** The sign face
+    lies in the world X-Z plane and the tubes stand off it along -Y, so a
+    stroke's angle is a rotation about Y. The previous version rotated about
+    Z, which spins the tube *out of the panel into depth* while leaving it in
+    the wrong plane: measured on `sign_arcade`, a stroke authored from
+    (0,0) to (0.30,0.50) came out with extent X 0.352 / Y 0.530 / Z 0.060
+    instead of X 0.300 / Y 0.060 / Z 0.500 — the whole 0.58 m panel depth.
+    Every glyph was therefore a fan of tubes standing at right angles to the
+    board, which is why no letterform on any of the 8 signs was readable:
+    the strokes overlapped each other in depth and projected as a smear of
+    disconnected bars instead of as letters.
     """
     dx, dz = x1 - x0, z1 - z0
     length = math.hypot(dx, dz)
@@ -225,7 +237,7 @@ def _neon_stroke(
     tube = P.neon_tube(name, rgb, length=length, radius=radius,
                        loc=(0.0, 0.0, 0.0), axis="x")
     return _place(tube, ((x0 + x1) * 0.5, y, (z0 + z1) * 0.5),
-                  (0.0, 0.0, math.atan2(dz, dx)))
+                  (0.0, math.atan2(dz, dx), 0.0))
 
 
 def _neon_path(
@@ -495,11 +507,30 @@ def _assemble(
                       rough=0.40, metal=0.90)
     bulb_mat = P.emissive(f"{asset_id}_bulb_mat", SODIUM, strength=5.0)
 
+    # --- tube radii, then letter-spacing ----------------------------------
+    # Letter-spacing must exceed the tube DIAMETER, or neighbouring glyphs
+    # physically intersect and the word fuses into one continuous smear.
+    # Measured before this clamp: every one of the 8 signs had tracking
+    # between 3.2 mm and 10.6 mm SMALLER than 2 * radius — e.g. sign_arcade
+    # tracked 50 mm glyphs on 56 mm tubes, so every pair of letters touched.
+    # A neon tube is a glass rod, and no glassbender leaves two letters fused
+    # at the shoulder; 1.15 x diameter is the clearance that keeps the word
+    # separable at preview resolution.
+    #
+    # This is computed BEFORE the panel is fitted below: widening the word
+    # after the panel has been sized from it would run the lettering off both
+    # ends of its own board.
+    main_r = max(0.018, min(0.038, cell * 0.28))
+    sub_cell = cell * sub_scale
+    sub_r = max(0.014, min(0.028, sub_cell * 0.28))
+    accent_r = max(0.018, min(0.030, cell * 0.24))
+    tracking = max(tracking, main_r * 2.0 * 1.15)
+    sub_tracking = max(tracking * sub_scale, sub_r * 2.0 * 1.15)
+
     # --- panel sized from the lettering ------------------------------------
     main_w = _text_width(main, cell, tracking)
-    sub_w = _text_width(sub, cell * sub_scale, tracking * sub_scale)
+    sub_w = _text_width(sub, sub_cell, sub_tracking)
     width = max(main_w, sub_w) + 2.0 * PAD
-    sub_cell = cell * sub_scale
     sub_h = GLYPH_H * sub_cell
     gap = 0.16
     height = PAD + GLYPH_H * cell + gap + sub_h + PAD
@@ -507,10 +538,6 @@ def _assemble(
     z_top = mast_h - 0.16
     z_bottom = z_top - height
     z_centre = (z_top + z_bottom) * 0.5
-
-    main_r = max(0.018, min(0.038, cell * 0.28))
-    sub_r = max(0.014, min(0.028, sub_cell * 0.28))
-    accent_r = max(0.018, min(0.030, cell * 0.24))
 
     tube_y = FACE_FRONT - main_r - 0.006
     crest_y = FACE_FRONT - accent_r - 0.006
@@ -531,7 +558,7 @@ def _assemble(
     sub_base = main_base + GLYPH_H * cell + gap
     _line_tubes(parts, f"{asset_id}_main", main, cell, tracking,
                 main_base, tube_y, tube_rgb, main_r)
-    _line_tubes(parts, f"{asset_id}_sub", sub, sub_cell, tracking * sub_scale,
+    _line_tubes(parts, f"{asset_id}_sub", sub, sub_cell, sub_tracking,
                 sub_base, tube_y, accent_rgb, sub_r)
 
     # --- accent rules ------------------------------------------------------

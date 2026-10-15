@@ -1,6 +1,6 @@
 """Render a preview per asset and prove the frame is not blank.
 
-Two rules from this pipeline's history are enforced here:
+Three rules from this pipeline's history are enforced here:
 
 1. `pixel stddev > 0` means "not a flat fill". A sign rendered from behind is a
    blank panel WITH healthy stddev, so the camera must be aimed relative to
@@ -8,10 +8,15 @@ Two rules from this pipeline's history are enforced here:
 2. `std == 0` means the camera is inside geometry or framed nothing. That is a
    framing bug, and reporting it as "lighting is off" sends the next pass in
    the wrong direction.
+3. **Exposure must not depend on the asset's size.** See `_light_rig` — the
+   old fixed-wattage rig put a 0.15 m grenade at 123 units of irradiance and a
+   48 m ship at 0.023, a 5,271x spread, which made every building read as an
+   untextured blockout no matter how well it was modelled.
 
     Blender --background --factory-startup --python tools/blender/render_previews3a.py
 """
 
+import json
 import math
 import os
 import sys
@@ -24,6 +29,101 @@ sys.path.insert(0, os.path.join(REPO, "tools", "blender"))
 
 OUT_DIR = os.path.join(REPO, "www", "preview")
 RES = 512
+
+# ---------------------------------------------------------------------------
+# exposure constants
+# ---------------------------------------------------------------------------
+# The KEY is a SUN, not a point/area light. Irradiance from a sun is its
+# Strength in W/m^2 and is independent of distance by construction, so a 48 m
+# ship and a 0.15 m grenade are lit identically for free — no distance maths,
+# nothing to get wrong later. The old rig used a 900 W area light at a distance
+# derived from each asset's own bbox, so irradiance went as 1/size^2: a
+# measured 5,271x spread, Pearson r(ln extent, mean luma) = -0.649 across the
+# 99 shipped previews, with buildings at ~1% of the light the props got.
+#
+# The fill and rim ARE area lights (a sky dome and a kicker are not
+# directional), so their wattage and panel size scale with the framing radius
+# by (d / REF_DIST) ** 2 — the same inverse-square compensation — which keeps
+# them size-invariant too.
+#
+# The sun strength, the fill and the rim were chosen from a measured sweep
+# over 5 assets spanning building / weapon / prop / vehicle / beach, scoring
+# SUBJECT-only mean luma and clipped-pixel fraction (full-frame luma is
+# dominated by framing area, so it cannot pick an exposure):
+#
+#   sun  fill  rim | subject luma | clipped | note
+#   3.0    80  140 |     0.7025   | 25.8%   | first guess; blown out
+#   1.6    45   80 |     0.5801   |  8.9%   |
+#   1.2    35   60 |     0.5084   |  0.7%   | <- chosen
+#   0.9    25   45 |     0.4355   |  0.4%   |
+#   0.7    20   35 |     0.3722   |  0.4%   |
+#
+# 1.2/35/60 puts a mid-tone asset at ~50% luma with under 1% of subject
+# pixels clipped, which is what a review sheet should look like. The ratio
+# sun:fill:rim = 1 : 0.4 : 0.7 is a sunny street, not a studio.
+SUN_STRENGTH = 1.2
+# Hard Miami sun: a small angular diameter gives a crisp terminator and a
+# readable cast shadow instead of a soft wrap.
+SUN_ANGLE = 0.035  # radians; the real sun is 0.0093
+
+REF_DIST = 3.0
+# Fill/rim energies AT REF_DIST, in watts. The key:fill:rim ratio of the old
+# rig is deliberately NOT preserved here, and that matters. With a 900 W area
+# key at REF_DIST the old fill (320 W) and rim (500 W) already contribute
+# 320/(4*pi*9) + 500/(4*pi*9) = 7.2 W/m^2 between them — more than any sun
+# in the sweep below. A measured sweep at sun = 1.2 / 2.0 / 3.0 / 4.0 with
+# the old fill/rim moved the tower's mean luma by 0.004: the sun was doing
+# nothing. These values put fill at 0.31 W/m^2 and rim at 0.53 W/m^2.
+BASE_FILL, BASE_RIM = 35.0, 60.0
+FILL_SIZE, RIM_SIZE = 6.0, 3.0
+# Sky fill. A constant world background contributes a size-INVARIANT ambient
+# term, which is what stops the shadow side of a large asset going to pure
+# black.
+WORLD_COLOUR = (0.055, 0.068, 0.100, 1.0)
+WORLD_STRENGTH = 1.0
+# Sun azimuth/elevation relative to the camera, which frames from the asset's
+# front-left. 32 deg off the front axis, 42 deg up — high enough to read as
+# midday rather than dusk, low enough to throw a shadow across the facade.
+SUN_AZIMUTH = 32.0
+SUN_ELEVATION = 42.0
+
+
+def _light_rig(radius):
+    """Return the fill/rim rows for a framing radius `radius`.
+
+    Offsets are unit-ish directions scaled by the radius and energies are
+    REF_DIST-normalised, so irradiance at the asset is P/d^2 * d^2 = constant.
+    """
+    d = radius
+    return (
+        ("fill", (-d, -d * 0.5, d * 0.4), BASE_FILL, FILL_SIZE),
+        ("rim", (-d * 0.4, d, d * 0.7), BASE_RIM, RIM_SIZE),
+    )
+
+
+def _set_view_transform(scene, name: str = "Standard") -> str:
+    """Force the display transform and return the one actually in effect.
+
+    Blender 4.5's factory default is AgX, which desaturates and crushes the
+    whole image into a narrow mid-grey band; the shipped previews inherited it
+    and 24/99 came out with zero pixels above the background's own luma.
+    `look` must be cleared too — the AgX 'Punchy' look is not a fix, it is a
+    different bug.
+    """
+    scene.display_settings.display_device = "sRGB"
+    try:
+        scene.view_settings.view_transform = name
+    except TypeError:
+        # Fall back to whatever is available, and say so in the summary rather
+        # than silently rendering a different transform than the one reported.
+        scene.view_settings.view_transform = "Standard"
+    try:
+        scene.view_settings.look = "None"
+    except TypeError:
+        pass
+    scene.view_settings.exposure = 0.0
+    scene.view_settings.gamma = 1.0
+    return scene.view_settings.view_transform
 
 
 def _frame_camera(cam_obj, centre, radius):
@@ -97,17 +197,34 @@ def render_one(asset_id, parts, out_dir):
     _frame_camera(cam, centre, radius)
     scene.camera = cam
 
-    # three-point-ish rig: a key light, a fill, and a rim, all outside the asset
-    for name, loc, energy, size in (
-        ("key", (centre[0] + radius, centre[1] - radius, centre[2] + radius), 900.0, 4.0),
-        ("fill", (centre[0] - radius, centre[1] - radius * 0.5, centre[2] + radius * 0.4),
-         320.0, 6.0),
-        ("rim", (centre[0] - radius * 0.4, centre[1] + radius, centre[2] + radius * 0.7),
-         500.0, 3.0),
-    ):
+    # SUN key. Strength is irradiance in W/m^2 and does not fall off with
+    # distance, so this one line is what makes exposure size-invariant.
+    sun_data = bpy.data.lights.new(f"{asset_id}_sun", type="SUN")
+    sun_data.energy = SUN_STRENGTH
+    sun_data.angle = SUN_ANGLE
+    sun = bpy.data.objects.new(f"{asset_id}_sun", sun_data)
+    az = math.radians(SUN_AZIMUTH)
+    el = math.radians(SUN_ELEVATION)
+    # From the camera's 3/4 front-left vantage, so the lit face and the shaded
+    # face are both visible and neither is edge-on.
+    sun.location = (
+        centre[0] + radius * math.cos(el) * math.sin(az),
+        centre[1] - radius * math.cos(el) * math.cos(az),
+        centre[2] + radius * math.sin(el),
+    )
+    scene.collection.objects.link(sun)
+    aim = Vector(centre) - Vector(sun.location)
+    sun.rotation_euler = aim.to_track_quat("-Z", "Y").to_euler()
+
+    # Fill and rim: area lights, so their wattage and panel size scale with
+    # the framing radius by (d / REF_DIST) ** 2. Irradiance at the asset is
+    # then P/d^2 * d^2 = constant, matching the sun.
+    scale = (radius / REF_DIST) ** 2
+    for name, offset, base_energy, base_size in _light_rig(radius):
+        loc = tuple(centre[i] + offset[i] for i in range(3))
         data = bpy.data.lights.new(f"{asset_id}_{name}", type="AREA")
-        data.energy = energy
-        data.size = size
+        data.energy = base_energy * scale
+        data.size = base_size * (radius / REF_DIST)
         light = bpy.data.objects.new(f"{asset_id}_{name}", data)
         light.location = loc
         scene.collection.objects.link(light)
@@ -118,18 +235,27 @@ def render_one(asset_id, parts, out_dir):
     world = bpy.data.worlds.new(f"{asset_id}_world")
     world.use_nodes = True
     bg = world.node_tree.nodes["Background"]
-    bg.inputs[0].default_value = (0.05, 0.06, 0.09, 1.0)
-    bg.inputs[1].default_value = 1.0
+    bg.inputs[0].default_value = WORLD_COLOUR
+    bg.inputs[1].default_value = WORLD_STRENGTH
     scene.world = world
 
     scene.render.engine = "BLENDER_EEVEE_NEXT"
     scene.render.resolution_x = RES
     scene.render.resolution_y = RES
     scene.render.film_transparent = False
+    view_transform = _set_view_transform(scene)
+    # Shadow + AO on. Without them every surface gets a single flat value and
+    # even a well-lit asset reads as flat-shaded blockout geometry.
     try:
-        scene.eevee.taa_render_samples = 16
+        scene.eevee.taa_render_samples = 64
+        scene.eevee.use_shadows = True
     except AttributeError:
         pass
+    for attr, value in (("use_raytracing", True), ("use_gtao", True)):
+        try:
+            setattr(scene.eevee, attr, value)
+        except (AttributeError, TypeError):
+            pass
 
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{asset_id}.png")
@@ -141,6 +267,10 @@ def render_one(asset_id, parts, out_dir):
         "id": asset_id,
         "ok": std > 2.0,
         "pixel_std": round(std, 3),
+        "view_transform": view_transform,
+        "sun_energy": SUN_STRENGTH,
+        "fill_energy": round(BASE_FILL * scale, 1),
+        "radius": round(radius, 3),
         "path": os.path.relpath(path, REPO),
     }
 
@@ -206,6 +336,12 @@ def _pixel_stddev(path):
 
 
 def main() -> int:
+    """Render every registry asset (or the subset named after `--`).
+
+    Writes `.audit/preview_render.json` with per-asset framing, key wattage
+    and the view transform actually used, so a later pass can check the
+    exposure is size-invariant without re-deriving it from the PNGs.
+    """
     from vcw_bpy.registry import all_assets
 
     only = set(sys.argv[sys.argv.index("--") + 1:]) if "--" in sys.argv else None
@@ -219,14 +355,22 @@ def main() -> int:
         try:
             parts = fn(aid, **kw)
             res = render_one(aid, parts, OUT_DIR)
+            res["category"] = category
         except Exception as exc:  # noqa: BLE001
             res = {"id": aid, "ok": False, "why": repr(exc)}
             traceback.print_exc()
         results.append(res)
         flag = "" if res["ok"] else "  <-- BLANK/FAILED"
-        print(f"  {aid:34s} std={res.get('pixel_std', res.get('why'))}{flag}")
+        print(f"  {aid:34s} std={res.get('pixel_std', res.get('why'))}"
+              f"  sun={res.get('sun_energy', '-')} fill={res.get('fill_energy', '-')}W"
+              f"  vt={res.get('view_transform', '-')}{flag}")
         if not res["ok"]:
             failures.append(aid)
+
+    report_dir = os.path.join(REPO, ".audit")
+    os.makedirs(report_dir, exist_ok=True)
+    with open(os.path.join(report_dir, "preview_render.json"), "w") as fh:
+        json.dump({"ref_dist": REF_DIST, "results": results}, fh, indent=1)
 
     print()
     print(f"PREVIEW: {len(results) - len(failures)}/{len(results)} non-blank")
