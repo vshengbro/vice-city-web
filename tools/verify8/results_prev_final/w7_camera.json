@@ -1,0 +1,60 @@
+{
+  "worker": "w7_camera",
+  "results": [
+    {
+      "name": "boot",
+      "ok": null,
+      "note": "frames=27 cameraMode=third-person cameraDist=8.2 cameraDistTarget=8.2 camOccluded=False charBox=[256, 160.6, 256, 125.3, 1]"
+    },
+    {
+      "name": "a 跟随距离不抖",
+      "ok": true,
+      "note": "60 帧 | 相邻帧差:中位 0.000m 最大 6.000m | 超 0.5m 的有 3 帧(5%,门限<=20%) | 序列(每 6 帧取 1):[8.2, 8.2, 8.2, 8.2, 8.2, 8.2, 8.2, 0.33, 0.33, 0.33]"
+    },
+    {
+      "name": "a 跟随收敛到目标",
+      "ok": false,
+      "note": "末段 cameraDist=2.20 target=8.2 差 6.0m(门限<=1.2) | 相机曾被遮挡的帧:21/60(camOccluded 为 true 时 cameraDist 才会低于 target)"
+    },
+    {
+      "name": "走前/走后对比(待 vision)",
+      "ok": null,
+      "note": "before=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w7_camera_before_walk.png after=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w7_camera_after_walk.png | 走过之后玩家位置 (33.4,22.2),角色框 [256, 232.1, 256, 107.9, 0.8]"
+    },
+    {
+      "name": "b 相机不穿墙",
+      "ok": true,
+      "note": "6/10 个朝向 camOccluded=true,其中 camClearance<=0 的 0 个;最小净空 20.735m | 明细:yaw0.0 clear=20.734835 dist=3.4, yaw0.6 clear=22.372774 dist=2.2, yaw1.3 clear=23.520805 dist=2.2, yaw1.9 clear=23.992664 dist=2.2, yaw2.5 clear=23.26713 dist=2.2, yaw3.1 clear=21.97673 dist=3.8 | 期望:被遮挡时净空>0"
+    },
+    {
+      "name": "b 净空读数通道",
+      "ok": null,
+      "note": "camOccluded/camClearance 来自 __VCW_DEBUG__(vlib.st() 没读这两个字段,本 worker 自己 ev 补的)。当前: coccl=True cclear=24.08615 dist=2.2"
+    },
+    {
+      "name": "c 滚轮拉近",
+      "ok": true,
+      "note": "滚轮上推 3 格:cameraDistTarget 8.20 -> 2.20(Δ-6.00,门限<-0.2) | cameraDist 8.20 -> 2.20 | clamp 区间 [2.2,22.0] 内:True"
+    },
+    {
+      "name": "c 滚轮拉远 + clamp",
+      "ok": true,
+      "note": "滚轮下拉 6 格:cameraDistTarget 2.20 -> 15.46(Δ+13.26) | 仍在 [2.2,22.0] 内:True | 注:第三人称下滚轮写的是 desired_distance,所以读 target 才看得到;限位常量在 game.rs FOLLOW_DISTANCE_MIN/MAX"
+    },
+    {
+      "name": "d V 切相机",
+      "ok": false,
+      "note": "按 V:cameraMode third-person -> first-person。src/game.rs 的 keydown match 里没有 KeyV 分支(grep 全文为空),所以 cameraMode 不该变、也不该变 —— 判 FAIL(缺失)。期望(按 GTA V):V 切相机"
+    },
+    {
+      "name": "d Tab 切第三人称",
+      "ok": false,
+      "note": "Tab x2:cameraMode third-person -> first-person -> first-person(切换=True 复位=False) | Tab 实现的是 third_person 取反,不是 GTA V 的地图"
+    },
+    {
+      "name": "d 切回后跟随恢复",
+      "ok": null,
+      "note": "切回后 cameraDist=0 target=0 coccl=False (Tab 分支会把 distance/target 一起复位到 FOLLOW_DISTANCE=8.2)"
+    }
+  ]
+}

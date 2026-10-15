@@ -1,0 +1,55 @@
+{
+  "worker": "w6_combat",
+  "results": [
+    {
+      "name": "boot",
+      "ok": null,
+      "note": "frames=27 位置=(33.5,45) hp=100 armor=10 weapon=0 mag=12 kills=0 敌人=7个 行人=0个 wanted={'stars': 0, 'heat': 0, 'unseen': 16.67, 'hidden': False, 'cooling': 16.67}"
+    },
+    {
+      "name": "a 站定不掉血",
+      "ok": true,
+      "note": "无敌开启下观测 60 帧:hp 100 -> 100(降 +0.00,容差 0.01) armor 11.2 -> 83.2(降 -72.00) | hp 序列 min=100.0 max=100.0 | 这条只证明「无人攻击时不掉血」,掉血归因见 c"
+    },
+    {
+      "name": "敌人清单",
+      "ok": null,
+      "note": "活着的敌人 13 个;最近 #12 位于 (47.4,53.1) hp=100 state=attack faction=0 距玩家 16.6m | 全部 state:patrol@70, attack@70, patrol@70, attack@70, patrol@70, patrol@70"
+    },
+    {
+      "name": "c 隔墙不掉血",
+      "ok": null,
+      "note": "未能构造出「墙真的挡在中间」的场景:玩家附近 1.15m 内有 0 个 AABB,场上活敌 15 个,但没有一个 AABB 与玩家→任一敌人的连线相交且两端各留 1.5m。玩家位置 (33.5,45.0)。没有真实隔断就不判,免得假通过。"
+    },
+    {
+      "name": "b 造成伤害",
+      "ok": false,
+      "note": "两种对准式(atan2 与 +pi)连开 14 发,敌人 hp 100.0 未变,距离 5.91m | mag 12 -> 12(弹药没动 -> hold 通道可能没生效) | 敌 state=attack faction=0"
+    },
+    {
+      "name": "b 开火通道",
+      "ok": null,
+      "note": "用 __vcw_teleport={hold:true} 注入开火意图。mag 12 -> 12。CDP 的 Input.dispatchMouseEvent 进不了 canvas mousedown(game.rs 注释已记录),所以不用鼠标事件这一条路径。"
+    },
+    {
+      "name": "d 切冲锋枪",
+      "ok": true,
+      "note": "combat.weapon 0 -> 1, mag 12 -> 30 (DIGIT1=Pistol/DIGIT2=Smg/DIGIT3=Bat) | GTA V 用数字键轮换武器,一致"
+    },
+    {
+      "name": "d 开火消耗弹药",
+      "ok": false,
+      "note": "开火 4 发:mag 30 -> 30, kills 0 -> 0, enemy hp [{'x': -5.55, 'z': 84.67, 'hp': 70, 'state': 'patrol', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 2.34}, {'x': 18.94, 'z': 29.72, 'hp': 70, 'state': 'chase', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 5.2}, {'x': 79.32, 'z': 2.85, 'hp': 70, 'state': 'patrol', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 2.34}, {'x': 46.87, 'z': 62.69, 'hp': 70, 'state': 'attack', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 18.8, 'z': 56.26, 'hp': 70, 'state': 'chase', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 5.2}, {'x': 4.7, 'z': -2.09, 'hp': 70, 'state': 'patrol', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 2.34}, {'x': 48.48, 'z': 36.3, 'hp': 70, 'state': 'attack', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 48.04, 'z': 34.42, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 30.13, 'z': 64.13, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 37.43, 'z': 46.82, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 5.2}, {'x': 40.55, 'z': 26.37, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 30.44, 'z': 22.37, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 47.44, 'z': 53.11, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 47.69, 'z': 33.69, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 30.73, 'z': 60.39, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}] -> [{'x': -3.88, 'z': 85.19, 'hp': 70, 'state': 'patrol', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 2.34}, {'x': 20.23, 'z': 30.88, 'hp': 70, 'state': 'attack', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 80.95, 'z': 3.45, 'hp': 70, 'state': 'patrol', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 2.34}, {'x': 46.87, 'z': 62.69, 'hp': 70, 'state': 'attack', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 20.37, 'z': 55.54, 'hp': 70, 'state': 'attack', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 6.15, 'z': -1.11, 'hp': 70, 'state': 'patrol', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 2.34}, {'x': 48.48, 'z': 36.3, 'hp': 70, 'state': 'attack', 'fac': 1, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 48.04, 'z': 34.42, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 30.13, 'z': 64.13, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 39.3, 'z': 47.73, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 5.2}, {'x': 40.55, 'z': 26.37, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 30.89, 'z': 23.68, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 47.44, 'z': 53.11, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 47.69, 'z': 33.69, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}, {'x': 30.73, 'z': 60.39, 'hp': 100, 'state': 'attack', 'fac': 0, 'alive': True, 'flash': 0, 'spd': 0}]"
+    },
+    {
+      "name": "d 拾取物",
+      "ok": null,
+      "note": "pickups={'total': 12, 'taken': 0} —— 拾取半径 2.2m,判定在 w8 做"
+    },
+    {
+      "name": "掉血来源归因",
+      "ok": null,
+      "note": "终态 hp=100 armor=100 respawn=0 | 敌人 state 分布:patrolx3, attackx12, patrolx3, attackx12, attackx12, patrolx3, attackx12, attackx12, attackx12, attackx12, attackx12, attackx12, attackx12, attackx12, attackx12 | 玩家血量只由 hurt_player 修改(护甲优先 + 0.45s 无敌帧),无坠楼/溺水/环境伤害分支 —— 所以「无缘无故掉血」只可能是敌人开枪打中了。"
+    }
+  ]
+}

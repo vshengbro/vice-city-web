@@ -1,0 +1,60 @@
+{
+  "worker": "w1_walk",
+  "results": [
+    {
+      "name": "boot",
+      "ok": null,
+      "note": "frames=27 出生点=(33.5,45) collisionShapes=1829"
+    },
+    {
+      "name": "walk KeyW",
+      "ok": false,
+      "note": "24 帧总位移 7.98m (阈值>2.0) 每帧均 0.347m 峰值 1.840m | 最差 12 帧窗口内静止 12 帧(阈值<6) | afterStatic=(33.50,35.53) afterVertical=[33.5, 35.549995] afterDynamic=[33.5, 35.549995] | inside=False vel=[0, -0.27969357] gait=0.38729197"
+    },
+    {
+      "name": "nearShapes KeyW",
+      "ok": null,
+      "note": "6m 内 0 个,前 3: (空:6m 内没有碰撞体,卡死不可能来自静态墙)"
+    },
+    {
+      "name": "walk KeyA",
+      "ok": false,
+      "note": "24 帧总位移 3.73m (阈值>2.0) 每帧均 0.162m 峰值 1.839m | 最差 12 帧窗口内静止 12 帧(阈值<6) | afterStatic=(28.28,35.55) afterVertical=[28.300001, 35.548492] afterDynamic=[28.300001, 35.548492] | inside=False vel=[-0.27972218, 0] gait=0.3872945"
+    },
+    {
+      "name": "nearShapes KeyA",
+      "ok": null,
+      "note": "6m 内 0 个,前 3: (空:6m 内没有碰撞体,卡死不可能来自静态墙)"
+    },
+    {
+      "name": "walk KeyS",
+      "ok": true,
+      "note": "24 帧总位移 42.12m (阈值>2.0) 每帧均 1.831m 峰值 1.840m | 最差 12 帧窗口内静止 0 帧(阈值<6) | afterStatic=(29.05,79.20) afterVertical=[29.046581, 79.2225] afterDynamic=[29.046581, 79.2225] | inside=False vel=[0, 0.27969357] gait=0.38729706"
+    },
+    {
+      "name": "nearShapes KeyS",
+      "ok": null,
+      "note": "6m 内 0 个,前 3: (空:6m 内没有碰撞体,卡死不可能来自静态墙)"
+    },
+    {
+      "name": "walk KeyD",
+      "ok": true,
+      "note": "24 帧总位移 35.84m (阈值>2.0) 每帧均 1.558m 峰值 1.840m | 最差 12 帧窗口内静止 3 帧(阈值<6) | afterStatic=(66.36,79.25) afterVertical=[66.356636, 79.24655] afterDynamic=[66.356636, 79.24655] | inside=False vel=[0, 0] gait=0.16750216"
+    },
+    {
+      "name": "nearShapes KeyD",
+      "ok": null,
+      "note": "6m 内 1 个,前 3: 0.35m AABB c=(79.00,80.20) half=(12.29,12.29)"
+    },
+    {
+      "name": "sprint Shift+W",
+      "ok": true,
+      "note": "步行每帧 0.347m,冲刺每帧 3.259m,比值 9.39(阈值>1.15) | 冲刺后 0.81~3.26 m/s(按 MAX_FRAME_TIME=0.25s 反推,1-4fps)"
+    },
+    {
+      "name": "W vs Shift+W 差值",
+      "ok": null,
+      "note": "W 采样每帧 0.347m,Shift+W 3.259m;冲刺后坐标 (8.20,0.69)"
+    }
+  ]
+}
