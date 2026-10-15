@@ -5691,6 +5691,25 @@ pub(crate) fn step_vertical(game: &mut Game, dt: f32) {
         radius,
     );
     let (x, z): (f32, f32) = (pushed[0], pushed[1]);
+    // 室内层分离之后,速度要按**实际走出来的位移**重算。
+    //
+    // `Player::step` 是拿静态层落点反算速度的(朝墙分量自然归零),但
+    // 室内层是在那之后又覆写了 XZ 的:玩家顶在室内墙上时位置冻结,
+    // 速度却仍然是满速的 2.2 —— 实测连续 17 帧 `x = 27.4000` 而
+    // `vx = 2.2`、`gaitAmount = 1.000`。位置是对的,只有状态读数错了,
+    // 而 `resolve_dynamic_bodies` 的推挤判据正是
+    // `player_speed > PLAYER_PUSH_MIN_SPEED`,于是卡在墙上的玩家照样被
+    // 判定成「正在快速移动」,继续接受把人往几何体里推的挤压力。
+    //
+    // 和 `Player::step` 一样:反算,不把分离量加回去(1/dt 会放大)。
+    let achieved: Vec2 = [x - here[0], z - here[2]];
+    let inverse_dt: f32 = 1.0 / dt.max(f32::EPSILON);
+    let carried: Vec2 = game.get_player().get_velocity();
+    let speed_cap: f32 = carried[0].abs().max(carried[1].abs()).max(RUN_SPEED);
+    game.get_mut_player().set_velocity([
+        (achieved[0] * inverse_dt).clamp(-speed_cap, speed_cap),
+        (achieved[1] * inverse_dt).clamp(-speed_cap, speed_cap),
+    ]);
     // ---- 2. 支撑面:脚下那块板(含楼梯下一级)。
     //
     // **这一帧必须切成一串小步走,不能只查落点。**
