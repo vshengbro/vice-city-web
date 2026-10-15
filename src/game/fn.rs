@@ -1002,13 +1002,25 @@ pub(crate) fn build_city_buildings_with(guard: f32, cx: f32, cz: f32) -> Vec<Bui
     // 「有转角楼」的路口会集体变成没有、又集体变成有 —— 窗口一平移,半个
     // 城市的转角楼凭空出现或消失。改用路口自己的**世界索引**
     // (`line_xi` / `line_zi`)取奇偶,奇偶性锚在世界网格上,与窗口无关。
-    let lights: Vec<i32> = street_indices_in(
-        (cx.min(cz) - BLOCK_VIEW_RADIUS).floor(),
-        (cx.max(cz) + BLOCK_VIEW_RADIUS).ceil(),
+    // 每个轴用**自己的**窗口。原先两个轴被压成同一个区间
+    // `[min(cx,cz)-R, max(cx,cz)+R]`,于是区间宽度随 |cx-cz| 增长,再用
+    // `for xi in lights / for zi in lights` 的笛卡尔积生成对角楼 —— 建筑数
+    // 随偏移量按 N² 爆炸。实测 (30,30) 提交 9.94 M 顶点,(30,6930) 提交
+    // 1.54 B(155.3×),碰撞体 1769 → 72,695。
+    //
+    // 同一个 min/max 缺陷在 `street_strips` 里已经修过一次(见那里的注释,
+    // 里面点名了 (-6000, 1500) 这个例子),这里必须同样按轴取窗口。
+    let lights_x: Vec<i32> = street_indices_in(
+        (cx - BLOCK_VIEW_RADIUS).floor(),
+        (cx + BLOCK_VIEW_RADIUS).ceil(),
     );
-    for &line_xi in lights.iter() {
+    let lights_z: Vec<i32> = street_indices_in(
+        (cz - BLOCK_VIEW_RADIUS).floor(),
+        (cz + BLOCK_VIEW_RADIUS).ceil(),
+    );
+    for &line_xi in lights_x.iter() {
         let line_x: f32 = street_axis(line_xi);
-        for &line_zi in lights.iter() {
+        for &line_zi in lights_z.iter() {
             if (line_xi + line_zi).rem_euclid(2) != 0 {
                 continue;
             }
@@ -1049,13 +1061,19 @@ pub(crate) fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
     let mut out: Vec<PropPlacement> = Vec::new();
     let corner: f32 = STREET_HALF_WIDTH + 0.9;
     // ---- 每个网格路口四个角的交通灯 ----
-    let junctions: Vec<i32> = street_indices_in(
-        (cx.min(cz) - BLOCK_VIEW_RADIUS).floor(),
-        (cx.max(cz) + BLOCK_VIEW_RADIUS).ceil(),
+    // 同样按轴取窗口(理由见 `build_city_buildings` 里那段注释):两个轴
+    // 合成一个区间时区间宽度随 |cx-cz| 增长,路口数按 N² 爆炸。
+    let junctions_x: Vec<i32> = street_indices_in(
+        (cx - BLOCK_VIEW_RADIUS).floor(),
+        (cx + BLOCK_VIEW_RADIUS).ceil(),
     );
-    for line_xi in junctions.iter() {
+    let junctions_z: Vec<i32> = street_indices_in(
+        (cz - BLOCK_VIEW_RADIUS).floor(),
+        (cz + BLOCK_VIEW_RADIUS).ceil(),
+    );
+    for line_xi in junctions_x.iter() {
         let line_x: f32 = street_axis(*line_xi);
-        for line_zi in junctions.iter() {
+        for line_zi in junctions_z.iter() {
             let line_z: f32 = street_axis(*line_zi);
             for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
                 out.push(PropPlacement {
