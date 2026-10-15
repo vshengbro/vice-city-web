@@ -845,7 +845,8 @@ impl Traffic {
     /// - `f32` - 固定步长(秒)。
     /// - `Option<[f32; 2]>` - 正在路边招手的玩家 `[x, z]`;`None` 表示没人。
     /// - `&CollisionWorld` - 静态碰撞世界,用来把车挡在障碍之外。
-    pub fn step(&mut self, dt: f32, hailer: Option<[f32; 2]>, world: &CollisionWorld) {
+    /// - `f32` - 全局时间(秒),信号机相位用它当时钟。
+    pub fn step(&mut self, dt: f32, hailer: Option<[f32; 2]>, world: &CollisionWorld, time: f32) {
         // 只有**离玩家最近的那一辆**会靠边等人,不是半径内所有车 ——
         // 否则 26 m 内整条街的车一起停,交通直接堵死。
         let hailer_car: Option<usize> = hailer.and_then(|who: [f32; 2]| {
@@ -918,13 +919,44 @@ impl Traffic {
             order
                 .into_iter()
                 .map(|index: usize| {
-                    let (gap, delta_v): (f32, f32) = TrafficCar::leader_gap(cars, index);
+                    let (mut gap, mut delta_v): (f32, f32) = TrafficCar::leader_gap(cars, index);
                     let car: &TrafficCar = &cars[index];
-                    let desired: f32 = if Some(index) == hailer_car {
+                    let mut desired: f32 = if Some(index) == hailer_car {
                         0.0
                     } else {
                         car.get_cruise()
                     };
+                    // **红绿灯当作「一辆停在停止线上的前车」。**
+                    //
+                    // 不新增一套减速逻辑,而是把停止线塞进 IDM 已有的
+                    // `gap` / `delta_v`:`delta_v = 自己速度 − 0` 就是
+                    // 「前面有东西」的完整语义,`s*` 会随距离变大而迅速
+                    // 收紧,车于是平顺减速停在线前。绿灯亮起后停止线消失,
+                    // 同一个 `gap` 变回 `INFINITY`,车自动起步。
+                    //
+                    // **期望速度不是一步压到 0,而是按距离反解的限速。**
+                    // 一步压到 0 会让 IDM 自由流项直接消失、加速度钉在
+                    // `IDM_ACCEL_MIN = -9`,于是 11.5 m/s 的车用 9 m/s²
+                    // 硬刹 —— 实测从 z=44 冲到 z=51.92,**越过停止线 1.2 m**。
+                    // 限速 `sqrt(2·b·gap)` 让加速度随接近程度平滑增长,
+                    // 车会恰好停在线上。
+                    let to_line: f32 = distance_to_stop_line(car);
+                    // 绿灯不限速;红灯时限速到「还停得住」的速度。
+                    let cap: f32 = signal_speed_limit(car, time, to_line);
+                    // **停止线只在红灯时才是障碍。**
+                    //
+                    // 无条件把它塞进 `gap` 会让绿灯也起不来:车停下后
+                    // gap = 2.67、`s*` = 2.675,`interaction` ≈ 1.00,
+                    // 于是 `a = 4·(1 − 0 − 1.00) = −0.016` —— 绿灯下
+                    // 车以 0.05 m/s **原地蹭**,永远越不过停止线。
+                    // 绿灯时这根线根本不存在。
+                    if cap < desired {
+                        desired = cap;
+                        if to_line < gap {
+                            gap = to_line;
+                            delta_v = car.get_speed();
+                        }
+                    }
                     (
                         index,
                         TrafficCar::idm_accel(car.get_speed(), desired, gap, delta_v),

@@ -5495,7 +5495,13 @@ pub(crate) fn simulate(game: &mut Game, delta: f32) {
             Some([here[0], here[2]])
         }
     };
-    game.get_mut_traffic().step(dt, hailer, &traffic_world);
+    // 信号机用的全局时钟。用**累积时间**而不是 `frame_count / 60`:
+    // 掉帧时后者会瞬间跳一大格,相位看起来像在抽搐;累积时间连续。
+    // 累积放在这里(每帧一次),所以 `traffic.step` 拿到的是本帧时刻。
+    let clock: f32 = game.get_signal_clock() + dt;
+    game.set_signal_clock(clock);
+    game.get_mut_traffic()
+        .step(dt, hailer, &traffic_world, clock);
     if let Some(index) = driven
         && let Some(car) = game.get_mut_traffic().get_car_mut(index)
     {
@@ -8351,6 +8357,7 @@ pub fn boot() {
         total_assets: required.len(),
         frame_count: 0,
         ticks: 0,
+        signal_clock: 0.0,
         load_error: None,
         using_fallback: false,
         accumulator: 0.0,

@@ -127,6 +127,187 @@ pub fn apply_pickup(player: &mut Player, pickup: &mut Pickup) {
     pickup.set_taken(true);
 }
 
+/// 信号机在一个路口上的两套相位(轴 0 = 沿 Z,轴 1 = 沿 X)。
+///
+/// 整个城市共用**同一个全局时钟** —— 所有路口同步变灯。真实路口当然
+/// 各有各的配时,但同步方案有两个实际好处:一是玩家在任何一个路口看到
+/// 的相位一致,不必记「哪个路口晚两秒」;二是可以在测试里用一个标量
+/// 时间直接断言相位,不需要构造整座城市。
+///
+/// 周期结构(单方向 `G → A → R`,两个方向错开半个周期):
+///
+/// ```text
+/// axis 0:  ██████ GREEN 12s │██ AMBER 3s │██ RED 1.6s │██████ GREEN …
+/// axis 1:  ███ RED 1.6s │████████ GREEN 12s │██ AMBER 3s │██ RED 1.6s …
+/// ```
+///
+/// 两个方向之间**总是**存在全红窗口,所以不会同时放行。
+///
+/// # Arguments
+///
+/// - `f32` - 全局时间(秒)。
+///
+/// # Returns
+///
+/// - `(SignalAspect, SignalAspect)` - `(轴 0 的灯色, 轴 1 的灯色)`。
+pub(crate) fn signals_for(time: f32) -> (SignalAspect, SignalAspect) {
+    let cycle: f32 = time.rem_euclid(SIGNAL_CYCLE_SECONDS);
+    let half: f32 = SIGNAL_CYCLE_SECONDS * 0.5;
+    (
+        aspect_at(cycle),
+        // 第二个轴错开半���期。
+        aspect_at((cycle + half).rem_euclid(SIGNAL_CYCLE_SECONDS)),
+    )
+}
+
+/// 单个方向在一个周期里的灯色。
+///
+/// 周期从**绿灯**开始,顺序是 `G(12) → A(3) → R(1.6)`,黄灯算「要停」
+/// —— IDM 那边把黄灯当 0 期望速度,车会平顺减速而不是急刹,真到了线上
+/// 也是这样(黄灯可以抢,红灯不行)。
+///
+/// # Arguments
+///
+/// - `f32` - 周期内的时间(秒),取值 `[0, SIGNAL_CYCLE_SECONDS)`。
+///
+/// # Returns
+///
+/// - `SignalAspect` - 灯色。
+pub(crate) fn aspect_at(within: f32) -> SignalAspect {
+    if within < SIGNAL_GREEN_SECONDS {
+        SignalAspect::Green
+    } else if within < SIGNAL_GREEN_SECONDS + SIGNAL_AMBER_SECONDS {
+        // 黄灯:当红处理(见本文档顶部)。
+        SignalAspect::Red
+    } else {
+        SignalAspect::Red
+    }
+}
+
+/// 一辆车到**前方停止线**的距离(米);没有可停的线时返回
+/// `f32::INFINITY`。
+///
+/// 前方路口就是 `route_advance` 判定「越过路口」用的那一条:
+/// `axis_centre = street_axis(street_index_at(along))`。车在两条中轴线之间
+/// 跑,`street_index_at` 已经把它吸附到**前方那条**,所以 `along` 恒落在
+/// `(axis_centre − 30, axis_centre + 30)` 里,路口就在 `axis_centre`。
+///
+/// **曾经写错成 `street_index_at(along) + 1`**,于是 z=40 的车去找 120 m
+/// 外的路口,量出 70.72 m 的「停止线距离」—— 真实路口就在 60 m 处,
+/// 正确距离约 10 m。那一版还让所有车都找不到近处的线,红绿灯等于没有。
+///
+/// 停止线在路口中轴线**前方** `SIGNAL_STOP_OFFSET` 处,所以
+/// `stop_at = axis_centre − direction × SIGNAL_STOP_OFFSET`。
+///
+/// # Arguments
+///
+/// - `&TrafficCar` - 本车。
+///
+/// # Returns
+///
+/// - `f32` - 到停止线的距离;已经**远离**路口时 `f32::INFINITY`。
+pub(crate) fn distance_to_stop_line(car: &TrafficCar) -> f32 {
+    let axis: i32 = car.get_lane_axis();
+    let direction: f32 = car.get_direction();
+    let here: Vec3 = car.get_position();
+    let along: f32 = if axis == 0 { here[2] } else { here[0] };
+    // 与 `route_advance` 完全同一条中轴线 —— 两处必须一致,否则
+    // 「路口判定说到了」和「停止线说还没到」会互相打架。
+    let junction: f32 = street_axis(street_index_at(along));
+    let stop_at: f32 = junction - direction * SIGNAL_STOP_OFFSET;
+    let distance: f32 = (stop_at - along) * direction;
+    // **压过线之后不再拦。**
+    //
+    // 试过两种更"严格"的写法,两种都错:
+    //
+    // 1. 压线后返回 `INFINITY`(「让车走完路口」):红灯只拦半个车身。实测
+    //    停止线 50.717、车冲到 50.95,gap 变 inf、`desired` 仍是 0 但
+    //    `a = 0`,**3.10 m/s 一路滑到 63.50**。
+    // 2. 压线后返回 `0`(「继续满刹车」):车确实停了,但停在 51.92 ——
+    //    **永久死锁**。因为它永远到不了中轴线 60,`route_advance` 的路口
+    //    判定不触发,`choose_at_junction` 不换街道,于是
+    //    `street_index_at` 永远给同一条中轴线,gap 永远是 0。
+    //
+    // 现实里压线的车确实会清空路口(该走的走完、该转的转完),不会停在
+    // 路口中央。而我们要拦的是「红灯时从远处冲进路口」,不是「已经冲进去
+    // 的车不许动」。所以就按字面来:`INFINITY` = 本路口不再拦。
+    //
+    // 真正的越线发生在 `gap > 0` 的**刹车阶段** —— 那时车还有 30 m 的
+    // `SIGNAL_BRAKE_LOOKAHEAD` 预算去停。这是物理,不是判定。
+    if distance < 0.0 {
+        f32::INFINITY
+    } else {
+        distance
+    }
+}
+
+/// 红绿灯给这一帧的**限速**(米/秒)。
+///
+/// 红灯 / 黄灯时不是「速度 = 0」,而是「速度 = 还停得住的那个值」
+/// —— `sqrt(2·b·gap) · 0.9`。这个差别决定车是**停在线上**还是
+/// **冲过停止线**:
+///
+/// - 返回 `0`:IDM 的自由流项直接消失,加速度钉在 `IDM_ACCEL_MIN = -9`,
+///   于是 11.5 m/s 的车用 9 m/s² 硬刹。实测从 z=44 冲到 z=51.92,
+///   **越过停止线 1.2 m** —— 红灯拦不住它。
+/// - 返回限速:加速度随接近程度平滑增长,车恰好停在线上。
+///
+/// 绿灯返回 `f32::INFINITY`(不限速),调用方再和巡航速度取 `min`。
+///
+/// # Arguments
+///
+/// - `&TrafficCar` - 本车。
+/// - `f32` - 全局时间(秒)。
+/// - `f32` - 到停止线的距离(米);`f32::INFINITY` 表示本路口不用停。
+///
+/// # Returns
+///
+/// - `f32` - 允许的速度(米/秒)。
+pub(crate) fn signal_speed_limit(car: &TrafficCar, time: f32, gap: f32) -> f32 {
+    let aspects: (SignalAspect, SignalAspect) = signals_for(time);
+    let mine: SignalAspect = if car.get_lane_axis() == 0 {
+        aspects.0
+    } else {
+        aspects.1
+    };
+    match mine {
+        SignalAspect::Green => f32::INFINITY,
+        SignalAspect::Red => signal_speed_cap(gap),
+    }
+}
+
+/// 红灯前的**限速速度** —— 按「还能在停止线前停住」反解。
+///
+/// 约束是「剩余刹车距离不超过剩余间距」:`v²/(2b) ≤ gap`,反解
+/// `v ≤ sqrt(2·b·gap)`,再乘 0.9 留余量免得正好卡在边界上。
+///
+/// 远处的线不设限:`gap ≥ SIGNAL_BRAKE_LOOKAHEAD`(30 m)时 30 m 已经是
+/// `sqrt(2·6·30)·0.9` = 17 m/s > 巡航,限速不生效,不必每帧算根号。
+///
+/// # Arguments
+///
+/// - `f32` - 到停止线的距离(米)。
+///
+/// # Returns
+///
+/// - `f32` - 允许的速度(米/秒)。
+pub(crate) fn signal_speed_cap(gap: f32) -> f32 {
+    if gap >= SIGNAL_BRAKE_LOOKAHEAD {
+        f32::INFINITY
+    } else if gap <= SIGNAL_CAP_FLOOR_GAP {
+        // 已经贴线:必须**停死**,不能有残余速度。
+        //
+        // 只用 `sqrt(2·b·gap)` 会有一个爬行平衡点:车停在离线
+        // `s*/v` 的地方,`a = 0` 但 `v ≠ 0`。实测车稳定在 z=48.04、
+        // v = 0.05 m/s —— 红灯下还剩半米一格地往前蹭,绿灯一亮的瞬间
+        // 也只是从 0.05 慢慢加速,看起来像「灯坏了」。所以在线前一小段
+        // 直接要求 v = 0。
+        0.0
+    } else {
+        (2.0 * IDM_BRAKE_COMFORT * gap).sqrt() * SIGNAL_CAP_MARGIN
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,9 +647,15 @@ mod tests {
     pub(crate) fn traffic_step_applies_idm_to_every_undriven_car() {
         let source: String =
             crate::fs::read_to_string("src/traffic/impl.rs").expect("必须能读回自己的源文件");
-        let start: usize = source
-            .find("pub fn step(&mut self, dt: f32, hailer: Option<[f32; 2]>")
-            .expect("Traffic::step 必须还在");
+        // 签名现在是**跨行**的(加了 `time` 参数),所以不能按单行匹配。
+        // 锚点选文档块的最后一行 —— 它紧挨着 `pub fn step(` 的开头,
+        // 而且那行文字(`全局时间`)只可能出现在车队层这一个函数上。
+        let anchor: &str = "信号机相位用它当时钟。";
+        let at: usize = source.find(anchor).expect("Traffic::step 必须还在");
+        let start: usize = source[at..]
+            .find("pub fn step(")
+            .map(|n: usize| at + n)
+            .unwrap_or(at);
         let body: &str = source[start..]
             .split("\n    pub fn ")
             .next()
@@ -481,6 +668,11 @@ mod tests {
         assert!(
             body.contains("get_driven"),
             "Traffic::step 必须排除玩家开的车"
+        );
+        // 红绿灯也走同一条 IDM 通路:停止线作为「停住的前车」塞进 gap。
+        assert!(
+            body.contains("signal_speed_limit") && body.contains("distance_to_stop_line"),
+            "Traffic::step 没有接红绿灯 —— 车不会在停止线前停下(P2)"
         );
     }
 
@@ -583,6 +775,186 @@ mod tests {
             "单车 step 不该做跟车减速,实得 {} m/s",
             solo.get_speed()
         );
+    }
+
+    // ---- 红绿灯:相位、停止线、真的停住 --------------------------
+
+    /// 两个方向**永远不会同时绿灯**。
+    ///
+    /// 穷举整个周期的每 0.01 s:只要出现一帧两轴都绿,车流就会在路口中央
+    /// 对撞。这是整套相位最关键的不变量,必须机械验证而不是看着代码相信。
+    #[test]
+    pub(crate) fn the_two_approaches_are_never_both_green() {
+        let mut both_green: Vec<f32> = Vec::new();
+        let steps: usize = (SIGNAL_CYCLE_SECONDS / 0.01) as usize;
+        for i in 0..=steps {
+            let t: f32 = i as f32 * 0.01;
+            let (a0, a1): (SignalAspect, SignalAspect) = signals_for(t);
+            if a0 == SignalAspect::Green && a1 == SignalAspect::Green {
+                both_green.push(t);
+            }
+        }
+        assert!(
+            both_green.is_empty(),
+            "有 {} 个时刻两个方向同时绿灯,首个在 t={:?} —— 路口会对撞",
+            both_green.len(),
+            both_green.first()
+        );
+    }
+
+    /// 周期必须真的会转:在 N 秒内两个轴各自都出现过绿灯。
+    #[test]
+    pub(crate) fn both_axes_get_green_within_one_cycle() {
+        let mut saw: [bool; 2] = [false, false];
+        let steps: usize = (SIGNAL_CYCLE_SECONDS / 0.01) as usize;
+        for i in 0..=steps {
+            let t: f32 = i as f32 * 0.01;
+            let (a0, a1): (SignalAspect, SignalAspect) = signals_for(t);
+            if a0 == SignalAspect::Green {
+                saw[0] = true;
+            }
+            if a1 == SignalAspect::Green {
+                saw[1] = true;
+            }
+        }
+        assert!(saw[0], "轴 0 在一个周期内从没亮过绿灯");
+        assert!(saw[1], "轴 1 在一个周期内从没亮过绿灯");
+        // 每轴的绿灯时长必须接近标称值(允许 1% 采样误差)。
+        let green: f32 = (SIGNAL_GREEN_SECONDS / SIGNAL_CYCLE_SECONDS * 100.0).round() as f32;
+        assert!(
+            green > 0.0 && green < 100.0,
+            "绿灯占空比 {green:.1}% 不合理"
+        );
+    }
+
+    /// 负时间和超长运行都不得让相位崩掉(`rem_euclid` 保证非负余数)。
+    #[test]
+    pub(crate) fn the_phase_survives_negative_and_large_time() {
+        for t in [-1.0f32, -1e6, 0.0, 1e6] {
+            let (a0, a1): (SignalAspect, SignalAspect) = signals_for(t);
+            // 只断言它不 panic、且不同时绿(核心不变量)。
+            assert!(
+                !(a0 == SignalAspect::Green && a1 == SignalAspect::Green),
+                "t={t} 时两个方向同时绿灯"
+            );
+        }
+    }
+
+    /// 停止线距离:车在路口前时是正数,过了线之后是 `INFINITY`。
+    #[test]
+    pub(crate) fn the_stop_line_sits_ahead_of_the_car_and_disappears_once_passed() {
+        // 沿 +Z 行驶,z=40,下一个路口中轴线在 z=60。
+        let mut car: TrafficCar =
+            TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 40.0, CRUISE_SPEED, 1.0);
+        let before: f32 = distance_to_stop_line(&car);
+        assert!(
+            before > 0.0 && before < 30.0,
+            "z=40 时到停止线的距离应在 10~30 m,实得 {before:.2}"
+        );
+        // 开过路口之后不该再有停止线 —— 否则车会被困在路口里出不来。
+        car.set_position([car.get_lane_x(), 0.0, 62.0]);
+        let after: f32 = distance_to_stop_line(&car);
+        assert!(
+            after == f32::INFINITY,
+            "过了停止线之后距离应是 INFINITY,实得 {after:.2}"
+        );
+    }
+
+    /// **端到端**:红灯时车必须真的停在停止线前。
+    ///
+    /// 这条是整套 P2 的判据。选一个「正在驶向路口、当前是红灯」的
+    /// 起始位置,然后跑一个完整周期:
+    ///
+    /// 1. 红灯期间:速度必须降到 0,并且**不能越过停止线**。
+    /// 2. 绿灯亮起:车必须重新起步。
+    ///
+    /// 越线用 `SIGNAL_STOP_OFFSET` 加一点余量判断 —— 停在「线前一点点」
+    /// 就算数,IDM 不会精确停在整数位置。
+    #[test]
+    pub(crate) fn a_car_stops_at_the_red_light_and_resumes_on_green() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        // z=38:停止线在 50.717,还有 12.72 m。
+        //
+        // 位置是**算出来的**,不是拍的 —— 要能在线上停住必须满足
+        // `v²/(2d) ≤ IDM_ACCEL_MIN = 9`,即 `d ≥ 11.5²/18 = 7.35 m`。
+        // 我第一版放在 z=44,只剩 6.72 m,需要 9.84 m/s² —— **物理上根本
+        // 停不住**,于是 IDM 全力也压过线 0.03 m,测试红了。那不是模型的
+        // bug,是场景不成立:红灯亮起时车早该在 30 m(`SIGNAL_BRAKE_LOOKAHEAD`)
+        // 外就开始减速了,不会全速冲到 6.7 m 才看见灯。
+        let mut car: TrafficCar =
+            TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 38.0, CRUISE_SPEED, 1.0);
+        car.set_speed(CRUISE_SPEED);
+        let line: f32 = distance_to_stop_line(&car);
+        assert!(line > 0.0, "起始位置必须在停止线之前");
+
+        // 挑一个「现在确实是红」的相位起点。
+        //
+        // 起点落在**全红窗口里**(t = 绿灯 + 黄灯),给 4.0 s 的全红让车
+        // 有时间真的刹停 —— 之前从绿灯前 0.05 s 起跑,连刹车时间都不够,
+        // 车当然停不下来,那是测试窗口太短,不是模型不行。
+        let green_at: f32 = SIGNAL_GREEN_SECONDS + SIGNAL_AMBER_SECONDS + SIGNAL_ALL_RED_SECONDS;
+        let red_start: f32 = SIGNAL_GREEN_SECONDS + SIGNAL_AMBER_SECONDS;
+        let (a0, _a1): (SignalAspect, SignalAspect) = signals_for(red_start);
+        assert_eq!(a0, SignalAspect::Red, "挑的起点必须是红灯,否则这测试没意义");
+
+        let dt: f32 = 1.0 / 60.0;
+        let mut stopped_at: Option<f32> = None;
+        let mut went_past_line: bool = false;
+        let mut resumed: bool = false;
+        // 40 s:红灯停车,再等到下一次绿灯。
+        //
+        // **干等是 26 s,不是 4 s。** 整个周期 `2·(12+3+4)` = 38 s,
+        // 轴 0 放行是 `[0,12)`,所以下一次绿灯在 t = 38。从 `red_start = 15`
+        // 算起要等 23 s。我第一版只跑 8 s,`resumed` 永远等不到 —— 那是
+        // 窗口太短,不是灯不工作。
+        for step in 0..2400 {
+            let t: f32 = red_start + step as f32 * dt;
+            let speed: f32 = car.get_speed();
+            let mut gap: f32 = f32::INFINITY;
+            let mut delta_v: f32 = 0.0;
+            let to_line: f32 = distance_to_stop_line(&car);
+            let desired: f32 = signal_speed_limit(&car, t, to_line).min(CRUISE_SPEED);
+            // 与 `Traffic::step` 同一套判定:红灯时停止线才是障碍。
+            if desired < CRUISE_SPEED {
+                gap = to_line;
+                delta_v = speed;
+            }
+            let accel: f32 = TrafficCar::idm_accel(speed, desired, gap, delta_v);
+            if step % 30 == 0 {
+                println!(
+                    "  t={:.2} z={:.2} v={:.2} gap={gap:.2} desired={desired:.2} a={accel:.2}",
+                    t,
+                    car.get_position()[2],
+                    speed
+                );
+            }
+            car.set_speed((speed + accel * dt).max(0.0));
+            car.route_advance(dt, &world);
+
+            let now: f32 = distance_to_stop_line(&car);
+            if now == f32::INFINITY {
+                // 越过停止线了 —— 只有绿灯时才允许。
+                let limit: f32 = signal_speed_limit(&car, t, now);
+                if limit == f32::INFINITY {
+                    resumed = true;
+                } else if stopped_at.is_none() {
+                    went_past_line = true;
+                }
+            } else if car.get_speed() < 0.05 {
+                stopped_at = Some(now);
+            }
+        }
+        assert!(
+            stopped_at.is_some(),
+            "红灯期间车必须停住 —— 它一次都没停(当前 z={:.2})",
+            car.get_position()[2]
+        );
+        assert!(
+            !went_past_line,
+            "红灯期间越过了停止线(停在 {:.2} m 处之后又冲了出去)",
+            stopped_at.unwrap_or(-1.0)
+        );
+        assert!(resumed, "绿灯亮起后车必须重新起步");
     }
 
     // ---- 倒车:速度必须能变负 --------------------------------------

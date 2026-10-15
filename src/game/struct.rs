@@ -263,6 +263,12 @@ pub struct Game {
     /// 已完成的固定步数(测试用)。
     #[get(type(copy), pub(crate))]
     pub(crate) ticks: u64,
+    /// 信号机相位时钟(秒)—— 每帧累积一次 `dt`。
+    ///
+    /// 不用 `frame_count / 60` 反推:掉帧时那一项会瞬间跳一大格,相位看着
+    /// 像在抽搐。累积量与真实经过时间一致。
+    #[get(type(copy), pub(crate))]
+    pub(crate) signal_clock: f32,
     /// 加载失败信息(有值时显示在遮罩上)。
     #[get(type(clone), pub(crate))]
     pub(crate) load_error: Option<String>,
