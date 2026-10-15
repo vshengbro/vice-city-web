@@ -5433,22 +5433,29 @@ pub(crate) fn simulate(game: &mut Game, delta: f32) {
         (forward_input, strafe_input)
     };
     // 车队先走:玩家开的那辆由 `drive` 接管,其余按巡航速度循环。
+    //
+    // **`traffic.step()` 必须无条件调用。** 它是全部 NPC 车的唯一逐帧
+    // 更新,而它原先只挂在 `None`(步行)分支上 —— 玩家一上车,其余 9 辆
+    // 就再也不会被遍历、积分或碰撞,整个 NPC 车流**逐帧冻结**。实测:玩家
+    // 踩油门 6 s 跑了 85.32 m,同期 NPC 车位移 0.000 m,速度前后逐位相同
+    // (11.20 → 11.20),下车 3 s 内 4/9 才恢复。GTA 里车流永远在动。
+    //
+    // 「招手打车」只在**步行**时成立:玩家坐在车里不该再被路边停靠的车
+    // 缠住,所以 `hailer` 跟着 `driven.is_none()` 走。
     let driven: Option<usize> = game.get_player().get_vehicle();
-    match driven {
-        Some(index) => {
-            let world: CollisionWorld = game.get_world_ref().clone();
-            if let Some(car) = game.get_mut_traffic().get_car_mut(index) {
-                car.drive(forward_input, steer_input, dt, &world);
-            }
-        }
+    let traffic_world: CollisionWorld = game.get_world_ref().clone();
+    let hailer: Option<[f32; 2]> = match driven {
+        Some(_) => None,
         None => {
-            // 玩家在路边「招手」:附近的车会减速停靠,不然 8–14 m/s 的车
-            // 徒步根本追不上,上车功能等于不存在。
             let here: Vec3 = game.get_player().get_position();
-            let world: CollisionWorld = game.get_world_ref().clone();
-            game.get_mut_traffic()
-                .step(dt, Some([here[0], here[2]]), &world);
+            Some([here[0], here[2]])
         }
+    };
+    game.get_mut_traffic().step(dt, hailer, &traffic_world);
+    if let Some(index) = driven
+        && let Some(car) = game.get_mut_traffic().get_car_mut(index)
+    {
+        car.drive(forward_input, steer_input, dt, &traffic_world);
     }
     // 玩家。
     match game.get_player().get_vehicle() {
@@ -7343,6 +7350,14 @@ pub(crate) fn collect_pickups(game: &mut Game) {
         let picked: Option<Pickup> = game.get_mut_traffic().get_pickup_mut(index).cloned();
         if let Some(mut picked) = picked {
             apply_pickup(game.get_mut_player(), &mut picked);
+        }
+        // `apply_pickup` 的 `set_taken(true)` 落在上面那份 **clone** 上,
+        // 真正的拾取物 `taken` 一直是 false,于是下一帧第 7326 行的
+        // `get_taken()` 守卫形同虚设 —— 玩家站在原地可以无限次拾取同一件,
+        // 实测 HUD 打到 `pickups 330/12`、现金 $8250(12 件物品)。
+        // 收益结算靠 clone 已经走完了,这里只需要把**活的那个**标记掉。
+        if let Some(live) = game.get_mut_traffic().get_pickup_mut(index) {
+            live.set_taken(true);
         }
         game.get_mut_player().set_collected_push(index);
         // 拾走了就不该还在地上:把该批次的实例清零。
