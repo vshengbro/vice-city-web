@@ -401,6 +401,190 @@ mod tests {
         assert!(STEER_RATE > 0.0 && STEER_RATE.is_finite());
     }
 
+    // ---- IDM 跟车:前车停住时必须真的刹车 --------------------------
+
+    /// 前车停住 30 m 外,后车**必须减速**。
+    ///
+    /// 原来的模型是 `speed += (cruise - speed) * approach` —— 一个朝
+    /// 巡航速度的指数逼近,**完全没有前车感知**。数值实测它在
+    /// t = 2.60 s 直接撞上前车,一次都不减速。
+    #[test]
+    pub(crate) fn a_car_behind_a_stopped_car_brakes_instead_of_ramming_it() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        let mut back: TrafficCar =
+            TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 60.0, CRUISE_SPEED, 1.0);
+        // 前车:同一根车道轴、同向、停在正前方 30 m,速度 0。
+        let mut front: TrafficCar = TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 90.0, 0.0, 1.0);
+        front.set_speed(0.0);
+        let cars: Vec<TrafficCar> = vec![back.clone(), front.clone()];
+        let (gap, delta_v): (f32, f32) = TrafficCar::leader_gap(&cars, 0);
+        assert!(gap < f32::INFINITY, "后车必须看得见前车,实得间距 {gap}");
+        assert!(
+            delta_v > 0.0,
+            "前车停着时速度差必须是正的(自己在动),实得 {delta_v}"
+        );
+        // 自由流(没有前车)时应当**加速**去追巡航速度,证明下面测到的
+        // 减速确实来自 IDM 的前车项,不是别的东西。
+        let free: f32 = TrafficCar::idm_accel(CRUISE_SPEED, CRUISE_SPEED, f32::INFINITY, 0.0);
+        let blocked: f32 = TrafficCar::idm_accel(CRUISE_SPEED, CRUISE_SPEED, gap, delta_v);
+        assert!(free >= 0.0, "无前车时不该减速,实得 {free}");
+        assert!(
+            blocked < -1.0,
+            "前车停在 30 m 外,后车必须给出明显减速,实得 {blocked}"
+        );
+        // 真的跑一遍:带上前车推 5 秒,后车必须掉速。
+        for _ in 0..300 {
+            back.step(1.0 / 60.0, false, &world);
+            let (g, dv): (f32, f32) = {
+                let snapshot: Vec<TrafficCar> = vec![back.clone(), front.clone()];
+                TrafficCar::leader_gap(&snapshot, 0)
+            };
+            back.set_speed(
+                (back.get_speed()
+                    + TrafficCar::idm_accel(back.get_speed(), CRUISE_SPEED, g, dv) / 60.0)
+                    .max(0.0),
+            );
+        }
+        let travelled: f32 = back.get_position()[2] - 60.0;
+        assert!(
+            back.get_speed() < CRUISE_SPEED * 0.6,
+            "5 秒后后车必须明显掉速,实得 {} m/s(巡航 {CRUISE_SPEED})",
+            back.get_speed()
+        );
+        assert!(
+            travelled < 50.0,
+            "5 秒行程 {travelled:.1} m 超过它以巡航速度能跑的距离 —— \
+             说明它压根没减速"
+        );
+    }
+
+    /// `Traffic::step` 必须真的调 IDM —— 上面几条测的是 `idm_accel` 和
+    /// `leader_gap` **本身**,把车队层的调用换成旧 lerp 它们照样全绿
+    /// (我第一版就是这么写的,发现方式是把这行改成 `0.0` 重跑)。
+    /// 这条盯住**调用点**:车队每帧都必须对每辆没被开的车算一次跟车。
+    #[test]
+    pub(crate) fn traffic_step_applies_idm_to_every_undriven_car() {
+        let source: String =
+            crate::fs::read_to_string("src/traffic/impl.rs").expect("必须能读回自己的源文件");
+        let start: usize = source
+            .find("pub fn step(&mut self, dt: f32, hailer: Option<[f32; 2]>")
+            .expect("Traffic::step 必须还在");
+        let body: &str = source[start..]
+            .split("\n    pub fn ")
+            .next()
+            .expect("能切出函数体");
+        assert!(
+            body.contains("idm_accel") && body.contains("leader_gap"),
+            "Traffic::step 没有调用 IDM —— 跟车不会生效(P1)"
+        );
+        // 还要确保玩家开的那辆车不参与 AI 跟车(否则玩家自己会被减速)。
+        assert!(
+            body.contains("get_driven"),
+            "Traffic::step 必须排除玩家开的车"
+        );
+    }
+
+    /// 跟车稳态:队列里每辆车都保持正的净间距,不重叠。
+    ///
+    /// 队列必须留在**一条直道的一格内** —— 超过一格就会跨过路口,而
+    /// 跨路口会真的转弯(`choose_at_junction`),于是沿街坐标不再单调,
+    /// 「后车在前面」这个前提本身就不成立,测的就不是跟车了。
+    #[test]
+    pub(crate) fn a_car_following_keeps_a_positive_gap() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        // 三辆车、一条直道、一格之内(街道间距 60 m)。
+        //
+        // 间距取 **9 m** 而不是稳态的 `s* ≈ 19.9 m`:`s*` 附近 IDM 会
+        // 判成「间距刚好」,车继续跑巡航 —— 那是**正确**行为。所以要测
+        // 「会减速」就必须排在**比 s* 更近**的位置上。
+        //
+        // 沿 +Z 行驶,所以**队首是 z 最大的那辆**:数组按 z 降序摆,
+        // `cars[0]` 是队首(没有前车),`cars[2]` 是队尾。整队落在
+        // (0, 60) 这一格里,离两侧的路口中轴线都有余量。
+        let mut cars: Vec<TrafficCar> = Vec::new();
+        for i in 0..3 {
+            let z: f32 = 26.0 - i as f32 * 9.0;
+            let mut c: TrafficCar =
+                TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, z, CRUISE_SPEED, 1.0);
+            c.set_speed(CRUISE_SPEED);
+            cars.push(c);
+        }
+        // 队首(索引 0)没有前车,同样要走一遍 IDM,否则它会一直保持巡航
+        // 速度而后车全在减速,量出来的「重叠」其实是队列被拉散。
+        //
+        // 只跑 **0.75 s**。路口中轴线在 z = 0 / 60 / 120;队首从 z=34
+        // 起跑,0.75 s 后到 ~42,离 60 还有 18 m。这段窗口里 IDM 已经有
+        // 足够帧数给出可观的减速,又不会跨过中轴线触发
+        // `choose_at_junction` 的 `set_position` —— 那会把车搬到路口中心,
+        // 沿街坐标不再单调,「谁在前谁在后」的前提就失效了。
+        for _ in 0..45 {
+            let order: Vec<usize> = (0..cars.len()).collect();
+            for i in order {
+                let snapshot: Vec<TrafficCar> = cars.clone();
+                let (gap, dv): (f32, f32) = TrafficCar::leader_gap(&snapshot, i);
+                let a: f32 = TrafficCar::idm_accel(cars[i].get_speed(), CRUISE_SPEED, gap, dv);
+                let next: f32 = (cars[i].get_speed() + a / 60.0).max(0.0);
+                cars[i].set_speed(next);
+            }
+            for i in (0..cars.len()).rev() {
+                cars[i].route_advance(1.0 / 60.0, &world);
+            }
+        }
+        // 判据用 `leader_gap` 自己报出来的净间距 —— 队列按 z 降序摆,
+        // 所以「前面那辆」不是 `cars[i-1]`(它在后面)。手写 `cars[i-1]`
+        // 的比较等于拿后车当前车,净间距必然为负,和 IDM 无关。
+        for i in 0..cars.len() {
+            let (gap, _dv): (f32, f32) = TrafficCar::leader_gap(&cars, i);
+            if gap == f32::INFINITY {
+                continue;
+            }
+            assert!(
+                gap > 0.0,
+                "第 {i} 辆车已经压到前车身上(净间距 {gap:.2} m)—— \
+                 IDM 没有守住跟车距离"
+            );
+        }
+        // 队尾必须真的**慢下来**:跟车的意义就在这里。
+        let tail: f32 = cars[cars.len() - 1].get_speed();
+        assert!(
+            tail < CRUISE_SPEED * 0.9,
+            "队尾必须因为前面有车而减速,实得 {tail:.2} m/s(巡航 {CRUISE_SPEED})"
+        );
+    }
+
+    /// 无前车时 IDM 必须**收敛到巡航速度**,不能越冲越快。
+    #[test]
+    pub(crate) fn idm_converges_to_cruise_with_no_leader() {
+        let mut speed: f32 = 0.0;
+        for _ in 0..600 {
+            let a: f32 = TrafficCar::idm_accel(speed, CRUISE_SPEED, f32::INFINITY, 0.0);
+            speed = (speed + a / 60.0).max(0.0);
+        }
+        assert!(
+            (speed - CRUISE_SPEED).abs() < 0.05,
+            "无前车时应收敛到巡航 {CRUISE_SPEED},实得 {speed:.3}"
+        );
+    }
+
+    /// `TrafficCar::step` 单独跑时不会看别人 —— 跟车必须由车队层做。
+    /// 这条测试把两者的职责钉死,免得有人把 IDM 又塞回单车模型里。
+    #[test]
+    pub(crate) fn single_car_step_has_no_leader_awareness() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        let mut solo: TrafficCar =
+            TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 60.0, CRUISE_SPEED, 1.0);
+        for _ in 0..300 {
+            solo.step(1.0 / 60.0, false, &world);
+        }
+        // 单车模型只朝巡航逼近,不该出现任何「因为前车而减速」的痕迹 ——
+        // 这正是它当初漏掉跟车的原因。
+        assert!(
+            solo.get_speed() > CRUISE_SPEED * 0.9,
+            "单车 step 不该做跟车减速,实得 {} m/s",
+            solo.get_speed()
+        );
+    }
+
     // ---- 倒车:速度必须能变负 --------------------------------------
 
     /// 静止时按住 S 必须真的倒出去(速度变负),而不是停在 0。

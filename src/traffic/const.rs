@@ -107,6 +107,46 @@ pub(crate) const HAUL_RANGE: f32 = 26.0;
 /// 「靠边等人」的减速强度(1/秒)。
 pub(crate) const HAUL_BRAKE: f32 = 3.4;
 
+// ---- IDM 跟车模型(Intelligent Driver Model)-------------------------
+//
+// 原来的纵向模型是 `speed += (cruise - speed) * approach`:一个朝巡航速度
+// 的指数逼近,**没有任何前车感知**。前车停住时它照开不误 —— 数值实测
+// 前车停在 30 m 外,t = 2.60 s 就撞上去,一次都不减速。
+//
+// IDM(`a = a_max [1 - (v/v0)^delta - (s*/s)^2]`)给出真实跟车行为:
+// 自由流趋近巡航,靠近前车时平顺减速,间距稳定在 `s*` 附近。
+
+/// IDM 的期望最小车距(米)。
+///
+/// `s0` 是静止时的安全间距(约两个车头),`T` 是期望时间间隔。两者相加
+/// 就是稳态跟车距离:11.5 m/s + 1.5 s 时距 ≈ 20 m。
+pub(crate) const IDM_MIN_GAP: f32 = 2.6;
+
+/// IDM 的期望时间间隔(秒)。
+///
+/// 城市道路按 1.5 s 取:车距 11.5 m/s × 1.5 s ≈ 17 m,加上 2.6 m 静止
+/// 间距,稳态 20 m。真实驾驶员在市区大致是这个量级。
+pub(crate) const IDM_HEADWAY: f32 = 1.5;
+
+/// IDM 的最大加速度(米/秒²)—— 自由流时追巡航速度的加速度。
+pub(crate) const IDM_ACCEL_MAX: f32 = 4.0;
+
+/// IDM 的舒适减速度(米/秒²)。
+///
+/// 真实车辆的最大制动约 8–9 m/s²,但 IDM 的 `b` 是**舒适**减速度,只在
+/// 极端跟车时用到;取 6.0 让急刹仍然跟得上物理刹车的手感。
+pub(crate) const IDM_BRAKE_COMFORT: f32 = 6.0;
+
+/// IDM 速度差的指数(固定为 4)。
+///
+/// 学术标准值。取 4 时 `s* = s0 + max(0, v*T + v*dv/(2*sqrt(a*b)))`,
+/// 前车更快(`dv < 0`)时 `s*` 反而变大 —— 于是**别人插到你前面你会
+/// 自动减速让出空间**,而不是撞上去。
+pub(crate) const IDM_DELTA: f32 = 4.0;
+
+/// IDM 的加速度下限(米/秒²)—— 避免 a 变负得没完,把车推成倒车。
+pub(crate) const IDM_ACCEL_MIN: f32 = -9.0;
+
 /// `pickup_health_pack` 的回血量(点)。
 pub(crate) const HEALTH_PACK_HEAL: f32 = 35.0;
 
