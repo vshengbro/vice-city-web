@@ -589,9 +589,20 @@ impl CollisionWorld {
         let side: Vec2 = [forward[1], -forward[0]];
         let footprint: Vec2 = body.get_footprint();
         let mut current: Vec2 = point;
+        // **整帧推出预算** —— 不只是每个形状一次,而是这一轮 `separate_static`
+        // 的总位移上限。
+        //
+        // 只给单次推出封顶还不够:一个形状在 `RESOLVE_ITERATIONS`(4)轮里
+        // 每轮都能推满,叠起来一帧仍是 4 × 上限;街区里十几栋楼的 AABB 又会
+        // 互相接力,实测峰值 9.6 m。预算记在**位移**上而不是「推了几次」上,
+        // 所以无论迭代几轮、形状几个,一帧的总修正都锁死在预算内。
+        let mut budget: f32 = MAX_STATIC_PUSH_PER_FRAME;
         for _ in 0..RESOLVE_ITERATIONS {
             let mut moved: bool = false;
             for shape in self.get_shapes() {
+                if budget <= STATIC_PUSH_BUDGET_EPSILON {
+                    break;
+                }
                 let hit: Option<(Vec2, f32)> = match shape {
                     Shape::Aabb { center, half } => {
                         push_out_box_aabb(*center, *half, current, forward, side, footprint)
@@ -602,8 +613,10 @@ impl CollisionWorld {
                     } => push_out_circle(*center, *other, current, footprint[1]),
                 };
                 if let Some((direction, depth)) = hit {
-                    current[0] += direction[0] * depth;
-                    current[1] += direction[1] * depth;
+                    let allowed: f32 = depth.min(budget);
+                    current[0] += direction[0] * allowed;
+                    current[1] += direction[1] * allowed;
+                    budget -= allowed;
                     moved = true;
                 }
             }
