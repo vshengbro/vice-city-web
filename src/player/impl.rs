@@ -178,7 +178,12 @@ impl Player {
             (direction[0] * forward + -direction[1] * strafe) * speed,
             (direction[1] * forward + direction[0] * strafe) * speed,
         ];
-        let ramp: f32 = (1.0 - (-SPEED_RAMP * dt).exp()).clamp(0.0, 1.0);
+        // 加速与减速用不同的速率:松键后的滑步尾巴必须比起步长,
+        // 否则松键和起步的手感完全一样(实测倒过来:停得比起步快)。
+        // `intent` 长度为 0 就是松键,此时目标速度为零向量。
+        let braking: bool = intent[0].abs() + intent[1].abs() < 1.0e-3;
+        let ramp_rate: f32 = if braking { DECEL_RAMP } else { SPEED_RAMP };
+        let ramp: f32 = (1.0 - (-ramp_rate * dt).exp()).clamp(0.0, 1.0);
         let current: Vec2 = self.get_velocity();
         self.set_velocity([
             current[0] + (target[0] - current[0]) * ramp,
@@ -222,7 +227,13 @@ impl Player {
         let planar: f32 = (velocity[0] * velocity[0] + velocity[1] * velocity[1]).sqrt();
         if planar > PLANAR_EPSILON {
             let desired: f32 = facing_yaw(velocity);
-            let turning: f32 = wrap_angle(desired - self.get_yaw()) * TURN_RATE * dt;
+            // 转身速率随速度下降:站定/慢走用满 [`TURN_RATE`],满速跑动收到
+            // [`TURN_RATE_MIN_FACTOR`] 倍。固定角速度会让冲刺时的急转和
+            // 走路时一样利落,那正是「不像 GTA」的地方。
+            let speed_ratio: f32 = (planar / speed).clamp(0.0, 1.0);
+            let rate: f32 =
+                TURN_RATE * (TURN_RATE_MIN_FACTOR + (1.0 - TURN_RATE_MIN_FACTOR) * speed_ratio);
+            let turning: f32 = wrap_angle(desired - self.get_yaw()) * rate * dt;
             self.set_yaw(self.get_yaw() + turning);
         }
 

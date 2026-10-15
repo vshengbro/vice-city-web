@@ -259,7 +259,10 @@ impl Camera {
     /// 色,角色和街景全被地面挡住。上限避免接近垂直时的万向节翻转。
     pub const FOLLOW_PITCH_MIN: f32 = -0.05;
     /// 第三人称俯仰的合法上限(弧度)。
-    pub const FOLLOW_PITCH_MAX: f32 = 1.05;
+    ///
+    /// GTA III / VC 的越肩相机俯角上限约 34°(0.60 rad);1.05 rad
+    /// 等于 60°,是 GTA 的近两倍,俯视下去只剩楼顶和马路,失去街道感。
+    pub const FOLLOW_PITCH_MAX: f32 = 0.60;
 
     /// 把第三人称的 pitch 收进「相机在角色上方」的区间。
     pub fn clamp_follow_pitch(&mut self) {
@@ -523,6 +526,14 @@ impl Camera {
         }
         // 眼点高度 = target.y + direction.y * distance,要 >= CAMERA_MIN_HEIGHT。
         let headroom: f32 = CAMERA_MIN_HEIGHT - target[1];
+        // 焦点本来就比眼点下限还高(`FOLLOW_HEIGHT` 1.45 > `CAMERA_MIN_HEIGHT`
+        // 0.45),任何朝下的距离都满足约束。此时 `headroom` 为负,除出来
+        // 的 `needed` 也是负的,`.max()` 会把距离钳到下限 —— 第三人称
+        // 相机在任何俯角 <= 0 的地方都被粘在 2.2 m 上。焦点已经够高就
+        // 直接返回,地面修正不该存在。
+        if headroom <= 0.0 {
+            return;
+        }
         let needed: f32 = if direction[1] < -1.0e-4 {
             headroom / -direction[1]
         } else {

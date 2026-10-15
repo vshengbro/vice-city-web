@@ -127,6 +127,33 @@ def main() -> int:
     }
     X.write_manifest(built, OUT_DIR, manifest["generator"])
 
+    # Fail the build, loudly, if the manifest is not shaped the way the Rust
+    # loader needs. Commit `bfac59a` fixed the committed JSON but not the
+    # generator, so the very next rebuild silently reverted the schema and
+    # the deployed scene came up empty. A rebuild must never again be able to
+    # emit a manifest the renderer cannot read.
+    with open(os.path.join(OUT_DIR, "manifest.json"), encoding="utf-8") as fh:
+        written = json.load(fh)
+    entries = written.get("assets")
+    if not isinstance(entries, list) or not entries:
+        raise SystemExit(
+            f"manifest schema regression: 'assets' is "
+            f"{type(entries).__name__}, expected a list of "
+            f"{{id, category, file}} (Rust: Manifest.assets: Vec<ManifestEntry>)"
+        )
+    for e in entries:
+        missing = [k for k in ("id", "category", "file") if not e.get(k)]
+        if missing:
+            raise SystemExit(
+                f"manifest schema regression: entry {e.get('id', '?')} "
+                f"missing {missing}"
+            )
+        if not os.path.isfile(os.path.join(OUT_DIR, e["file"])):
+            raise SystemExit(
+                f"manifest references a missing file: {e['file']}"
+            )
+    print(f"manifest schema OK: {len(entries)} entries, all files present")
+
     print()
     print("=== per-category breakdown ===")
     for cat in sorted(per_category):

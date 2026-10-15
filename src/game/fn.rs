@@ -1002,13 +1002,25 @@ pub(crate) fn build_city_buildings_with(guard: f32, cx: f32, cz: f32) -> Vec<Bui
     // 「有转角楼」的路口会集体变成没有、又集体变成有 —— 窗口一平移,半个
     // 城市的转角楼凭空出现或消失。改用路口自己的**世界索引**
     // (`line_xi` / `line_zi`)取奇偶,奇偶性锚在世界网格上,与窗口无关。
-    let lights: Vec<i32> = street_indices_in(
-        (cx.min(cz) - BLOCK_VIEW_RADIUS).floor(),
-        (cx.max(cz) + BLOCK_VIEW_RADIUS).ceil(),
+    // 每个轴用**自己的**窗口。原先两个轴被压成同一个区间
+    // `[min(cx,cz)-R, max(cx,cz)+R]`,于是区间宽度随 |cx-cz| 增长,再用
+    // `for xi in lights / for zi in lights` 的笛卡尔积生成对角楼 —— 建筑数
+    // 随偏移量按 N² 爆炸。实测 (30,30) 提交 9.94 M 顶点,(30,6930) 提交
+    // 1.54 B(155.3×),碰撞体 1769 → 72,695。
+    //
+    // 同一个 min/max 缺陷在 `street_strips` 里已经修过一次(见那里的注释,
+    // 里面点名了 (-6000, 1500) 这个例子),这里必须同样按轴取窗口。
+    let lights_x: Vec<i32> = street_indices_in(
+        (cx - BLOCK_VIEW_RADIUS).floor(),
+        (cx + BLOCK_VIEW_RADIUS).ceil(),
     );
-    for &line_xi in lights.iter() {
+    let lights_z: Vec<i32> = street_indices_in(
+        (cz - BLOCK_VIEW_RADIUS).floor(),
+        (cz + BLOCK_VIEW_RADIUS).ceil(),
+    );
+    for &line_xi in lights_x.iter() {
         let line_x: f32 = street_axis(line_xi);
-        for &line_zi in lights.iter() {
+        for &line_zi in lights_z.iter() {
             if (line_xi + line_zi).rem_euclid(2) != 0 {
                 continue;
             }
@@ -1049,13 +1061,19 @@ pub(crate) fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
     let mut out: Vec<PropPlacement> = Vec::new();
     let corner: f32 = STREET_HALF_WIDTH + 0.9;
     // ---- 每个网格路口四个角的交通灯 ----
-    let junctions: Vec<i32> = street_indices_in(
-        (cx.min(cz) - BLOCK_VIEW_RADIUS).floor(),
-        (cx.max(cz) + BLOCK_VIEW_RADIUS).ceil(),
+    // 同样按轴取窗口(理由见 `build_city_buildings` 里那段注释):两个轴
+    // 合成一个区间时区间宽度随 |cx-cz| 增长,路口数按 N² 爆炸。
+    let junctions_x: Vec<i32> = street_indices_in(
+        (cx - BLOCK_VIEW_RADIUS).floor(),
+        (cx + BLOCK_VIEW_RADIUS).ceil(),
     );
-    for line_xi in junctions.iter() {
+    let junctions_z: Vec<i32> = street_indices_in(
+        (cz - BLOCK_VIEW_RADIUS).floor(),
+        (cz + BLOCK_VIEW_RADIUS).ceil(),
+    );
+    for line_xi in junctions_x.iter() {
         let line_x: f32 = street_axis(*line_xi);
-        for line_zi in junctions.iter() {
+        for line_zi in junctions_z.iter() {
             let line_z: f32 = street_axis(*line_zi);
             for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
                 out.push(PropPlacement {
@@ -5433,22 +5451,29 @@ pub(crate) fn simulate(game: &mut Game, delta: f32) {
         (forward_input, strafe_input)
     };
     // 车队先走:玩家开的那辆由 `drive` 接管,其余按巡航速度循环。
+    //
+    // **`traffic.step()` 必须无条件调用。** 它是全部 NPC 车的唯一逐帧
+    // 更新,而它原先只挂在 `None`(步行)分支上 —— 玩家一上车,其余 9 辆
+    // 就再也不会被遍历、积分或碰撞,整个 NPC 车流**逐帧冻结**。实测:玩家
+    // 踩油门 6 s 跑了 85.32 m,同期 NPC 车位移 0.000 m,速度前后逐位相同
+    // (11.20 → 11.20),下车 3 s 内 4/9 才恢复。GTA 里车流永远在动。
+    //
+    // 「招手打车」只在**步行**时成立:玩家坐在车里不该再被路边停靠的车
+    // 缠住,所以 `hailer` 跟着 `driven.is_none()` 走。
     let driven: Option<usize> = game.get_player().get_vehicle();
-    match driven {
-        Some(index) => {
-            let world: CollisionWorld = game.get_world_ref().clone();
-            if let Some(car) = game.get_mut_traffic().get_car_mut(index) {
-                car.drive(forward_input, steer_input, dt, &world);
-            }
-        }
+    let traffic_world: CollisionWorld = game.get_world_ref().clone();
+    let hailer: Option<[f32; 2]> = match driven {
+        Some(_) => None,
         None => {
-            // 玩家在路边「招手」:附近的车会减速停靠,不然 8–14 m/s 的车
-            // 徒步根本追不上,上车功能等于不存在。
             let here: Vec3 = game.get_player().get_position();
-            let world: CollisionWorld = game.get_world_ref().clone();
-            game.get_mut_traffic()
-                .step(dt, Some([here[0], here[2]]), &world);
+            Some([here[0], here[2]])
         }
+    };
+    game.get_mut_traffic().step(dt, hailer, &traffic_world);
+    if let Some(index) = driven
+        && let Some(car) = game.get_mut_traffic().get_car_mut(index)
+    {
+        car.drive(forward_input, steer_input, dt, &traffic_world);
     }
     // 玩家。
     match game.get_player().get_vehicle() {
@@ -5691,6 +5716,25 @@ pub(crate) fn step_vertical(game: &mut Game, dt: f32) {
         radius,
     );
     let (x, z): (f32, f32) = (pushed[0], pushed[1]);
+    // 室内层分离之后,速度要按**实际走出来的位移**重算。
+    //
+    // `Player::step` 是拿静态层落点反算速度的(朝墙分量自然归零),但
+    // 室内层是在那之后又覆写了 XZ 的:玩家顶在室内墙上时位置冻结,
+    // 速度却仍然是满速的 2.2 —— 实测连续 17 帧 `x = 27.4000` 而
+    // `vx = 2.2`、`gaitAmount = 1.000`。位置是对的,只有状态读数错了,
+    // 而 `resolve_dynamic_bodies` 的推挤判据正是
+    // `player_speed > PLAYER_PUSH_MIN_SPEED`,于是卡在墙上的玩家照样被
+    // 判定成「正在快速移动」,继续接受把人往几何体里推的挤压力。
+    //
+    // 和 `Player::step` 一样:反算,不把分离量加回去(1/dt 会放大)。
+    let achieved: Vec2 = [x - here[0], z - here[2]];
+    let inverse_dt: f32 = 1.0 / dt.max(f32::EPSILON);
+    let carried: Vec2 = game.get_player().get_velocity();
+    let speed_cap: f32 = carried[0].abs().max(carried[1].abs()).max(RUN_SPEED);
+    game.get_mut_player().set_velocity([
+        (achieved[0] * inverse_dt).clamp(-speed_cap, speed_cap),
+        (achieved[1] * inverse_dt).clamp(-speed_cap, speed_cap),
+    ]);
     // ---- 2. 支撑面:脚下那块板(含楼梯下一级)。
     //
     // **这一帧必须切成一串小步走,不能只查落点。**
@@ -7324,6 +7368,14 @@ pub(crate) fn collect_pickups(game: &mut Game) {
         let picked: Option<Pickup> = game.get_mut_traffic().get_pickup_mut(index).cloned();
         if let Some(mut picked) = picked {
             apply_pickup(game.get_mut_player(), &mut picked);
+        }
+        // `apply_pickup` 的 `set_taken(true)` 落在上面那份 **clone** 上,
+        // 真正的拾取物 `taken` 一直是 false,于是下一帧第 7326 行的
+        // `get_taken()` 守卫形同虚设 —— 玩家站在原地可以无限次拾取同一件,
+        // 实测 HUD 打到 `pickups 330/12`、现金 $8250(12 件物品)。
+        // 收益结算靠 clone 已经走完了,这里只需要把**活的那个**标记掉。
+        if let Some(live) = game.get_mut_traffic().get_pickup_mut(index) {
+            live.set_taken(true);
         }
         game.get_mut_player().set_collected_push(index);
         // 拾走了就不该还在地上:把该批次的实例清零。

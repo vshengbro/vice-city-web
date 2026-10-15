@@ -10,3 +10,6 @@ __pycache__/
 # can serve them. Never commit it: Pages would receive a dangling link, and
 # the deploy workflow stages real files into www/assets itself.
 www/assets
+# Audit scratch output from tools/blender/audit_*.py (geometry_audit.json,
+# preview_pixels.json, render_ab/, sign_hires/). Regenerate on demand.
+.audit/
