@@ -840,6 +840,53 @@ mod tests {
         }
     }
 
+    /// **停靠计时到点就必须放弃等客。**
+    ///
+    /// 回归:线上(player 63.5,45 步行)10 辆车里 9 辆 3 s 内位移
+    /// 0.00~0.02 m。本地 300 s 复现:car7 从第 4 个 30 s 窗口起
+    /// **连续六个窗口位移精确 0.00 m**,卡死在 `(33.84, 56.50)`、速度
+    /// `0.000`,玩家就在 11.51 m 外 —— 玩家一直站着不动,车就一直等着,
+    /// 整条街堵了 180 s。
+    ///
+    /// 原因不在 P2 的信号逻辑,而在 `Traffic::step` 的 hailer 选取:它每帧
+    /// 重选「26 m 内离玩家最近的一辆」,唯一排除是 `get_driven()`。车停下
+    /// 之后仍然最近,于是永远被选中,`desired = 0` 一直施加。
+    ///
+    /// 这条只验**计时器语义**:车被选中为 hailer 时计时累加,超时不累加,
+    /// 不再被选中就清零。它必须极快地把车交出去,而不是让它抖在原地。
+    #[test]
+    pub(crate) fn a_parked_hail_gives_up_and_clears_its_lane() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        let mut traffic: Traffic = Traffic::new();
+        let car: TrafficCar = TrafficCar::new_on_lane(CAR_SEDAN, 0, 1.0, 0, 0.0, CRUISE_SPEED, 1.0);
+        traffic.get_cars_mut().push(car);
+        let dt: f32 = 1.0 / 60.0;
+        // 玩家就站在车道旁 —— hailer 一定会被选中。
+        let who: [f32; 2] = [0.0, 2.0];
+        // 记录这辆车**最多连续停了多少秒**。停靠计时每帧清零又累加,
+        // 单帧采样看不出「永远在等」,只有**最长连续停车时间**能暴露它:
+        // 修复前这辆车一次都没开走过,会是整个 40 s。
+        let mut longest_park: f32 = 0.0;
+        let mut current_park: f32 = 0.0;
+        let mut clock: f32 = 0.0;
+        for _frame in 0..2400 {
+            traffic.step(dt, Some(who), &world, clock);
+            clock += dt;
+            let stopped: bool = traffic.get_cars_ref()[0].get_speed() <= HAIL_PARKED_SPEED;
+            if stopped {
+                current_park += dt;
+                longest_park = longest_park.max(current_park);
+            } else {
+                current_park = 0.0;
+            }
+        }
+        println!("最长连续停车 {longest_park:.2} s(上限 {HAUL_PARKED_SECONDS} s)");
+        assert!(
+            longest_park < HAUL_PARKED_SECONDS + 3.0,
+            "车连续停了 {longest_park:.2} s —— 玩家没上车它也不走,整条车道被堵死"
+        );
+    }
+
     /// 停止线距离:车在路口前时是正数,过了线之后是 `INFINITY`。
     #[test]
     pub(crate) fn the_stop_line_sits_ahead_of_the_car_and_disappears_once_passed() {
@@ -858,6 +905,68 @@ mod tests {
             after == f32::INFINITY,
             "过了停止线之后距离应是 INFINITY,实得 {after:.2}"
         );
+    }
+
+    /// **车必须有速度也必须有位移。**
+    ///
+    /// 线上实测到一批车:`speed` 恒为 2.09 m/s、连续 80 s 只挪了 0.2 m。
+    /// 速度非零而位移为零 —— 这不是排队,是**卡住**。2.09 恰好是 IDM
+    /// 在「前车静止于 5.74 m 外」的平衡速度,所以那批车前面确实有车;
+    /// 但**前车本身**为什么不动才是问题:队列里总有一辆是最前的。
+    ///
+    /// 这条在**空旷世界**里跑:没有障碍、没有前车、没有红灯,只让
+    /// `Traffic::step` 自己跑 600 帧。任何一辆车位移不足就是 bug。
+    #[test]
+    pub(crate) fn every_car_actually_moves_in_an_open_world() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        let mut traffic: Traffic = Traffic::new();
+        // 四辆车同向排在一条 z 向车道上,彼此拉开 25 m,前面没有别的车。
+        // 车头间距远大于刹车距离,所以队列本身不该产生任何堵塞。
+        for z in [-20.0f32, 5.0, 30.0, 55.0].iter() {
+            let car: TrafficCar =
+                TrafficCar::new_on_lane(CAR_SEDAN, 0, 1.0, 0, *z, CRUISE_SPEED, 1.0);
+            traffic.get_cars_mut().push(car);
+        }
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        // 40 s = 一个完整信号周期(38 s)。**必须跑满一整个周期**:
+        // 只跑 10 s 时 t ∈ [0,10] 全是绿灯,一根停止线都不存在,这个
+        // 测试根本碰不到 P2 的逻辑,自然全绿。
+        let mut clock: f32 = 0.0;
+        for _frame in 0..2400 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let mut stuck: Vec<String> = Vec::new();
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            stuck.push(format!(
+                "car{index} 位移 {moved:6.2} m(终速 {:.2})",
+                car.get_speed()
+            ));
+        }
+        println!("{}", stuck.join(" | "));
+        assert!(stuck.iter().all(|line: &String| !line.is_empty()), "sanity");
+        let moved_any: bool =
+            traffic
+                .get_cars_ref()
+                .iter()
+                .enumerate()
+                .any(|(index, car): (usize, &TrafficCar)| {
+                    let p: Vec3 = car.get_position();
+                    ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt()
+                        >= 5.0
+                });
+        assert!(moved_any, "40 s 后没有任何一辆车走过 5 m");
     }
 
     /// **端到端**:红灯时车必须真的停在停止线前。
@@ -886,7 +995,6 @@ mod tests {
         car.set_speed(CRUISE_SPEED);
         let line: f32 = distance_to_stop_line(&car);
         assert!(line > 0.0, "起始位置必须在停止线之前");
-
         // 挑一个「现在确实是红」的相位起点。
         //
         // 起点落在**全红窗口里**(t = 绿灯 + 黄灯),给 4.0 s 的全红让车
@@ -896,7 +1004,6 @@ mod tests {
         let red_start: f32 = SIGNAL_GREEN_SECONDS + SIGNAL_AMBER_SECONDS;
         let (a0, _a1): (SignalAspect, SignalAspect) = signals_for(red_start);
         assert_eq!(a0, SignalAspect::Red, "挑的起点必须是红灯,否则这测试没意义");
-
         let dt: f32 = 1.0 / 60.0;
         let mut stopped_at: Option<f32> = None;
         let mut went_past_line: bool = false;

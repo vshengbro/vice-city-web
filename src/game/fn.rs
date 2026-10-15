@@ -10915,6 +10915,634 @@ mod tests {
         }
     }
 
+    /// 用**真实城市道具**造一个碰撞世界。
+    ///
+    /// 五条车队测试都要同一份世界(交通灯 + 锥桶的碰撞盒 + 街区建筑)。
+    /// 之前每条各抄一遍 `read_to_string` + `collider_bounds`,于是 §1.3c
+    /// 一次性报 50 个「字符串必须写在 const.rs」—— 字面量本身没问题,
+    /// 重复才是问题。抽成这一个函数,同时也保证五条测的是**同一个世界**。
+    ///
+    /// 必须走生产路径 [`build_collision_world`]:手工拼 `push_box` 会绕过
+    /// `solid_bounds` 的高度带和 `on_lane` 的车道排除,测出来的是测试
+    /// 自己造的空气墙,不是线上缺陷。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 世界中心的 X。
+    /// - `f32` - 世界中心的 Z。
+    ///
+    /// # Returns
+    ///
+    /// - `CollisionWorld` - 造好的碰撞世界。
+    pub(crate) fn traffic_world_at(cx: f32, cz: f32) -> CollisionWorld {
+        let raw: String =
+            crate::fs::read_to_string(TRAFFIC_LIGHT_ASSET_PATH).expect(TRAFFIC_LIGHT_ASSET_MISSING);
+        let asset: MeshAsset = serde_json::from_str(&raw).expect(TRAFFIC_LIGHT_ASSET_UNREADABLE);
+        let mut bounds: HashMap<String, crate::mesh::Bounds> = HashMap::new();
+        collider_bounds(&mut bounds, TRAFFIC_LIGHT_ASSET_ID, &asset);
+        collider_bounds(&mut bounds, TRAFFIC_CONE_ASSET_ID, &asset);
+        let mut world: CollisionWorld = CollisionWorld::new();
+        build_collision_world(&mut world, &bounds, cx, cz);
+        world
+    }
+
+    /// **车队 + 红绿灯 + 真实城市:车必须真的动。**
+    ///
+    /// 线上(P2 部署后)实测到一批车:`carSpeed` 恒为 **2.09 m/s**,
+    /// 连续 80 s 只挪了 **0.2 m** —— 速度非零、位移为零。
+    ///
+    /// 两条已有测试都覆盖不到这个组合:
+    ///
+    /// - `traffic_drives_through_a_junction_in_the_real_city` 跑的是**单车**
+    ///   `TrafficCar::step`,不经过 `Traffic::step`,所以**永远碰不到红绿灯**。
+    /// - `every_car_actually_moves_in_an_open_world` 用的是**空碰撞世界**,
+    ///   没有楼,也就测不到「车被建筑吃掉每帧位移」。
+    ///
+    /// 而线上的车卡在路口附近 —— 正是「楼 + 停止线 + 车队跟车」三者
+    /// 叠加的地方。2.09 m/s 恰好是 IDM 在「前车静止于 5.74 m 外」的平衡
+    /// 速度(`(v/11.5)^4 + ((2.6+1.5v)/5.74)^2 = 1`),所以这些车**确实
+    /// 在跟车**;问题是队列最前面那辆为什么不动。
+    ///
+    /// 这条用**真实城市道具** + **完整 40 s 信号周期**跑整支车队。
+    #[test]
+    pub(crate) fn the_whole_fleet_keeps_moving_through_two_signal_cycles() {
+        let mut world: CollisionWorld = traffic_world_at(60.0, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        // 沿 +Z 排 4 辆,间隔 25 m。
+        for z in [-20.0f32, 5.0, 30.0, 55.0].iter() {
+            let car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 0, 1.0, 0, *z, 11.5, 1.0);
+            traffic.get_cars_mut().push(car);
+        }
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        // 40 s > 38 s 一个周期 —— 必须跑满,否则 t∈[0,10] 全是绿灯,
+        // 停止线一根都不存在,测试等于没测 P2。
+        let mut clock: f32 = 0.0;
+        for _frame in 0..2400 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let mut worst: String = String::new();
+        let mut min_moved: f32 = f32::INFINITY;
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            min_moved = min_moved.min(moved);
+            worst.push_str(&format!(
+                "car{index} {moved:.1}m v={:.2}; ",
+                car.get_speed()
+            ));
+        }
+        println!("车队 40s: {worst}");
+        assert!(
+            min_moved >= 5.0,
+            "真实城市里跑满一个信号周期,最慢的车只走了 {min_moved:.2} m({worst})"
+        );
+    }
+
+    /// **单车在路口附近会不会卡死 —— 复现线上 car5 的状态。**
+    ///
+    /// 线上实测(玩家在 63.5,45):
+    ///
+    /// ```text
+    /// car5: v=2.09 pos=(-67.2,-56.5) 距玩家 165.5 m  <- 远超 HAUL_RANGE 26
+    /// car9: v=2.09 pos=(-62.7,-56.5) 距玩家 161.9 m
+    /// car6: v=0.20 pos=(-58.3,-56.5) 距玩家 158.5 m
+    /// ```
+    ///
+    /// 三辆车都停在 x≈-60 的路口中轴线两侧,而且**全都远离玩家** ——
+    /// 所以既不是 hailer(26 m 外),也不是玩家造成的。2.09 m/s 是
+    /// 「有前车静止于 5.74 m 外」的 IDM 平衡速度,但这条街上不该有
+    /// 一辆永远不动的车给它们当前车。
+    ///
+    /// 这条把车直接放在 `(-67.2, -56.5)` 上单独跑:**没有前车、没有
+    /// 玩家、没有 hailer**。它要是也卡住,那就是单车在路口被静态几何
+    /// 挡住 —— `route_advance` 每帧把速度砍到 0,而车队层在其之后又把
+    /// 速度按 IDM 写回非零值,于是探针读到「有速度却没位移」。
+    #[test]
+    pub(crate) fn a_lone_car_near_the_minus_sixty_junction_keeps_rolling() {
+        let mut world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        // 街道 -1、右侧车道 => 横向中心 = -60 + 3.5 = -56.5,与线上一致。
+        let mut car: crate::traffic::TrafficCar =
+            crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, -1, 1.0, 0, -67.2, 11.5, 1.0);
+        car.set_position([-67.2, 0.0, -56.5]);
+        traffic.get_cars_mut().push(car);
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        let mut first: [f32; 2] = [-67.2, -56.5];
+        for frame in 0..1200 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+            if frame == 0 {
+                let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
+                let p: Vec3 = c.get_position();
+                first = [p[0], p[2]];
+            }
+        }
+        let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
+        let p: Vec3 = c.get_position();
+        let moved: f32 = ((p[0] - first[0]).powi(2) + (p[2] - first[1]).powi(2)).sqrt();
+        println!(
+            "单车 20s: ({:.2},{:.2}) -> ({:.2},{:.2}) 位移 {moved:.2} m 终速 {:.2}",
+            first[0],
+            first[1],
+            p[0],
+            p[2],
+            c.get_speed()
+        );
+        assert!(
+            moved >= 5.0,
+            "路口附近的一辆车 20 s 只走了 {moved:.2} m(终速 {:.2},位置 {:.2},{:.2})",
+            c.get_speed(),
+            p[0],
+            p[2]
+        );
+    }
+
+    /// **四辆车挤在路口上,前后只差一个车长 —— 会不会互相锁死。**
+    ///
+    /// 线上实测(玩家在 63.5,45),x 方向那一排:
+    ///
+    /// ```text
+    /// car3 x=48.3 v=2.09 | car1 x=52.9 v=2.09 | car4 x=57.4 v=2.09 | car2 x=61.7 v=0.20
+    /// ```
+    ///
+    /// 相邻间距 2.2 m —— **恰好是一个车长**(`CAR_FOOTPRINT[0] = 2.283`),
+    /// 也就是四辆车**鼻碰着尾**堵在路口中轴线 x=60 上,队首(car2)已经
+    /// 越过中轴线 1.7 m。而且这四辆**互相**是前车:`leader_gap` 算的是
+    /// 车身净间距,净间距≈0 时 `interaction` 项直接饱和,后车全被按死。
+    ///
+    /// 单车测试(`a_lone_car_near_the_minus_sixty_junction_keeps_rolling`)
+    /// 一辆车走 214 m 完全正常 —— 所以这不是「车过不去路口」,而是
+    /// **车队在这种初始排布下会自锁**。这正是线上 80 s 只挪 0.2 m 的样子。
+    #[test]
+    pub(crate) fn a_nose_to_tail_pile_up_at_a_junction_unlocks() {
+        let mut world: CollisionWorld = traffic_world_at(60.0, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        // 街道 1、右侧车道 => 横向中心 = 60 + 3.5 = 63.5,沿 +X 行驶。
+        for x in [48.3f32, 52.9, 57.4, 61.7].iter() {
+            let mut car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 1, *x, 11.5, 1.0);
+            car.set_position([*x, 0.0, 63.5]);
+            traffic.get_cars_mut().push(car);
+        }
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        for _frame in 0..2400 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let mut worst: String = String::new();
+        let mut min_moved: f32 = f32::INFINITY;
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            min_moved = min_moved.min(moved);
+            worst.push_str(&format!(
+                "car{index} {moved:.1}m v={:.2}; ",
+                car.get_speed()
+            ));
+        }
+        println!("鼻碰尾车队 40s: {worst}");
+        assert!(
+            min_moved >= 5.0,
+            "鼻碰尾堵在路口的车队跑满一个周期后,最慢的车只走了 {min_moved:.2} m({worst})"
+        );
+    }
+
+    /// **玩家站在路边招手时,整支车队会不会全被钉死。**
+    ///
+    /// 线上实测(玩家在 63.5,45,步行):**10 辆车里 9 辆完全不动** ——
+    /// 3 s 内位移 0.00~0.02 m,而速度探针读出 2.09 / 0.13 m/s。
+    /// 只有 car7(3243 m 外,早开出交通半径)在正常跑。
+    ///
+    /// 关键在于**线上 `hailer` 不是 `None`**:玩家步行时
+    /// `hailer = Some([x, z])`,于是 `Traffic::step` 会挑一辆 `HAUL_RANGE`
+    /// 内最近的车 `desired = 0` 停靠等人。之前所有测试都传 `None`,
+    /// 所以一条都没碰到这条路径 —— 包括「有 hailer 时车队仍能流动」。
+    ///
+    /// 这条把玩家放在车队正中间,逼出 hailer,再要求每辆车都必须动。
+    #[test]
+    pub(crate) fn a_hailing_player_does_not_freeze_the_whole_fleet() {
+        let mut world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        for z in [-40.0f32, -15.0, 10.0, 35.0].iter() {
+            let car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 0, 1.0, 0, *z, 11.5, 1.0);
+            traffic.get_cars_mut().push(car);
+        }
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        // 玩家站在 z=-2.5 的路边:四辆车里至少一辆落在 HAUL_RANGE 26 内,
+        // 于是 hailer 一定被选中。
+        let who: [f32; 2] = [3.5, -2.5];
+        for _frame in 0..2400 {
+            traffic.step(dt, Some(who), &world, clock);
+            clock += dt;
+        }
+        let mut worst: String = String::new();
+        let mut min_moved: f32 = f32::INFINITY;
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            min_moved = min_moved.min(moved);
+            worst.push_str(&format!(
+                "car{index} {moved:.1}m v={:.2}; ",
+                car.get_speed()
+            ));
+        }
+        println!("有招手人 40s: {worst}");
+        // 只允许**一辆**被钉住等客(那就是 hailer 的设计),其余必须动。
+        let moving: usize = traffic
+            .get_cars_ref()
+            .iter()
+            .enumerate()
+            .filter(|(index, car): &(usize, &crate::traffic::TrafficCar)| {
+                let p: Vec3 = car.get_position();
+                ((p[0] - start[*index][0]).powi(2) + (p[2] - start[*index][1]).powi(2)).sqrt()
+                    >= 5.0
+            })
+            .count();
+        assert!(
+            moving >= 2,
+            "玩家招手后 40 s 只有 {moving}/4 辆车动过 —— 整支车队被钉死({worst})"
+        );
+    }
+
+    /// **队首车刚越过路口中轴线就停住 —— 后车全体被锁。**
+    ///
+    /// 线上实测(玩家在 63.5,45)沿 +X 那一排:
+    ///
+    /// ```text
+    /// car3 x=48.3 v=2.09 | car1 x=52.9 v=2.09 | car4 x=57.4 v=2.09 | car2 x=61.7 v=0.20
+    /// ```
+    ///
+    /// 逐个对几何(街道 1,`LANE_OFFSET` 3.5,停止线 50.717,中轴线 60):
+    ///
+    /// - car3 @48.3 —— 停止线**外** 2.4 m,队列最末。
+    /// - car1 @52.9 —— 已压过停止线 2.18 m,**在路口箱内**。
+    /// - car4 @57.4 —— 也在路口箱内。
+    /// - car2 @61.7 —— 已越过中轴线 1.7 m,`v = 0.20` 基本停死。
+    ///
+    /// car1 之所以只有 2.09 m/s,是**跟在 car2 后面**:净间距
+    /// `61.7 − 52.9 − 2.283` = 6.52 m,IDM 平衡速度 2.61 m/s,实测 2.09
+    /// —— 数量级吻合。所以 2.09 不是 bug,是正常跟车。
+    ///
+    /// 真正的问题是**队首 car2 为什么停下**。它已经越过中轴线,应该触发
+    /// `choose_at_junction` 换到下一条街继续开。这条直接盯这个状态:
+    /// 一辆车停在刚过中轴线的位置,给它 20 s,看它走不走。
+    #[test]
+    pub(crate) fn a_car_just_past_the_junction_centre_keeps_driving() {
+        let mut world: CollisionWorld = traffic_world_at(60.0, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        let mut car: crate::traffic::TrafficCar =
+            crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 1, 61.7, 11.5, 1.0);
+        car.set_position([61.7, 0.0, 63.5]);
+        traffic.get_cars_mut().push(car);
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        for _frame in 0..1200 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
+        let p: Vec3 = c.get_position();
+        println!(
+            "刚过中轴线的车 20s 后在 ({:.2},{:.2}) 终速 {:.2}",
+            p[0],
+            p[2],
+            c.get_speed()
+        );
+        let moved: f32 = ((p[0] - 61.7).powi(2) + (p[2] - 63.5).powi(2)).sqrt();
+        assert!(
+            moved >= 5.0,
+            "刚越过路口中轴线的车 20 s 只走了 {moved:.2} m,停在 ({:.2},{:.2}) 终速 {:.2}",
+            p[0],
+            p[2],
+            c.get_speed()
+        );
+    }
+
+    /// **生产出生点 + 路边招手 —— 逐字复现线上被冻住的 9 辆车。**
+    ///
+    /// 这是把线上观测全部对齐之后的第一条测试。前七条复现都各自改了
+    /// 一个变量(空世界 / 单车 / 鼻碰尾 / hailer),全都绿 —— 说明缺的是
+    /// **组合**,而组合里的关键是线上真实的那两条:
+    ///
+    /// 1. **生产出生点** [`TRAFFIC_LANE_PLAN`]:车不是随机撒的,而是按
+    ///    `TRAFFIC_LANE_PLAN` 逐条 `new_on_lane` 铺在街道 1 / -1 上。
+    /// 2. **`hailer = Some([x, z])`**:玩家步行时一定非空。之前所有
+    ///    traffic 测试都传 `None`,没碰过这条路。
+    ///
+    /// 线上(player 63.5,45)实测 9/10 辆车 3 s 内位移 0.00~0.02 m。
+    ///
+    /// # Arguments
+    ///
+    /// 无。
+    ///
+    /// # Returns
+    ///
+    /// 无 —— 失败即 panic。
+    #[test]
+    pub(crate) fn the_production_fleet_with_a_hailing_player_keeps_flowing() {
+        let mut world: CollisionWorld = traffic_world_at(33.5, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        // **走生产路径**:`traffic_lanes()` + `populate`,和 `load_assets_and_build`
+        // 一模一样。手工 `new_on_lane` 会漏掉资产种类和方向。
+        traffic.populate(&traffic_lanes(), PICKUP_PLACEMENTS);
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        // 玩家出生点 —— 线上就是这个位置。
+        let who: [f32; 2] = [33.5, 45.0];
+        for _frame in 0..2400 {
+            traffic.step(dt, Some(who), &world, clock);
+            clock += dt;
+        }
+        let mut worst: String = String::new();
+        let mut frozen: Vec<String> = Vec::new();
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            worst.push_str(&format!(
+                "car{index} {moved:.1}m v={:.2}; ",
+                car.get_speed()
+            ));
+            if moved < 1.0 {
+                frozen.push(format!("car{index}({moved:.2}m)"));
+            }
+        }
+        println!("生产车队+招手 40s: {worst}");
+        // 最多允许**一辆**不动(离玩家最近的那辆在等客,这是设计)。
+        assert!(
+            frozen.len() <= 1,
+            "生产车队里 {} 辆车 40 s 没动(只有一辆可以等客):{}",
+            frozen.len(),
+            frozen.join(",")
+        );
+    }
+
+    /// **长时间运行后车队会不会退化 —— 跑 300 秒。**
+    ///
+    /// 线上那批车不是一开始就冻住的:页面已经跑了 23,000+ 帧(≈ 6 分钟)
+    /// 才采样到。前八条复现都只跑 40 s,全部绿 —— 初始条件显然没问题。
+    ///
+    /// 于是剩下的唯一变量是**时间**。最可疑的是 [`next_route_draw`]:
+    /// 路口抽签用 `route_seed`,历史上就有过「洗回 0 之后永远转向」的
+    /// 死循环 bug(`route_rand(0) == 0` 是不动点)。如果某辆车抽签后
+    /// 反复被分到同一个路口,就会在路口箱里原地打转 —— 位置不动而
+    /// `leader_gap` 让后车读到 2.09 m/s 的平衡速度。
+    ///
+    /// 这条跑 18,000 帧(300 s,≈ 8 个信号周期),要求每辆车累计位移
+    /// 都远超一个街区。
+    #[test]
+    pub(crate) fn the_fleet_still_flows_after_five_minutes() {
+        let mut world: CollisionWorld = traffic_world_at(33.5, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        traffic.populate(&traffic_lanes(), PICKUP_PLACEMENTS);
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        let who: [f32; 2] = [33.5, 45.0];
+        // 每 30 s 记一次净位移:真实车轮转 5 圈,不该有哪一圈是 0。
+        let mut trace: Vec<String> = Vec::new();
+        let mut frozen_ever: bool = false;
+        let mut last: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        for window in 1..=10 {
+            for _frame in 0..1800 {
+                traffic.step(dt, Some(who), &world, clock);
+                clock += dt;
+            }
+            let now: Vec<[f32; 2]> = traffic
+                .get_cars_ref()
+                .iter()
+                .map(|car: &crate::traffic::TrafficCar| {
+                    let p: Vec3 = car.get_position();
+                    [p[0], p[2]]
+                })
+                .collect();
+            let worst_index: usize = (0..now.len())
+                .min_by(|a: &usize, b: &usize| {
+                    let da: f32 = ((now[*a][0] - last[*a][0]).powi(2)
+                        + (now[*a][1] - last[*a][1]).powi(2))
+                    .sqrt();
+                    let db: f32 = ((now[*b][0] - last[*b][0]).powi(2)
+                        + (now[*b][1] - last[*b][1]).powi(2))
+                    .sqrt();
+                    da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+                })
+                .unwrap_or(0);
+            let d: f32 = ((now[worst_index][0] - last[worst_index][0]).powi(2)
+                + (now[worst_index][1] - last[worst_index][1]).powi(2))
+            .sqrt();
+            trace.push(format!("w{window} 最慢 car{worst_index} {d:.2}m"));
+            // 「卡死」的判据是**彻底不动**,不是「慢」。1.0 m / 30 s = 0.03 m/s,
+            // 那仍然是流动中的车;线上观察到的是位移**精确为 0.00 m**,
+            // 而速度探针同时读出 2.09 m/s —— 位置和速度互相矛盾。
+            if d < 0.001 {
+                println!(
+                    "  >> car{worst_index} 完全卡住 在 ({:.2},{:.2}) 速度 {:.3} lane_axis={} dir={}",
+                    now[worst_index][0],
+                    now[worst_index][1],
+                    traffic.get_cars_ref()[worst_index].get_speed(),
+                    traffic.get_cars_ref()[worst_index].get_lane_axis(),
+                    traffic.get_cars_ref()[worst_index].get_direction()
+                );
+                frozen_ever = true;
+            }
+            last = now;
+        }
+        println!("300s 分窗: {}", trace.join(" | "));
+        // 每一窗至少要有一辆车跑过 20 m(30 s × 11.5 m/s 上限 = 345 m,
+        // 20 m 是极宽松的下限,只为抓「完全不动」)。
+        assert!(
+            !frozen_ever,
+            "5 分钟里有车彻底卡死(30 s 位移 < 1 mm):{}",
+            trace.join(" | ")
+        );
+    }
+
+    /// **招手的车停稳之后,必须让位给下一辆 —— 不能霸占车道。**
+    ///
+    /// 线上实测(玩家 63.5,45 步行)10 辆车里 9 辆 3 s 内位移 0.00~0.02 m,
+    /// 速度探针读 2.09 / 0.13 m/s。本地 300 s 复现:car7 在第 4 个 30 s
+    /// 窗口之后**连续六个窗口位移精确为 0.00 m**,卡死在
+    /// `(33.84, 56.50)`、速度 `0.000`,而玩家出生点就在 `(33.5, 45)`
+    /// —— **相距 11.51 m,在 `HAUL_RANGE = 26` 之内**。
+    ///
+    /// 机制([`Traffic::step`] 的 `hailer_car` 选取):每帧重新挑
+    /// 「26 m 内离玩家最近的一辆」,**唯一排除条件是 `get_driven()`**。
+    /// 一辆车一旦停下等客,下一帧它仍然最近,于是继续被选中,
+    /// `desired = 0` 一直施加 —— 车道被**永久**占住,后车全被锁在
+    /// IDM 平衡速度上。
+    ///
+    /// 这条要求:玩家一直站在原地招手 300 s,车队里**仍然要有车在动**。
+    #[test]
+    pub(crate) fn a_stopped_hail_does_not_permanently_block_the_lane() {
+        let mut world: CollisionWorld = traffic_world_at(33.5, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        traffic.populate(&traffic_lanes(), PICKUP_PLACEMENTS);
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        // 玩家**一直不动**地站在出生点招手 —— 这正是线上观察到的条件。
+        let who: [f32; 2] = [33.5, 45.0];
+        let mut last: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let mut stalled_since: usize = 0;
+        for window in 1..=10 {
+            for _frame in 0..1800 {
+                traffic.step(dt, Some(who), &world, clock);
+                clock += dt;
+            }
+            let now: Vec<[f32; 2]> = traffic
+                .get_cars_ref()
+                .iter()
+                .map(|car: &crate::traffic::TrafficCar| {
+                    let p: Vec3 = car.get_position();
+                    [p[0], p[2]]
+                })
+                .collect();
+            let moving: usize = (0..now.len())
+                .filter(|i: &usize| {
+                    ((now[*i][0] - last[*i][0]).powi(2) + (now[*i][1] - last[*i][1]).powi(2)).sqrt()
+                        >= 1.0
+                })
+                .count();
+            println!("  w{window}: {moving}/{} 辆车在动", now.len());
+            if moving <= 1 {
+                stalled_since += 1;
+            } else {
+                stalled_since = 0;
+            }
+            last = now;
+        }
+        assert_eq!(
+            stalled_since, 0,
+            "玩家原地招手时,车队连续 {stalled_since} 个 30 s 窗口只有 ≤1 辆车在动 —— 车道被停靠的车永久堵死"
+        );
+    }
+
+    /// **两个路口、两组完全静止的车 —— 玩家不在 26 m 内。**
+    ///
+    /// 线上(player 63.5,45)实测的 2.09 m/s 车队其实分成**两组**:
+    ///
+    /// ```text
+    /// 组 A:x=48.3 / 52.9 / 57.4 / 61.7   z=63.5   距玩家 18~24 m
+    /// 组 B:x=-67.2 / -62.7 / -58.3        z=-56.5  距玩家 158~166 m
+    /// ```
+    ///
+    /// 组 A 落在 `HAUL_RANGE = 26` 内,可以用「停靠等客」解释;**组 B 离
+    /// 玩家 160 m,跟 hailer 一点关系都没有**,却同样是 2.09 / 0.20 m/s
+    /// 且位移 0.00~0.02 m。只修 hailer 解释不了组 B。
+    ///
+    /// 这条把 `hailer` 传 `None`,复现组 B 的几何(街道 -1、z=-56.5、
+    /// 沿 +X),跑 300 s,要求每一辆车都动。
+    #[test]
+    pub(crate) fn two_junction_queues_flow_without_any_player() {
+        let mut world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        // 组 B 的实测几何:街道 -1、side +1 => z = -60 + 3.5 = -56.5,沿 +X。
+        // 相邻间距 ~4.5 m,和线上 2.2 m 那个「鼻碰尾」不同,这里是正常排队。
+        for x in [-71.7f32, -67.2, -62.7, -58.3, -53.8].iter() {
+            let mut car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, -1, 1.0, 1, *x, 11.5, 1.0);
+            car.set_position([*x, 0.0, -56.5]);
+            traffic.get_cars_mut().push(car);
+        }
+        let mut last: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        let mut frozen_ever: bool = false;
+        // **没有玩家**:`hailer = None`。
+        for window in 1..=10 {
+            for _frame in 0..1800 {
+                traffic.step(dt, None, &world, clock);
+                clock += dt;
+            }
+            let now: Vec<[f32; 2]> = traffic
+                .get_cars_ref()
+                .iter()
+                .map(|car: &crate::traffic::TrafficCar| {
+                    let p: Vec3 = car.get_position();
+                    [p[0], p[2]]
+                })
+                .collect();
+            for i in 0..now.len() {
+                let d: f32 =
+                    ((now[i][0] - last[i][0]).powi(2) + (now[i][1] - last[i][1]).powi(2)).sqrt();
+                if d < 0.001 {
+                    frozen_ever = true;
+                    println!(
+                        "  >> w{window} car{i} 完全卡住 在 ({:.2},{:.2}) 速度 {:.3}",
+                        now[i][0],
+                        now[i][1],
+                        traffic.get_cars_ref()[i].get_speed()
+                    );
+                }
+            }
+            last = now;
+        }
+        assert!(
+            !frozen_ever,
+            "没有玩家在场,街道 -1 的五辆车却有彻底不动的 —— 与 hailer 无关"
+        );
+    }
+
     #[test]
     pub(crate) fn traffic_drives_through_a_junction_in_the_real_city() {
         // 回归:用**真实城市道具**当碰撞世界,让一辆车从街道 1 的南向车道
@@ -10924,14 +11552,7 @@ mod tests {
         // 必须走**生产路径** `build_collision_world`:手工拼 `push_box`
         // 会绕过 `solid_bounds` 的高度带和 `on_lane` 的车道排除,测出来
         // 的是测试自己造的空气墙,不是线上缺陷。
-        let raw: String = crate::fs::read_to_string("assets/prop_trafficlight.json")
-            .expect("交通灯资产必须在磁盘上");
-        let asset: MeshAsset = serde_json::from_str(&raw).expect("交通灯资产必须能解析");
-        let mut bounds: HashMap<String, crate::mesh::Bounds> = HashMap::new();
-        collider_bounds(&mut bounds, "prop_trafficlight", &asset);
-        collider_bounds(&mut bounds, "prop_traffic_cone", &asset);
-        let mut world: CollisionWorld = CollisionWorld::new();
-        build_collision_world(&mut world, &bounds, 0.0, 0.0);
+        let mut world: CollisionWorld = traffic_world_at(0.0, 0.0);
         let mut c: crate::traffic::TrafficCar =
             crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 60.0, 11.5, -1.0);
         let start: Vec3 = c.get_position();

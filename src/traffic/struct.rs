@@ -40,6 +40,15 @@ pub struct TrafficCar {
     /// 玩家是否正在驾驶这辆车。
     #[get(type(copy), pub(crate))]
     pub(crate) driven: bool,
+    /// 这辆车为了接正在招手的玩家而停靠,已经停了多久(秒)。
+    ///
+    /// 用来给停靠**设上限**:玩家一直站在路边不动时,车不该永远停在那儿
+    /// 把整条车道堵死。计时归零后这辆车放弃等客,恢复正常巡航,车道让给
+    /// 后面那辆 —— 现实里的出租车也是这么做的。
+    ///
+    /// `0.0` = 当前不是停靠状态(它在正常跑)。
+    #[get(type(copy), pub(crate))]
+    pub(crate) hailing_seconds: f32,
     /// 车当前所在街道的网格索引(`street_axis` 的参数)。
     ///
     /// AI 巡航的**路网坐标**:配合 [`Self::lane_side`] 与
