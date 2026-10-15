@@ -181,6 +181,91 @@ mod tests {
         );
     }
 
+    /// 路网的抽签流**不能坍缩到常数 0**。
+    ///
+    /// 原实现 `get_route_seed()` 读出旧值之后写 0,而 `route_rand(0) == 0`
+    /// —— 全零是这个哈希的不动点。于是流状态从第一次抽签之后就永远停在
+    /// 0,`next_unit(0) == 0.0`,而路口判定是 `draw < ROUTE_PICK`(0.62),
+    /// 于是**每一个路口都必然转向**,文档里写的「38% 直行」从来没发生过。
+    ///
+    /// 这条测试断言的是**行为**(直行与转向都真的会出现),而不是
+    /// 「某个数字等于某个数字」—— 前者能在实现被重构时继续成立。
+    #[test]
+    pub(crate) fn junction_draws_vary_instead_of_collapsing_to_zero() {
+        let mut c: TrafficCar = TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 45.0, 11.5, 1.0);
+        let mut turns: usize = 0;
+        let mut straights: usize = 0;
+        for _ in 0..256 {
+            let draw: f32 = c.next_route_draw();
+            assert!(
+                draw > 0.0 && draw < 1.0,
+                "抽签结果必须落在 [0,1),实得 {draw}:坍缩成 0 之后路口决策就是常量的"
+            );
+            if draw < ROUTE_PICK {
+                turns += 1;
+            } else {
+                straights += 1;
+            }
+        }
+        assert!(
+            turns > 0 && straights > 0,
+            "256 次抽签必须同时出现转向({turns})与直行({straights}):\
+             只有一个分支命中就说明随机流又退化成常量了"
+        );
+    }
+
+    /// 同一条车流轨迹必须**可重放**:同样的初始状态跑两遍,抽签序列逐项
+    /// 相同。这是 `route_seed` 存在的唯一理由,也是它 doc comment 的承诺。
+    #[test]
+    pub(crate) fn junction_draws_are_replayable() {
+        let mut a: TrafficCar = TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 45.0, 11.5, 1.0);
+        let mut b: TrafficCar = a.clone();
+        for _ in 0..64 {
+            assert_eq!(
+                a.next_route_draw(),
+                b.next_route_draw(),
+                "同初始状态的两辆车抽签序列发散了:同一条轨迹无法重放"
+            );
+        }
+    }
+
+    /// 车必须真的在路口**转弯**,而不是 10 条永不交叉的直线轨道。
+    ///
+    /// 原判定是 `along >= street_axis(street_index_at(along) + 1)`,而
+    /// `street_index_at` 是 `(along / 60).round()`,`along` 恒落在
+    /// `[60k - 30, 60k + 30)` —— 比要求整整差一个 60 m 档。穷举
+    /// 802,000 个坐标验证过:满足条件的坐标 **0 个**,所以
+    /// `choose_at_junction()` 是死代码。
+    ///
+    /// 判定「真的转过」不看内部状态,只看**世界坐标里的行进轴**:
+    /// 一辆沿 Z 走的车转过之后必须改沿 X 走。
+    #[test]
+    pub(crate) fn a_car_actually_changes_street_at_a_junction() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        let mut c: TrafficCar = TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 45.0, 11.5, 1.0);
+        let start_axis: i32 = c.get_lane_axis();
+        let mut turns_seen: usize = 0;
+        let mut previous_axis: i32 = start_axis;
+        for _ in 0..6000 {
+            c.route_advance(1.0 / 60.0, &world);
+            let axis: i32 = c.get_lane_axis();
+            if axis != previous_axis {
+                turns_seen += 1;
+                previous_axis = axis;
+            }
+        }
+        let p: Vec3 = c.get_position();
+        assert!(
+            turns_seen > 0,
+            "6000 帧({:.0} m 行程)一次都没转弯,最终在 ({:.1},{:.1}) 轴向 {} —— \
+             路口判定又是死代码了",
+            p[0].abs() + p[2].abs(),
+            p[0],
+            p[2],
+            c.get_lane_axis()
+        );
+    }
+
     /// 满舵直线行驶:车必须真的转出角度,而不是继续沿原方向直行。
     #[test]
     pub(crate) fn steering_turns_the_car() {

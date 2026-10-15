@@ -41,26 +41,33 @@ pub(crate) const STYLE_MINIMAP: &str = "position:absolute;right:14px;bottom:14px
 /// 车辆损坏后的色调(耐久越低越暗)。
 pub(crate) const TINT_VEHICLE_MIN: [f32; 3] = [0.55, 0.42, 0.42];
 
-/// 医院 A 的 X 坐标(米)。
-pub(crate) const HOSPITAL_A_X: f32 = 8.2;
-/// 医院 A 的 Z 坐标(米)。
-pub(crate) const HOSPITAL_A_Z: f32 = 8.2;
-/// 医院 B 的 X 坐标(米)。
-pub(crate) const HOSPITAL_B_X: f32 = -52.0;
-/// 医院 B 的 Z 坐标(米)。
-pub(crate) const HOSPITAL_B_Z: f32 = 52.0;
-/// 医院 C 的 X 坐标(米)。
-pub(crate) const HOSPITAL_C_X: f32 = 52.0;
-/// 医院 C 的 Z 坐标(米)。
-pub(crate) const HOSPITAL_C_Z: f32 = -52.0;
-/// 医院 D 的 X 坐标(米)。
-pub(crate) const HOSPITAL_D_X: f32 = -98.0;
-/// 医院 D 的 Z 坐标(米)。
-pub(crate) const HOSPITAL_D_Z: f32 = -98.0;
-/// 医院 E 的 X 坐标(米)。
-pub(crate) const HOSPITAL_E_X: f32 = 98.0;
-/// 医院 E 的 Z 坐标(米)。
-pub(crate) const HOSPITAL_E_Z: f32 = 98.0;
+/// WASTED 重生点相对街道中轴线的偏移(米)。
+///
+/// 取人行道内侧、车行道之外:路面半宽 7 m,车道中心 ±3.5 m,所以 14 m
+/// 处一定在人行道上,不会把玩家复活在车流中间。
+pub(crate) const HOSPITAL_SPAWN_OFFSET: f32 = 14.0;
+
+/// WASTED 重生的**最大跳变距离**(米)。
+///
+/// 上界来自几何:玩家位置先对齐到街道网格(最多偏 `STREET_PITCH/2`),
+/// 再加 `HOSPITAL_SPAWN_OFFSET` 的对角分量,所以最坏情况是
+/// `sqrt(30² + 30²) + sqrt(14² + 14²)` ≈ 62 m。旧实现固定 12 个重生点,
+/// 实测在 (5000, 5000) 处跳 **6932.5 m**。
+///
+/// 这条常量的用途是**回归测试断言**,不是运行时钳制。
+pub(crate) const HOSPITAL_SPAWN_MAX_OFFSET: f32 =
+    (crate::game::STREET_PITCH * 0.5 + HOSPITAL_SPAWN_OFFSET) * 1.415;
+
+/// 单元测试断言文案:WASTED 把玩家传送到了远离死亡点的地方。
+///
+/// 旧实现在**无限**世界里只认 12 个固定重生点,所以离城市原点越远,
+/// 跳得越远 —— 在 (5000, 5000) 处一次跳 6932.5 m。这就是用户报的「瞬移」。
+#[cfg(test)]
+pub(crate) const T_WASTED_SPAWN_TELEPORTS: &str = "在 ({death}) 死亡却重生在 ({spot}),一次跳了 {jump} m(上限 {max} m) —— 重生点必须由死亡点所在街区决定,不能是城市里的固定几个点";
+
+/// 单元测试断言文案:重生点落在了车行道正中。
+#[cfg(test)]
+pub(crate) const T_WASTED_SPAWN_IN_TRAFFIC: &str = "在 ({death}) 死亡,重生点 ({spot}) 离街道中轴线只有 offX={offX} / offZ={offZ} m —— 必须在人行道上,不能一复活就在车流里";
 
 /// 水面每个面的自发光(全黑 —— 水面的「亮」来自反射,不是自发光)。
 pub(crate) const WATER_EMISSIVE: [f32; 3] = [0.0, 0.0, 0.0];
@@ -1672,13 +1679,6 @@ pub(crate) const PED_GATHER_MAX_CROWD: f32 = 5.0;
 pub(crate) const PED_TALK_SLOT_STEP: f32 = 1.256_637_1;
 
 /// 医院点坐标(XZ),分��在城市四角与中心附近。
-pub(crate) const HOSPITAL_SPOTS: &[[f32; 3]] = &[
-    [HOSPITAL_A_X, 0.0, HOSPITAL_A_Z],
-    [HOSPITAL_B_X, 0.0, HOSPITAL_B_Z],
-    [HOSPITAL_C_X, 0.0, HOSPITAL_C_Z],
-    [HOSPITAL_D_X, 0.0, HOSPITAL_D_Z],
-    [HOSPITAL_E_X, 0.0, HOSPITAL_E_Z],
-];
 
 /// 敌人剔除后不再写实例的距离(米)。
 pub(crate) const ENEMY_RENDER_RANGE: f32 = 62.0;

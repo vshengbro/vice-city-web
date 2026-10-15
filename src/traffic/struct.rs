@@ -58,6 +58,14 @@ pub struct TrafficCar {
     #[set(skip, pub(crate))]
     #[get(skip, pub(crate))]
     pub(crate) route_seed: u32,
+    /// 上一帧的「沿街坐标」(米)—— 判定是否**跨过**了街道中轴线用。
+    ///
+    /// 路口判定必须比较「本帧位置」和「上一帧位置」,只看本帧位置
+    /// 无法区分「正在越过中轴线」和「停在中轴线上」:后者会让
+    /// `choose_at_junction()` 每帧重复触发。
+    #[get(type(copy), pub(crate))]
+    #[set(pub(crate))]
+    pub(crate) last_along: f32,
 }
 /// 地面拾取物。
 #[derive(Data, Clone, Debug)]
