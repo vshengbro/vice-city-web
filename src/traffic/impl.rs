@@ -149,6 +149,7 @@ impl TrafficCar {
             lateral: 0.0,
             wheel_spin: 0.0,
             driven: false,
+            hailing_seconds: 0.0,
             route_street: street,
             route_side: side,
             route_axis: axis,
@@ -211,6 +212,7 @@ impl TrafficCar {
             lateral: 0.0,
             wheel_spin: 0.0,
             driven: false,
+            hailing_seconds: 0.0,
             route_street: street,
             route_side: side,
             route_axis: axis,
@@ -855,6 +857,25 @@ impl Traffic {
                 if car.get_driven() {
                     continue;
                 }
+                // **停靠计时超时的车不再参与竞争。**
+                //
+                // 原来每帧都重选「26 m 内最近的一辆」,唯一排除是
+                // `get_driven()`。于是它停下之后下一帧仍然最近,继续被
+                // 选中,`desired = 0` 一直施加 —— 它**永远不会**开走,整条
+                // 车道被一辆停着的车永久占住。
+                //
+                // 实测(生产出生点 + 玩家固定站在出生点招手,跑 300 s):
+                // car7 在第 4 个 30 s 窗口之后**连续六个窗口位移精确
+                // 0.00 m**,卡死在 `(33.84, 56.50)`、速度 `0.000`,玩家就在
+                // 11.51 m 外 —— 它把整条街堵了 180 s。
+                //
+                // 判据用 `hailing_seconds` 而不是速度:按速度判会在**刹车
+                // 途中**掉出选择(速度降过阈值),于是 `desired` 又变回巡航,
+                // 车重新加速、再被选中、再刹车 —— 永远停在玩家旁边抖动。
+                // 计时只在真的**停稳等客**时累加,一旦开走就清零。
+                if car.get_hailing_seconds() >= HAUL_PARKED_SECONDS {
+                    continue;
+                }
                 let here: Vec3 = car.get_position();
                 let dx: f32 = here[0] - who[0];
                 let dz: f32 = here[2] - who[1];
@@ -874,7 +895,20 @@ impl Traffic {
                 if car.get_driven() {
                     continue;
                 }
-                car.step(dt, Some(index) == hailer_car, world);
+                let is_hailer: bool = Some(index) == hailer_car;
+                car.step(dt, is_hailer, world);
+                // 停靠计时:只有**真的停住等客**才累加,开走就清零。
+                //
+                // 计时用「速度已经接近零」而不是「本帧是 hailer」—— 刹车
+                // 途中也可能是 hailer,但那时候车还在动,不该算在等客时间里。
+                // 清零用 `min`,于是中途取消(玩家走远 / 上了车)立刻归零。
+                let stopped: bool = car.get_speed() <= HAIL_PARKED_SPEED;
+                if is_hailer && stopped {
+                    let waited: f32 = car.get_hailing_seconds() + dt;
+                    car.set_hailing_seconds(waited);
+                } else {
+                    car.set_hailing_seconds(car.get_hailing_seconds().min(dt));
+                }
             }
         }
         // **跟车**在纵向积分**之后**统一做一遍。

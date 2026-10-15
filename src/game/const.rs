@@ -587,6 +587,21 @@ pub(crate) const T_TRAFFIC_LANE_OFF_ROAD: &str = "车队车道必须压在沥青
      start_z={start_z}";
 
 /// 车队车道蓝图表。`街道索引` 交给 [`traffic_lanes`] 在运行时解成坐标。
+/// 车队测试用的交通灯资产 id 与路径。
+///
+/// §1.3c 要求字面量写在 `const.rs`。这几条只被车队测试用,但测试也得守
+/// 同一套规矩 —— 而且集中在这里之后,「五条测试用的是不是同一个资产」
+/// 一眼看得出来。
+pub(crate) const TRAFFIC_LIGHT_ASSET_ID: &str = "prop_trafficlight";
+/// 见 [`TRAFFIC_LIGHT_ASSET_ID`]:锥桶同样参与碰撞盒注册。
+pub(crate) const TRAFFIC_CONE_ASSET_ID: &str = "prop_traffic_cone";
+/// 见 [`TRAFFIC_LIGHT_ASSET_ID`]:资产在磁盘上的相对路径。
+pub(crate) const TRAFFIC_LIGHT_ASSET_PATH: &str = "assets/prop_trafficlight.json";
+/// 见 [`TRAFFIC_LIGHT_ASSET_ID`]:文件读不到时的失败原因。
+pub(crate) const TRAFFIC_LIGHT_ASSET_MISSING: &str = "交通灯资产必须在磁盘上";
+/// 见 [`TRAFFIC_LIGHT_ASSET_ID`]:文件在但解析不了时的失败原因。
+pub(crate) const TRAFFIC_LIGHT_ASSET_UNREADABLE: &str = "交通灯资产必须能解析";
+
 pub(crate) const TRAFFIC_LANE_PLAN: &[TrafficLane] = &[
     // (资产 id, 街道索引, 车道侧 +1 / -1, 初始 Z, 巡航速度, 行驶方向)
     //
