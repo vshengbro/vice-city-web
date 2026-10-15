@@ -4219,6 +4219,37 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             .iter()
             .map(|car: &TrafficCar| f64::from(car.get_speed()))
             .collect();
+        // 停靠计时 —— 区分「车在等客」和「车在红灯前停车」的唯一依据。
+        //
+        // 线上排查 P2 时栽在这里:探针只给 `carSpeed`,于是「速度 0.07 m/s
+        // 且 40 s 不动」看不出它是**停靠等客**(`hailing_seconds` 在涨)还是
+        // **停在红灯前**(计时恒为 0)。两者在速度上完全一样。
+        let car_hailing: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_hailing_seconds()))
+            .collect();
+        // 每辆车的路网状态:沿哪根轴跑、朝哪个方向。路口是否已越过、
+        // 停止线在身后还是身前,都要靠这三个数才能判。
+        let car_axis: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_lane_axis()))
+            .collect();
+        let car_dir: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_direction()))
+            .collect();
+        let car_street: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_lane_street()))
+            .collect();
         // 第一件还没被捡走的医疗包:验收脚本读它就能走过去真的拾取,而不是
         // 猜一组魔法坐标。
         let health_pack: Option<[f64; 2]> = game
@@ -4478,7 +4509,7 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             .collect::<Vec<String>>()
             .join(",");
         let json: String = format!(
-            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"gpuSubmitted\":{gpu_submitted},\"quality\":\"{quality}\",\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf},\"mapOpen\":{map_open},\"grenadesLeft\":{grenades},\"liveGrenades\":{live_grenades},\"grenadeTubes\":{tubes}{DEBUG_CLOSE}",
+            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"carHail\":[{car_hail}],\"carAxis\":[{car_axis}],\"carDir\":[{car_dir}],\"carStreet\":[{car_street}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"gpuSubmitted\":{gpu_submitted},\"quality\":\"{quality}\",\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf},\"mapOpen\":{map_open},\"grenadesLeft\":{grenades},\"liveGrenades\":{live_grenades},\"grenadeTubes\":{tubes}{DEBUG_CLOSE}",
             x = position[0],
             z = position[2],
             yaw = game.get_player().get_yaw(),
@@ -4534,6 +4565,10 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             car_x = join_f64(&car_x),
             car_z = join_f64(&car_z),
             car_speed = join_f64(&car_speed),
+            car_hail = join_f64(&car_hailing),
+            car_axis = join_f64(&car_axis),
+            car_dir = join_f64(&car_dir),
+            car_street = join_f64(&car_street),
             total = game.get_traffic().get_pickups_ref().len(),
             taken = game.get_player().collected_count(),
             hud = hud
