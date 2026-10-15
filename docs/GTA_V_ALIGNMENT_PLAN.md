@@ -201,7 +201,7 @@ let accel: f32 = MAX_ACCEL * (1.0 - (speed / cruise).powi(4)
                               - (s_star / gap).powi(2));
 ```
 
-### P2 🟡 红绿灯状态机
+### P2 🟢 红绿灯状态机（已交付）
 
 **现状实测**：`prop_trafficlight` 只是静态装饰网格
 （`src/game/fn.rs:1078-1084`，每个路口放 4 个）。
@@ -209,12 +209,29 @@ let accel: f32 = MAX_ACCEL * (1.0 - (speed / cruise).powi(4)
 历史审计实测：**12 次路口穿越速度恒为 11.50 m/s，零方差** ——
 证明完全没有信号逻辑。
 
-**修**：每个路口一个相位状态机，南北 / 东西对冲，含黄灯过渡：
-```rust
-pub enum Signal { Green, Amber, Red }
-pub fn phase_at(junction: (i32,i32), t: f32) -> (Signal, Signal)
-```
-停止线按 `STREET_HALF_WIDTH + 2` 米布置，红灯时目标速度钳到 0。
+**已实现**：
+
+- `SignalAspect { Red, Green }`（`src/traffic/enum.rs`）——
+  按**车道轴**表示，不建组合枚举：`signals_for(t) -> (axis0, axis1)`。
+- `signals_for(t)`（`src/traffic/fn.rs`）—— 全城共用一个时钟，
+  南北 / 东西交替 + 强制全红间隔。周期 `2·(12+3+4)` = 38 s。
+  不同时绿灯由 `both_axes_are_never_green_at_the_same_time` 穷举验证。
+- 停止线在路口中轴线前 `7.0 + CAR_FOOTPRINT[0]` = **9.283 m**，
+  车头停在线外。`distance_to_stop_line` 过了线返回 `INFINITY`
+  （车必须能清空路口，否则会在路口里死锁 —— 试过返回 `0`，
+  车永久停在 z=51.92，因为永远到不了中轴线、路口判定不触发）。
+- 红灯用**距离反解限速** `sqrt(2·b·gap)·0.9`，不是把目标速度压到 0。
+  压到 0 会让 IDM 加速度钉在 `IDM_ACCEL_MIN = -9`，实测从 z=38
+  **冲过停止线**。限速让加速度随接近程度平滑增长，车恰好停在线前。
+- 停止线**只在红灯时**作为 `gap` 障碍。绿灯时也塞进去会让
+  `interaction ≈ 1.00` → `a = -0.016`，车以 0.05 m/s 原地蹭，
+  绿灯也起不来。
+- `SIGNAL_ALL_RED_SECONDS = 4.0` **由刹车距离反推**：11.5 m/s 的车
+  `v/b` = 1.92 s、约 11 m。原定 1.6 s 时，距线 6.7 m 的车
+  在 0.93 s 内压线 0.02 m。
+
+实测停车点：z=48.04，停止线在 50.717，**留 2.6 m**（= IDM `s0`）——
+车不压线，绿灯一响从静止起步穿过。
 
 ### P3 🟡 路权
 
