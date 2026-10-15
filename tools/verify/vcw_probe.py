@@ -26,29 +26,43 @@ from typing import Any
 CANVAS: str = "document.querySelector('canvas')"
 
 # The browser harness injects `cdp` / `js` / `goto_url` / ... into the calling
-# scope, not into this module's. Bind them here at import time so the helpers
-# below are plain functions that can also be called directly.
+# scope, not into this module's. The helpers below call them as plain globals,
+# which resolves against `builtins` — so `_bind_harness` stashes them there and
+# the functions stay plain callables.
 import builtins as _builtins
 
-for _name in ("cdp", "js", "goto_url", "wait_for_load", "ensure_real_tab", "new_tab"):
-    setattr(_builtins, _name, globals().get(_name))
+HARNESS_NAMES: tuple[str, ...] = (
+    "cdp",
+    "js",
+    "goto_url",
+    "wait_for_load",
+    "ensure_real_tab",
+    "new_tab",
+)
 
 
 def _bind_harness() -> bool:
-    """Pick the harness helpers out of the calling frame. True when found."""
+    """Find the harness helpers in the caller's scope and publish them.
+
+    Walks the frame stack outward looking for the scope the browser harness
+    executed our code in. Frames belonging to this module are skipped: this
+    module's own globals never carry the helpers, and matching them would
+    return early with `None` values installed on `builtins`.
+    """
     import inspect
 
+    own: dict[str, object] = globals()
     frame = inspect.currentframe()
+    frame = frame.f_back if frame is not None else None
     while frame is not None:
-        found: bool = False
-        for _name in ("cdp", "js", "goto_url", "wait_for_load", "ensure_real_tab", "new_tab"):
-            if _name in frame.f_globals:
-                setattr(_builtins, _name, frame.f_globals[_name])
-                found = True
-        if found:
-            return True
+        scope: dict[str, object] = frame.f_globals
+        if scope is not own:
+            for name in HARNESS_NAMES:
+                found: object = scope.get(name)
+                if callable(found):
+                    setattr(_builtins, name, found)
         frame = frame.f_back
-    return False
+    return all(callable(getattr(_builtins, name, None)) for name in HARNESS_NAMES)
 
 
 def ensure_raf() -> str:
@@ -56,7 +70,13 @@ def ensure_raf() -> str:
     _bind_harness()
     cdp("Emulation.setFocusEmulationEnabled", enabled=True)
     cdp("Page.setWebLifecycleState", state="active")
-    return js("document.visibilityState")
+    return _js("document.visibilityState")
+
+
+def _js(expression: str) -> object:
+    """Evaluate JS in the page, binding the harness helpers first."""
+    _bind_harness()
+    return _builtins.js(expression)
 
 
 def open_game(url: str = "http://localhost:8765/", settle: float = 6.0) -> str:
@@ -78,7 +98,7 @@ def open_game(url: str = "http://localhost:8765/", settle: float = 6.0) -> str:
 
 def hud() -> str:
     """The game's own one-line status readout."""
-    return js("document.querySelector('#vcw-hud')?.innerText || ''") or ""
+    return _js("document.querySelector('#vcw-hud')?.innerText || ''") or ""
 
 
 def state(*keys: str) -> dict[str, Any]:
@@ -92,7 +112,7 @@ def state(*keys: str) -> dict[str, Any]:
         keys = ("__all__",)
     out: dict[str, Any] = {}
     for key in keys:
-        out[key] = js(
+        out[key] = _js(
             "(function(){try{var s=window['__vcw'];"
             "if(!s)return 'NO_STATE';"
             "var v=%s;"
@@ -224,7 +244,7 @@ def hold_keys(codes: list[str], seconds: float = 3.0, sample_fn=None) -> list[di
 
 def tap(code: str) -> None:
     """Press and release a key with no dwell."""
-    js(
+    _js(
         f"(function(){{"
         f"['keydown','keyup'].forEach(function(t){{"
         f"window.dispatchEvent(new KeyboardEvent(t,{{code:'{code}',bubbles:true}}));"
@@ -252,11 +272,11 @@ def screenshot(path: str) -> str:
     import os
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    js(
+    _js(
         f"(function(){{var c={CANVAS};if(!c)return 'no canvas';"
         f"window.__shot=c.toDataURL('image/png');return 'ok';}})()"
     )
-    data_url: str = js("window.__shot || ''") or ""
+    data_url: str = _js("window.__shot || ''") or ""
     if not data_url.startswith("data:image/png"):
         return ""
     import base64

@@ -14,10 +14,11 @@ AUDIT="${HOME}/.agents/skills/rust-standards/scripts/audit_rust_standards.py"
 TARGET="/Users/sqs/Library/Caches/cargo-target/vcweb"
 FAILED=""
 
-# The repo baseline is 47/53 (six pre-existing failures in collision/fn.rs and
-# the traffic rewrite). A change that makes those worse fails the gate; an
-# unchanged or better count passes. Compare against this number, not 53.
-BASELINE_FAILS=6
+# The repo baseline is 48/53. The five failing checks (26, 35, 36, 41, 47)
+# all live in the pre-existing uncommitted traffic/collision/combat work, not in
+# the GTA-alignment changes: at committed HEAD the same audit reports 51/53.
+# A change that makes this worse fails the gate; unchanged or better passes.
+BASELINE_FAILS=5
 
 step() { printf '\n=== %s ===\n' "$1"; }
 
