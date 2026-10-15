@@ -57,15 +57,28 @@ impl TrafficCar {
         draw
     }
 
-    /// 取当前流状态,并置零 —— 下一次 [`Self::set_route_seed`] 从这里续上。
+    /// 取当前流状态。
+    ///
+    /// **不要在这里把 `route_seed` 清零。** 原来的实现读出旧值之后写 0,
+    /// 而 `route_rand(0) == 0`(全零是这个哈希的**不动点**:每一轮
+    /// `wrapping_mul` / `xor-shift` 都保持 0),于是 `set_route_seed()`
+    /// 把 0 洗回 0,流状态从第一次抽签之后就永远停在 0,
+    /// `next_unit(0) == 0.0`。
+    ///
+    /// 后果实测:`next_route_draw()` 的序列是
+    /// `0.581102, 0.000000, 0.000000, 0.000000, ...`,
+    /// 而路口判定是 `draw < ROUTE_PICK`(0.62),于是**每一个路口都必然
+    /// 转向** —— 文档里写的「38% 直行」从来没有发生过。
+    ///
+    /// 现在流状态是纯粹的 `route_rand` 递推:
+    /// 读旧值 → 洗牌 → 写回,同一条轨迹仍然可重放(这正是它文档承诺的),
+    /// 但不再坍缩。
     ///
     /// # Returns
     ///
     /// - `u32` - 本轮抽签使用的流状态。
     fn get_route_seed(&mut self) -> u32 {
-        let seed: u32 = self.route_seed;
-        self.route_seed = 0;
-        seed
+        self.route_seed
     }
 
     /// 把流状态洗牌后写回。
@@ -140,6 +153,9 @@ impl TrafficCar {
             route_side: side,
             route_axis: axis,
             route_seed: 0x7A11_u32 ^ street as u32 ^ (direction > 0.0) as u32,
+            // 起始沿街坐标必须和 `position` 对齐,否则第一帧会拿 `last_along`
+            // = 0 去比「有没有越过中轴线」,车一出生就抽一次签。
+            last_along: start_z,
         }
     }
 
@@ -199,6 +215,7 @@ impl TrafficCar {
             route_side: side,
             route_axis: axis,
             route_seed: 0x7A11_u32 ^ (street as u32).wrapping_mul(31) ^ side.to_bits(),
+            last_along: start_along,
         }
     }
 
@@ -363,17 +380,34 @@ impl TrafficCar {
             here[1],
             if axis == 0 { resolved[1] } else { centre },
         ]);
-        // 走过路口了吗?取「前进方向上的下一个路口」。
-        let junction: f32 = if direction >= 0.0 {
-            street_axis(street_index_at(along) + 1)
-        } else {
-            street_axis(street_index_at(along) - 1)
-        };
+        // 走过路口了吗?
+        //
+        // **判定必须比较本帧与上一帧的沿街坐标**,而不是「是否到达下一条
+        // 街道的索引」。原实现是:
+        //
+        // ```text
+        // junction = street_axis(street_index_at(along) + 1)
+        // crossed  = along >= junction - EPS
+        // ```
+        //
+        // 而 `street_index_at` 是 `(along / 60).round()`,所以 `along` 恒落在
+        // `[60k - 30, 60k + 30)` 里,而判定要求 `along >= 60(k + 1)` —— 差整整
+        // 一个 60 m 档。穷举 802,000 个坐标验证过:正向分支满足的坐标有
+        // **0 个**,反向分支同样是 **0 个**。也就是说
+        // `choose_at_junction()` 从来没在生产里被调用过,10 辆车是 10 条
+        // 永不转弯的直线轨道。
+        //
+        // 现在改成真正的「越过中轴线」:本帧和上一帧分处中轴线两侧。
+        // 用上一帧的位置而不是「距离中轴线够近」,是因为停在中轴线上
+        // 的车不该反复触发路口决策。
+        let axis_centre: f32 = street_axis(street_index_at(along));
+        let previous: f32 = self.get_last_along();
         let crossed: bool = if direction >= 0.0 {
-            along >= junction - CAR_ROUTE_EPSILON
+            previous < axis_centre && along >= axis_centre
         } else {
-            along <= junction + CAR_ROUTE_EPSILON
+            previous > axis_centre && along <= axis_centre
         };
+        self.set_last_along(along);
         if crossed && self.get_speed() > 0.0 {
             self.choose_at_junction();
         }

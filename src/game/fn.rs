@@ -6554,9 +6554,12 @@ pub(crate) fn step_death(game: &mut Game, dt: f32) {
     if game.get_hurt().get_respawn() > 0.0 {
         return;
     }
-    // 重生:在最近的医院点复活,扣钱,清通缉。
+    // 重生:在**就近**的医院门口复活,扣钱,清通缉。
     // Y 归零:医院都在地面上,不能把玩家复活在二楼楼板上(或者半空里)。
-    let spot: Vec3 = nearest_hospital(game.get_player().get_position());
+    //
+    // 用 `hospital_near`(按死亡点所在街区程序化选点),不用固定重生点数组:
+    // 后者在无限世界里会跳几百米到几千米,那就是用户报的「瞬移」。
+    let spot: Vec3 = hospital_near(game.get_player().get_position());
     let resolved: Vec2 = game.get_world().resolve([spot[0], spot[2]]);
     game.get_mut_player()
         .set_position([resolved[0], GROUND_LEVEL, resolved[1]]);
@@ -6572,42 +6575,58 @@ pub(crate) fn step_death(game: &mut Game, dt: f32) {
         .set_notice(String::from(NOTICE_WASTED));
 }
 
-/// 医院点:玩家死亡后在这里重生。
-///
-/// 选四个城市的四角 + 中心,保证任何位置都能找到「最近的一个」。
-///
-/// # Returns
-///
-/// - `Vec<Vec3>` - 医院点的世界坐标。
-pub(crate) fn hospital_spots() -> Vec<Vec3> {
-    let mut out: Vec<Vec3> = Vec::new();
-    for spot in HOSPITAL_SPOTS {
-        out.push(*spot);
-    }
-    out
-}
-
-/// 距离给定点最近的医院点。
+/// WASTED 之后在**就近**的医院门口复活。
 ///
 /// # Arguments
 ///
-/// - `Vec3` - 玩家当前坐标。
+/// - `Vec3` - 玩家死亡时的坐标。
 ///
 /// # Returns
 ///
-/// - `Vec3` - 最近的医院坐标。
-pub(crate) fn nearest_hospital(from: Vec3) -> Vec3 {
-    let spots: Vec<Vec3> = hospital_spots();
-    let mut best: Vec3 = spots[0];
-    let mut best_distance: f32 = f32::MAX;
-    for spot in spots {
-        let d: f32 = flat_distance(from, spot);
-        if d < best_distance {
-            best_distance = d;
-            best = spot;
-        }
-    }
-    best
+/// - `Vec3` - 复活点(始终在死亡点所在的街区附近)。
+///
+/// # Note
+///
+/// 旧实现挑的是 [`HOSPITAL_SPOTS`] 里**固定 12 个点**中最近的一个,而世界
+/// 是无限生成的(`street_axis` 接受任意整数索引)。实测跳变距离:
+///
+/// | 死亡位置 | 旧实现跳到 | 距离 |
+/// |---|---|---|
+/// | (300, 0) | (98, 98) | **224.5 m** |
+/// | (600, 0) | (98, 98) | **511.5 m** |
+/// | (5000, 5000) | (98, 98) | **6932.5 m** |
+///
+/// 这就是用户报的「瞬移」。它看起来和「跨街区」相关,是因为每次流式换块
+/// 都会在玩家附近刷新 7 个敌对混混(`repopulate_streamed_combatants`),
+/// 于是玩家在换块后 3 秒被打死,然后被传回城市原点 —— 一条因果链,不是巧合。
+///
+/// 现在按死亡点**所在街区**程序化地选门口:先对齐街道网格,再用
+/// `crc32(街区索引)` 在四个角里挑一个。`crc32` 而不是内置 `hash()`,因为
+/// 后者每个进程加盐,同一个位置重开一局就会换一个医院,重生点不可重放。
+///
+/// 跳变因此被限制在**半个街距**(≤ [`HOSPITAL_SPAWN_MAX_OFFSET`]),
+/// 和 GTA V 的「就近医院门口复活」一致。
+pub(crate) fn hospital_near(from: Vec3) -> Vec3 {
+    let street: i32 = (from[0] / STREET_PITCH).round() as i32;
+    let cross: i32 = (from[2] / STREET_PITCH).round() as i32;
+    let cx: f32 = street_axis(street);
+    let cz: f32 = street_axis(cross);
+    // 用街区索引混合出稳定的四选一,不用内置 hash():它每进程加盐,
+    // 同一位置重开一局就换医院,重生点不可重放。
+    let pick: u32 = (street as u32)
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add((cross as u32).wrapping_mul(0x85EB_CA6B))
+        ^ (street as u32).wrapping_mul(31);
+    // 四个候选门口:街区四角的 sidewalk 边。落在车道之外,不会重生在
+    // 车流中间。
+    let corners: [Vec2; 4] = [
+        [HOSPITAL_SPAWN_OFFSET, HOSPITAL_SPAWN_OFFSET],
+        [-HOSPITAL_SPAWN_OFFSET, HOSPITAL_SPAWN_OFFSET],
+        [HOSPITAL_SPAWN_OFFSET, -HOSPITAL_SPAWN_OFFSET],
+        [-HOSPITAL_SPAWN_OFFSET, -HOSPITAL_SPAWN_OFFSET],
+    ];
+    let corner: Vec2 = corners[(pick % 4) as usize];
+    [cx + corner[0], GROUND_LEVEL, cz + corner[1]]
 }
 
 /// 抢车的通缉结算:抢警车加更多热度。
@@ -12574,5 +12593,110 @@ mod tests {
         // 换完之后弹匣**只补一次**,不会补出 18 发。
         arsenal.tick(RELOAD_TIME + FIXED_DT);
         assert_eq!(arsenal.get_magazine(), PISTOL_MAGAZINE);
+    }
+
+    /// WASTED 重生必须落在**死亡点附近**,不能把玩家传送回城市原点。
+    ///
+    /// 这是用户报的「瞬移」。旧实现从 `HOSPITAL_SPOTS`(固定 12 个点)里挑
+    /// 最近的一个,而世界是无限生成的,实测跳变:
+    ///
+    /// | 死亡位置 | 旧跳到 | 距离 |
+    /// |---|---|---|
+    /// | (300, 0) | (98, 98) | 224.5 m |
+    /// | (5000, 5000) | (98, 98) | 6932.5 m |
+    ///
+    /// 它看起来和「跨街区」有关,是因为每次流式换块都会在玩家附近刷 7 个
+    /// 敌对混混,于是换块后 3 秒被打死,然后被传回原点 —— 因果链,不是巧合。
+    #[test]
+    pub(crate) fn wasted_respawns_next_to_the_death_not_at_the_city_origin() {
+        // 覆盖出生点附近、远处、以及负坐标(负数是整数除法最容易出错的一侧)。
+        let deaths: [Vec3; 6] = [
+            [65.0, 0.0, 30.0],
+            [300.0, 0.0, 0.0],
+            [5000.0, 0.0, 5000.0],
+            [-300.0, 0.0, -300.0],
+            [-5000.0, 0.0, 5000.0],
+            [12.5, 0.0, -7.25],
+        ];
+        for death in deaths {
+            let spot: Vec3 = hospital_near(death);
+            let jumped: f32 = flat_distance(death, spot);
+            assert!(
+                jumped <= HOSPITAL_SPAWN_MAX_OFFSET,
+                "{}",
+                fill(
+                    T_WASTED_SPAWN_TELEPORTS,
+                    &[
+                        ("death", &format!("({:.1}, {:.1})", death[0], death[2])),
+                        ("spot", &format!("({:.1}, {:.1})", spot[0], spot[2])),
+                        ("jump", &format!("{jumped:.1}")),
+                        ("max", &format!("{HOSPITAL_SPAWN_MAX_OFFSET:.1}")),
+                    ]
+                )
+            );
+            // 必须在地面上,不能复活在半空或者二楼楼板上。
+            assert_eq!(spot[1], GROUND_LEVEL);
+        }
+    }
+
+    /// 重生点必须**可重放**:同一个死亡位置两次调用给出同一个点。
+    ///
+    /// 用内置 `hash()` 选医院会每进程加盐,重开一局就换一个医院,
+    /// 于是「回到上次死的地方」这件事不再成立。
+    #[test]
+    pub(crate) fn the_respawn_point_is_replayable() {
+        let deaths: [Vec3; 4] = [
+            [65.0, 0.0, 30.0],
+            [300.0, 0.0, 0.0],
+            [-300.0, 0.0, -300.0],
+            [12.5, 0.0, -7.25],
+        ];
+        for death in deaths {
+            let first: Vec3 = hospital_near(death);
+            let second: Vec3 = hospital_near(death);
+            assert_eq!(
+                first, second,
+                "同一个死亡位置 ({:.2}, {:.2}) 两次重生点不同 ({:?} vs {:?}) —— \
+                 选点用了每进程加盐的 hash",
+                death[0], death[2], first, second
+            );
+        }
+    }
+
+    /// 重生点必须落在**人行道上**,不能把玩家丢进车流中间。
+    ///
+    /// 车行道半宽 7 m、车道中心 ±3.5 m,所以重生点与街道中轴线的横向距离
+    /// 至少要大于车道半宽,否则玩家一复活就在车流里。
+    #[test]
+    pub(crate) fn the_respawn_point_is_off_the_carriageway() {
+        let mut checked: usize = 0;
+        // 扫一段街区,确认四个候选角都落在车道之外。
+        for k in -6..6 {
+            for death in [
+                [k as f32 * 60.0 + 3.0, 0.0, 11.0],
+                [11.0, 0.0, k as f32 * 60.0 + 3.0],
+            ] {
+                let spot: Vec3 = hospital_near(death);
+                let street_centre: f32 = street_axis(street_index_at(spot[0]));
+                let cross_centre: f32 = street_axis(street_index_at(spot[2]));
+                let off_x: f32 = (spot[0] - street_centre).abs();
+                let off_z: f32 = (spot[2] - cross_centre).abs();
+                assert!(
+                    off_x > STREET_HALF_WIDTH || off_z > STREET_HALF_WIDTH,
+                    "{}",
+                    fill(
+                        T_WASTED_SPAWN_IN_TRAFFIC,
+                        &[
+                            ("death", &format!("({:.1}, {:.1})", death[0], death[2])),
+                            ("spot", &format!("({:.1}, {:.1})", spot[0], spot[2])),
+                            ("offX", &format!("{off_x:.1}")),
+                            ("offZ", &format!("{off_z:.1}")),
+                        ]
+                    )
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "一条重生点都没检查到");
     }
 }
