@@ -4232,6 +4232,12 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             .collect();
         // 每辆车的路网状态:沿哪根轴跑、朝哪个方向。路口是否已越过、
         // 停止线在身后还是身前,都要靠这三个数才能判。
+        let car_blocked: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_blocked()))
+            .collect();
         let car_axis: Vec<f64> = game
             .traffic
             .get_cars_ref()
@@ -4509,7 +4515,7 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             .collect::<Vec<String>>()
             .join(",");
         let json: String = format!(
-            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"carHail\":[{car_hail}],\"carAxis\":[{car_axis}],\"carDir\":[{car_dir}],\"carStreet\":[{car_street}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"gpuSubmitted\":{gpu_submitted},\"quality\":\"{quality}\",\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf},\"mapOpen\":{map_open},\"grenadesLeft\":{grenades},\"liveGrenades\":{live_grenades},\"grenadeTubes\":{tubes}{DEBUG_CLOSE}",
+            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"carHail\":[{car_hail}],\"carBlocked\":[{car_blocked}],\"carAxis\":[{car_axis}],\"carDir\":[{car_dir}],\"carStreet\":[{car_street}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"gpuSubmitted\":{gpu_submitted},\"quality\":\"{quality}\",\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf},\"mapOpen\":{map_open},\"grenadesLeft\":{grenades},\"liveGrenades\":{live_grenades},\"grenadeTubes\":{tubes}{DEBUG_CLOSE}",
             x = position[0],
             z = position[2],
             yaw = game.get_player().get_yaw(),
@@ -4566,6 +4572,7 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             car_z = join_f64(&car_z),
             car_speed = join_f64(&car_speed),
             car_hail = join_f64(&car_hailing),
+            car_blocked = join_f64(&car_blocked),
             car_axis = join_f64(&car_axis),
             car_dir = join_f64(&car_dir),
             car_street = join_f64(&car_street),
@@ -11493,6 +11500,63 @@ mod tests {
             );
         }
         println!("开出建造半径 200s: {report}");
+    }
+
+    /// **同一个点,碰撞世界中心不同 —— 几何就不同。**
+    ///
+    /// 线上那台死锁的车每轮都精确停在同一个点:
+    ///
+    /// ```text
+    /// car6 x = -58.269272  z = -56.50  v = 0.00000  hail = 0.00
+    /// ```
+    ///
+    /// 12 次采样 `dx` 全是 `+0.000000` —— 不是慢,是**被钉死**;
+    /// 后面 car5 / car7 停在 2.091 m/s 的跟车平衡速度上。
+    ///
+    /// 之前用 `traffic_world_at(0.0, 0.0)` 在这个点上做 0.5 m 位移解算,
+    /// **自由通过** —— 于是差点判它「没有静态几何」。但那个世界以原点
+    /// 为中心,线上世界以**玩家出生点 (63.5, 45)** 为中心:
+    ///
+    /// ```text
+    /// 以 (0, 0)    为中心 -> 街区 ix ∈ [-5, 5]
+    /// 以 (63.5, 45) 为中心 -> 街区 ix ∈ [-3, 6]
+    /// ```
+    ///
+    /// `BLOCK_VIEW_RADIUS = 300` 之下窗口不对称,两者的建筑集合并不相同。
+    /// **用错中心构造的碰撞世界,量到的「这里没东西」不算数。**
+    ///
+    /// 这条用真正的出生点中心重建世界,在车头前方一格做解算。
+    #[test]
+    pub(crate) fn the_deadlocked_spot_differs_between_world_centres() {
+        let mut spawn_world: CollisionWorld = traffic_world_at(63.5, 45.0);
+        let mut origin_world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        let spawn_shapes: usize = spawn_world.get_shapes_mut().len();
+        let origin_shapes: usize = origin_world.get_shapes_mut().len();
+        // 车头前沿:x + CAR_FOOTPRINT[0]。
+        let nose: Vec2 = [-58.269272 + 2.283, -56.5];
+        let a: Vec2 = spawn_world.resolve_car_footprint(nose, [0.0, 0.0], 0.0);
+        let b: Vec2 = origin_world.resolve_car_footprint(nose, [0.0, 0.0], 0.0);
+        println!(
+            "车头 ({:.3},{:.1}): 出生点世界 {:?} / 原点世界 {:?} / 形状数 {}/{}",
+            nose[0],
+            nose[1],
+            (a[0], a[1]),
+            (b[0], b[1]),
+            spawn_shapes,
+            origin_shapes
+        );
+        let step: Vec2 = spawn_world.resolve_car_footprint(nose, [0.3, 0.0], 0.0);
+        println!(
+            "出生点世界里挪 0.3 m: ({:.3},{:.3}) -> ({:.3},{:.3})",
+            nose[0], nose[1], step[0], step[1]
+        );
+        assert!(
+            step[0] > nose[0] + 0.1,
+            "出生点世界里车头前方 0.3 m 也挪不动 —— 静态几何就压在 ({:.2},{:.2}),\
+             这就是线上 car6 被钉死的原因(原点世界里量到的是另一套几何)",
+            nose[0],
+            nose[1]
+        );
     }
 
     /// **车停在 (-58.27, -56.50) 动不了 —— 那个点上是不是有静态碰撞体。**
