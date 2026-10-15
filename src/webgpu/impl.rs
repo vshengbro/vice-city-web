@@ -1,10 +1,63 @@
 use super::*;
 
-/// 顶点缓冲步长(字节):12 f32 × 4 = 48 B。
+/// 顶点缓冲步长(字节):`STRIDE_FLOATS`(20)× 4 = 80 B。
 ///
 /// WebGPU 只要求步长是 4 的倍数(Vulkan 才要求 16),所以这里能直接
 /// 沿用 WebGL2 端那份**逐字节相同**的顶点数据,不需要重排。
 const VERTEX_STRIDE_BYTES: u64 = (STRIDE_FLOATS * 4) as u64;
+
+/// 顶点 buffer 里声明的属性条数。
+///
+/// 一条 `GPUVertexBufferLayout` 的 `attributes` 数组**只装顶点 buffer
+/// 自己的**属性;instanced 那几条走另一个 layout。⚠️ 数组长度与
+/// `shaderLocation` 的取值范围**没有任何关系** —— location 跳号不影响
+/// 数组长度,详见 [`WebGpuRenderer::build_vertex_layout`]。
+const VERTEX_ATTRIBUTE_COUNT: usize = 8;
+
+/// instance buffer 里声明的属性条数:model matrix 4 × vec4 + tint vec3。
+const INSTANCE_ATTRIBUTE_COUNT: u32 = 5;
+
+/// `(shaderLocation, byte offset, format)` —— 顶点 buffer 的一份属性。
+///
+/// 写成表而不是就地循环,是为了能被测试直接钉住:`shaderLocation` 与
+/// 数组下标必须各走各的,一旦有人再把前者当后者用,断言立刻红。
+const VERTEX_ATTRIBUTES: [(u32, u64, &str); VERTEX_ATTRIBUTE_COUNT] = [
+    (0, 0, VERTEX_FORMAT_F32X3),  // position
+    (1, 12, VERTEX_FORMAT_F32X3), // normal
+    (2, 24, VERTEX_FORMAT_F32X3), // color
+    (3, 36, VERTEX_FORMAT_F32X3), // emissive
+    // PBR:`uv` 占 float 12/13(byte 48/52),`tangent(xyz, w)` 占 float
+    // 14-17,`roughness|metallic` 在 float 18/19。切线拆成两个 f32x2,
+    // 因为单个 vec4 会吃掉 4 个连续 location,而 4-8 已被 instanced
+    // 属性占用 —— 与 WebGL2 端的 9/10/11/12 逐项一致。
+    (9, 48, VERTEX_FORMAT_F32X2),  // uv
+    (10, 56, VERTEX_FORMAT_F32X2), // tangent.xy
+    (11, 64, VERTEX_FORMAT_F32X2), // tangent.zw
+    (12, 72, VERTEX_FORMAT_F32X2), // roughness | metallic
+];
+
+/// 顶点属性在 `attributes` 数组里的下标 = 它在
+/// [`VERTEX_ATTRIBUTES`] 里的位置,**与 `shaderLocation` 无关**。
+///
+/// 抽成函数而不是在循环里写 `enumerate()`,是因为这里正是**这个 bug
+/// 的形状**:下标一旦取自 location(跳号的 0-3 + 9-12),前 4 个元素
+/// 写完 `array.length == 4`,轮到 `location 9` 时 `push_into` 断言
+/// `expected len 10, got 5` 抛出,`createRenderPipeline` 当场失败,
+/// 三层回退(WebGPU → WebGL2 → Canvas2D)之后一帧都画不出来。
+///
+/// 它是纯函数且与运行时无关,所以测试能直接对任意 location 问「你落在
+/// 第几格」—— 那条断言在旧写法下会立刻红。
+///
+/// # Arguments
+///
+/// - `u32` - 属性在表里的位置(0..`VERTEX_ATTRIBUTE_COUNT`)。
+///
+/// # Returns
+///
+/// - `usize` - 该属性在 `attributes` 数组里的下标。
+const fn attribute_slot(table_index: u32) -> usize {
+    table_index as usize
+}
 
 /// instance buffer 的预分配实例数(与 WebGL2 端一致)。
 const INSTANCE_PREALLOC: usize = 64;
@@ -620,57 +673,42 @@ impl WebGpuRenderer {
         Ok(())
     }
 
-    /// 建顶点布局数组:一个 stride 48 B 的顶点 buffer + 一个 stride
+    /// 建顶点布局数组:一个 stride 80 B 的顶点 buffer + 一个 stride
     /// 80 B 的 instance buffer,后者用 `stepMode: "instance"` 表达实例化。
     ///
     /// # Returns
     ///
     /// - `Result<JsValue, String>` - `GPUVertexBufferLayout[]`。
     fn build_vertex_layout(&self) -> Result<JsValue, String> {
-        // 顶点:pos(3) | normal(3) | color(3) | emissive(3)。
+        // ⚠️ `push_into` 的第二个参数是**数组下标**,不是
+        // `shaderLocation`。
+        //
+        // 顶点属性的 `shaderLocation` 刻意跳号(0-3 是顶点、4-8 被
+        // instanced 属性占、9-12 是 PBR 那组),于是 `location + 1`
+        // 与「下一个元素该落在第几格」彻底脱钩。曾经把
+        // `shaderLocation` 当下标传,前 4 个元素写完 `length` 是 4,
+        // 轮到 `location 9` 就断言 `expected len 10, got 5`,
+        // 整条 `createPipeline` 当场失败 —— WebGPU / WebGL2 / Canvas2D
+        // 依次不可用,游戏一帧都画不出来。
+        //
+        // 真正的下标由 `enumerate()` 给出;`shaderLocation` 只写进描述符。
         let vertex_attributes: JsValue = make_array();
-        for index in 0..4u32 {
+        for (table_index, (location, offset, format)) in VERTEX_ATTRIBUTES.iter().enumerate() {
+            let slot: usize = attribute_slot(table_index as u32);
             let attribute: Object = new_object();
             set(
                 &attribute,
                 FIELD_SHADER_LOCATION,
-                &JsValue::from_f64(index as f64),
+                &JsValue::from_f64(f64::from(*location)),
             )?;
-            set(
-                &attribute,
-                FIELD_OFFSET,
-                &JsValue::from_f64((index as u64 * 12) as f64),
-            )?;
-            set(
-                &attribute,
-                FIELD_FORMAT,
-                &JsValue::from_str(VERTEX_FORMAT_F32X3),
-            )?;
-            push_into(&vertex_attributes, index as usize, attribute.as_ref())?;
-        }
-        // PBR:`uv` 在 float 12/13(byte 48/52),`tangent(xyz, w)` 在 float
-        // 14-17,`roughness|metallic` 在 float 18/19。切线拆成两个 f32x2
-        // (location 10/11),uv 是 9,表面参数是 12 —— 与 WebGL 侧的
-        // 9/10/11/12 一致,并避开 4-8(instance 属性)占用的 location。
-        for (index, offset, format) in [
-            (9u32, 48u64, VERTEX_FORMAT_F32X2),
-            (10, 56, VERTEX_FORMAT_F32X2),
-            (11, 64, VERTEX_FORMAT_F32X2),
-            (12, 72, VERTEX_FORMAT_F32X2),
-        ] {
-            let attribute: Object = new_object();
-            set(
-                &attribute,
-                FIELD_SHADER_LOCATION,
-                &JsValue::from_f64(index as f64),
-            )?;
-            set(&attribute, FIELD_OFFSET, &JsValue::from_f64(offset as f64))?;
+            set(&attribute, FIELD_OFFSET, &JsValue::from_f64(*offset as f64))?;
             set(&attribute, FIELD_FORMAT, &JsValue::from_str(format))?;
-            push_into(&vertex_attributes, index as usize, attribute.as_ref())?;
+            push_into(&vertex_attributes, slot, attribute.as_ref())?;
         }
         // instance:model matrix 4 × vec4 在 0..64 B,tint 在 64 B。
+        // 这五条的 location 是 4-8,连续,所以下标与 location 恰好相等。
         let instance_attributes: JsValue = make_array();
-        for index in 0..5u32 {
+        for index in 0..INSTANCE_ATTRIBUTE_COUNT {
             let attribute: Object = new_object();
             set(
                 &attribute,
@@ -764,19 +802,7 @@ impl WebGpuRenderer {
         Ok(())
     }
 
-    /// 建 bloom 那四条 pipeline 的资源(采样器 / uniform buffer /
-    /// 两条 bind group layout / 四条 pipeline)。
-    ///
-    /// 与主 / 阴影两条管线一样整段包在 validation error scope 里:
-    /// 着色器编译错误、bind group layout 与 bind group 不匹配、颜色
-    /// 目标格式对不上,**全是异步报上来的** —— 不开 error scope 的
-    /// 症状是「画面纯黑,console 一句话没有」。
-    ///
-    /// # Returns
-    ///
-    /// - `Result<(), String>` - 创建失败时的可读原因。
     /// 建 SSAO 的采样器与三条 uniform buffer。
-    ///
     ///
     /// 必须在 [`WebGpuRenderer::ensure_ao_targets`] **之前**跑:建目标
     /// 时要顺手建 bind group,而 bind group 需要这里造出来的 sampler
@@ -1600,8 +1626,8 @@ impl WebGpuRenderer {
     /// - `Result<usize, String>` - 这份资产在本表里的下标。
     pub fn upload_mesh(&mut self, mesh: &crate::render::MeshAssetGpu) -> Result<usize, String> {
         let device: JsValue = self.get_device().clone();
-        let vertex_bytes: &[u8] = f32_slice_to_bytes(&mesh.get_vertices());
-        let index_bytes: &[u8] = u32_slice_to_bytes(&mesh.get_indices());
+        let vertex_bytes: &[u8] = f32_slice_to_bytes(mesh.get_vertices());
+        let index_bytes: &[u8] = u32_slice_to_bytes(mesh.get_indices());
         let vertex_buffer: JsValue =
             create_buffer(&device, vertex_bytes.len(), USAGE_VERTEX_BUFFER)?;
         let index_buffer: JsValue = create_buffer(&device, index_bytes.len(), USAGE_INDEX_BUFFER)?;
@@ -1641,8 +1667,8 @@ impl WebGpuRenderer {
         mesh: &crate::render::MeshAssetGpu,
     ) -> Result<(), String> {
         let device: JsValue = self.get_device().clone();
-        let vertex_bytes: &[u8] = f32_slice_to_bytes(&mesh.get_vertices());
-        let index_bytes: &[u8] = u32_slice_to_bytes(&mesh.get_indices());
+        let vertex_bytes: &[u8] = f32_slice_to_bytes(mesh.get_vertices());
+        let index_bytes: &[u8] = u32_slice_to_bytes(mesh.get_indices());
         let Some(slot) = self.get_meshes_mut().get_mut(mesh_index) else {
             return Err(format!(
                 "{}: {mesh_index} of {}",
@@ -1681,8 +1707,8 @@ impl WebGpuRenderer {
             slot.set_index_buffer(buffer);
             slot.set_index_capacity(capacity);
         }
-        write_buffer(&device, &slot.get_vertex_buffer(), 0.0, vertex_bytes)?;
-        write_buffer(&device, &slot.get_index_buffer(), 0.0, index_bytes)?;
+        write_buffer(&device, slot.get_vertex_buffer(), 0.0, vertex_bytes)?;
+        write_buffer(&device, slot.get_index_buffer(), 0.0, index_bytes)?;
         slot.set_index_count((index_bytes.len() / 4) as u32);
         Ok(())
     }
@@ -2378,8 +2404,8 @@ impl WebGpuRenderer {
             // 与 WebGL2 端同一条静默路径:下标越界不报错,只是不画。
             return Ok(0);
         };
-        set_vertex_buffer(pass, SLOT_VERTEX, &mesh.get_vertex_buffer())?;
-        set_index_buffer(pass, &mesh.get_index_buffer())?;
+        set_vertex_buffer(pass, SLOT_VERTEX, mesh.get_vertex_buffer())?;
+        set_index_buffer(pass, mesh.get_index_buffer())?;
         // `first_instance` 让顶点着色器的 `@location(4..8)` 从
         // instance buffer 的对应位置读 —— instance buffer 是整帧
         // 连续的一段,每个批次占其中 `count` 个实例。
@@ -2560,17 +2586,6 @@ impl WebGpuRenderer {
         call1(&device, METHOD_CREATE_TEXTURE, descriptor.as_ref())
     }
 
-    /// 给四条 bloom pass 各建一个 bind group。
-    ///
-    /// ⚠️ 每个 bind group 的**颜色输入**是上一 pass 的输出:
-    /// 提取读主场景 → 模糊 H 读 bright → 模糊 V 读 ping →
-    /// 合成读「主场景 + pong」。所以这里是一次性的**链式**绑定,
-    /// 不能少任何一环。
-    ///
-    /// # Returns
-    ///
-    ///
-    /// - `Result<(), String>` - 创建失败时的错误文本。
     /// 建三条 AO pass 的 bind group。
     ///
     /// 三条的形状完全一样:sampler + 法线图 + 深度图 + 各自的 uniform。
@@ -3030,5 +3045,151 @@ impl GpuUnavailable {
     /// - `GpuUnavailable` - 包好的错误值。
     pub fn new(reason: &'static str) -> Self {
         Self { reason }
+    }
+}
+
+/// 顶点布局的回归测试。
+///
+/// 这里的每条断言都对应一次真实故障:形状对了不代表下标对了。
+#[cfg(test)]
+mod tests {
+    use super::{INSTANCE_ATTRIBUTE_COUNT, VERTEX_ATTRIBUTE_COUNT, VERTEX_ATTRIBUTES};
+
+    /// 顶点属性的**数组下标**与 `shaderLocation` 是两件事。
+    ///
+    /// `build_vertex_layout` 曾经把 `shaderLocation` 当成 `push_into`
+    /// 的下标传。顶点属性的 location 是 0-3 + 9-12(4-8 让给
+    /// instanced 属性),跳号本身合法,但它让 `location + 1` 与
+    /// 「下一个元素该落在第几格」彻底脱钩:前 4 个元素写完
+    /// `array.length == 4`,轮到 `location 9` 时断言
+    /// `expected len 10, got 5` 抛出,`createRenderPipeline` 当场失败。
+    ///
+    /// 症状被三层回退放大成一帧都画不出来:WebGPU 管线建不起来 →
+    /// 退回 WebGL2(同一份共享顶点数据,那份也因为同样的假设出错)
+    /// → 退回 Canvas2D。
+    ///
+    /// ⚠️ 这条测试必须真的驱动 [`attribute_slot`],而不是只断言
+    /// `VERTEX_ATTRIBUTES` 那张表 —— 只查表的写法在把调用点改回
+    /// location 之后**照样绿**(表没被动过),是一枚空守卫。
+    /// 这里对**每一条** location 都问一遍下标,只要下标改回取自
+    /// location,第 5 条(uv,location 9)就会拿到 9,越出 8 格数组。
+    #[test]
+    pub(crate) fn vertex_attribute_slots_are_separate_from_shader_locations() {
+        assert_eq!(VERTEX_ATTRIBUTES.len(), VERTEX_ATTRIBUTE_COUNT);
+        // location 刻意跳号:0-3 顶点、9-12 PBR,4-8 归 instanced。
+        // 数组长度是 8 而不是 13 —— 这是本测试的核心断言。
+        let locations: Vec<u32> = VERTEX_ATTRIBUTES
+            .iter()
+            .map(|(l, _, _): &(u32, u64, &str)| *l)
+            .collect();
+        assert_eq!(
+            locations,
+            vec![0, 1, 2, 3, 9, 10, 11, 12],
+            "vertex shaderLocations must stay sparse (4..8 belong to instance attributes)"
+        );
+        // 逐条验:`push_into(array, slot, …)` 会断言 `array.length == slot + 1`,
+        // 所以 slot 必须在 `0..VERTEX_ATTRIBUTE_COUNT` 里且严格递增。
+        for (table_index, (location, _, _)) in VERTEX_ATTRIBUTES.iter().enumerate() {
+            let slot: usize = super::attribute_slot(table_index as u32);
+            assert!(
+                slot < VERTEX_ATTRIBUTE_COUNT,
+                "vertex attribute at table index {table_index} (location {location}) lands on \
+                 array slot {slot}, past the {VERTEX_ATTRIBUTE_COUNT}-entry attributes array"
+            );
+            if *location != table_index as u32 {
+                // 这里就是 bug 的判据:location 与下标不同的地方,正是
+                // 「把 location 当下标」会越界的地方。
+                let location_as_slot: usize = *location as usize;
+                assert!(
+                    location_as_slot >= VERTEX_ATTRIBUTE_COUNT,
+                    "location {location} (table index {table_index}) coincidentally equals its \
+                     slot — the sparse-location hazard this guards against is currently \
+                     undetectable by location alone"
+                );
+            }
+        }
+    }
+
+    /// 顶点属性那个循环里,**下标必须来自 `attribute_slot`**,不能来自
+    /// `location`。
+    ///
+    /// ⚠️ 上面那条测试在调用点改回 location 之后照样绿:`VERTEX_ATTRIBUTES`
+    /// 那张表一个字都没动,`attribute_slot` 本身也没动 —— 动的只是
+    /// `build_vertex_layout` 里那一行,而它在 wasm 上才跑得到,宿主测试
+    /// 根本进不去。
+    ///
+    /// 所以这里守的是**那一行本身**。`push_into` 的下标参数写成
+    /// `*location as usize` 时,uv 那一条会传 9,而 `attributes` 只有 8 格,
+    /// 断言 `expected len 10, got 5` 当场抛出,`createRenderPipeline` 失败,
+    /// 三层回退之后画面全黑。这条断言抓的正是那次真实故障。
+    #[test]
+    pub(crate) fn the_vertex_loop_never_pushes_at_a_shader_location() {
+        let source: &str = include_str!("impl.rs");
+        let start: usize = source
+            .find("fn build_vertex_layout")
+            .expect("build_vertex_layout must exist");
+        let body: &str = &source[start..];
+        let end: usize = body
+            .find("pub fn create_uniform_buffers")
+            .unwrap_or(body.len());
+        let body: &str = &body[..end];
+        // 循环体里出现的那个 push_into —— 下标只能是 `slot`。
+        let push_line: &str = body
+            .lines()
+            .find(|line: &&str| line.contains("push_into(&vertex_attributes"))
+            .expect("the vertex loop must push attributes into vertex_attributes");
+        assert!(
+            !push_line.contains("location"),
+            "the vertex attributes array must be indexed by slot, not shaderLocation \
+             — pushing at a location is what produced `expected len 10, got 5`: \
+             got {push_line:?}"
+        );
+        assert!(
+            push_line.contains("slot"),
+            "the vertex attributes push must use the `slot` derived from attribute_slot: \
+             got {push_line:?}"
+        );
+    }
+
+    /// 顶点与 instance 的属性偏移必须落在各自 stride 之内。
+    ///
+    /// 顶点 buffer 是 `STRIDE_FLOATS`(20)× 4 = 80 B。最后一条属性
+    /// 在 byte 72 占 `float32x2`,结束于 80 —— 正好贴边。stride 一旦
+    /// 与 `STRIDE_FLOATS` 脱钩,这里就会越界。
+    #[test]
+    pub(crate) fn vertex_attribute_offsets_fit_inside_the_declared_stride() {
+        let stride: u64 = super::VERTEX_STRIDE_BYTES;
+        for (slot, (location, offset, format)) in VERTEX_ATTRIBUTES.iter().enumerate() {
+            let width: u64 = if *format == super::VERTEX_FORMAT_F32X2 {
+                8
+            } else {
+                12
+            };
+            assert!(
+                offset + width <= stride,
+                "vertex attribute {slot} (location {location}) ends at {} past the {stride} B stride",
+                offset + width
+            );
+        }
+        // instance:4 × vec4 (0..64) + tint vec3 (64..76),stride 80 B。
+        let instance_stride: u64 = super::INSTANCE_STRIDE_BYTES as u64;
+        assert_eq!(instance_stride, 80);
+        assert!(64 + 12 <= instance_stride);
+        assert_eq!(INSTANCE_ATTRIBUTE_COUNT, 5);
+    }
+
+    /// 顶点布局里**没有** instance 属性。
+    ///
+    /// 两条 layout 的数组长度必须分别是 8 与 5;把 instanced 那几条
+    /// 混进顶点 layout 会让 WebGPU 把 instance 数据按 per-vertex 读,
+    /// 画面上是所有实例叠在同一个模型矩阵上。
+    #[test]
+    pub(crate) fn instance_attributes_stay_out_of_the_vertex_buffer_layout() {
+        for (slot, (location, _, _)) in VERTEX_ATTRIBUTES.iter().enumerate() {
+            assert!(
+                !(*location >= 4 && *location <= 8),
+                "vertex attribute {slot} must not claim instanced location {location}"
+            );
+        }
     }
 }

@@ -15,16 +15,16 @@ pub use ::core::array;
 pub(crate) use {r#const::*, r#fn::*, r#struct::*};
 
 pub(crate) use crate::{
-    camera::{Camera, Mat4, Mat4Data},
+    camera::Mat4,
     r#config::{
         BAKED_CONTACT_AO_HEIGHT, BLOOM_BLUR_SPREAD, BLOOM_MIN_GAIN, BLOOM_SCALE, BLOOM_STRENGTH,
         BLOOM_THRESHOLD, CONTACT_SHADOW_FEATHER, CONTACT_SHADOW_FLOOR, CONTACT_SHADOW_MIN_HEIGHT,
         CONTACT_SHADOW_REACH, REPLACE_MESH_OUT_OF_RANGE, SHADOW_MAP_SIZE, SHADOW_PCF_RADIUS,
-        SSAO_POWER, SSAO_RADIUS,
+        SSAO_RADIUS,
     },
     mesh::{f32_slice_to_bytes, u32_slice_to_bytes},
     render::{
-        FLOATS_PER_INSTANCE, INSTANCE_STRIDE_BYTES, STRIDE_FLOATS, SceneLighting, build_gpu_mesh,
+        FLOATS_PER_INSTANCE, INSTANCE_STRIDE_BYTES, STRIDE_FLOATS, SceneLighting,
         instance_affects_shadow, shadow_view_projection,
     },
     r#type::*,

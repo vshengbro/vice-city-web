@@ -247,22 +247,7 @@ pub struct GpuUnavailable {
     pub(crate) reason: &'static str,
 }
 
-/// 从 JS 对象读一个**属性**(不是方法)。
-///
-/// `device.queue` 这类成员必须走这里:拿 `call0` 去调它会得到
-/// `queue is not a function`。
-///
-/// # Arguments
-///
-/// - `&JsValue` - 承载属性的 JS 对象。
-/// - `&str` - 属性名。
-///
-/// # Returns
-///
-/// - `Result<JsValue, String>` - 属性值。
-
 /// WebGPU 渲染后端。
-///
 ///
 /// 构造是**异步**的(见 [`acquire`]),但 [`WebGpuRenderer::render`]
 /// 是同步的 —— 拿到 device 之后,每帧不再需要任何 await。

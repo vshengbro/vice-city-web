@@ -542,7 +542,7 @@ pub(crate) const BINDING_BLOOM_AO_SAMPLER: u32 = 5;
 pub(crate) const BINDING_BLOOM_AO_MAP: u32 = 6;
 
 pub(crate) const SSAO_BLUR_BODY: &str = r#"
-pub(crate) struct BlurUniform {
+struct BlurUniform {
     // xy = 1/分辨率, z = 方向 x, w = 方向 y
     direction : vec4<f32>,
 };
@@ -552,13 +552,13 @@ pub(crate) struct BlurUniform {
 @group(0) @binding(2) var blur_depth : texture_2d<f32>;
 @group(0) @binding(3) var<uniform> blur : BlurUniform;
 
-pub(crate) struct VsOut {
+struct VsOut {
     @builtin(position) position : vec4<f32>,
     @location(0) uv : vec2<f32>,
 };
 
 @vertex
-pub(crate) fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
+fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
     var x : f32 = -1.0;
     var y : f32 = -1.0;
     if (index == 1u) {
@@ -573,7 +573,7 @@ pub(crate) fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
 }
 
 @fragment
-pub(crate) fn fs_blur(in : VsOut) -> @location(0) vec4<f32> {
+fn fs_blur(in : VsOut) -> @location(0) vec4<f32> {
     let centre_depth : f32 = textureSampleLevel(blur_depth, blur_sampler, in.uv, 0.0).r;
     if (centre_depth >= {NO_GEOMETRY}) {
         return vec4<f32>(1.0, 1.0, 1.0, 1.0);
@@ -621,7 +621,7 @@ pub(crate) const WGSL_SLOT_DEPTH_SIGMA: &str = "{DEPTH_SIGMA}";
 pub(crate) const WGSL_SLOT_SAMPLES: &str = "{SAMPLES}";
 
 pub(crate) const SSAO_BODY: &str = r#"
-pub(crate) struct AoUniform {
+struct AoUniform {
     // x = 1/宽度, y = 1/高度, z = 抖动种子, w = 强度下限
     misc : vec4<f32>,
     // x = 采样半径(米), y = 强度(0 = 关闭), z/w = 预留
@@ -633,13 +633,13 @@ pub(crate) struct AoUniform {
 @group(0) @binding(2) var ao_depth : texture_2d<f32>;
 @group(0) @binding(3) var<uniform> ao : AoUniform;
 
-pub(crate) struct VsOut {
+struct VsOut {
     @builtin(position) position : vec4<f32>,
     @location(0) uv : vec2<f32>,
 };
 
 @vertex
-pub(crate) fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
+fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
     var x : f32 = -1.0;
     var y : f32 = -1.0;
     if (index == 1u) {
@@ -657,17 +657,17 @@ pub(crate) fn vs_fullscreen(@builtin(vertex_index) index : u32) -> VsOut {
 ///
 /// 逐分量比较而不是四条 `||`:`sample_uv` 越界时整圈样本都得跳过,
 /// 提前返回的代价低于继续采样。
-pub(crate) fn inside_unit(value : vec2<f32>) -> bool {
+fn inside_unit(value : vec2<f32>) -> bool {
     return all(value >= vec2<f32>(0.0)) && all(value <= vec2<f32>(1.0));
 }
 
 /// 哈希到 [0,1),每像素抖动以打散采样噪声。
-pub(crate) fn hash(value : vec2<f32>) -> f32 {
+fn hash(value : vec2<f32>) -> f32 {
     return fract(sin(dot(value, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 
 @fragment
-pub(crate) fn fs_ssao(in : VsOut) -> @location(0) vec4<f32> {
+fn fs_ssao(in : VsOut) -> @location(0) vec4<f32> {
     let centre_depth : f32 = textureSampleLevel(ao_depth, ao_sampler, in.uv, 0.0).r;
     let strength : f32 = ao.params.y;
     if (centre_depth >= {NO_GEOMETRY} || strength <= 0.0) {
@@ -842,12 +842,6 @@ pub(crate) const G_BUFFER_DEPTH_FORMAT: &str = "r32float";
 
 /// SSAO 三条 pass 的槽位下标。
 pub(crate) const AO_PASS_SAMPLE: usize = 0;
-
-/// SSAO 采样半径(米)。
-///
-
-/// AO 双边模糊的步长(纹素)。
-///
 
 /// 模糊的**水平**那一趟。
 pub(crate) const AO_PASS_BLUR_H: usize = 1;
@@ -1079,11 +1073,11 @@ pub(crate) const SHADOW_NORMAL_OFFSET_SLOPE_GAIN: f32 = 2.0;
 
 /// WebGPU 顶点着色器。
 pub(crate) const SHADER_VERTEX: &str = r#"
-pub(crate) struct Frame {
+struct Frame {
     view_proj : mat4x4<f32>,
 };
 
-pub(crate) struct Varyings {
+struct Varyings {
     @builtin(position) clip : vec4<f32>,
     @location(0) normal : vec3<f32>,
     @location(1) color : vec3<f32>,
@@ -1094,7 +1088,7 @@ pub(crate) struct Varyings {
     @location(6) contact_ao : f32,
 };
 
-pub(crate) struct Shading {
+struct Shading {
     light_dir : vec4<f32>,
     light_color : vec4<f32>,
     ambient : vec4<f32>,
@@ -1154,7 +1148,7 @@ pub(crate) struct Shading {
 // 两项相乘成一条曲线:离基座近且贴地 → 压到 `ao_params.y`;离得远
 // 或站得高 → 回到 1.0(完全不压)。model 矩阵的第 4 列(row3)就是
 // 世界平移(WGSL 的 `mat4x4<f32>(row0..row3)` 按**列**构造)。
-pub(crate) fn contact_ao(world : vec3<f32>, base : vec3<f32>) -> f32 {
+fn contact_ao(world : vec3<f32>, base : vec3<f32>) -> f32 {
     let horizontal : f32 = length(world.xz - base.xz);
     let reach : f32 = max(shading.ao_params.z, 0.001);
     let feather : f32 = max(shading.ao_params.w, 0.001);
@@ -1173,7 +1167,7 @@ pub(crate) fn contact_ao(world : vec3<f32>, base : vec3<f32>) -> f32 {
 }
 
 @vertex
-pub(crate) fn vs_main(
+fn vs_main(
     @location(0) position : vec3<f32>,
     @location(1) normal : vec3<f32>,
     @location(2) color : vec3<f32>,
@@ -1225,14 +1219,14 @@ pub(crate) fn vs_main(
 /// 管线各有各的 pipeline layout,同一个 binding 号在它们里面指的是
 /// 不同的 buffer。
 pub(crate) const SHADER_SHADOW_VERTEX: &str = r#"
-pub(crate) struct ShadowFrame {
+struct ShadowFrame {
     view_proj : mat4x4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> shadow_frame : ShadowFrame;
 
 @vertex
-pub(crate) fn vs_shadow(
+fn vs_shadow(
     @location(0) position : vec3<f32>,
     @location(4) row0 : vec4<f32>,
     @location(5) row1 : vec4<f32>,
@@ -1252,7 +1246,7 @@ pub(crate) fn vs_shadow(
 /// 色相保持色调映射 → 接触 AO → 天空色晕染 → smoothstep 雾 → sRGB 编码),
 /// 这样两个后端画出来的是同一座城市,而不是「一个亮一个暗」的两种美术。
 pub(crate) const SHADER_FRAGMENT: &str = r#"
-pub(crate) struct Shading {
+struct Shading {
     light_dir : vec4<f32>,
     light_color : vec4<f32>,
     ambient : vec4<f32>,
@@ -1294,13 +1288,13 @@ pub(crate) struct Shading {
 @group(1) @binding(0) var shadow_map : texture_depth_2d;
 @group(1) @binding(1) var shadow_sampler : sampler_comparison;
 
-pub(crate) struct ShadowFrame {
+struct ShadowFrame {
     view_proj : mat4x4<f32>,
 };
 
 @group(1) @binding(2) var<uniform> shadow_frame : ShadowFrame;
 
-pub(crate) fn tonemap_luma(luma : f32, exposure : f32, white : f32) -> f32 {
+fn tonemap_luma(luma : f32, exposure : f32, white : f32) -> f32 {
     let w : f32 = select(1.0, white, white > 0.0000001);
     let x : f32 = max(luma, 0.0) * exposure;
     return (x * (1.0 + x / (w * w))) / (1.0 + x);
@@ -1308,7 +1302,7 @@ pub(crate) fn tonemap_luma(luma : f32, exposure : f32, white : f32) -> f32 {
 
 // 色相保持:只压亮度再按比例缩回 RGB,保住粉/薄荷这类浅色的色相。
 // 逐通道 clamp 会把 1.5 亮度的粉红面去色成纯白 —— 那正是「一片惨白」。
-pub(crate) fn tonemap(value : vec3<f32>, exposure : f32, white : f32) -> vec3<f32> {
+fn tonemap(value : vec3<f32>, exposure : f32, white : f32) -> vec3<f32> {
     let luma : f32 = dot(value, vec3<f32>(0.2126, 0.7152, 0.0722));
     if (luma <= 0.000001) {
         return vec3<f32>(0.0, 0.0, 0.0);
@@ -1319,7 +1313,7 @@ pub(crate) fn tonemap(value : vec3<f32>, exposure : f32, white : f32) -> vec3<f3
     return value * scale;
 }
 
-pub(crate) fn linear_to_srgb(value : vec3<f32>) -> vec3<f32> {
+fn linear_to_srgb(value : vec3<f32>) -> vec3<f32> {
     let c : vec3<f32> = clamp(value, vec3<f32>(0.0), vec3<f32>(1.0));
     let lo : vec3<f32> = c * 12.92;
     let hi : vec3<f32> = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
@@ -1339,7 +1333,7 @@ pub(crate) fn linear_to_srgb(value : vec3<f32>) -> vec3<f32> {
 /// 另外 WebGPU 的 NDC 深度是 `[0, 1]`(GL 是 `[-1, 1]`),所以
 /// `current` **不需要**再乘 `0.5 + 0.5`;而纹理里存下来的深度已经
 /// 是 `[0, 1]` 的设备深度,可以直接喂给 `textureSampleCompare`。
-pub(crate) fn sample_shadow(world : vec3<f32>, n_dot_l : f32) -> f32 {
+fn sample_shadow(world : vec3<f32>, n_dot_l : f32) -> f32 {
     let light_clip : vec4<f32> = shadow_frame.view_proj * vec4<f32>(world, 1.0);
     let ndc : vec3<f32> = light_clip.xyz / light_clip.w;
     // 走出 shadow frustum 的地方没有数据,判全亮而不是判全黑 ——
@@ -1402,14 +1396,14 @@ pub(crate) fn sample_shadow(world : vec3<f32>, n_dot_l : f32) -> f32 {
 /// ⚠️ 每个 `@fragment` 常量编译成**独立的** `GPUShaderModule`,彼此
 /// 看不见对方的类型。所以这个 `struct` 必须完整写在**城市**的片元
 /// 模块里,不能只声明在顶点模块 —— 否则报 `unresolved type 'FragOut'`。
-pub(crate) struct FragOut {
+struct FragOut {
     @location(0) color : vec4<f32>,
     @location(1) normal : vec4<f32>,
     @location(2) depth : vec4<f32>,
 }
 
 @fragment
-pub(crate) fn fs_main(
+fn fs_main(
     @location(0) normal : vec3<f32>,
     @location(1) color : vec3<f32>,
     @location(2) emissive : vec3<f32>,
@@ -1518,13 +1512,13 @@ pub(crate) fn fs_main(
 /// ⚠️ 必须 `return clip`(真实裁剪坐标),不能塞
 /// `vec4(clip.xy, 0.5, 1.0)` —— 那是几何 pass 踩过的坑。
 pub(crate) const SHADER_FULLSCREEN_VERTEX: &str = r#"
-pub(crate) struct FullscreenOut {
+struct FullscreenOut {
     @builtin(position) clip : vec4<f32>,
     @location(0) uv : vec2<f32>,
 };
 
 @vertex
-pub(crate) fn vs_fullscreen(@builtin(vertex_index) index : u32) -> FullscreenOut {
+fn vs_fullscreen(@builtin(vertex_index) index : u32) -> FullscreenOut {
     // 一个覆盖裁剪空间的三角形:(0,0) (2,0) (0,2)。
     let p : vec2<f32> = vec2<f32>(
         f32((index << 1u) & 2u),
@@ -1554,7 +1548,7 @@ pub(crate) fn vs_fullscreen(@builtin(vertex_index) index : u32) -> FullscreenOut
 /// ⚠️ **合成那个入口多绑一对 sampler + 纹理**(槽位 3 / 4),所以它
 /// 用的是**另一条** bind group layout。
 pub(crate) const SHADER_BLOOM_FRAGMENT: &str = r#"
-pub(crate) struct BloomParams {
+struct BloomParams {
     // x = 亮度阈值, y = 合成强度, zw = 模糊方向(uv 单位)。
     params : vec4<f32>,
     // 高斯核权重 w0..w3。
@@ -1576,7 +1570,7 @@ pub(crate) struct BloomParams {
 
 // 取第 index 个核权重(index ∈ 0..4)。第 5 个(w4)放在 texel.x,
 // 所以这里单独分流而不是直接索引 kernel。
-pub(crate) fn kernel_weight(index : i32) -> f32 {
+fn kernel_weight(index : i32) -> f32 {
     if (index == 4) {
         return bloom.texel.x;
     }
@@ -1588,7 +1582,7 @@ pub(crate) fn kernel_weight(index : i32) -> f32 {
 // (threshold 与 threshold-knee 之间的 smoothstep)比硬阈值好:硬阈值会让
 // 亮度刚好越线的像素「突然」出现光晕,看起来像描边。
 @fragment
-pub(crate) fn fs_extract(
+fn fs_extract(
     @location(0) uv : vec2<f32>,
 ) -> @location(0) vec4<f32> {
     let color : vec3<f32> = textureSample(source_color, source_sampler, uv).rgb;
@@ -1603,7 +1597,7 @@ pub(crate) fn fs_extract(
 
 // 5 抽头线性采样优化的高斯核(等价于 9 抽头,只用 5 次纹理读取)。
 // 方向来自 uniform:水平传 (texel.x * spread, 0),竖直传 (0, texel.y * spread)。
-pub(crate) fn blur(uv : vec2<f32>) -> vec4<f32> {
+fn blur(uv : vec2<f32>) -> vec4<f32> {
     let direction : vec2<f32> = bloom.params.zw;
     var color : vec3<f32> = textureSample(source_color, source_sampler, uv).rgb
         * kernel_weight(0);
@@ -1618,7 +1612,7 @@ pub(crate) fn blur(uv : vec2<f32>) -> vec4<f32> {
 
 // 水平模糊:方向 (texel.x * spread, 0)。
 @fragment
-pub(crate) fn fs_blur_h(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+fn fs_blur_h(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     return blur(uv);
 }
 
@@ -1627,14 +1621,14 @@ pub(crate) fn fs_blur_h(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
 // 写死成两个函数体的话,核权重就得分叉两份,改一处忘另一处的症状是
 // 「光晕一边糊一边不糊」。
 @fragment
-pub(crate) fn fs_blur_v(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+fn fs_blur_v(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     return blur(uv);
 }
 
 // 合成:主场景颜色 + 模糊后的 bloom,加法混合。
 // 强度 bloom.params.y 由 Rust 侧算好再上传。
 @fragment
-pub(crate) fn fs_composite(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+fn fs_composite(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
     let color : vec3<f32> = textureSample(source_color, source_sampler, uv).rgb;
     let glow : vec3<f32> = textureSample(blur_map, blur_sampler, uv).rgb;
     // SSAO 当**乘性**项作用在场景色上,而不是加一层黑 —— 加法会在本来
