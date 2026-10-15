@@ -11232,6 +11232,177 @@ mod tests {
         );
     }
 
+    /// **车停在路口中轴线前 1.73 m、后方还有四辆 —— 必须能开走。**
+    ///
+    /// 线上实测(探针加了 `carHail` / `carAxis` / `carDir` / `carStreet`
+    /// 之后才看清):
+    ///
+    /// ```text
+    /// car9 (-76.35,-56.50) v=2.09  car5 (-71.78,-56.50) v=2.09
+    /// car6 (-67.24,-56.50) v=2.09  car7 (-62.69,-56.50) v=2.09
+    /// car8 (-58.27,-56.50) v=0.07 hail=0.00  ax=1 dir=+1 street=-1
+    /// ```
+    ///
+    /// 五辆全部 `ax=1 dir=+1 street=-1`,即同一条横向车道
+    /// (z=-56.5 = `street_axis(-1) + 3.5`),间距 4.42 m 递增。
+    /// **队首 car8 连续 80 s 位移精确 0.00 m**,后四辆全被锁在 2.09 m/s
+    /// 的跟车平衡速度上。
+    ///
+    /// 关键的几何事实:car8 在 x=-58.27,而路口中轴线在
+    /// `street_axis(-1)` = -60 —— 它**已经越过中轴线 1.73 m**,却没能
+    /// 触发路口换道。`choose_at_junction` 判的是「沿街坐标越过**下一个**
+    /// 路口中轴线」,下一个是 x=0,离它还有 49 m,换道迟迟不触发。
+    ///
+    /// 这条把五辆车按线上坐标摆好,跑 200 s,要求队首必须开走。
+    #[test]
+    pub(crate) fn a_queue_head_past_the_junction_centre_keeps_driving() {
+        let world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        for x in [-76.35f32, -71.78, -67.24, -62.69, -58.27].iter() {
+            let mut car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, -1, 1.0, 1, *x, 11.5, 1.0);
+            car.set_position([*x, 0.0, -56.5]);
+            traffic.get_cars_mut().push(car);
+        }
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        for _frame in 0..12000 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let mut worst: String = String::new();
+        let mut min_moved: f32 = f32::INFINITY;
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            min_moved = min_moved.min(moved);
+            worst.push_str(&format!(
+                "car{index}(x0={:.2}) {moved:.2}m v={:.3} ax={} st={}; ",
+                start[index][0],
+                car.get_speed(),
+                car.get_lane_axis(),
+                car.get_lane_street()
+            ));
+        }
+        println!("线上坐标队列 200s: {worst}");
+        assert!(
+            min_moved >= 5.0,
+            "线上那五辆按原坐标摆开,跑 200 s 后最慢的只走了 {min_moved:.2} m({worst})"
+        );
+    }
+
+    /// **被挡住的车的速度必须真的是 0。**
+    ///
+    /// 线上症状是「位置和速度互相矛盾」:探针读出 `carSpeed = 0.067`,
+    /// 而位置连续 **80 s 精确 0.00 m**。car8 后面还锁着四辆
+    /// (car7 / 6 / 5 / 9,间距 4.42 m,全停在 2.09 m/s 的跟车平衡速度上)。
+    ///
+    /// 机制:`route_advance` 里位移被静态几何吃掉时把速度砍到 0 并
+    /// `return`;但车队层的 IDM 在**之后**才统一回写速度,它只看到
+    /// 「速度 0、前面 49 m 没车、不在红灯前」——`gap = INFINITY`、
+    /// `interaction = 0`、`free = 0`,于是 `a = A·(1 − 0 − 0) = +4 m/s²`,
+    /// 把速度拉回 0.067。下一帧又撞同一个障碍、再被砍到 0,永远循环。
+    ///
+    /// 这条构造一个**静态墙**把车挡死,然后断言:速度必须恒为 0,
+    /// 且位移必须精确为 0(不能是「有速度却不动的自相矛盾」)。
+    #[test]
+    pub(crate) fn a_blocked_car_reports_zero_speed_not_a_ghost_value() {
+        let mut world: CollisionWorld = crate::collision::CollisionWorld::new();
+        // 在车头正前方摆一堵墙:沿 +X 行驶,车头在 z=-56.5 这条线上。
+        world.get_shapes_mut().push(crate::collision::Shape::Aabb {
+            // 墙横在 z = -56.5 这条车道上,覆盖 x ∈ [-31.0, -29.0]。
+            //
+            // 位置是算过的:车从 x=-40 出发、沿 +X 开,到墙还有 9 m,
+            // **中间不经过任何路口**(路口在 -60 和 0)。第一版把墙放在
+            // x=-56,车却在 2 m 外的路口 -60 就抽签拐走了,墙根本没被碰到
+            // —— 测试看着「没被挡」,其实量错了东西。
+            center: [-30.0, -56.5],
+            half: [1.0, 3.0],
+        });
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        let mut car: crate::traffic::TrafficCar =
+            crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, -1, 1.0, 1, -40.0, 11.5, 1.0);
+        car.set_position([-40.0, 0.0, -56.5]);
+        traffic.get_cars_mut().push(car);
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        for _frame in 0..1800 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
+        let p: Vec3 = c.get_position();
+        println!(
+            "被墙挡住的车 30 s 后: ({:.2},{:.2}) 速度 {:.5} blocked={}",
+            p[0],
+            p[2],
+            c.get_speed(),
+            c.get_blocked()
+        );
+        assert!(
+            c.get_speed() <= 0.001,
+            "被静态几何挡了 30 s,速度却读出 {:.5} —— IDM 每帧把它从 0 拉起来又被碰撞打回去",
+            c.get_speed()
+        );
+        assert!(
+            p[0] <= -31.0,
+            "车不该穿过墙(墙左沿 x=-31.0),车心却跑到了 x={:.2}",
+            p[0]
+        );
+    }
+
+    /// **车停在 (-58.27, -56.50) 动不了 —— 那个点上是不是有静态碰撞体。**
+    ///
+    /// 线上实测(探针加了路网状态之后):car8 `v = 0.066`、`hail = 0.00`
+    /// (不是停靠)、`ax=1 dir=+1 street=-1`,连续 **80 s 位移精确 0.00 m**,
+    /// 后面四辆(car7 / 6 / 5 / 9)全被锁在 2.09 m/s。它在路口中轴线
+    /// `street_axis(-1) = -60` 前方 1.73 m,下一个停止线还在 49 m 外 ——
+    /// 所以**红灯解释不了**(P2 的停止线不在这)。
+    ///
+    /// 之前排除过流式:世界按 `BLOCK_VIEW_RADIUS = 300` 建造,158 m 在里面,
+    /// 碰撞体数量稳定在 1674 没变过。所以只可能是**某个静态形状正好压在
+    /// 车头前**。
+    ///
+    /// 这条直接把车放在那个点上跑 30 s,并打印它到底停在哪一步 ——
+    /// `route_advance` 里被挡住会把速度砍到 0 并**不再推进路网状态**。
+    #[test]
+    pub(crate) fn the_frozen_online_spot_has_no_static_geometry_in_it() {
+        let world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        // 车头朝 +X,车心在 -58.27 => 车头前沿约 -58.27 + 2.283 = -55.99。
+        let probe: Vec2 = [-55.99, -56.5];
+        let before: Vec2 = world.resolve_car_footprint(probe, [0.0, 0.0], 0.0);
+        println!(
+            "零位移解算: 输入 ({:.2},{:.2}) -> 输出 ({:.2},{:.2})",
+            probe[0], probe[1], before[0], before[1]
+        );
+        assert_eq!(
+            (before[0], before[1]),
+            (probe[0], probe[1]),
+            "那个点上本来就卡着一辆车 —— 线上 car8 冻结的真实原因"
+        );
+        // 再验一次:真给它 0.5 m 的位移,看能不能走。
+        let moved: Vec2 = world.resolve_car_footprint(probe, [0.5, 0.0], 0.0);
+        println!(
+            "0.5 m 位移解算: ({:.2},{:.2}) -> ({:.2},{:.2})",
+            probe[0], probe[1], moved[0], moved[1]
+        );
+        assert!(
+            moved[0] > probe[0] + 0.2,
+            "车头前 0.5 m 都挪不动,静态几何就压在 ({:.2},{:.2})",
+            probe[0],
+            probe[1]
+        );
+    }
+
     /// **队首车刚越过路口中轴线就停住 —— 后车全体被锁。**
     ///
     /// 线上实测(玩家在 63.5,45)沿 +X 那一排:
