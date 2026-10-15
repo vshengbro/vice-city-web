@@ -5540,6 +5540,10 @@ pub(crate) fn simulate(game: &mut Game, delta: f32) {
     // 信号机用的全局时钟。用**累积时间**而不是 `frame_count / 60`:
     // 掉帧时后者会瞬间跳一大格,相位看起来像在抽搐;累积时间连续。
     // 累积放在这里(每帧一次),所以 `traffic.step` 拿到的是本帧时刻。
+    //
+    // 合并说明:另一条线的 `traffic.step(dt, hailer, &world)` 是 P2 之前
+    // 的三参签名 —— 它从 `978c6b9` 就分出去了,没见过红绿灯那一个参数。
+    // 四参是新的那个,保留。
     let clock: f32 = game.get_signal_clock() + dt;
     game.set_signal_clock(clock);
     game.get_mut_traffic()

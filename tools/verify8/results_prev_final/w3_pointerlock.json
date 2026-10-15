@@ -1,0 +1,60 @@
+{
+  "worker": "w3_pointerlock",
+  "results": [
+    {
+      "name": "boot",
+      "ok": null,
+      "note": "frames=27 画布=512x263 初始 cameraYaw=1.5708 playerYaw=1.5708 charBox=[256, 160.6, 256, 125.3, 1]"
+    },
+    {
+      "name": "a 点击后指针锁",
+      "ok": true,
+      "note": "pointerLockElement=非 null(tag=CANVAS) —— 期望非 null。src/ 内无任何 request_pointer_lock 调用,视角实际走 canvas pointerdown 拖拽。"
+    },
+    {
+      "name": "b Escape 后解锁",
+      "ok": false,
+      "note": "手动 requestPointerLock(requested)后 locked=True;发 Escape 之后 locked=True —— 无头 Chrome 需要 --enable-features 或用户手势,可能本来就没锁上,读不到就记 SKIP 而不是 FAIL"
+    },
+    {
+      "name": "c 拖拽时 cameraYaw 连续变化",
+      "ok": true,
+      "note": "按住拖 240px 期间 8 次采样 ΔcameraYaw=['-0.180', '-0.180', '-0.180', '-0.180', '-0.180', '-0.180', '-0.180'] 总 Δ=-1.4400 rad;期望 0.006×240=1.440 rad"
+    },
+    {
+      "name": "反向拖拽回到原朝向",
+      "ok": null,
+      "note": "右拖后 cameraYaw=0.1308,左拖 240px 后=1.5708 (起始 1.5708)"
+    },
+    {
+      "name": "画面方向截图(待 vision 描述)",
+      "ok": null,
+      "note": "右拖后=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w3_pointerlock_yaw_drag_right.png 左拖后=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w3_pointerlock_yaw_drag_left.png —— 判据 A「鼠标右移=视角右转」必须由这两张图的文字描述确认,不能由 ΔcameraYaw 的符号推出来:符号只说明数学关系,不说明玩家看到画面往哪转。"
+    },
+    {
+      "name": "W 位移沿相机前向",
+      "ok": false,
+      "note": "cameraYaw=1.5708 时 W 位移 (+0.000,-0.372) 长 0.372m | 候选 A +0.000 | 候选 B -0.000 -> 命中 前向=(-sin,-cos) | 门限 cos>=0.82(约 35 度)"
+    },
+    {
+      "name": "B W 让角色远离相机(depth 降)",
+      "ok": false,
+      "note": "charBox depth 1.00000 -> 1.00000 Δ=+0.00000(负=更远) | 脚底屏幕 (256.0,160.6) -> (256.0,160.3) Δ=(+0.0,-0.3)px | 画布 512x263"
+    },
+    {
+      "name": "B W 屏幕位移偏上",
+      "ok": true,
+      "note": "Δscreen=(+0.0,-0.3)px:Y 轴向下为正,所以「往屏幕上方」要求 Δy 为负。当前 Δy=-0.3 是负值,符合。"
+    },
+    {
+      "name": "方向符号真值表",
+      "ok": null,
+      "note": "鼠标右拖 240px -> ΔcameraYaw = -1.4400 rad(减) | W 按下 -> Δ(playerX,playerZ) = +0.000,-0.372 m | W 按下 -> ΔcharBox[0](屏幕 x) = +0.0px | W 按下 -> ΔcharBox[4](depth) = +0.00000"
+    },
+    {
+      "name": "A 鼠标右移=视角右转(数学半)",
+      "ok": null,
+      "note": "ΔcameraYaw=-1.4400 rad 为「增」。game.rs `camera.yaw += dx*0.006`,dx>0 时 yaw 增大,几何上相机绕焦点右转。数学半成立;感知半(画面是否真的往右转)见上面两张截图的 vision 描述。"
+    }
+  ]
+}

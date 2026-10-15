@@ -1,0 +1,75 @@
+{
+  "worker": "w8_world",
+  "results": [
+    {
+      "name": "boot",
+      "ok": null,
+      "note": "frames=27 位置=(33.5,45) tris=188788 batches=100 sceneMeshes=80 gpu={'meshes': 80, 'oob': 0, 'lastIndexCount': 2256} collisionShapes=1829 画布=512x263"
+    },
+    {
+      "name": "初始画面有内容",
+      "ok": true,
+      "note": "1280x657 平均亮度 153.0,非黑像素 840960/840960(100.0%) | /Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w8_world_initial.png"
+    },
+    {
+      "name": "a tris 无泄漏",
+      "ok": true,
+      "note": "120 帧 tris 188788 -> 188788;单帧增量 max=+0 min=+0,超 +2000/帧 的有 0 帧 | 后半程净增 +0(门限<=4000,玩家全程不动) | 逐段首值 [188788, 188788, 188788, 188788]"
+    },
+    {
+      "name": "a tris 读数",
+      "ok": null,
+      "note": "tris 每 10 帧取 1:[188788, 188788, 188788, 188788, 188788, 188788, 188788, 188788, 188788, 188788, 188788, 188788] —— 判据是**单帧增量**与静止累积,不是绝对值;三角数在涨本身不是缺陷(流式地面本来就在铺)"
+    },
+    {
+      "name": "b 流式 远 A",
+      "ok": null,
+      "note": "传送到 (214,-135),实到 (213.5,-135.0)(移动 250m) | loadedAssets 45 -> 45 | streamCenter (33.5,45) -> (240,-120) | tris 188788 batches=37 sceneMeshes=80 | 画面非黑 100.0%,平均亮度 151.5 | /Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w8_world_teleport_A.png"
+    },
+    {
+      "name": "b 流式 远 B",
+      "ok": null,
+      "note": "传送到 (-146,225),实到 (-146.5,225.0)(移动 509m) | loadedAssets 45 -> 45 | streamCenter (240,-120) -> (-120,240) | tris 188788 batches=37 sceneMeshes=80 | 画面非黑 100.0%,平均亮度 150.5 | /Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w8_world_teleport_B.png"
+    },
+    {
+      "name": "b 传送后画面非空",
+      "ok": true,
+      "note": "两次传送后画面仍然有内容(非黑占比见上)。数字只证明「有像素」,「这些像素是一座城市还是一片虚空」要靠 vision 描述。"
+    },
+    {
+      "name": "c 拾取物被拾走",
+      "ok": true,
+      "note": "目标来自 healthPack(专用字段) = (35.4,36.0);拾取后玩家在 (35.40,36.00),距目标 0.00m(拾取半径 2.2m) | pickups.taken 0 -> 1(total=12) | cash None hp=100"
+    },
+    {
+      "name": "c 拾取判据",
+      "ok": null,
+      "note": "判据是 pickups.taken 增加,且玩家确实踩进了 2.2m 半径内(当前 0.00m)。若 taken 没涨而距离在半径内,那是拾取逻辑坏了;"
+    },
+    {
+      "name": "d T 切昼夜:phase 变化",
+      "ok": true,
+      "note": "phase NOON -> DUSK(DayPhase 有 4 档,连按会绕圈)"
+    },
+    {
+      "name": "d 画面亮度随之变化",
+      "ok": true,
+      "note": "平均亮度 148.64 -> 145.42(Δ-3.22,门限|Δ|>=3.0) | /Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w8_world_phase_before.png / /Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w8_world_phase_after.png | 这是数字半;「白天还是夜里、能不能看清路面」要看 vision 描述"
+    },
+    {
+      "name": "d 昼夜可循环",
+      "ok": null,
+      "note": "再按一次 T:phase DUSK -> NIGHT 亮度均值 148.64(初始) vs 130.13(绕一圈后)(与初始不同,phase 未绕回)"
+    },
+    {
+      "name": "e HUD 非空",
+      "ok": true,
+      "note": "hud = 'VICE CITY WEB · WebGL2 · phase NIGHT · third-person · ON FOOT · HP 97 · $0 · pickups 1/12 · xyz 35.4 0.0 36.0 · 14118660 tris · frame 471 · +35 HP · health pack' | 该串由 format_hud 拼装,含血量/金钱/三角形/位置/车辆状态/相机模式/通知"
+    },
+    {
+      "name": "感知截图汇总",
+      "ok": null,
+      "note": "初始=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w8_world_initial.png 传送后=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w8_world_teleport_A.png 昼夜前=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w8_world_phase_before.png 昼夜后=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w8_world_phase_after.png —— 这四张必须交给 vision_analyze 用文字描述,否则 w8 只是一堆数字。"
+    }
+  ]
+}
