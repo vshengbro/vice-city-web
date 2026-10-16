@@ -11563,6 +11563,91 @@ mod tests {
         );
     }
 
+    /// **线上那台被钉死的车:脚下到底压着什么。**
+    ///
+    /// `d4a1bde` 的探针上线后,死锁的机制第一次被坐实:
+    ///
+    /// ```text
+    /// car6 x = -56.50  v = 0.000  blocked = 1   连续 120 s 位移精确 0.00 m
+    /// ```
+    ///
+    /// 其余九辆车每个 12 s 窗口跑 400~680 m,只有它不动。`blocked = 1`
+    /// 指向**静态碰撞体**,不是红灯、不是停靠、不是 IDM —— 幽灵速度修掉
+    /// 之后(`1a6b298`)速度读数诚实了,车照样走不了。
+    ///
+    /// x = -56.50 = `street_axis(-1) + 3.5`,街道 -1 的横向车道中心。
+    /// 这条要求:**车道的中心线上不许有任何静态碰撞体。**
+    #[test]
+    pub(crate) fn the_deadlocked_spot_has_nothing_standing_on_it() {
+        // 用线上那个世界中心(玩家出生点),不是原点 —— 用错中心量到的
+        // 「这里没东西」不算证据(1674 vs 1802 个碰撞体)。
+        let world: CollisionWorld = traffic_world_at(63.5, 45.0);
+        // 线上 car6 被钉死的精确位置。
+        let pin: Vec2 = [-56.5, -59.42];
+        println!(
+            "钉死点 ({:.2},{:.2}) 净空 {:.4} m,车足迹 +Z 推 0.19 -> {:?}",
+            pin[0],
+            pin[1],
+            world.nearest_surface_distance(pin),
+            world.resolve_car_footprint(pin, [0.0, 0.19], 0.0)
+        );
+        // 让一辆车在这个点上跑 30 s,看它到底是卡住还是只是每帧试一次。
+        let mut solo: crate::traffic::TrafficCar =
+            crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 0, 1.0, 0, -59.42, 11.5, 1.0);
+        solo.set_position([pin[0], 0.0, pin[1]]);
+        let dt: f32 = 1.0 / 60.0;
+        let mut blocked_frames: u32 = 0;
+        for _f in 0..1800 {
+            solo.step(dt, false, &world);
+            if solo.get_blocked() {
+                blocked_frames += 1;
+            }
+        }
+        let after: Vec3 = solo.get_position();
+        println!(
+            "单台车 30 s: ({:.2},{:.2}) v={:.4} blocked 帧数 {}/1800",
+            after[0],
+            after[2],
+            solo.get_speed(),
+            blocked_frames
+        );
+        assert!(
+            !solo.get_blocked(),
+            "空地上跑 30 s 却还在 blocked:位置 ({:.2},{:.2}) —— 净空有 {:.1} m,\
+             没有任何东西挡它",
+            after[0],
+            after[2],
+            world.nearest_surface_distance([after[0], after[2]])
+        );
+        // 横向车道中心,沿整条街扫一遍。
+        for street in [-2i32, -1, 0, 1, 2].iter() {
+            for side in [-1.0f32, 1.0].iter() {
+                let lane: f32 = lane_axis(*street, *side);
+                let mut worst: (f32, Vec2) = (f32::MAX, [0.0, 0.0]);
+                // 每 2 m 采一个点,覆盖街道之间的整段路面。
+                for step in -28i32..28 {
+                    let along: f32 = step as f32 * 2.0;
+                    let center: f32 = street_axis(*street);
+                    let at: Vec2 = [center + along, lane];
+                    let clear: f32 = world.nearest_surface_distance(at);
+                    if clear < worst.0 {
+                        worst = (clear, at);
+                    }
+                }
+                assert!(
+                    worst.0 > 0.5,
+                    "街道 {} 横向车道 z={:.1} 的 ({:.1},{:.1}) 上只有 {:.3} m 净空 —— \
+                     有静态碰撞体压在这条车道上,车会被永久钉死",
+                    *street,
+                    lane,
+                    worst.1[0],
+                    worst.1[1],
+                    worst.0
+                );
+            }
+        }
+    }
+
     /// **车停在 (-58.27, -56.50) 动不了 —— 那个点上是不是有静态碰撞体。**
     ///
     /// 线上实测(探针加了路网状态之后):car8 `v = 0.066`、`hail = 0.00`
