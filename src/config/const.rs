@@ -313,7 +313,7 @@ pub(crate) const STYLE_BLOCK_02: &str = "position: absolute;top: 0;left: 0;width
 
 pub(crate) const STYLE_BLOCK_03: &str = "position: absolute;top: 0;left: 0;right: 0;padding: 10px 14px;display: flex;flex-direction: row;align-items: center;justify-content: space-between;box-sizing: border-box;font-family: ui-monospace, monospace;font-size: 12px;color: #ffd9f2;text-shadow: 0 1px 3px rgba(0,0,0,.85);pointer-events: none";
 
-pub(crate) const STYLE_BLOCK_04: &str = "background: rgba(10,12,22,.55);border: 1px solid rgba(255,140,200,.35);border-radius: 6px;padding: 5px 9px;letter-spacing: .04em";
+pub(crate) const STYLE_BLOCK_04: &str = "background: rgba(10,12,22,.55);border: 1px solid rgba(255,140,200,.35);border-radius: 6px;padding: 5px 9px;letter-spacing: .04em;min-width: 0;white-space: nowrap;overflow: hidden;text-overflow: ellipsis";
 
 pub(crate) const STYLE_BLOCK_05: &str = "background: rgba(10,12,22,.55);border: 1px solid rgba(255,140,200,.35);border-radius: 6px;padding: 5px 9px;display: flex;flex-direction: row;align-items: center;gap: 8px;pointer-events: auto";
 
@@ -1459,6 +1459,13 @@ pub(crate) const THUG_HEALTH: f32 = 70.0;
 pub(crate) const ENEMY_SPEED: f32 = 5.2;
 /// 敌人发现玩家的最大距离(米)。
 pub(crate) const ENEMY_SIGHT: f32 = 46.0;
+/// 混混主动开战的距离(米):贴身才敌对,否则只巡逻。
+///
+/// 取 12 m 的理由:比交火距离(`ENEMY_STANDOFF` 9 m)多半步 —— 玩家
+/// 走进帮派分子的「私人空间」就会挨打,但隔条街(车道宽 14 m)路过
+/// 不会被卷进来。原来混混是 46 m(`ENEMY_SIGHT`)看见就全员追杀,
+/// 玩家刚出生读操作说明的十几秒就被打死。
+pub(crate) const THUG_AGGRO_RANGE: f32 = 12.0;
 /// 敌人开火的最大距离(米)。
 pub(crate) const ENEMY_FIRE_RANGE: f32 = 26.0;
 /// 敌人每发伤害。
@@ -1729,6 +1736,12 @@ pub(crate) const ID_HUD: &str = "vcw-hud";
 pub(crate) const ID_HUD_VITALS: &str = "vcw-vitals";
 /// `Element::set_attribute` 的 `id` 属性名。
 pub(crate) const ATTR_ID: &str = "id";
+/// 资产 JSON 顶层 `bounds` 字段名。
+pub(crate) const ATTR_BOUNDS: &str = "bounds";
+/// 资产 JSON `bounds` 里的 `min` 字段名。
+pub(crate) const ATTR_MIN: &str = "min";
+/// 资产 JSON `bounds` 里的 `max` 字段名。
+pub(crate) const ATTR_MAX: &str = "max";
 /// `document.create_element` 的 div 标签名。
 pub(crate) const TAG_DIV: &str = "div";
 /// `document.create_element` 的 canvas 标签名。
@@ -1743,13 +1756,13 @@ pub(crate) const STYLE_HUD_HEALTH: &str = "height:14px;width:100%;background:#2e
 /// 护甲条:同形状,蓝色。
 pub(crate) const STYLE_HUD_ARMOR: &str = "height:9px;width:0%;background:#3aa0ff;border-radius:3px;box-shadow:0 0 8px rgba(58,160,255,.5)";
 /// 右上角通缉星。
-pub(crate) const STYLE_HUD_WANTED: &str = "position:absolute;right:26px;top:22px;font-size:30px;letter-spacing:3px;color:#ffd24a;text-shadow:0 0 12px rgba(255,210,74,.6)";
+pub(crate) const STYLE_HUD_WANTED: &str = "position:absolute;right:26px;top:56px;font-size:30px;letter-spacing:3px;color:#ffd24a;text-shadow:0 0 12px rgba(255,210,74,.6)";
 /// 右下角弹药。
 pub(crate) const STYLE_HUD_AMMO: &str = "position:absolute;right:196px;bottom:30px;font-size:17px;color:#eaf6ff;text-shadow:0 2px 6px rgba(0,0,0,.85)";
 /// 右下角现金。
 pub(crate) const STYLE_HUD_CASH: &str = "position:absolute;right:26px;bottom:196px;font-size:20px;color:#7dffb0;text-shadow:0 2px 6px rgba(0,0,0,.85)";
 /// 顶部任务文字。
-pub(crate) const STYLE_HUD_MISSION: &str = "position:absolute;left:50%;top:20px;transform:translateX(-50%);font-size:16px;color:#ffe6a8;text-align:center;text-shadow:0 2px 6px rgba(0,0,0,.9);white-space:pre-line";
+pub(crate) const STYLE_HUD_MISSION: &str = "position:absolute;left:50%;top:56px;transform:translateX(-50%);font-size:16px;color:#ffe6a8;text-align:center;text-shadow:0 2px 6px rgba(0,0,0,.9);white-space:pre-line";
 /// 准星:一个空心小方块。
 pub(crate) const STYLE_HUD_CROSSHAIR: &str = "position:absolute;left:50%;top:50%;width:16px;height:16px;margin:-8px 0 0 -8px;border:2px solid rgba(255,255,255,.85);border-radius:50%;box-shadow:0 0 6px rgba(0,0,0,.7)";
 /// 命中标记:默认透明,由 `sync_hud` 点亮。

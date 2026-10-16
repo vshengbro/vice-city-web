@@ -395,6 +395,39 @@ pub(crate) fn showcase_span(asset: &str) -> Vec2 {
     }
 }
 
+/// 路口对角楼的**旋转占地半径**(米,scale = 1 时)。
+///
+/// 对角楼固定转 `-π/4`(见 `build_city_buildings_with` 的 corner 段),
+/// 此时它离中心最远的点是包围盒的**角**,半径是「半对角线 × scale」
+/// 而不是「半边 × scale」。这里的值取自各资产 JSON 的 `bounds` 字段,
+/// 由 `building_corner_radius_matches_asset_bounds` 测试钉住 —— 资产
+/// 重新导出后必须同步更新。
+///
+/// # Arguments
+///
+/// - `&str` - 资产 id。
+///
+/// # Returns
+///
+/// - `f32` - 包围盒半对角线(米)。未知资产保守返回 16.0(池里最大 15.2)。
+pub(crate) fn building_corner_radius(asset: &str) -> f32 {
+    match asset {
+        BLDG_DECO_PINK => 11.92,
+        BLDG_MINT_SHOP => 9.34,
+        BLDG_CREAM_BLOCK => 13.71,
+        BLDG_CORAL_HALL => 13.34,
+        BLDG_TEAL_LOFT => 10.38,
+        BLDG_AQUA_ARCADE => 14.42,
+        BLDG_DECO_TEAL => 11.92,
+        BLDG_SAND_MIDRISE => 13.69,
+        BLDG_PINK_TERRACE => 15.13,
+        BLDG_WHITE_LANDMARK => 14.75,
+        BLDG_APRICOT_MOTEL => 12.18,
+        BLDG_LILAC_TOWER => 12.63,
+        _ => 16.0,
+    }
+}
+
 /// 两栋可进入样板楼的外轮廓半尺寸。
 ///
 /// # Arguments
@@ -1043,17 +1076,25 @@ pub(crate) fn build_city_buildings_with(guard: f32, cx: f32, cz: f32) -> Vec<Bui
             }
             let line_z: f32 = street_axis(line_zi);
             let seed: u32 = slot_seed(line_xi, line_zi, 0xBEEF);
-            let corner: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH + 9.0;
+            let asset: &'static str = BUILDING_POOL[hash2(seed, 8) as usize % BUILDING_POOL.len()];
+            let scale: f32 = 0.95 + hash_unit(seed, 9) * 0.3;
+            // 占地半径必须用「旋转 45° 后的包围盒角点半径」—— 这栋楼
+            // `yaw = -π/4`,离中心最远的是角不是边。固定 9.0 m 的旧写法
+            // 对角点半径 15~19 m 的资产来说差 6~10 m:楼的西/南立面会
+            // 直接切进车道(实测 bldg_cream_block 的立面切进车道 2.7 m,
+            // AI 车被楼角永久卡死,120 s 位移精确 0.00 m)。
+            let radius: f32 = building_corner_radius(asset) * scale;
+            let corner: f32 = STREET_HALF_WIDTH + SIDEWALK_WIDTH + 1.0 + radius;
             let px: f32 = line_x + corner;
             let pz: f32 = line_z + corner;
-            if hits_a_showcase(px, pz, 8.0) {
+            if hits_a_showcase(px, pz, radius) {
                 continue;
             }
             out.push(BuildingPlacement {
-                asset: BUILDING_POOL[hash2(seed, 8) as usize % BUILDING_POOL.len()],
+                asset,
                 position: [px, pz],
                 yaw: -FRAC_PI_4,
-                scale: 0.95 + hash_unit(seed, 9) * 0.3,
+                scale,
                 tint: [1.0, 0.96 + hash_unit(seed, 10) * 0.1, 1.0],
             });
         }
@@ -9543,6 +9584,98 @@ mod tests {
     /// 地面扰动哈希必须 60 m 周期 —— 这是「地面局部建一次 + 实例平移」
     /// 的成立前提:换块时实例平移 S ∈ 60ℤ,`hash(p) == hash(p + S)`
     /// 才能保证玩家看不到噪声图案在脚下整体跳变。
+
+    /// 对角楼占地半径表必须与资产 JSON 的 `bounds` 一致 —— 表错了,
+    /// 楼角就会切进车道把 AI 车永久卡死(线上实测)。
+    #[test]
+    pub(crate) fn building_corner_radius_matches_asset_bounds() {
+        for asset in BUILDING_POOL {
+            let raw: String =
+                crate::fs::read_to_string(format!("assets/{asset}.json")).expect("楼资产必须能读");
+            let json: serde_json::Value = serde_json::from_str(&raw).expect("楼资产必须可解析");
+            let b: &serde_json::Value = &json[ATTR_BOUNDS];
+            let hx: f32 = {
+                let lo: f64 = b[ATTR_MIN][0].as_f64().expect("min.x");
+                let hi: f64 = b[ATTR_MAX][0].as_f64().expect("max.x");
+                (lo.abs().max(hi.abs())) as f32
+            };
+            let hz: f32 = {
+                let lo: f64 = b[ATTR_MIN][2].as_f64().expect("min.z");
+                let hi: f64 = b[ATTR_MAX][2].as_f64().expect("max.z");
+                (lo.abs().max(hi.abs())) as f32
+            };
+            let actual: f32 = hx.hypot(hz);
+            let table: f32 = building_corner_radius(asset);
+            assert!(
+                (table - actual).abs() < 0.05,
+                "{asset}: 表值 {table} 与资产 bounds 半对角线 {actual} 不符 —— 资产重新导出后必须同步表"
+            );
+        }
+    }
+
+    /// **真世界全车道扫掠:每个路口四个方向都必须能开过。**
+    ///
+    /// 线上实测 car2/car4 被路口对角楼的立面永久卡死(120 s 位移 0.00 m):
+    /// 对角楼转 45° 后占地半径是包围盒**半对角线**(15~19 m),而放置
+    /// margin 只有 9 m,立面切进车道 2.7 m。这条测试用**完整资产**的碰撞
+    /// 世界,在出生点附近每个路口的每条车道上,以车身足迹盒逐米扫过路口,
+    /// 断言没有任何静态形状把车道封死。
+    #[test]
+    pub(crate) fn every_lane_clears_every_junction_in_the_real_world() {
+        // 完整资产世界(与线上一致)
+        let manifest_raw: String =
+            crate::fs::read_to_string("assets/manifest.json").expect("manifest");
+        let manifest: Manifest = serde_json::from_str(&manifest_raw).expect("manifest json");
+        let mut bounds_all: HashMap<String, crate::mesh::Bounds> = HashMap::new();
+        for entry in manifest.get_assets() {
+            let id: &str = entry.get_id();
+            let file: &str = entry.get_file();
+            let text: String = crate::fs::read_to_string(format!("assets/{file}")).expect("asset");
+            if let Ok(asset) = parse_asset(id, &text) {
+                collider_bounds(&mut bounds_all, id, &asset);
+            }
+        }
+        let mut world: CollisionWorld = CollisionWorld::new();
+        build_collision_world(&mut world, &bounds_all, 60.0, 60.0);
+        // 扫出生点附近 [-120, 180]² 的路口:每条车道中心线逐米推进。
+        let lane_off: f32 = LANE_OFFSET_X;
+        let mut blocked_at: Vec<String> = Vec::new();
+        for street in (-2..=3).map(|i: i32| street_axis(i)) {
+            for dir in [-1.0f32, 1.0] {
+                // 沿 Z 开的车道:x = street ± lane_off
+                let lane_x: f32 = street + dir * lane_off;
+                let yaw: f32 = if dir > 0.0 { 0.0 } else { PI };
+                let mut z: f32 = -120.0;
+                while z <= 180.0 {
+                    let resolved: Vec2 =
+                        world.resolve_car_footprint([lane_x, z], [0.0, 0.05 * dir], yaw);
+                    let stuck: bool = (resolved[1] - (z + 0.05 * dir)).abs() > 1.0e-4;
+                    if stuck {
+                        blocked_at.push(format!("沿Z车道 x={lane_x:.1} 在 z={z:.1} 被挡"));
+                    }
+                    z += 1.0;
+                }
+                // 沿 X 开的车道:z = street ± lane_off
+                let lane_z: f32 = street + dir * lane_off;
+                let yawx: f32 = if dir > 0.0 { FRAC_PI_2 } else { -FRAC_PI_2 };
+                let mut x: f32 = -120.0;
+                while x <= 180.0 {
+                    let resolved: Vec2 =
+                        world.resolve_car_footprint([x, lane_z], [0.05 * dir, 0.0], yawx);
+                    let stuck: bool = (resolved[0] - (x + 0.05 * dir)).abs() > 1.0e-4;
+                    if stuck {
+                        blocked_at.push(format!("沿X车道 z={lane_z:.1} 在 x={x:.1} 被挡"));
+                    }
+                    x += 1.0;
+                }
+            }
+        }
+        assert!(
+            blocked_at.is_empty(),
+            "车道被静态几何封死:\n{}",
+            blocked_at.join("\n")
+        );
+    }
 
     #[test]
     pub(crate) fn ground_cell_hash_is_street_periodic() {

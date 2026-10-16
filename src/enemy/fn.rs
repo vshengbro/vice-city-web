@@ -28,10 +28,16 @@ pub fn decide(
     let distance: f32 = flat_distance(here, player_at);
     let sees: bool =
         distance <= ENEMY_SIGHT && has_line_of_sight(world, here, player_at, ENEMY_SIGHT);
-    // 警察只在「有通缉」时敌对;混混一开始就是敌对的,不需要理由。
+    // 警察只在「有通缉」时敌对。
+    //
+    // 混混:**贴身或被惹毛才敌对**,不再「46 m 看见就冲过来杀」。原来的
+    // 无条件敌对让 7 个混混从出生点 34~62 m 处直接围过来,玩家站着读
+    // 操作说明的 15~30 s 里就被打死(WASTED)—— 线上实测连验证脚本都
+    // 来不及跑。GTA 的街头帮派是巡逻状态,玩家贴近或先动手才开战。
+    // 「被惹毛」用掉血判定(挨了枪子 / 被车擦碰都会掉血),仇恨不消退。
     let hostile: bool = match enemy.get_faction() {
         Faction::Police => wanted,
-        Faction::Thug => true,
+        Faction::Thug => enemy.get_health() < THUG_HEALTH || distance <= THUG_AGGRO_RANGE,
     };
     let idle: EnemyDecision = EnemyDecision {
         next: *enemy.get_state(),
@@ -269,4 +275,45 @@ pub fn aim_with_spread(from: Vec3, to: Vec3, wander: f32, shot_index: u32) -> Ve
 /// - `bool` - 在激活圈内为 `true`。
 pub fn is_active(at: Vec3, player_at: Vec3) -> bool {
     flat_distance(at, player_at) <= ENEMY_ACTIVATION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 混混仇恨门槛:远处巡逻、贴身敌对、挨过打永久敌对。
+    ///
+    /// 钉这条是因为线上实测:无条件敌对让 7 个混混从出生点 34~62 m
+    /// 围过来,玩家站着读操作说明的十几秒里就被打死(WASTED)。
+    #[test]
+    fn thugs_aggro_only_when_close_or_provoked() {
+        let world: CollisionWorld = CollisionWorld::new();
+        let player: Vec3 = [0.0, 0.0, 0.0];
+        // 远处(30 m,视野内)的满血混混:不敌对,不射击。
+        let far: Enemy = Enemy::new(Faction::Thug, [30.0, 0.0, 0.0], 0.0, 0.0);
+        let d_far: EnemyDecision = decide(&far, player, &world, false, 0.0);
+        assert!(!d_far.get_shoot(), "30 m 外的满血混混不该开火");
+        assert_eq!(
+            d_far.get_next(),
+            AiState::Patrol,
+            "30 m 外的满血混混该在巡逻"
+        );
+        // 贴身(10 m < THUG_AGGRO_RANGE)的满血混混:敌对。
+        let near: Enemy = Enemy::new(Faction::Thug, [10.0, 0.0, 0.0], 0.0, 0.0);
+        let d_near: EnemyDecision = decide(&near, player, &world, false, 0.0);
+        assert!(d_near.get_shoot(), "贴身的混混该开火");
+        // 挨过打(掉血)的混混:即使远了也保持敌对(仇恨不消退)。
+        let mut hurt: Enemy = Enemy::new(Faction::Thug, [30.0, 0.0, 0.0], 0.0, 0.0);
+        hurt.set_health(THUG_HEALTH - 1.0);
+        let d_hurt: EnemyDecision = decide(&hurt, player, &world, false, 0.0);
+        assert_ne!(
+            d_hurt.get_next(),
+            AiState::Patrol,
+            "挨过打的混混即使远了也不该回去巡逻"
+        );
+        // 警察不受这条影响:无通缉就该巡逻。
+        let cop: Enemy = Enemy::new(Faction::Police, [30.0, 0.0, 0.0], 0.0, 0.0);
+        let d_cop: EnemyDecision = decide(&cop, player, &world, false, 0.0);
+        assert!(!d_cop.get_shoot(), "无通缉的警察不该开火");
+    }
 }
