@@ -1,6 +1,6 @@
 use super::*;
 /// 静态碰撞世界:一组形状 + 世界边界 + 玩家圆半径。
-#[derive(Data, Clone, Debug)]
+#[derive(Clone, Data, Debug)]
 pub struct CollisionWorld {
     /// 全部静态碰撞体。
     #[get(pub(crate))]
@@ -12,6 +12,24 @@ pub struct CollisionWorld {
     /// 世界半边长(X / Z 各一半,米),玩家不许走出这个范围。
     #[get(type(copy), pub(crate))]
     pub(crate) half_extent: Vec2,
+    /// broadphase 网格(惰性):`None` = 待重建。
+    ///
+    /// 形状表经 [`CollisionWorld::get_shapes_mut`] 的任何修改都会把它
+    /// 作废;下一次分离查询按需重建(wasm 单线程,`RefCell` 无并发)。
+    /// **不要经派生的 `set_shapes` 整体换表**(目前无调用点)—— 那条
+    /// 路径不会作废网格;要换表就走 `get_shapes_mut()`。
+    #[get(pub(crate))]
+    pub(crate) grid: RefCell<Option<ShapeGrid>>,
+}
+/// broadphase:形状索引的均匀网格。
+///
+/// 每个形状按自己的 AABB 登记进所有覆盖到的单元;查询给定一个
+/// AABB,返回**升序去重**的形状索引 —— 与全表扫描的访问顺序严格
+/// 一致(候选是全表扫描的子序列),只是跳过了必然不重叠的形状。
+#[derive(Clone, Data, Debug)]
+pub struct ShapeGrid {
+    /// 单元 → 形状索引(按插入顺序,即形状索引升序)。
+    pub(crate) cells: HashMap<(i32, i32), Vec<u32>>,
 }
 /// 一个参与动态分离的实体(**有向足迹** + 质量)。
 ///
@@ -23,7 +41,7 @@ pub struct CollisionWorld {
 /// 在 `TrafficCar::drive` **之后**再跑一遍静态分离,若它还用 1.25 m 的圆
 /// 把车推离墙,`drive` 里刚算好的 2.283 m 会被缩回 1.25 m,车头重新插进
 /// 墙里 —— 也就是这个缺陷在同一条调用链上被复活一次。
-#[derive(Data, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Data, Debug)]
 pub struct DynamicBody {
     /// 实体类型(决定同类之间是否也要分开)。
     #[get(type(copy), pub(crate))]

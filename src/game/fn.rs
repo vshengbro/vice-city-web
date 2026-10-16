@@ -155,6 +155,23 @@ pub(crate) fn street_axis(index: i32) -> f32 {
     STREET_PITCH * index as f32
 }
 
+/// 地面块的世界 snap:与 `build_ground_near` 内部的 origin 对齐规则
+/// 完全一致(`street_axis(round(c / STREET_PITCH))`)。
+///
+/// 地面 mesh 只在局部原点建一次(见 `build_scene`),换块时实例按这个
+/// snap 平移。两处必须用**同一个函数**,否则地面会比街区图案滑半格。
+///
+/// # Arguments
+///
+/// - `f32` - 生成中心坐标分量(米)。
+///
+/// # Returns
+///
+/// - `f32` - snap 后的世界坐标(米,60 的整数倍)。
+pub(crate) fn ground_snap(c: f32) -> f32 {
+    street_axis((c / STREET_PITCH).round() as i32)
+}
+
 /// 枚举覆盖 `[lo, hi]` 区间的全部街道索引。
 ///
 /// 世界没有边界,任何摆放逻辑都不能再遍历一张写死的数组 —— 只能问
@@ -1572,6 +1589,82 @@ pub fn build_ground() -> MeshAsset {
     build_ground_near(0.0, 0.0)
 }
 
+/// 地面单元格心的 **60 m 周期**亮度哈希。
+///
+/// 量化:格心是 1.25 m 的倍数(`GROUND_SPAN / GROUND_SUBDIV` = 2.5 m
+/// 一格,格心偏移半格),×4 取整后是精确整数;对 48(= 60 m / 1.25 m)
+/// 取 `rem_euclid` 让哈希与街道图案同周期 —— 这是地面「局部建一次 +
+/// 实例平移」能成立的前提(见 `build_scene` 的注释)。
+///
+/// # Arguments
+///
+/// - `f32` - 格心世界 X(米,1.25 的倍数)。
+/// - `f32` - 格心世界 Z(米,1.25 的倍数)。
+///
+/// # Returns
+///
+/// - `f32` - `[0, 1)` 的确定性伪随机数。
+pub(crate) fn ground_cell_hash(x: f32, z: f32) -> f32 {
+    let ix: i32 = (x * 4.0).round() as i32;
+    let iz: i32 = (z * 4.0).round() as i32;
+    let px: u32 = ix.rem_euclid(48) as u32;
+    let pz: u32 = iz.rem_euclid(48) as u32;
+    let mut h: u32 = px.wrapping_mul(0x8da6b343) ^ pz.wrapping_mul(0xd8163841) ^ 0x9e3779b9;
+    h ^= h >> 13;
+    h = h.wrapping_mul(0x85ebca6b);
+    h ^= h >> 16;
+    (h & 0xffff) as f32 / 65536.0
+}
+
+/// 路面车道的磨损亮度系数。
+///
+/// 真路面的沥青不是均匀灰:每条车道被车轮磨出两条发亮的轮迹
+/// (|横向偏移| ≈ `LANE_OFFSET_X ± 0.85` m),中线附近则是油污 /
+/// 胎屑堆出来的暗带。全部按「距最近街道轴线的横向距离」算,
+/// 与街道图案同周期。
+///
+/// # Arguments
+///
+/// - `f32` - 距最近街道轴线的横向距离(米,非负)。
+///
+/// # Returns
+///
+/// - `f32` - 亮度系数(轮迹 ~1.15,中线 ~0.88,其余 1.0)。
+pub(crate) fn road_wear_factor(across: f32) -> f32 {
+    let shine: f32 = wheel_track_shine(across - (LANE_OFFSET_X - 0.85))
+        + wheel_track_shine(across - (LANE_OFFSET_X + 0.85));
+    // 中线油污带:0.9 m 内全强,到 1.6 m 平滑退出。
+    let oil: f32 = 1.0 - ((across - 0.9) / 0.7).clamp(0.0, 1.0);
+    (1.0 + 0.15 * shine - 0.12 * oil * oil).clamp(0.7, 1.35)
+}
+
+/// 单条轮迹的高斯亮度包络(σ = 0.55 m)。
+///
+/// # Arguments
+///
+/// - `f32` - 距轮迹中心线的横向距离(米)。
+///
+/// # Returns
+///
+/// - `f32` - 0..1 的归一化权重。
+fn wheel_track_shine(d: f32) -> f32 {
+    (-d * d / (2.0 * 0.55 * 0.55)).exp()
+}
+
+/// 逐通道缩放地面颜色(扰动 / 磨损共用)。
+///
+/// # Arguments
+///
+/// - `[f32; 3]` - 基础色(线性 RGB)。
+/// - `f32` - 亮度系数。
+///
+/// # Returns
+///
+/// - `[f32; 3]` - 缩放后的颜色。
+fn scale_ground_color(color: [f32; 3], factor: f32) -> [f32; 3] {
+    [color[0] * factor, color[1] * factor, color[2] * factor]
+}
+
 /// 以 `(cx, cz)` 为中心生成一块 [`GROUND_SPAN`] 见方的地面。
 ///
 /// 地面不能像建筑那样「卸载了就没了」—— 脚下的每一格都得永远存在。
@@ -1627,13 +1720,27 @@ pub fn build_ground_near(centre_x: f32, centre_z: f32) -> MeshAsset {
             let nearest_z: f32 = street_axis((cz / STREET_PITCH).round() as i32);
             let dist: f32 = (cx - nearest_x).abs().min((cz - nearest_z).abs());
             let color: [f32; 3] = if dist <= STREET_HALF_WIDTH {
-                if (i + j) % 2 == 0 { ROAD } else { ROAD_ALT }
+                // 沥青:逐格亮度扰动 + 车道磨损带。
+                //
+                // 扰动哈希必须 **60 m 周期**(对格心量化坐标取 mod 48,
+                // 48 格 × 1.25 m = 60 m):地面现在是局部建一次、换块靠
+                // 实例平移(见 `build_scene`),世界锚定的哈希会让噪声
+                // 图案在每次换块时整体「洗牌」,玩家眼睁睁看着路面纹理
+                // 在脚下跳;周期哈希与街道图案同周期,平移后逐位一致。
+                let base: [f32; 3] = if (i + j) % 2 == 0 { ROAD } else { ROAD_ALT };
+                let jitter: f32 = 0.80 + 0.40 * ground_cell_hash(cx, cz);
+                scale_ground_color(base, jitter * road_wear_factor(dist))
             } else if dist <= edge_x {
-                if i % 4 == 0 { SIDEWALK_EDGE } else { SIDEWALK }
-            } else if (i + j) % 2 == 0 {
-                LOT_GROUND
+                // 人行道:更轻的扰动(盐换一下,免得与沥青同相)。
+                let base: [f32; 3] = if i % 4 == 0 { SIDEWALK_EDGE } else { SIDEWALK };
+                scale_ground_color(base, 0.86 + 0.28 * ground_cell_hash(cz, cx))
             } else {
-                LOT_ALT
+                let base: [f32; 3] = if (i + j) % 2 == 0 {
+                    LOT_GROUND
+                } else {
+                    LOT_ALT
+                };
+                scale_ground_color(base, 0.82 + 0.36 * ground_cell_hash(cx + 17.0, cz - 31.0))
             };
             let y: f32 = if dist <= STREET_HALF_WIDTH {
                 0.0
@@ -2137,25 +2244,37 @@ pub(crate) fn build_fallback_scene() -> Scene {
 ///
 /// - `Vec<usize>` - 要隐藏的批次索引列表。
 pub fn hidden_batches() -> Vec<usize> {
-    window()
-        .and_then(|w: Window| w.location().search().ok())
-        .map(|q: String| q.trim_start_matches('?').to_string())
-        .and_then(|q: String| {
-            // 扫**全部** `k=v` 对找 `hide`,而不是只看第一个参数 ——
-            // 否则 `?cb=123&hide=1,2` 这种带缓存戳的验收链接会静默失效,
-            // 批次没被隐藏,截图看起来"没变化",很容易误判成渲染 bug。
-            q.split('&')
-                .filter_map(|kv: &str| {
-                    kv.split_once('=')
-                        .map(|(k, v): (&str, &str)| (k.to_string(), v.to_string()))
-                })
-                .find(|(k, _): &(String, String)| k == HIDE)
-                .map(|(_, v): (String, String)| v)
-        })
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|v: &str| v.trim().parse::<usize>().ok())
-        .collect()
+    // `location.search` 在同一次页面生命周期里不会变,每帧重解析
+    // (字符串切分 + 若干 String 分配)是纯浪费 —— 缓存一次。
+    thread_local! {
+        static CACHED: RefCell<Option<Vec<usize>>> = const { RefCell::new(None) };
+    }
+    CACHED.with(|slot: &RefCell<Option<Vec<usize>>>| {
+        if let Some(list) = slot.borrow().as_ref() {
+            return list.clone();
+        }
+        let parsed: Vec<usize> = window()
+            .and_then(|w: Window| w.location().search().ok())
+            .map(|q: String| q.trim_start_matches('?').to_string())
+            .and_then(|q: String| {
+                // 扫**全部** `k=v` 对找 `hide`,而不是只看第一个参数 ——
+                // 否则 `?cb=123&hide=1,2` 这种带缓存戳的验收链接会静默失效,
+                // 批次没被隐藏,截图看起来"没变化",很容易误判成渲染 bug。
+                q.split('&')
+                    .filter_map(|kv: &str| {
+                        kv.split_once('=')
+                            .map(|(k, v): (&str, &str)| (k.to_string(), v.to_string()))
+                    })
+                    .find(|(k, _): &(String, String)| k == HIDE)
+                    .map(|(_, v): (String, String)| v)
+            })
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|v: &str| v.trim().parse::<usize>().ok())
+            .collect();
+        *slot.borrow_mut() = Some(parsed.clone());
+        parsed
+    })
 }
 
 /// 读一个数字型 query 参数(`?fps=20` 这类),缺省或非法时退回 `fallback`。
@@ -2263,11 +2382,13 @@ pub(crate) fn build_scene(
     cx: f32,
     cz: f32,
 ) -> (usize, usize, usize) {
-    let mut ground_slot: usize = 0;
-    let mut water_slot: usize = 0;
-    // 地面:程序化网格,走同一条展开管线。以生成中心为准 —— 世界无限,
-    // 地面永远跟着生成中心走。
-    let ground: MeshAsset = build_ground_near(cx, cz);
+    // 地面:程序化网格,走同一条展开管线。**以局部原点建一次**:
+    // 街道图案以 `STREET_PITCH`(60 m)为周期、所有内容按世界坐标对 60 m
+    // 对齐计算,而生成中心永远 snap 到 60 m 的整数倍 —— 所以任何生成
+    // 中心的地面都是**同一张周期图案的平移**。本地建一块、换块只改
+    // 实例平移,就把「每跨一格重铺 10 万三角形 + 24 MB GPU 上传」
+    // (实测一帧冻结 4.8 s)彻底删掉。
+    let ground: MeshAsset = build_ground_near(0.0, 0.0);
     let mut ground_emissive: Vec<[f32; 3]> = Vec::with_capacity(
         ground
             .parts
@@ -2285,10 +2406,18 @@ pub(crate) fn build_scene(
     let ground_index: usize = scene.push_mesh(build_gpu_mesh(&ground_mesh, &ground_emissive));
 
     let ground_batch: usize = scene.push_batch(ground_index, true);
-    ground_slot = ground_batch;
+    let ground_slot: usize = ground_batch;
+    // 地面 mesh 是局部的(以原点为中心),实例把它平移到 snap 后的
+    // 生成中心。snap 规则与 `build_ground_near` 内部的 origin 对齐
+    // 规则一致:`street_axis(round(c / STREET_PITCH))`。
     scene.push_instance(
         ground_batch,
-        Instance::new([0.0, 0.0, 0.0], 0.0, 1.0, [1.0, 1.0, 1.0]),
+        Instance::new(
+            [ground_snap(cx), 0.0, ground_snap(cz)],
+            0.0,
+            1.0,
+            [1.0, 1.0, 1.0],
+        ),
     );
 
     // 水面:外海 + 内湖,同样是程序化网格,走同一条展开管线。
@@ -2311,7 +2440,7 @@ pub(crate) fn build_scene(
     let water_mesh: crate::mesh::GpuMesh = expand_asset(&water).expect(EXPECT_WATER);
     let water_index: usize = scene.push_mesh(build_gpu_mesh(&water_mesh, &water_emissive));
     let water_batch: usize = scene.push_batch(water_index, true);
-    water_slot = water_batch;
+    let water_slot: usize = water_batch;
     scene.push_instance(
         water_batch,
         Instance::new([0.0, 0.0, 0.0], 0.0, 1.0, [1.0, 1.0, 1.0]),
@@ -2455,7 +2584,12 @@ pub(crate) fn rebuild_streamed_collision_world(game: &mut Game, next_x: f32, nex
     // 成本可接受:换块频率是一格街道(60 m),这里只是重算一遍 AABB 列表,
     // 而且**只在真的换块时**才跑(`stream_needs_rebuild` 已经挡住了)。
     let asset_bounds: HashMap<String, Bounds> = game.get_asset_bounds().clone();
-    build_collision_world(game.get_mut_world(), &asset_bounds, next_x, next_z);
+    // 世界是 `Rc` 持有的(见 `Game::world` 的字段注释):不在原地 clear +
+    // 重推,而是建一份全新的再整体换入 —— 旧世界可能正被上一帧留下的
+    // 快照句柄引用着,原地改会让 `Rc` 形同虚设。
+    let mut world: CollisionWorld = CollisionWorld::new();
+    build_collision_world(&mut world, &asset_bounds, next_x, next_z);
+    game.set_world(Rc::new(world));
 }
 
 /// 围绕玩家当前位置重建地面与水面网格。
@@ -2493,10 +2627,18 @@ pub fn rebuild_streamed_surface(
     let new_static_count: usize =
         rebuild_static_batches(scene, index_map, static_batch_count, cx, cz);
     let mut rewritten: Vec<usize> = Vec::new();
-    let surfaces: [(usize, MeshAsset); 2] = [
-        (ground_batch, build_ground_near(cx, cz)),
-        (water_batch, build_water_near(cx, cz)),
-    ];
+    // 地面**不重铺**:mesh 是以局部原点建的周期图案(见 `build_scene`),
+    // 换块只把实例平移到新的 snap 中心。这一步删掉的是每次换块的
+    // ~10 万三角形重建 + ~24 MB GPU 重传(实测单帧冻结 4.8 s)。
+    if let Some(ground) = scene.get_mut_batches().get_mut(ground_batch) {
+        let instances: &mut Vec<Instance> = ground.get_mut_instances();
+        if let Some(slot) = instances.first_mut() {
+            *slot = Instance::new([cx, 0.0, cz], 0.0, 1.0, [1.0, 1.0, 1.0]);
+        }
+    }
+    // 水面不是周期图案(外海 / 内湖的位置由真实海岸线决定),必须真重建
+    // —— 但它只有 ~700 个三角形,重建 + 重传的成本可以忽略。
+    let surfaces: [(usize, MeshAsset); 1] = [(water_batch, build_water_near(cx, cz))];
     for (batch, asset) in surfaces {
         let batches: &Vec<SceneBatch> = scene.get_batches_ref();
         let Some(target) = batches.get(batch) else {
@@ -3080,10 +3222,66 @@ pub(crate) fn push_player_part(scene: &mut Scene, asset: &MeshAsset, part_name: 
         bounds: None,
         parts: vec![part.clone()],
     };
-    let mesh: GpuMesh = expand_asset(&solo).expect(PLAYER_PART_EXPECT);
+    // 核心展不开(理论上不会:躯干永远不在 LIMB_PLAN 里)就跳过这一节,
+    // 整具只剩四肢也比直接 panic 强 —— R11.4 生产代码不许 panic。
+    let mesh: GpuMesh = match expand_asset(&solo) {
+        Ok(mesh) => mesh,
+        Err(_) => return usize::MAX,
+    };
     let mesh_index: usize = scene.push_mesh(build_gpu_mesh(&mesh, &emissive));
     // `near_cull = false`:第三人称相机离角色只有几米,而默认的近处剔除
     // 半径是 26 m,不豁免的话角色会被整批剔掉、画面里根本看不到人。
+    scene.push_batch_with_cull(mesh_index, true, false)
+}
+
+/// 把一个行人模型的**刚性 part**(躯干 / 头 / 发型 / 配饰 —— 即不在
+/// [`LIMB_PLAN`](crate::player::LIMB_PLAN) 里的全部)合并成一个 mesh,
+/// 挂成单个批次。
+///
+/// 刚性部分没有关节动画,合成一个 mesh 把每模型的 draw call 从
+/// 「配饰数量」压到 1(西装的领带 / 领口 / 衣襟等 20 来个 part 只占
+/// 一次绘制)。肢体部分由 [`push_player_part`] 逐 part 建批。
+///
+/// # Arguments
+///
+/// - `&mut Scene` - 场景。
+/// - `&MeshAsset` - 行人模型的完整资产。
+///
+/// # Returns
+///
+/// - `usize` - 新批次的索引;刚性 part 为空(异常资产)时返回
+///   `usize::MAX` 作为「无核心」哨兵,调用方靠 `if let Some` 守卫跳过,
+///   不在生产路径 panic(R11.4)。
+pub(crate) fn push_ped_core_part(scene: &mut Scene, asset: &MeshAsset) -> usize {
+    let rigid: Vec<MeshPart> = asset
+        .get_parts()
+        .iter()
+        .filter(|part: &&MeshPart| {
+            !LIMB_PLAN
+                .iter()
+                .any(|entry: &(&str, &str, f32, f32)| entry.0 == part.get_name())
+        })
+        .cloned()
+        .collect();
+    if rigid.is_empty() {
+        return usize::MAX;
+    }
+    let mut emissive: Vec<[f32; 3]> = Vec::new();
+    for part in &rigid {
+        let base: [f32; 3] = part.get_emissive().unwrap_or([0.0; 3]);
+        for _ in part.get_faces() {
+            emissive.push(base);
+        }
+    }
+    let merged: MeshAsset = MeshAsset {
+        id: asset.get_id().clone(),
+        category: asset.get_category().clone(),
+        y_up: asset.get_y_up(),
+        bounds: None,
+        parts: rigid,
+    };
+    let mesh: GpuMesh = expand_asset(&merged).expect(PLAYER_PART_EXPECT);
+    let mesh_index: usize = scene.push_mesh(build_gpu_mesh(&mesh, &emissive));
     scene.push_batch_with_cull(mesh_index, true, false)
 }
 
@@ -3391,7 +3589,7 @@ pub(crate) fn part_local_bounds(asset: &MeshAsset, part_name: &str) -> (Vec3, Ve
 ///
 /// - `&GameHandles` - GameHandles 的只读引用。
 pub(crate) fn bind_pointer_events(handles: &GameHandles) {
-    let canvas: &HtmlCanvasElement = &handles.get_canvas();
+    let canvas: &HtmlCanvasElement = handles.get_canvas();
     // ---- 指针锁:锁定态下用 movement_x/y 转视角,不需要按住左键 ----
     //
     // **这一段是 A 组「拖 240px 而 cameraYaw 完全不动」的真凶修复。**
@@ -3418,7 +3616,7 @@ pub(crate) fn bind_pointer_events(handles: &GameHandles) {
             }
             {
                 let mut game: RefMut<Game> = handles.get_game().borrow_mut();
-                apply_look_delta(&mut game.get_mut_camera(), dx, dy);
+                apply_look_delta(game.get_mut_camera(), dx, dy);
             }
             event.prevent_default();
         }));
@@ -3491,7 +3689,7 @@ pub(crate) fn bind_pointer_events(handles: &GameHandles) {
                 let dy: f64 = y - game.get_input().get_last_pointer()[1];
                 drop(game);
                 let mut game: RefMut<Game> = handles.get_game().borrow_mut();
-                apply_look_delta(&mut game.get_mut_camera(), dx, dy);
+                apply_look_delta(game.get_mut_camera(), dx, dy);
                 game.get_mut_input().set_last_pointer([x, y]);
             }
         }));
@@ -3567,7 +3765,7 @@ pub(crate) fn bind_pointer_events(handles: &GameHandles) {
                 }
                 let dx: f64 = x - previous[0];
                 let dy: f64 = y - previous[1];
-                apply_look_delta(&mut game.get_mut_camera(), dx, dy);
+                apply_look_delta(game.get_mut_camera(), dx, dy);
                 game.get_mut_input().set_last_pointer([x, y]);
             }
             event.prevent_default();
@@ -3591,7 +3789,7 @@ pub(crate) fn bind_pointer_events(handles: &GameHandles) {
                     let previous: [f64; 2] = game.get_input().get_last_pointer();
                     let dx: f64 = x - previous[0];
                     let dy: f64 = y - previous[1];
-                    apply_look_delta(&mut game.get_mut_camera(), dx, dy);
+                    apply_look_delta(game.get_mut_camera(), dx, dy);
                     game.get_mut_input().set_last_pointer([x, y]);
                 }
                 2 => {
@@ -3616,7 +3814,7 @@ pub(crate) fn bind_pointer_events(handles: &GameHandles) {
                         let mut game: RefMut<Game> = handles.get_game().borrow_mut();
                         let previous_pinch: f64 = game.get_input().get_last_pinch();
                         let previous_center: [f64; 2] = game.get_input().get_last_pointer();
-                        let camera: Camera = take(&mut game.get_mut_camera());
+                        let camera: Camera = take(game.get_mut_camera());
                         (camera, previous_pinch, previous_center)
                     };
                     if previous_pinch > 0.0 {
@@ -3756,7 +3954,7 @@ pub(crate) fn apply_look_delta(camera: &mut Camera, dx: f64, dy: f64) {
 ///
 /// - `&GameHandles` - GameHandles 的只读引用。
 pub(crate) fn bind_combat_mouse(handles: &GameHandles) {
-    let canvas: &HtmlCanvasElement = &handles.get_canvas();
+    let canvas: &HtmlCanvasElement = handles.get_canvas();
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |event: Event| {
@@ -3826,7 +4024,7 @@ pub(crate) fn bind_combat_mouse(handles: &GameHandles) {
 ///
 /// - `&GameHandles` - GameHandles 的只读引用。
 pub(crate) fn bind_keyboard(handles: &GameHandles) {
-    let window: &Window = &handles.get_window();
+    let window: &Window = handles.get_window();
     {
         let handles: GameHandles = handles.clone();
         let closure: Closure<dyn FnMut(Event)> = Closure::wrap(Box::new(move |event: Event| {
@@ -4445,7 +4643,7 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
                     // 走同一个函数 [`ped_bob`]。验收脚本要靠它判「身体
                     // 起伏的波峰有没有和落脚对齐」:脚点屏幕 Y 会混进透视,
                     // 读矩阵里的 Y 才是唯一不受相机影响的读数。
-                    let bob: f32 = ped_bob(&ped);
+                    let bob: f32 = ped_bob(ped);
                     format!(
                         "{{\"x\":{:.2},\"z\":{:.2},\"down\":{},\"gait\":{:.2},\
                          \"gaitPhase\":{:.4},\"bob\":{:.5}}}",
@@ -4465,7 +4663,7 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             game.get_wanted().get_stars(),
             game.get_wanted().get_heat(),
             game.get_wanted().get_unseen(),
-            is_hidden(&game.get_hideouts(), position),
+            is_hidden(game.get_hideouts(), position),
             game.get_wanted().get_unseen()
         );
         let combat_json: String = format!(
@@ -4629,7 +4827,7 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             cdrive_x = cdrive_x,
             cdrive_z = cdrive_z,
             cdrive_v = cdrive_v,
-            throttle = axis(&game.get_input(), KEYW, KEYS),
+            throttle = axis(game.get_input(), KEYW, KEYS),
             frames = game.get_frame_count(),
             enemies_json = enemies_json,
             peds_json = peds_json,
@@ -5533,8 +5731,8 @@ pub(crate) fn show_loading_error(message: &str) {
 /// - `&mut Game` - Game 的可变引用。
 /// - `f32` - 本帧的秒数增量。
 pub(crate) fn simulate(game: &mut Game, delta: f32) {
-    let forward_input: f32 = axis(&game.get_input(), KEYW, KEYS);
-    let strafe_input: f32 = axis(&game.get_input(), KEYD, KEYA);
+    let forward_input: f32 = axis(game.get_input(), KEYW, KEYS);
+    let strafe_input: f32 = axis(game.get_input(), KEYD, KEYA);
     // 验收通道的「朝世界方向走」优先于键盘:它绕过相机朝向,让脚本不用
     // 先转相机就能沿直线推进。零向量表示不干预。
     let world_walk: Vec2 = game.get_walk_request();
@@ -5574,7 +5772,7 @@ pub(crate) fn simulate(game: &mut Game, delta: f32) {
     // 「招手打车」只在**步行**时成立:玩家坐在车里不该再被路边停靠的车
     // 缠住,所以 `hailer` 跟着 `driven.is_none()` 走。
     let driven: Option<usize> = game.get_player().get_vehicle();
-    let traffic_world: CollisionWorld = game.get_world_ref().clone();
+    let traffic_world: Rc<CollisionWorld> = game.get_world_rc();
     let hailer: Option<[f32; 2]> = match driven {
         Some(_) => None,
         None => {
@@ -5623,7 +5821,7 @@ pub(crate) fn simulate(game: &mut Game, delta: f32) {
             // 这一帧的位移,才能把切向分量沿隔墙滑过去。
             game.set_previous_step_xz([feet[0], feet[2]]);
             let speed: f32 = wanted;
-            let world: CollisionWorld = game.get_world_ref().clone();
+            let world: Rc<CollisionWorld> = game.get_world_rc();
             game.get_mut_player()
                 .step(intent, forward, dt, speed, &world);
             // 静态层(`resolve_slide`)刚定下的位置:验收探针拿它和
@@ -5715,8 +5913,9 @@ pub(crate) fn step_streamed_surface(game: &mut Game) {
     // 同一次换块(`STREAM_REBUILD_STEP` = 一格街道),不多花一次判定。
     repopulate_streamed_combatants(game, next_x, next_z);
     rebuild_streamed_collision_world(game, next_x, next_z);
-    // 地面 / 水面的顶点数据换了,GPU 缓冲必须跟着换 —— 否则玩家走出街区
-    // 边界后看到的还是出生点那块地,而 CPU 侧探针报告的却是新数据。
+    // 水面的顶点数据换了,GPU 缓冲必须跟着换 —— 否则玩家走出街区
+    // 边界后看到的还是旧位置的水。地面网格不再重建(见
+    // `rebuild_streamed_surface`),所以没有地面重传。
     if let Some(mut renderer) = game.get_mut_renderer().take() {
         reupload_streamed_meshes(&mut renderer, game.get_scene(), &rewritten);
         game.get_mut_renderer().replace(renderer);
@@ -6013,7 +6212,7 @@ pub(crate) fn step_combat(game: &mut Game, dt: f32) {
     step_enemies(game, dt);
     step_peds(game, dt);
     // 社交是群体行为,必须在所有行人各自步进完之后统一算一次。
-    update_ped_social(&mut game.get_mut_peds(), dt);
+    update_ped_social(game.get_mut_peds(), dt);
     update_wanted(game, dt);
     update_mission(game, dt);
     if game.get_hitmarker() > 0.0 {
@@ -6120,7 +6319,7 @@ pub(crate) fn fire_weapon(game: &mut Game) {
     let range: f32 = weapon.range();
     // 先求射线打到静态几何的位置(墙 / 楼 / 车)。
     let wall_hit: Option<(f32, Vec2)> =
-        crate::collision::ray_to_shapes(&game.get_world(), muzzle, direction);
+        crate::collision::ray_to_shapes(game.get_world(), muzzle, direction);
     let wall_distance: f32 = wall_hit.map_or(range, |hit: (f32, Vec2)| hit.0);
     // 再扫敌人:取射程内、且比墙更近的第一个。
     let mut best: Option<(usize, f32)> = None;
@@ -6253,7 +6452,7 @@ pub(crate) fn step_enemies(game: &mut Game, dt: f32) {
     let stars: u32 = game.get_wanted().get_stars();
     let phase: f32 = game.get_frame_count() as f32 * 0.017;
     deploy_police(
-        &mut game.get_mut_enemies(),
+        game.get_mut_enemies(),
         stars,
         player_at,
         ENEMY_WANTED_TOTAL,
@@ -6309,11 +6508,11 @@ pub(crate) fn step_enemies(game: &mut Game, dt: f32) {
         let decision: crate::enemy::EnemyDecision = decide(
             &game.get_enemies()[index],
             player_at,
-            &game.get_world(),
+            game.get_world(),
             wanted,
             game.get_enemies()[index].get_wander(),
         );
-        let world_ref: CollisionWorld = game.get_world_ref().clone();
+        let world_ref: Rc<CollisionWorld> = game.get_world_rc();
         let shoot: bool = decision.get_shoot();
         let fired: bool = match game.get_mut_enemies().get_mut(index) {
             Some(enemy) => crate::enemy::apply(enemy, &decision, dt, &world_ref, shoot),
@@ -6355,11 +6554,7 @@ pub(crate) fn step_enemies(game: &mut Game, dt: f32) {
             index += 1;
         }
     }
-    // 批次表跟着收缩,避免索引错位。
-    if game.get_enemy_batches().len() > game.get_enemies().len() {
-        let enemy_count: usize = game.get_enemies().len();
-        game.get_mut_enemy_batches().truncate(enemy_count);
-    }
+    // 骨架批次按模型共享,不随个体增删 —— 这里没有批次表要收缩。
 }
 
 /// 敌人开火的一次结算:打玩家、加一点通缉热度。
@@ -6401,14 +6596,10 @@ pub(crate) fn enemy_shot(game: &mut Game, index: usize) {
     // 实测玩家停在楼里(`inSolid == true`)、19 m 外的警察持续开火,
     // 90 帧掉 31.8 血,门控计数器全程为 0。`blocks_sight` 补上这一半。
     let sight_y: f32 = from[1] + AIM_CHEST_HEIGHT;
-    if !has_line_of_sight(
-        &game.get_world(),
-        from,
-        player_at,
-        ENEMY_FIRE_RANGE.max(1.0),
-    ) || game
-        .interiors
-        .blocks_sight([from[0], from[2]], [player_at[0], player_at[2]], sight_y)
+    if !has_line_of_sight(game.get_world(), from, player_at, ENEMY_FIRE_RANGE.max(1.0))
+        || game
+            .interiors
+            .blocks_sight([from[0], from[2]], [player_at[0], player_at[2]], sight_y)
     {
         // 记一笔,验收探针据此确认「这一枪是被视线挡掉的」而不是
         // 别的分支提前 return 的。
@@ -6467,7 +6658,7 @@ pub(crate) fn hurt_player(game: &mut Game, amount: f32) {
 pub(crate) fn update_wanted(game: &mut Game, dt: f32) {
     let player_at: Vec3 = game.get_player().get_position();
     // 藏身区:站在后巷 / 警局门口就强制降温。
-    let hidden: bool = is_hidden(&game.get_hideouts(), player_at);
+    let hidden: bool = is_hidden(game.get_hideouts(), player_at);
     // 「被看见」:有没有任何一个活着的警察视线通畅。
     let mut spotted: bool = false;
     for enemy in game.get_enemies() {
@@ -6476,7 +6667,7 @@ pub(crate) fn update_wanted(game: &mut Game, dt: f32) {
         }
         let at: Vec3 = enemy.get_position();
         if flat_distance(at, player_at) <= ENEMY_SIGHT
-            && has_line_of_sight(&game.get_world(), at, player_at, ENEMY_SIGHT)
+            && has_line_of_sight(game.get_world(), at, player_at, ENEMY_SIGHT)
         {
             spotted = true;
             break;
@@ -6563,7 +6754,7 @@ pub(crate) fn advance_mission_for_player(
     let (target_index, target_dead): (usize, bool) = mission_target_state(mission, enemies);
     advance_mission(
         mission,
-        &enemies,
+        enemies,
         player_at,
         target_index,
         target_dead,
@@ -6650,7 +6841,7 @@ pub(crate) fn step_peds(game: &mut Game, dt: f32) {
         [car_at[0], car_at[2]]
     };
     let car_to: Vec2 = [car_at[0], car_at[2]];
-    let ped_world: CollisionWorld = game.get_world_ref().clone();
+    let ped_world: Rc<CollisionWorld> = game.get_world_rc();
     let ped_driving: bool = game.get_player().get_driving();
     let mut runover_heat: f32 = 0.0;
     for ped in game.get_mut_peds().iter_mut() {
@@ -6686,10 +6877,7 @@ pub(crate) fn step_peds(game: &mut Game, dt: f32) {
             index += 1;
         }
     }
-    let ped_count: usize = game.get_peds().len();
-    if game.get_ped_batches().len() > ped_count {
-        game.get_mut_ped_batches().truncate(ped_count);
-    }
+    // 骨架批次按模型共享,不随行人增删 —— 这里没有批次表要收缩。
 }
 
 /// 玩家死亡 / 重生的一帧推进。
@@ -6800,36 +6988,28 @@ pub(crate) fn report_jacking(game: &mut Game, index: usize) {
     }
 }
 
-/// 为敌人 / 行人建立渲染批次(必须在唯一的 `upload_mesh` 之前调用)。
+/// 为行人 / 敌人的模型建立**骨架批次**(必须在唯一的 `upload_mesh` 之前调用)。
 ///
-/// 每个实体一个批次,而不是「同类共用一个批次」—— 因为每个敌人有
-/// **独立姿态**,共批就必须在 CPU 侧逐个算矩阵再拆回去,反而更慢。
-/// 顶点数据仍然只上传一次(每个批次引用同一个 `mesh_index`),
-/// 所以「一次上传 + 多次 instanced draw」这个核心不变。
+/// 每个行人模型建一组:刚性核心(躯干 / 头 / 发型 / 配饰合并成一个 mesh)
+/// + [`LIMB_PLAN`](crate::player::LIMB_PLAN) 里每个可动肢体各一个批次。
+/// 同一模型的所有实例(市民、警察、混混)每帧把自己的矩阵推进同一组
+/// 批次 —— instanced draw 一次画一排,draw call 数与**模型数**成正比
+/// (4 模型 × 11 批次),而不是与实体数成正比。
 ///
+/// 顶点数据仍然只上传一次(批次引用的 mesh 在这里建好后随主上传走),
 /// `near_cull = false`:第三人称相机离角色只有几米,默认 26 m 的近处
-/// 剔除会把整批敌人剔光(见 `push_player_part` 的同类说明)。
+/// 剔除会把整批角色剔光(见 `push_player_part` 的同类说明)。
 ///
 /// # Arguments
 ///
 /// - `&mut Game` - Game 的可变引用。
 /// - `&HashMap<String, usize>` - 资产 id → 场景 mesh 索引。
-pub(crate) fn spawn_combat_batches(game: &mut Game, index_map: &HashMap<String, usize>) {
-    game.get_mut_enemy_batches().clear();
-    let enemy_assets: Vec<&'static str> = game
-        .get_enemies()
-        .iter()
-        .map(|enemy: &Enemy| enemy_asset(enemy.get_faction()))
-        .collect();
-    for asset in &enemy_assets {
-        let slot: Option<usize> = index_map.get(*asset).copied();
-        let Some(mesh_index) = slot else {
-            game.get_mut_enemy_batches().push(usize::MAX);
-            continue;
-        };
-        let batch: usize = find_or_create_batch(game.get_mut_scene(), mesh_index);
-        game.get_mut_enemy_batches().push(batch);
-    }
+/// - `&HashMap<String, MeshAsset>` - 4 套行人模型的完整资产(切 part 用)。
+pub(crate) fn spawn_combat_batches(
+    game: &mut Game,
+    index_map: &HashMap<String, usize>,
+    ped_assets: &HashMap<String, MeshAsset>,
+) {
     // 手持武器:一个批次,每帧换一次实例矩阵(跟着角色手部走)。
     let weapon_asset: &'static str = game.get_arsenal().get_weapon().asset();
     let weapon_slot: Option<usize> = index_map.get(weapon_asset).copied();
@@ -6838,20 +7018,41 @@ pub(crate) fn spawn_combat_batches(game: &mut Game, index_map: &HashMap<String, 
         None => usize::MAX,
     };
     game.set_weapon_batch(weapon_batch);
-    game.get_mut_ped_batches().clear();
-    let ped_models: Vec<&'static str> = game
-        .get_peds()
-        .iter()
-        .map(|ped: &Pedestrian| *ped.get_model())
-        .collect();
-    for model in &ped_models {
-        let Some(mesh_index) = index_map.get(&**model).copied() else {
-            game.get_mut_ped_batches().push(usize::MAX);
+    // 4 套行人模型的骨架批次。模型缺 part 时对应肢体批次记 usize::MAX,
+    // 渲染端跳过该节 —— 模型换装(比如裙子没鞋)不至于整具消失。
+    let mut rigs: Vec<PedModelRig> = Vec::new();
+    for model in PED_POOL {
+        let Some(asset) = ped_assets.get(*model) else {
             continue;
         };
-        let batch: usize = find_or_create_batch(game.get_mut_scene(), mesh_index);
-        game.get_mut_ped_batches().push(batch);
+        let mut limbs: Vec<PlayerLimbBatch> = Vec::new();
+        for (part_name, _, _, _) in LIMB_PLAN {
+            let batch: usize = push_player_part(game.get_mut_scene(), asset, part_name);
+            if batch == usize::MAX {
+                continue;
+            }
+            let pivot: Vec3 = joint_pivot(part_name, part_local_bounds(asset, part_name));
+            let parent: &str = limb_parent(part_name);
+            let root_pivot: Vec3 = if parent.is_empty() {
+                pivot
+            } else {
+                joint_pivot(parent, part_local_bounds(asset, parent))
+            };
+            limbs.push(PlayerLimbBatch {
+                part: (*part_name).to_string(),
+                pivot,
+                root_pivot,
+                batch,
+            });
+        }
+        let core_batch: usize = push_ped_core_part(game.get_mut_scene(), asset);
+        rigs.push(PedModelRig {
+            model: String::from(*model),
+            core_batch,
+            limbs,
+        });
     }
+    game.set_ped_rigs(rigs);
 }
 
 /// 一个阵营用的模型资产。
@@ -7243,7 +7444,129 @@ pub(crate) fn join_talk(
 ///
 /// 不会 panic。
 pub(crate) fn ped_bob(ped: &Pedestrian) -> f32 {
-    (ped.get_gait_phase() * 2.0).cos() * PED_BOB_HEIGHT * ped.get_gait_amount()
+    bob_offset(ped.get_gait_phase(), ped.get_gait_amount())
+}
+
+/// 步态起伏的核心算式:与 [`ped_bob`] 同一套,但按相位 / 幅度参数化,
+/// 让**敌人**(同样有两条腿,字段在 `Enemy::gait_phase`)与行人共用
+/// 一条曲线,不要在两个地方各抄一份。
+///
+/// # Arguments
+///
+/// - `f32` - 步态相位(弧度)。
+/// - `f32` - 步态幅度 0..1。
+///
+/// # Returns
+///
+/// - `f32` - 世界 Y 偏移(米)。
+pub(crate) fn bob_offset(phase: f32, amount: f32) -> f32 {
+    (phase * 2.0).cos() * PED_BOB_HEIGHT * amount
+}
+
+/// 把一个角色(行人或敌人)的核心 + 肢体实例推进它所属模型的骨架批次。
+///
+/// 与玩家骨架完全同一套:核心 rigid 矩阵 + 每节 limb 走
+/// [`limb_chain_matrix`](crate::player::limb_chain_matrix) 两级链式摆动。
+/// 行人不再是整具刚体上下颠 —— 那个「蹦蹦跳跳」的观感来自「腿不会动、
+/// 身体在颠」,而不是起伏本身有问题。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+/// - `&str` - 模型资产 id。
+/// - `Vec3` - 世界坐标(已含 bob 抬升)。
+/// - `f32` - 朝向(弧度)。
+/// - `f32` - 步态相位(弧度)。
+/// - `f32` - 步态幅度 0..1。
+/// - `f32` - 整体缩放(尸体下沉用)。
+/// - `Vec3` - 实例色调。
+pub(crate) fn push_rig_instances(
+    game: &mut Game,
+    model: &str,
+    at: Vec3,
+    yaw: f32,
+    phase: f32,
+    amount: f32,
+    scale: f32,
+    tint: Vec3,
+) {
+    let Some(rig_index) = game
+        .get_ped_rigs()
+        .iter()
+        .position(|rig: &PedModelRig| rig.get_model() == model)
+    else {
+        return;
+    };
+    let (core_batch, limbs) = {
+        let rig: &PedModelRig = &game.get_ped_rigs()[rig_index];
+        (rig.get_core_batch(), rig.get_limbs().clone())
+    };
+    if core_batch != usize::MAX
+        && let Some(scene_batch) = game.get_mut_scene().get_mut_batches().get_mut(core_batch)
+    {
+        let model_matrix: Mat4 = body_matrix(at, yaw, scale);
+        scene_batch
+            .get_mut_instances()
+            .push(Instance::from_matrix(model_matrix, tint));
+    }
+    for limb in &limbs {
+        let Some(scene_batch) = game
+            .get_mut_scene()
+            .get_mut_batches()
+            .get_mut(limb.get_batch())
+        else {
+            continue;
+        };
+        let swing: f32 = limb_swing(limb.get_part(), phase, amount);
+        let parent: &str = limb_parent(limb.get_part());
+        let root_swing: f32 = if parent.is_empty() {
+            0.0
+        } else {
+            limb_swing(parent, phase, amount)
+        };
+        let mut model_matrix: Mat4 = limb_chain_matrix(
+            at,
+            yaw,
+            limb.get_root_pivot(),
+            limb.get_pivot(),
+            root_swing,
+            swing,
+        );
+        // 尸体下沉:绕角色脚底原点整体缩放,肢体跟着躯干一起缩,
+        // 否则躯干缩小、四肢还悬在原尺寸的空中。
+        if (scale - 1.0).abs() > f32::EPSILON {
+            model_matrix = scale_matrix_about(model_matrix, at, scale);
+        }
+        scene_batch
+            .get_mut_instances()
+            .push(Instance::from_matrix(model_matrix, tint));
+    }
+}
+
+/// 把矩阵绕空间点 `pivot` 均匀缩放 `scale`:`M' = T(p)·S(s)·T(-p)·M`。
+///
+/// 列主序展开:线性部分(前 3 列的前 3 行)乘 `s`,平移列变成
+/// `s·t + (1−s)·p`。不绕原点而绕角色脚下缩放,是为了尸体下沉时
+/// 脚底留在地面上,而不是整个人往地心钻。
+///
+/// # Arguments
+///
+/// - `Mat4` - 原矩阵。
+/// - `Vec3` - 缩放中心(世界坐标)。
+/// - `f32` - 均匀缩放系数。
+///
+/// # Returns
+///
+/// - `Mat4` - 缩放后的矩阵。
+pub(crate) fn scale_matrix_about(matrix: Mat4, pivot: Vec3, scale: f32) -> Mat4 {
+    let mut e: Mat4Data = matrix.get_elements();
+    for index in [0usize, 1, 2, 4, 5, 6, 8, 9, 10] {
+        e[index] *= scale;
+    }
+    for (column, axis) in [(12usize, 0usize), (13, 1), (14, 2)] {
+        e[column] = scale * e[column] + (1.0 - scale) * pivot[axis];
+    }
+    Mat4::from_column_major(e)
 }
 
 /// 把敌人与行人的姿态写回场景批次。
@@ -7256,19 +7579,25 @@ pub(crate) fn ped_bob(ped: &Pedestrian) -> f32 {
 /// - `&mut Game` - Game 的可变引用。
 pub(crate) fn sync_combat_instances(game: &mut Game) {
     let here: Vec3 = game.get_player().get_position();
-    for index in 0..game.get_enemies().len() {
-        let Some(batch) = game.get_enemy_batches().get(index).copied() else {
-            continue;
-        };
+    // 骨架批次是**共享**的:每帧先整体清空,再由在范围内的实例重新推入。
+    let mut rig_batches: Vec<usize> = Vec::new();
+    for rig in game.get_ped_rigs() {
+        rig_batches.push(rig.get_core_batch());
+        for limb in rig.get_limbs() {
+            rig_batches.push(limb.get_batch());
+        }
+    }
+    for batch in rig_batches {
         if batch == usize::MAX {
             continue;
         }
+        if let Some(scene_batch) = game.get_mut_scene().get_mut_batches().get_mut(batch) {
+            scene_batch.get_mut_instances().clear();
+        }
+    }
+    for index in 0..game.get_enemies().len() {
         let enemy: Enemy = game.get_enemies()[index].clone();
         let at: Vec3 = enemy.get_position();
-        let Some(scene_batch) = game.get_mut_scene().get_mut_batches().get_mut(batch) else {
-            continue;
-        };
-        scene_batch.get_mut_instances().clear();
         if flat_distance(at, here) > ENEMY_RENDER_RANGE {
             continue;
         }
@@ -7279,10 +7608,22 @@ pub(crate) fn sync_combat_instances(game: &mut Game) {
             (enemy.get_death_timer() / DEATH_FADE_TIME).clamp(0.0, 1.0)
         };
         let tint: Vec3 = enemy_tint(&enemy);
-        let model: Mat4 = body_matrix(at, enemy.get_yaw(), sink);
-        scene_batch
-            .instances
-            .push(Instance::from_matrix(model, tint));
+        let bob: f32 = if enemy.is_alive() {
+            bob_offset(enemy.get_gait_phase(), enemy.get_gait_amount())
+        } else {
+            0.0
+        };
+        let lift: Vec3 = [at[0], at[1] + bob, at[2]];
+        push_rig_instances(
+            game,
+            enemy_asset(enemy.get_faction()),
+            lift,
+            enemy.get_yaw(),
+            enemy.get_gait_phase(),
+            enemy.get_gait_amount(),
+            sink,
+            tint,
+        );
     }
     // ---- 手持武器:贴在角色右手,朝向 = 瞄准方向 ----
     {
@@ -7309,35 +7650,31 @@ pub(crate) fn sync_combat_instances(game: &mut Game) {
         }
     }
     for index in 0..game.get_peds().len() {
-        let Some(batch) = game.get_ped_batches().get(index).copied() else {
-            continue;
-        };
-        if batch == usize::MAX {
-            continue;
-        }
         let ped: Pedestrian = game.get_peds()[index].clone();
         let at: Vec3 = ped.get_position();
-        let Some(scene_batch) = game.get_mut_scene().get_mut_batches().get_mut(batch) else {
-            continue;
-        };
-        scene_batch.get_mut_instances().clear();
         if flat_distance(at, here) > PED_RENDER_RANGE {
             continue;
         }
-        // 行人不做逐部件骨架(那要 13 个批次 × 18 个行人),整具一个矩阵:
-        // 走路时靠 Y 轴的轻微上下起伏表达「在走」。相位为什么必须这样选,
-        // 见 [`ped_bob`]。
-        let bob: f32 = ped_bob(&ped);
+        // 行人走与玩家相同的逐部件骨架:核心 rigid + 四肢链式摆动,
+        // 起伏只保留很轻的一层(见 [`ped_bob`] 的相位推导)。
+        // 原来「整具一个矩阵 + ±4.5 cm 上下颠」就是用户报的「NPC 蹦着走」。
+        let bob: f32 = if ped.is_down() { 0.0 } else { ped_bob(&ped) };
         let lift: Vec3 = [at[0], at[1] + bob, at[2]];
-        let model: Mat4 = body_matrix(lift, ped.get_yaw(), 1.0);
         let tint: Vec3 = if ped.is_down() {
             TINT_PED_DOWN
         } else {
             TINT_PED
         };
-        scene_batch
-            .instances
-            .push(Instance::from_matrix(model, tint));
+        push_rig_instances(
+            game,
+            ped.get_model(),
+            lift,
+            ped.get_yaw(),
+            ped.get_gait_phase(),
+            ped.get_gait_amount(),
+            1.0,
+            tint,
+        );
     }
 }
 
@@ -7455,8 +7792,8 @@ pub(crate) fn update_camera(game: &mut Game, delta: f32) {
     // 走室内版本:玩家站进样板楼时,挡在镜头和角色之间的是隔墙和门垛,
     // 它们不在 `CollisionWorld` 里,只查外部世界会直接穿墙。
     let hit: Option<f32> = game.get_camera().resolve_occlusion_interior(
-        &game.get_world(),
-        &game.get_interiors(),
+        game.get_world(),
+        game.get_interiors(),
         wanted,
     );
     let allowed: f32 = hit.unwrap_or(wanted);
@@ -7619,7 +7956,7 @@ pub(crate) fn step_live_grenades(game: &mut Game, dt: f32) {
     let mut survivors: Vec<Grenade> = Vec::new();
     let mut blasts: Vec<Vec3> = Vec::new();
     let grenades: Vec<Grenade> = take(game.get_mut_live_grenades());
-    let world_snapshot: CollisionWorld = game.get_world_ref().clone();
+    let world_snapshot: Rc<CollisionWorld> = game.get_world_rc();
     let floor_world: FloorWorld = game.get_interiors().clone();
     for mut grenade in grenades {
         grenade.set_age(grenade.get_age() + dt);
@@ -7803,7 +8140,7 @@ pub(crate) fn toggle_vehicle(game: &mut Game) -> bool {
         }
         None => {
             let here: Vec3 = game.get_player().get_position();
-            let Some(index) = nearest_car(&game.get_traffic(), here) else {
+            let Some(index) = nearest_car(game.get_traffic(), here) else {
                 game.get_mut_player()
                     .set_notice(String::from(NOTICE_NO_CAR));
                 return false;
@@ -7942,14 +8279,16 @@ pub(crate) fn spawn_player_traffic_pickups(
 
     // 碰撞世界:从资产 bounds 自动推导。
     let asset_bounds: HashMap<String, Bounds> = game.get_asset_bounds().clone();
+    let mut world: CollisionWorld = CollisionWorld::new();
     build_collision_world(
-        game.get_mut_world(),
+        &mut world,
         &asset_bounds,
         spawn_point()[0],
         spawn_point()[2],
     );
+    game.set_world(Rc::new(world));
     // 室内碰撞世界:两栋可进入样板楼的楼板 / 隔墙 / 楼梯 / 外墙。
-    build_showcase_interiors(&mut game.get_mut_interiors());
+    build_showcase_interiors(game.get_mut_interiors());
 
     // 验收脚本要的「最近一栋楼」:街区布局是程序化生成的,写死一个
     // 魔法坐标早晚会推到空地上,所以在这里对着同一份 `build_city_buildings()`
@@ -7997,8 +8336,8 @@ pub(crate) fn sync_dynamic_instances(game: &mut Game) {
         if driving {
             continue;
         }
-        let swing: f32 = limb_swing(&limb.get_part(), phase, amount);
-        let parent: &str = limb_parent(&limb.get_part());
+        let swing: f32 = limb_swing(limb.get_part(), phase, amount);
+        let parent: &str = limb_parent(limb.get_part());
         let root_swing: f32 = if parent.is_empty() {
             0.0
         } else {
@@ -8182,7 +8521,7 @@ pub(crate) fn step_and_render(
             // 某个后端一帧都没画出来。所以验收必须看这里这个「本帧真的
             // 提交了多少三角形」的 `gpu_submitted`。
             Renderer::WebGpu(gpu) => gpu.render(crate::webgpu::RenderParams {
-                scene: &game.get_scene(),
+                scene: game.get_scene(),
                 view_proj: &view_proj,
                 lighting: &lighting,
                 eye: game.get_camera().eye(),
@@ -8194,7 +8533,7 @@ pub(crate) fn step_and_render(
                 shadow_focus: game.get_player().get_position(),
             }),
             Renderer::WebGl(webgl) => webgl.render(
-                &game.get_scene(),
+                game.get_scene(),
                 &view_proj,
                 &game.get_camera().view_matrix(),
                 &lighting,
@@ -8209,8 +8548,8 @@ pub(crate) fn step_and_render(
                 game.get_quality().tier(),
             ),
             Renderer::Software(software) => Ok(software.render(
-                &game.get_scene(),
-                &game.get_camera(),
+                game.get_scene(),
+                game.get_camera(),
                 &lighting,
                 width,
                 height,
@@ -8483,7 +8822,7 @@ pub fn boot() {
         nearest_building: None,
         player: Player::new(spawn_point(), SPAWN_YAW),
         traffic: Traffic::new(),
-        world: CollisionWorld::new(),
+        world: Rc::new(CollisionWorld::new()),
         interiors: FloorWorld::new(),
         player_batches: Vec::new(),
         car_batches: Vec::new(),
@@ -8499,11 +8838,10 @@ pub fn boot() {
         wanted: Wanted::new(),
         enemies: Vec::new(),
         peds: Vec::new(),
-        enemy_batches: Vec::new(),
+        ped_rigs: Vec::new(),
         weapon_batch: usize::MAX,
         weapon_mesh: usize::MAX,
         index_map: HashMap::new(),
-        ped_batches: Vec::new(),
         mission: Mission::new(),
         hitmarker: 0.0,
         did_hit: false,
@@ -8798,6 +9136,8 @@ async fn load_assets_and_build(handles: GameHandles) {
     let mut index_map: HashMap<String, usize> = HashMap::new();
     let mut asset_bounds: HashMap<String, Bounds> = HashMap::new();
     let mut ped_suit: Option<MeshAsset> = None;
+    // 行人模型与 `ped_suit` 同理:解析一次、留一份原始 part(骨架按模型切)。
+    let mut ped_assets: HashMap<String, MeshAsset> = HashMap::new();
     // 车辆资产要留着按 part 切轮子(`tyres` / `hubs` 各自被切成单个轮子),
     // 与 `ped_suit` 同理:解析一次、留一份原始 part。
     let mut car_assets: HashMap<String, MeshAsset> = HashMap::new();
@@ -8850,6 +9190,11 @@ async fn load_assets_and_build(handles: GameHandles) {
                         }
                         if *id == PED_SUIT {
                             ped_suit = Some(asset.clone());
+                        }
+                        // 4 套行人模型都要留原始 part:骨架批次按模型切
+                        // (行人 / 警察 / 混混共用同一套 LIMB_PLAN 命名)。
+                        if PED_POOL.contains(id) {
+                            ped_assets.insert((*id).to_string(), asset.clone());
                         }
                         if CAR_ASSET_IDS.contains(id) {
                             car_assets.insert((*id).to_string(), asset.clone());
@@ -8997,7 +9342,7 @@ async fn load_assets_and_build(handles: GameHandles) {
         // 索引必须在那一次上传之前就定下来。
         game.set_index_map(index_map.clone());
         populate_combatants(&mut game, 0.37);
-        spawn_combat_batches(&mut game, &index_map);
+        spawn_combat_batches(&mut game, &index_map, &ped_assets);
         if let Some(ped) = ped_suit.as_ref() {
             spawn_player_traffic_pickups(&mut game, &index_map, ped, &car_assets);
         }
@@ -9195,6 +9540,118 @@ pub fn app_root() -> VirtualNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 地面扰动哈希必须 60 m 周期 —— 这是「地面局部建一次 + 实例平移」
+    /// 的成立前提:换块时实例平移 S ∈ 60ℤ,`hash(p) == hash(p + S)`
+    /// 才能保证玩家看不到噪声图案在脚下整体跳变。
+
+    #[test]
+    pub(crate) fn ground_cell_hash_is_street_periodic() {
+        let mut seed: f32 = 0.0;
+        for i in 0..500 {
+            // 覆盖正负、非整格心(格心是 1.25 m 的倍数)。
+            let x: f32 = (i as f32 * 7.31) - 300.0;
+            let z: f32 = (i as f32 * 3.77) - 180.0;
+            seed = ground_cell_hash(x, z);
+            for shift in [60.0_f32, -60.0, 300.0, -600.0] {
+                assert_eq!(
+                    ground_cell_hash(x + shift, z),
+                    ground_cell_hash(x, z),
+                    "x 平移 {shift} 后哈希必须不变(x={x})"
+                );
+                assert_eq!(
+                    ground_cell_hash(x, z + shift),
+                    ground_cell_hash(x, z),
+                    "z 平移 {shift} 后哈希必须不变(z={z})"
+                );
+            }
+        }
+        // 确定性:同一点两次调用必须同值(周期性 assert 已隐含,这里钉死)。
+        assert_eq!(
+            seed,
+            ground_cell_hash(499.0_f32 * 7.31 - 300.0, 499.0_f32 * 3.77 - 180.0)
+        );
+    }
+
+    /// 行人 / 敌人骨架回归:每节 LIMB_PLAN 肢体都真的切得出 mesh,
+    /// 刚性核心留下躯干但不带走四肢。
+    ///
+    /// 钉的是「NPC 蹦着走」的修复接线:骨架化不是「`ped_rigs` 字段存在」,
+    /// 而是**每一个**行人模型都能切出 10 节肢体 + 1 个刚性核心。用真实
+    /// 资产 JSON(与运行时同一份),防资产改名后渲染静默退化回刚体。
+    #[test]
+    pub(crate) fn ped_rig_cuts_every_limb_and_keeps_a_rigid_core() {
+        let asset: MeshAsset =
+            parse_asset(PED_SUIT, FIXTURE_PED_SUIT_JSON).expect(E_FIXTURE_ASSET_JSON);
+        let whole_vertices: usize = {
+            let mut total: usize = 0;
+            for part in asset.get_parts() {
+                total += part.get_faces().len();
+            }
+            total
+        };
+        let mut scene: Scene = Scene::default();
+        for (part, _, _, _) in LIMB_PLAN {
+            let batch: usize = push_player_part(&mut scene, &asset, part);
+            assert!(
+                batch != usize::MAX,
+                "行人骨架切不出肢体 part「{part}」—— 资产改名后 NPC 会静默退回刚体蹦跳"
+            );
+        }
+        let meshes_before_core: usize = scene.get_meshes().len();
+        let core: usize = push_ped_core_part(&mut scene, &asset);
+        assert!(core != usize::MAX, "刚性核心必须有躯干 / 头 / 配饰");
+        let core_mesh: &MeshAssetGpu = scene
+            .get_meshes()
+            .get(meshes_before_core)
+            .expect("核心 mesh");
+        let core_faces: usize = core_mesh.get_indices().len() / 3;
+        assert!(core_faces > 0, "刚性核心不能是空 mesh");
+        assert!(
+            core_faces < whole_vertices,
+            "核心({core_faces} 面)必须比整具({whole_vertices} 面)少 —— 肢体没被切走"
+        );
+    }
+
+    /// 步态相位不同的两帧,肢体矩阵必须真的不同(否则批次推的是
+    /// 「不会动的骨架」,与整具刚体等价)。
+    #[test]
+    pub(crate) fn walking_ped_limbs_actually_swing() {
+        let asset: MeshAsset =
+            parse_asset(PED_SUIT, FIXTURE_PED_SUIT_JSON).expect(E_FIXTURE_ASSET_JSON);
+        let pivot: Vec3 = joint_pivot(
+            PART_UPPER_LEG_L,
+            part_local_bounds(&asset, PART_UPPER_LEG_L),
+        );
+        let at: Vec3 = [0.0, 0.0, 0.0];
+        let yaw: f32 = 0.7;
+        let a: Mat4 = limb_chain_matrix(
+            at,
+            yaw,
+            pivot,
+            pivot,
+            0.0,
+            limb_swing(PART_UPPER_LEG_L, 0.0, 1.0),
+        );
+        let b: Mat4 = limb_chain_matrix(
+            at,
+            yaw,
+            pivot,
+            pivot,
+            0.0,
+            limb_swing(PART_UPPER_LEG_L, 1.2, 1.0),
+        );
+        let diff: f32 = a
+            .get_elements()
+            .iter()
+            .zip(b.get_elements().iter())
+            .map(|(x, y): (&f32, &f32)| (x - y).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            diff > 1.0e-3,
+            "步态相位从 0 → 1.2,大腿矩阵必须明显变化,实测最大差 {diff}"
+        );
+    }
+
     /// 零输入时玩家必须原地不动 —— 动态层的人群让位不构成位移。
     ///
     /// 回归(2026-10-12 浏览器实测):不按任何键,玩家以恒定
@@ -11036,6 +11493,8 @@ mod tests {
             indices: Vec::new(),
             faces: Vec::new(),
             triangle_count: 0,
+            // 半径 0 = 未初始化:渲染端按「永远可见」处理(见字段注释)。
+            bounds_sphere: [0.0; 4],
         }
     }
 

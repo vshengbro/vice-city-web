@@ -640,24 +640,25 @@ impl TrafficCar {
         // 打方向(倒库全靠它)。写 `speed > STEER_MIN_SPEED` 会让整段倒车
         // 永远转不动 —— 速度为负时那个判断恒假。
         //
-        // **这里不带负号,而负号正是上一版的取值 —— 符号随前向约定一起翻。**
+        // **这里必须带负号 —— 「右」是屏幕上的右,不是叉乘写反的那个。**
         //
         // `steer` 的契约是「正 = 右转」(`steer_sign` 对 KEYD / ARROWRIGHT
-        // 返回 +1)。前向改成 [`yaw_forward`](crate::orient::yaw_forward)
-        // 即 `[sin yaw, cos yaw]` 之后:
+        // 返回 +1),「右」的屏幕真值由第三人称相机锚定:相机跟在车尾沿
+        // `fwd` 看时,画面右侧 = `cross(fwd, up)`(右手系)。前向
+        // [`yaw_forward`](crate::orient::yaw_forward) = `[sin yaw, cos yaw]`
+        // 对 yaw 求导:
         //
-        //     d(fwd)/d(yaw) = [cos yaw, -sin yaw] = yaw_right(yaw)
+        //     d(fwd)/d(yaw) = [cos yaw, -sin yaw] = **−** yaw_right(yaw)
         //
-        // 也就是说 **yaw 增大 = 车向自己的右方转**,和 `steer` 的契约同号,
-        // 所以 `yaw_rate = +steer * K`。旧约定的 `fwd = [cos yaw, -sin yaw]`
-        // 给出的是 `d(fwd)/d(yaw) = [-sin, -cos]`,那才是车头的左方,当时
-        // 才需要负号去抵消。
+        // 即 **yaw 增大 = 车头向自己的左方转**,所以前进右转要
+        // `yaw_rate = −steer * K`。上一版把 `cross(up, fwd)`(左)当成了
+        // 「右」,于是按 D 车往屏幕左拐 —— 用户实测「左右反了」。
         //
-        // 两边的符号必须一起改:只把 `fwd` 换掉而保留负号,按 D 会立刻
-        // 变成往**左**拐 —— 正好复现这个缺陷历史上被误报成「方向键反向」
-        // 的现象。符号不是从直觉定的,是从上面这个 `fwd` 定义推出来的。
+        // 再乘 `speed.signum()`:bicycle model 的偏航率正比于**带符号**
+        // 速度(`v·tanδ/L`)。倒车打同一把舵,车身旋转方向与前进相反 ——
+        // 真车如此,GTA 也如此:倒车按 D,车尾甩向屏幕右、车头摆左。
         let yaw_rate: f32 = if speed.abs() > STEER_MIN_SPEED {
-            steer * STEER_RATE * grip_scale
+            -steer * STEER_RATE * grip_scale * speed.signum()
         } else {
             0.0
         };
@@ -684,10 +685,14 @@ impl TrafficCar {
         let fwd: Vec2 = crate::orient::yaw_forward(yaw);
         let right: Vec2 = crate::orient::yaw_right(yaw);
         let rotated: f32 = yaw_rate * dt;
-        // 旧车身系的速度投影 → 新车身系:前向多出 `speed * sin(rotated)`,
-        // 侧向多出 `-speed * sin(rotated) * steer_sign`。
+        // 旧车身系的速度投影 → 新车身系:前向多出 `speed * cos(rotated)`,
+        // 侧向多出 `speed * sin(rotated)`。符号推导:屏幕右约定下
+        // `d(fwd)/d(yaw) = −yaw_right`,车体转过 `rotated` 后,原来沿
+        // `fwd_old` 的速度在新车身系的 right 轴上分量为
+        // `speed * sin(rotated)` —— 右转(`rotated < 0`)时该分量为负,
+        // 即车尾向弯**外**侧滑,物理正确;符号取反车会往弯心里吸。
         let swung: f32 = speed * rotated.sin();
-        let lateral: f32 = self.get_lateral() - swung;
+        let lateral: f32 = self.get_lateral() + swung;
         // ---- 4. 轮胎抓地:侧向速度按指数衰减回 0 -------------------
         let decay: f32 = (-LATERAL_GRIP * dt).exp();
         let lateral: f32 = lateral * decay;

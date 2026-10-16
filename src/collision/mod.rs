@@ -4,7 +4,7 @@ mod r#fn;
 mod r#impl;
 mod r#struct;
 
-pub(crate) use crate::{r#config::*, r#type::*};
+pub(crate) use crate::{Ref, RefCell, r#config::*, r#type::*};
 pub(crate) use {r#const::*, r#enum::*, r#fn::*, r#struct::*};
 
 use super::*;

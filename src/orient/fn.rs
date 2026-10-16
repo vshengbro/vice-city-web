@@ -11,8 +11,8 @@
 //! (第 1 列 `model[0], model[2]`)。于是:
 //!
 //! - **车头 / 模型正面** = [`yaw_forward`] = `[sin yaw, cos yaw]`。
-//! - **手性为正的「右」** = [`yaw_right`] = `[cos yaw, -sin yaw]`,
-//!   即 `cross(up, fwd)`。
+//! - **屏幕意义的「右」** = [`yaw_right`] = `[-cos yaw, sin yaw]`,
+//!   即 `cross(fwd, up)`(右手系;`cross(up, fwd)` 是左)。
 //!
 //! 历史上物理侧用的是 `[cos yaw, -sin yaw]` 当「前」,而那正是渲染出来的
 //! **本地 +X**,与车头差了 90°:车「横着」开。修法不是改渲染 —— 相机、
@@ -45,8 +45,11 @@ pub(crate) fn yaw_forward(yaw: f32) -> Vec2 {
 
 /// 绕 Y 轴朝 `yaw` 时的世界「右」方向(XZ 分量)。
 ///
-/// 定义为 `cross(up, fwd)`,其中 `up = (0, 1, 0)`、`fwd = yaw_forward(yaw)`。
-/// 于是它恒为 `yaw_forward` 顺时针转 90°:`[fwd[1], -fwd[0]]`。
+/// 定义为 `cross(fwd, up)`,其中 `fwd = yaw_forward(yaw)`、`up = (0, 1, 0)`。
+/// 右手系里叉乘顺序**不能反过来**:`cross(up, fwd)` 算出来的是**左**。
+/// 验证锚点是屏幕:相机沿 `fwd` 看时(第三人称跟在车尾),`cross(fwd, up)`
+/// 正是画面右侧 —— 步行 strafe D 键走的也是这个方向,两者必须同源。
+/// 于是它恒为 `yaw_forward` **逆时针**转 90°:`[-fwd[1], fwd[0]]`。
 ///
 /// 写成由 `fwd` 推出而不是直接给分量,是为了让「右」的定义**不可能**
 /// 与「前」脱节 —— 历史上正是两处各写一份分量,差了一个符号。
@@ -57,8 +60,8 @@ pub(crate) fn yaw_forward(yaw: f32) -> Vec2 {
 ///
 /// # Returns
 ///
-/// - `Vec2` - `(cos yaw, -sin yaw)`,模长恒为 1。
+/// - `Vec2` - `(-cos yaw, sin yaw)`,模长恒为 1。
 pub(crate) fn yaw_right(yaw: f32) -> Vec2 {
     let fwd: Vec2 = yaw_forward(yaw);
-    [fwd[1], -fwd[0]]
+    [-fwd[1], fwd[0]]
 }

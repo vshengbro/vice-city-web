@@ -1,7 +1,7 @@
 use super::*;
 
 /// 已经 `configure` 好的 WebGPU 上下文。
-#[derive(Data, Debug, Clone)]
+#[derive(Clone, Data, Debug)]
 pub struct GpuContext {
     /// `GPUCanvasContext`,每帧 `getCurrentTexture()` 靠它。
     #[get(skip, pub(crate))]
@@ -21,7 +21,7 @@ pub struct GpuContext {
 /// 与 `render::GlMesh` 一一对应且**下标语义完全相同** ——
 /// [`crate::render::SceneBatch::mesh_index`] 在两个后端里都当这张表的
 /// 下标用,所以两张表必须长度相等、顺序一致,否则批次会取到别人的网格。
-#[derive(Data, Debug, Clone)]
+#[derive(Clone, Data, Debug)]
 pub struct GpuMesh {
     /// 顶点缓冲(`GPUBuffer`)。
     #[get(pub(crate))]
@@ -61,7 +61,7 @@ pub struct GpuMesh {
 /// clippy `too_many_arguments` 的阈值,而这里**不能**加 `#[allow]`。
 /// 更重要的是这八个参数天然成组(帧常量 / 着色参数 / 视口),
 /// 将来补上 `time` / `quality` 时不必再改一次签名。
-#[derive(Data, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Data, Debug)]
 pub struct RenderParams<'a> {
     /// 场景(资产 + 批次)。
     #[get(pub(crate))]
@@ -102,7 +102,7 @@ pub struct RenderParams<'a> {
 /// 字段顺序必须与 [`SHADER_FRAGMENT`] 里的 `Shading` 结构逐项一致,
 /// 否则读出来的是错位的颜色。统一用 `[f32; 4]` 是因为 WebGPU 的
 /// uniform 布局按 16 字节对齐,而本块恰好是 vec4 的整数倍。
-#[derive(Data, Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Data, Debug, Default)]
 pub struct ShadingUniforms {
     /// `light_dir` + 1 个 pad。
     #[get(type(copy), pub(crate))]
@@ -194,7 +194,7 @@ pub(crate) const SHADING_VEC4_COUNT: usize = 15;
 /// [`WebGpuRenderer::bloom_buffers`]),所以这个结构体里同时带着
 /// 「提取要的阈值」「两条模糊各要的方向」「合成要的强度」——
 /// 每个 pass 只读自己那两个分量,其余是陪坐。
-#[derive(Data, Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Data, Debug, Default)]
 pub struct BloomUniforms {
     /// `x` = 亮度阈值(线性空间,提取用),
     /// `y` = 合成强度,`zw` = 模糊方向(uv 单位,H 为 `(dx, 0)`、
@@ -236,7 +236,7 @@ pub(crate) const BLOOM_VEC4_COUNT: usize = 3;
 /// `struct.rs`。改成**只包一个字符串的 struct**,`Display` 由
 /// `impl.rs` 里的 `impl std::fmt::Display` 提供 —— 这样
 /// `format!("[vcw] WebGPU unavailable: {}", reason)` 照样能写。
-#[derive(Data, Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Data, Debug, Eq, PartialEq)]
 pub struct GpuUnavailable {
     /// 人可读的失败原因,例如 [`super::r#const::GPU_ERR_NO_ADAPTER`]。
     ///
@@ -455,6 +455,15 @@ pub struct WebGpuRenderer {
     /// 四个 AO 目标当前的尺寸,(0, 0) = 还没建。
     #[get(type(copy), pub(crate))]
     pub(crate) ao_size: (u32, u32),
+    /// 后处理 bind group 是否需要重建。
+    ///
+    /// AO / bloom 目标**尺寸不变时纹理对象不会换**,bind group 引用的
+    /// 还是同一批纹理 —— 每帧无条件重建 7 个 bind group(~10 次
+    /// `createView` + 上百次 `Reflect` 属性拼装)是纯浪费。只有
+    /// `ensure_*_targets` 真的重建了纹理才把这一位置 `true`。
+    #[get(type(copy), pub(crate))]
+    #[set(pub(crate))]
+    pub(crate) postprocess_dirty: bool,
     /// 三条 AO pass(采样 / 模糊 H / 模糊 V)**各一个**的 uniform buffer。
     ///
     /// ⚠️ 和 bloom 同样受队列时间线约束:同帧写三次同一个 buffer,
@@ -488,7 +497,7 @@ pub(crate) const AO_PASS_COUNT: usize = 3;
 ///
 /// 收成数组而不是拆成六个字段,理由和 [`GpuBloomPass`] 一样:一一对应
 /// 的东西拆开就会出现「某条 pipeline 绑了别人的 group」这种静默错误。
-#[derive(Data, Debug, Clone)]
+#[derive(Clone, Data, Debug)]
 pub struct GpuAoPass {
     /// 渲染 pipeline。
     #[get(pub(crate))]
@@ -514,7 +523,7 @@ pub struct GpuAoPass {
 /// `uploads[i].2` 这种下标读,而提取与合成两条的形状一样
 /// (方向恒为 `(0.0, 0.0)`),读错了编译器不会报错。字段名让
 /// 「这条 pass 的方向是什么」变成一句能读的话。
-#[derive(Data, Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Data, Debug, Default)]
 pub(crate) struct BloomPassUpload {
     /// `params.x`:亮度阈值(线性空间)。
     #[get(type(copy), pub(crate))]
@@ -555,7 +564,7 @@ pub(crate) const BLOOM_PASS_COMPOSITE: usize = 3;
 /// 传递整张表时用 [`WebGpuRenderer::get_bloom_passes`] 按值克隆 ——
 /// 每帧一次、四个句柄,代价可以忽略,换来的是调用点不必操心
 /// 借用与 `&mut self` 的冲突。
-#[derive(Data, Debug, Clone)]
+#[derive(Clone, Data, Debug)]
 pub struct GpuBloomPass {
     /// `GPURenderPipeline`。
     #[get(pub(crate))]

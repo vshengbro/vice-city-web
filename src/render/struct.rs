@@ -1,6 +1,6 @@
 use super::*;
 /// 一个三角面在 CPU 侧的表示,软件渲染与 WebGL 共用。
-#[derive(Data, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Data, Debug)]
 pub struct Face {
     /// 三个顶点下标(指向 [`GpuMesh::vertices`],单位是顶点而不是 f32)。
     #[get(type(copy), pub(crate))]
@@ -36,12 +36,20 @@ pub struct MeshAssetGpu {
     /// 三角形数量。
     #[get(type(copy), pub(crate))]
     pub(crate) triangle_count: usize,
+    /// 包围球(局部空间,`[cx, cy, cz, radius]`)。
+    ///
+    /// 主 pass 的视锥剔除按「实例模型矩阵 × 包围球」做:球在视锥外
+    /// 整实例跳过。`radius <= 0.0` 表示未初始化(测试手工构造的
+    /// mesh),渲染端按**永远可见**处理,保证剔除只会少画、不会漏画。
+    #[get(type(copy), pub(crate))]
+    #[set(pub(crate))]
+    pub(crate) bounds_sphere: [f32; 4],
 }
 /// 两个后端共享的光照参数。
 ///
 /// WebGL 把它作为 uniform 上传,Canvas2D 后端在 CPU 上跑同一个公式,
 /// 保证两个后端的画面在色调整体上一致。
-#[derive(Data, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Data, Debug)]
 pub struct SceneLighting {
     /// 太阳 / 月亮方向光方向(指向光源)。
     #[get(type(copy), pub(crate))]
@@ -115,7 +123,7 @@ pub struct SceneLighting {
 // 场景批次(instancing 友好的组织方式)
 // ===========================================================================
 /// 一个实例:model matrix(列主序 16 f32)+ tint。
-#[derive(Data, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Data, Debug)]
 pub struct Instance {
     /// model matrix,列主序,直接喂 `uniformMatrix4fv` / 自己算。
     #[get(type(copy), pub(crate))]
@@ -169,7 +177,7 @@ pub struct Scene {
 /// 目标很简单:**宁可掉画质,不要掉帧率**。这在软渲染(SwiftShader)上尤其
 /// 重要 —— 基准线已经是 25 fps,再叠上海面 / 草地 / 山体,不动的话会掉到
 /// 个位数,截图能截但画面已经没法看了。
-#[derive(Data, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Data, Debug)]
 pub struct AdaptiveQuality {
     #[get(type(copy), pub(crate))]
     pub(crate) tier: QualityTier,
@@ -526,7 +534,7 @@ pub(crate) struct PipelineTargets {
 // Canvas2D 软件渲染后端
 // ===========================================================================
 /// 一个待绘制的屏幕空间三角形。
-#[derive(Data, Clone, Debug)]
+#[derive(Clone, Data, Debug)]
 pub(crate) struct ScreenTriangle {
     /// 三个屏幕顶点 `(x, y)`。
     #[get(type(copy), pub(crate))]

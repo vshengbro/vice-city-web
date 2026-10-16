@@ -115,6 +115,18 @@ impl Game {
         &self.world
     }
 
+    /// 碰撞世界的廉价快照句柄。
+    ///
+    /// 每帧要「快照世界再改自己」的解算(车队 / 玩家 / 行人 / 敌人)
+    /// 用这个:`Rc` 克隆只加引用计数,不复制 ~2500 个 Shape。
+    ///
+    /// # Returns
+    ///
+    /// - `Rc<CollisionWorld>` - 与 `self.world` 共享同一份数据。
+    pub(crate) fn get_world_rc(&self) -> Rc<CollisionWorld> {
+        Rc::clone(&self.world)
+    }
+
     /// 当前渲染后端的只读引用。
     ///
     /// # Returns

@@ -197,6 +197,91 @@ pub fn pop_error_scope(device: &JsValue, scope: &str) {
     });
 }
 
+/// 视投影矩阵的第 `i` 行(列主序存储,行 i = e[i], e[4+i], e[8+i], e[12+i])。
+///
+/// # Arguments
+///
+/// - `&[f32; 16]` - 列主序 4×4 矩阵。
+/// - `usize` - 行下标(0..4)。
+///
+/// # Returns
+///
+/// - `[f32; 4]` - 该行四个分量。
+fn vp_row(e: &[f32; 16], i: usize) -> [f32; 4] {
+    [e[i], e[4 + i], e[8 + i], e[12 + i]]
+}
+
+/// 从视投影矩阵提取 6 个视锥平面(Gribb-Hartmann 法)。
+///
+/// 每个平面是 `[nx, ny, nz, d]`,点 `p` 满足 `dot(n, p) + d >= 0` 即在
+/// 内侧。输入是 GL 风格的列主序矩阵(NDC z ∈ [-1, +1])—— 与
+/// [`frame_bytes`] 修正前的同一个矩阵,所以近平面是 `row3 + row2`。
+///
+/// # Arguments
+///
+/// - `&Mat4` - 列主序视投影矩阵。
+///
+/// # Returns
+///
+/// - `[[f32; 4]; 6]` - 左 / 右 / 下 / 上 / 近 / 远六个已归一化平面。
+pub(crate) fn frustum_planes(m: &Mat4) -> [[f32; 4]; 6] {
+    let e: &[f32; 16] = &m.elements;
+    let (r0, r1, r2, r3): ([f32; 4], [f32; 4], [f32; 4], [f32; 4]) =
+        (vp_row(e, 0), vp_row(e, 1), vp_row(e, 2), vp_row(e, 3));
+    let mut planes: [[f32; 4]; 6] = [
+        [r3[0] + r0[0], r3[1] + r0[1], r3[2] + r0[2], r3[3] + r0[3]],
+        [r3[0] - r0[0], r3[1] - r0[1], r3[2] - r0[2], r3[3] - r0[3]],
+        [r3[0] + r1[0], r3[1] + r1[1], r3[2] + r1[2], r3[3] + r1[3]],
+        [r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2], r3[3] - r1[3]],
+        [r3[0] + r2[0], r3[1] + r2[1], r3[2] + r2[2], r3[3] + r2[3]],
+        [r3[0] - r2[0], r3[1] - r2[1], r3[2] - r2[2], r3[3] - r2[3]],
+    ];
+    for plane in &mut planes {
+        let len: f32 = (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
+        if len > f32::EPSILON {
+            for component in plane.iter_mut() {
+                *component /= len;
+            }
+        }
+    }
+    planes
+}
+
+/// 「实例包围球 × 模型矩阵」是否落在视锥内(保守:只会多画、不会漏画)。
+///
+/// 包围球半径 `<= 0.0` 视为未初始化,**永远可见** —— 手工构造的测试
+/// mesh 不会被意外剔掉。
+///
+/// # Arguments
+///
+/// - `&[[f32; 4]; 6]` - [`frustum_planes`] 的结果。
+/// - `[f32; 4]` - 局部空间包围球(中心 xyz + 半径)。
+/// - `&[f32; 16]` - 实例模型矩阵(列主序,等比缩放)。
+///
+/// # Returns
+///
+/// - `bool` - 可能可见为 `true`。
+pub(crate) fn instance_in_frustum(
+    planes: &[[f32; 4]; 6],
+    sphere: [f32; 4],
+    model: &[f32; 16],
+) -> bool {
+    if sphere[3] <= 0.0 {
+        return true;
+    }
+    let center: [f32; 3] = [
+        model[0] * sphere[0] + model[4] * sphere[1] + model[8] * sphere[2] + model[12],
+        model[1] * sphere[0] + model[5] * sphere[1] + model[9] * sphere[2] + model[13],
+        model[2] * sphere[0] + model[6] * sphere[1] + model[10] * sphere[2] + model[14],
+    ];
+    // 等比缩放:第 0 列的长度就是缩放系数(实例没有剪切)。
+    let scale: f32 = (model[0] * model[0] + model[1] * model[1] + model[2] * model[2]).sqrt();
+    let radius: f32 = sphere[3] * scale;
+    !planes.iter().any(|plane: &[f32; 4]| {
+        plane[0] * center[0] + plane[1] * center[1] + plane[2] * center[2] + plane[3] < -radius
+    })
+}
+
 /// 视投影矩阵的字节序(列主序,直接 `writeBuffer`)。
 ///
 /// # Arguments

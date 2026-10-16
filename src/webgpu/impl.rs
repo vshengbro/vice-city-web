@@ -122,6 +122,7 @@ impl WebGpuRenderer {
             ao_ping: JsValue::NULL,
             ao_pong: JsValue::NULL,
             ao_size: (0, 0),
+            postprocess_dirty: true,
             ao_buffers: empty_ao_buffers(),
             ao_sampler: JsValue::NULL,
             ao_group_layout: JsValue::NULL,
@@ -2036,6 +2037,10 @@ impl WebGpuRenderer {
         let mut total: usize = 0;
         let hidden: Vec<usize> = crate::game::hidden_batches();
         let batches: &Vec<crate::render::SceneBatch> = scene.get_batches_ref();
+        // 主 pass 视锥剔除:按「实例模型矩阵 × mesh 包围球」测 6 个平面,
+        // 整实例在视锥外就跳过。沿街看时身后 / 街尾的建筑与道具占大
+        // 半,这一步把它们的顶点负载与 draw 提交直接省掉。
+        let frustum: [[f32; 4]; 6] = frustum_planes(view_proj);
         for (index, batch) in batches.iter().enumerate() {
             // ⚠️ **不能**按 `opaque` 过滤!这个标志在 WebGL2 端的含义是
             // 「这个批次要不要参与背面剔除」,地面 / 水面等大片是
@@ -2045,17 +2050,21 @@ impl WebGpuRenderer {
             if batch.get_instances().is_empty() || hidden.contains(&index) {
                 continue;
             }
-            let kept: Vec<&crate::render::Instance> = if batch.get_near_cull() {
-                batch
-                    .instances
-                    .iter()
-                    .filter(|instance: &&crate::render::Instance| {
-                        distance_to(instance, eye) > near_cull_radius
-                    })
-                    .collect()
-            } else {
-                batch.get_instances().iter().collect()
-            };
+            let sphere: [f32; 4] = scene
+                .get_meshes()
+                .get(batch.get_mesh_index())
+                .map(|mesh: &crate::render::MeshAssetGpu| mesh.get_bounds_sphere())
+                .unwrap_or([0.0, 0.0, 0.0, 0.0]);
+            let kept: Vec<&crate::render::Instance> = batch
+                .instances
+                .iter()
+                .filter(|instance: &&crate::render::Instance| {
+                    if batch.get_near_cull() && distance_to(instance, eye) <= near_cull_radius {
+                        return false;
+                    }
+                    instance_in_frustum(&frustum, sphere, instance.get_model_ref())
+                })
+                .collect();
             if kept.is_empty() {
                 continue;
             }
@@ -2501,7 +2510,10 @@ impl WebGpuRenderer {
         self.set_ao_depth(depth);
         self.set_ao_targets(ping, pong);
         self.set_ao_size(canvas_size);
-        self.create_ao_bind_groups()?;
+        // bind group 不在此处重建:渲染主流程末尾的
+        // `ensure_postprocess_bind_groups` 会在 AO / bloom 两组目标都
+        // 就绪后统一建(dirty 位驱动,见该函数)。
+        self.set_postprocess_dirty(true);
         Ok(())
     }
 
@@ -2539,6 +2551,7 @@ impl WebGpuRenderer {
             self.set_bloom_ping(ping);
             self.set_bloom_pong(pong);
             self.set_bloom_size(canvas_size);
+            self.set_postprocess_dirty(true);
             // ⚠️ **不要在这里建 bloom 的 bind group。**
             //
             // 合成的槽 6 要绑 AO 图,而 AO 目标是在 `ensure_ao_targets`
@@ -2823,6 +2836,12 @@ impl WebGpuRenderer {
     ///
     /// - `Result<(), String>` - 失败时的错误文本。
     fn ensure_postprocess_bind_groups(&mut self) -> Result<(), String> {
+        // 目标纹理没换过,bind group 引用的还是同一批纹理 —— 每帧
+        // 无条件重建 7 个 bind group 是纯 JS 桥开销,只在 dirty 时重建。
+        if !self.get_postprocess_dirty() {
+            return Ok(());
+        }
+        self.set_postprocess_dirty(false);
         self.create_ao_bind_groups()?;
         self.create_bloom_bind_groups()
     }

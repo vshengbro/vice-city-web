@@ -12,15 +12,48 @@ impl CollisionWorld {
             shapes: Vec::new(),
             player_radius: 0.35,
             half_extent: [48.0, 48.0],
+            grid: RefCell::new(None),
+        }
+    }
+
+    /// 按「查询盒可能重叠到的形状」迭代,**顺序与全表扫描严格一致**。
+    ///
+    /// 形状数低于 [`GRID_MIN_SHAPES`] 时直接全表;否则走惰性构建的
+    /// broadphase 网格。候选是全表扫描的**子序列**(升序去重),且查询
+    /// 每轮按当前位置重发 —— 任何能产生推出的形状必然与查询盒重叠,
+    /// 所以两条路径的分离结果逐位相同(见 `ShapeGrid` 的类型注释)。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 查询盒最小角(世界 XZ)。
+    /// - `Vec2` - 查询盒最大角(世界 XZ)。
+    /// - `impl FnMut(usize)` - 形状索引回调。
+    fn for_each_candidate(&self, lo: Vec2, hi: Vec2, mut f: impl FnMut(usize)) {
+        if self.get_shapes().len() < GRID_MIN_SHAPES {
+            for index in 0..self.get_shapes().len() {
+                f(index);
+            }
+            return;
+        }
+        if self.get_grid().borrow().is_none() {
+            *self.get_grid().borrow_mut() = Some(ShapeGrid::build(self.get_shapes()));
+        }
+        let grid: Ref<'_, Option<ShapeGrid>> = self.get_grid().borrow();
+        if let Some(grid) = grid.as_ref() {
+            grid.query(lo, hi, f);
         }
     }
 
     /// 静态碰撞体表的可变引用。
     ///
+    /// 拿到可变引用 = 形状表可能已变,broadphase 网格立即作废
+    /// (下一次分离查询会按需重建)。
+    ///
     /// # Returns
     ///
     /// - `&mut Vec<Shape>` - 碰撞体表。
     pub fn get_shapes_mut(&mut self) -> &mut Vec<Shape> {
+        *self.get_grid().borrow_mut() = None;
         &mut self.shapes
     }
 
@@ -61,20 +94,27 @@ impl CollisionWorld {
         let mut current: Vec2 = point;
         for _ in 0..RESOLVE_ITERATIONS {
             let mut moved: bool = false;
-            for shape in self.get_shapes() {
-                let hit: Option<(Vec2, f32)> = match shape {
-                    Shape::Aabb { center, half } => push_out_aabb(*center, *half, current, radius),
-                    Shape::Circle {
-                        center,
-                        radius: other,
-                    } => push_out_circle(*center, *other, current, radius),
-                };
-                if let Some((direction, depth)) = hit {
-                    current[0] += direction[0] * depth;
-                    current[1] += direction[1] * depth;
-                    moved = true;
-                }
-            }
+            self.for_each_candidate(
+                [current[0] - radius, current[1] - radius],
+                [current[0] + radius, current[1] + radius],
+                |index: usize| {
+                    let shape: &Shape = &self.get_shapes()[index];
+                    let hit: Option<(Vec2, f32)> = match shape {
+                        Shape::Aabb { center, half } => {
+                            push_out_aabb(*center, *half, current, radius)
+                        }
+                        Shape::Circle {
+                            center,
+                            radius: other,
+                        } => push_out_circle(*center, *other, current, radius),
+                    };
+                    if let Some((direction, depth)) = hit {
+                        current[0] += direction[0] * depth;
+                        current[1] += direction[1] * depth;
+                        moved = true;
+                    }
+                },
+            );
             if !moved {
                 break;
             }
@@ -310,20 +350,27 @@ impl CollisionWorld {
         let mut current: Vec2 = point;
         for _ in 0..RESOLVE_ITERATIONS {
             let mut moved: bool = false;
-            for shape in self.get_shapes() {
-                let hit: Option<(Vec2, f32)> = match shape {
-                    Shape::Aabb { center, half } => push_out_aabb(*center, *half, current, radius),
-                    Shape::Circle {
-                        center,
-                        radius: other,
-                    } => push_out_circle(*center, *other, current, radius),
-                };
-                if let Some((direction, depth)) = hit {
-                    current[0] += direction[0] * depth;
-                    current[1] += direction[1] * depth;
-                    moved = true;
-                }
-            }
+            self.for_each_candidate(
+                [current[0] - radius, current[1] - radius],
+                [current[0] + radius, current[1] + radius],
+                |index: usize| {
+                    let shape: &Shape = &self.get_shapes()[index];
+                    let hit: Option<(Vec2, f32)> = match shape {
+                        Shape::Aabb { center, half } => {
+                            push_out_aabb(*center, *half, current, radius)
+                        }
+                        Shape::Circle {
+                            center,
+                            radius: other,
+                        } => push_out_circle(*center, *other, current, radius),
+                    };
+                    if let Some((direction, depth)) = hit {
+                        current[0] += direction[0] * depth;
+                        current[1] += direction[1] * depth;
+                        moved = true;
+                    }
+                },
+            );
             if !moved {
                 break;
             }
@@ -405,34 +452,41 @@ impl CollisionWorld {
     pub fn resolve_car_box(&self, point: Vec2, yaw: f32) -> Vec2 {
         // 车身基向量,和 `TrafficCar::drive` 的第 3 步完全同一套:
         // `fwd = yaw_forward(yaw)`、`right = yaw_right(yaw)`。
-        // 符号必须一模一样 —— 这里的 `right` 若取成 `[−fwd[1], fwd[0]]`,
-        // 车身盒就成了左右翻转的镜像,斜着靠墙时会被判到墙的另一侧去。
-        //
-        // **两处必须同步改。** 足迹盒的长轴是**车头方向**(`CAR_FOOTPRINT`
-        // 的 2.283 m 对应车身 4.566 m),而车头在资产本地 +Z、渲染成
-        // `yaw_forward`。沿用旧的 `[cos, -sin]` 会让碰撞盒的 4.566 m 长边
-        // 横过来,车会「侧着」被墙挡住 —— 而玩家看到的是车头朝前。
+        // 足迹盒在 ±side 上对称,`yaw_right` 取哪个手性得到的是同一个盒;
+        // 真正不能错的是长轴方向:**车头方向**必须是 `yaw_forward`
+        // (`CAR_FOOTPRINT` 的 2.283 m 对应车身 4.566 m)。沿用旧的
+        // `[cos, -sin]` 会让碰撞盒的 4.566 m 长边横过来,车会「侧着」
+        // 被墙挡住 —— 而玩家看到的是车头朝前。
         let forward: Vec2 = crate::orient::yaw_forward(yaw);
         let side: Vec2 = crate::orient::yaw_right(yaw);
+        // 查询半径取足迹外接圆:任何与有向盒重叠的形状,其 AABB 必然
+        // 与外接圆的轴对齐方盒重叠 —— broadphase 不会漏掉能产生推出的
+        // 形状,结果与全表扫描逐位一致。
+        let reach: f32 = CAR_FOOTPRINT[0].hypot(CAR_FOOTPRINT[1]);
         let mut current: Vec2 = point;
         for _ in 0..RESOLVE_ITERATIONS {
             let mut moved: bool = false;
-            for shape in self.get_shapes() {
-                let hit: Option<(Vec2, f32)> = match shape {
-                    Shape::Aabb { center, half } => {
-                        push_out_box_aabb(*center, *half, current, forward, side, CAR_FOOTPRINT)
+            self.for_each_candidate(
+                [current[0] - reach, current[1] - reach],
+                [current[0] + reach, current[1] + reach],
+                |index: usize| {
+                    let shape: &Shape = &self.get_shapes()[index];
+                    let hit: Option<(Vec2, f32)> = match shape {
+                        Shape::Aabb { center, half } => {
+                            push_out_box_aabb(*center, *half, current, forward, side, CAR_FOOTPRINT)
+                        }
+                        Shape::Circle {
+                            center,
+                            radius: other,
+                        } => push_out_circle(*center, *other, current, CAR_FOOTPRINT[1]),
+                    };
+                    if let Some((direction, depth)) = hit {
+                        current[0] += direction[0] * depth;
+                        current[1] += direction[1] * depth;
+                        moved = true;
                     }
-                    Shape::Circle {
-                        center,
-                        radius: other,
-                    } => push_out_circle(*center, *other, current, CAR_FOOTPRINT[1]),
-                };
-                if let Some((direction, depth)) = hit {
-                    current[0] += direction[0] * depth;
-                    current[1] += direction[1] * depth;
-                    moved = true;
-                }
-            }
+                },
+            );
             if !moved {
                 break;
             }
@@ -450,16 +504,24 @@ impl CollisionWorld {
     ///
     /// - `bool` - 圆心(零半径)与任一形状重叠时为 `true`。
     pub fn contains_point(&self, point: Vec2) -> bool {
-        self.get_shapes().iter().any(|shape: &Shape| match shape {
-            Shape::Aabb { center, half } => {
-                (point[0] - center[0]).abs() <= half[0] && (point[1] - center[1]).abs() <= half[1]
+        let mut inside: bool = false;
+        self.for_each_candidate(point, point, |index: usize| {
+            if inside {
+                return;
             }
-            Shape::Circle { center, radius } => {
-                let dx: f32 = point[0] - center[0];
-                let dy: f32 = point[1] - center[1];
-                (dx * dx + dy * dy).sqrt() <= *radius
-            }
-        })
+            inside = match &self.get_shapes()[index] {
+                Shape::Aabb { center, half } => {
+                    (point[0] - center[0]).abs() <= half[0]
+                        && (point[1] - center[1]).abs() <= half[1]
+                }
+                Shape::Circle { center, radius } => {
+                    let dx: f32 = point[0] - center[0];
+                    let dy: f32 = point[1] - center[1];
+                    (dx * dx + dy * dy).sqrt() <= *radius
+                }
+            };
+        });
+        inside
     }
 
     /// 两两分离一组动态实体,返回各自被推开后的新位置。
@@ -601,29 +663,36 @@ impl CollisionWorld {
         // 互相接力,实测峰值 9.6 m。预算记在**位移**上而不是「推了几次」上,
         // 所以无论迭代几轮、形状几个,一帧的总修正都锁死在预算内。
         let mut budget: f32 = MAX_STATIC_PUSH_PER_FRAME;
+        // 查询半径取足迹外接圆(与 `resolve_car_box` 同一保守口径)。
+        let reach: f32 = footprint[0].hypot(footprint[1]);
         for _ in 0..RESOLVE_ITERATIONS {
             let mut moved: bool = false;
-            for shape in self.get_shapes() {
-                if budget <= STATIC_PUSH_BUDGET_EPSILON {
-                    break;
-                }
-                let hit: Option<(Vec2, f32)> = match shape {
-                    Shape::Aabb { center, half } => {
-                        push_out_box_aabb(*center, *half, current, forward, side, footprint)
+            self.for_each_candidate(
+                [current[0] - reach, current[1] - reach],
+                [current[0] + reach, current[1] + reach],
+                |index: usize| {
+                    if budget <= STATIC_PUSH_BUDGET_EPSILON {
+                        return;
                     }
-                    Shape::Circle {
-                        center,
-                        radius: other,
-                    } => push_out_circle(*center, *other, current, footprint[1]),
-                };
-                if let Some((direction, depth)) = hit {
-                    let allowed: f32 = depth.min(budget);
-                    current[0] += direction[0] * allowed;
-                    current[1] += direction[1] * allowed;
-                    budget -= allowed;
-                    moved = true;
-                }
-            }
+                    let shape: &Shape = &self.get_shapes()[index];
+                    let hit: Option<(Vec2, f32)> = match shape {
+                        Shape::Aabb { center, half } => {
+                            push_out_box_aabb(*center, *half, current, forward, side, footprint)
+                        }
+                        Shape::Circle {
+                            center,
+                            radius: other,
+                        } => push_out_circle(*center, *other, current, footprint[1]),
+                    };
+                    if let Some((direction, depth)) = hit {
+                        let allowed: f32 = depth.min(budget);
+                        current[0] += direction[0] * allowed;
+                        current[1] += direction[1] * allowed;
+                        budget -= allowed;
+                        moved = true;
+                    }
+                },
+            );
             if !moved {
                 break;
             }
@@ -661,6 +730,67 @@ impl Default for CollisionWorld {
     /// 返回空碰撞世界,与 `CollisionWorld::new` 等价。
     fn default() -> Self {
         CollisionWorld::new()
+    }
+}
+
+/// Inherent implementation of [`ShapeGrid`].
+impl ShapeGrid {
+    /// 把整张形状表登记进网格。
+    ///
+    /// 形状按索引升序插入,所以每个单元里的索引表**天然有序** ——
+    /// 查询侧只需合并 + 去重,候选顺序就与全表扫描一致。
+    ///
+    /// # Arguments
+    ///
+    /// - `&[Shape]` - 静态碰撞体表。
+    ///
+    /// # Returns
+    ///
+    /// - `Self` - 可直接查询的网格。
+    pub(crate) fn build(shapes: &[Shape]) -> Self {
+        let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+        for (index, shape) in shapes.iter().enumerate() {
+            let (lo, hi): (Vec2, Vec2) = shape_aabb(shape);
+            let (cx0, cz0): (i32, i32) = (grid_cell(lo[0]), grid_cell(lo[1]));
+            let (cx1, cz1): (i32, i32) = (grid_cell(hi[0]), grid_cell(hi[1]));
+            for cx in cx0..=cx1 {
+                for cz in cz0..=cz1 {
+                    cells.entry((cx, cz)).or_default().push(index as u32);
+                }
+            }
+        }
+        Self { cells }
+    }
+
+    /// 查询与给定 AABB 可能重叠的形状索引(升序、去重)。
+    ///
+    /// 重叠的两个闭区间盒必然共享至少一个网格单元(见
+    /// [`crate::collision`] 模块级别约定:`grid_cell` 用 floor 的闭区间
+    /// 映射,贴边也覆盖),所以这条路径不会漏掉任何真能重叠的形状。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 查询盒最小角(世界 XZ)。
+    /// - `Vec2` - 查询盒最大角(世界 XZ)。
+    /// - `impl FnMut(usize)` - 形状索引回调。
+    pub(crate) fn query(&self, lo: Vec2, hi: Vec2, mut f: impl FnMut(usize)) {
+        let mut found: Vec<u32> = Vec::new();
+        let (cx0, cz0): (i32, i32) = (grid_cell(lo[0]), grid_cell(lo[1]));
+        let (cx1, cz1): (i32, i32) = (grid_cell(hi[0]), grid_cell(hi[1]));
+        for cx in cx0..=cx1 {
+            for cz in cz0..=cz1 {
+                if let Some(list) = self.get_cells().get(&(cx, cz)) {
+                    found.extend_from_slice(list);
+                }
+            }
+        }
+        // 跨单元的形状会被登记多次:升序 + 去重后,候选顺序与全表
+        // 扫描的子序列完全一致 —— 这是「分离结果逐位相同」的关键。
+        found.sort_unstable();
+        found.dedup();
+        for index in found {
+            f(index as usize);
+        }
     }
 }
 

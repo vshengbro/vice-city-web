@@ -513,12 +513,13 @@ mod tests {
         }
     }
 
-    /// **回归:`steer` 的契约「正 = 右转」必须在新的前向约定下成立。**
+    /// **回归:`steer` 的契约「正 = 屏幕右转」必须成立。**
     ///
-    /// 前向从 `[cos yaw, -sin yaw]` 换成 `[sin yaw, cos yaw]` 之后,
-    /// `d(fwd)/d(yaw)` 从车头**左方**变成了车头**右方** —— 所以偏航率
-    /// 的负号必须跟着去掉,否则按 D 会往左拐。只改 `fwd` 不改这个符号,
-    /// 就是「换完约定方向键立刻反向」的那个坑。
+    /// 「右」的真值不在数学手里,在屏幕上:第三人称相机跟在车尾沿
+    /// `fwd` 看时,画面右侧 = `cross(fwd, up)`(右手系),也就是
+    /// 步行 strafe D 走的那个方向。`d(fwd)/d(yaw)` 在这个约定下是
+    /// 车头**左方**(`= −yaw_right`),所以偏航率必须带负号 ——
+    /// 只翻前向约定、不翻这个符号,按 D 就往屏幕左拐(用户实测)。
     #[test]
     pub(crate) fn steering_right_turns_toward_the_noses_own_right() {
         let world: crate::collision::CollisionWorld = empty_world();
@@ -529,18 +530,18 @@ mod tests {
         }
         let right: Vec2 = crate::orient::yaw_right(yaw0);
         let yaw_delta: f32 = c.get_yaw() - yaw0;
-        // 正的 `steer` 必须让车头朝**自己的右方**偏:新约定下
-        // `d(fwd)/d(yaw) = yaw_right(yaw)`,所以偏航角增量必须为正。
+        // 正的 `steer` 必须让车头朝**屏幕右方**偏:`d(fwd)/d(yaw)` 指向
+        // `−yaw_right`,所以偏航角增量必须为**负**。
         assert!(
-            yaw_delta > 0.1,
-            "正 steer(右转)后偏航角增量应为正(yaw 右转),实际 {:.4}",
+            yaw_delta < -0.1,
+            "正 steer(右转)后偏航角增量应为负(yaw 减小 = 屏幕右转),实际 {:.4}",
             yaw_delta
         );
         let moved: Vec2 = crate::orient::yaw_forward(c.get_yaw());
         let lateral: f32 = moved[0] * right[0] + moved[1] * right[1];
         assert!(
             lateral > 0.0,
-            "车头没有偏向自己的右方,与 yaw_right 的内积 {:.4}",
+            "车头没有偏向屏幕右方,与 yaw_right 的内积 {:.4}",
             lateral
         );
     }

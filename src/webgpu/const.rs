@@ -1086,6 +1086,10 @@ struct Varyings {
     @location(4) world : vec3<f32>,
     @location(5) eye_distance : f32,
     @location(6) contact_ao : f32,
+    // 逐顶点 PBR 参数(roughness / metallic),顶点 buffer 的 location 12
+    // 一直在上传,只是旧着色器没读 —— 车(0.85 金属)与沥青(0.92 粗糙)
+    // 的数据都是现成的。
+    @location(7) rough_metal : vec2<f32>,
 };
 
 struct Shading {
@@ -1177,6 +1181,7 @@ fn vs_main(
     @location(6) row2 : vec4<f32>,
     @location(7) row3 : vec4<f32>,
     @location(8) tint : vec3<f32>,
+    @location(12) rough_metal : vec2<f32>,
     @builtin(instance_index) instance : u32,
 ) -> Varyings {
     // `instance` 由 WebGPU 自己递增给出,这里断言性地把它绑到整数上:
@@ -1195,6 +1200,7 @@ fn vs_main(
     out.world = world.xyz;
     out.eye_distance = length(world.xyz - shading.eye.xyz);
     out.contact_ao = contact_ao(world.xyz, row3.xyz);
+    out.rough_metal = rough_metal;
     // 让优化器保留 builtin 读取:写入一个恒等于 0 的分量不会影响画面。
     out.clip = out.clip + vec4<f32>(0.0, 0.0, 0.0, f32(index) * 0.0);
     return out;
@@ -1402,6 +1408,38 @@ struct FragOut {
     @location(2) depth : vec4<f32>,
 }
 
+// ---- PBR 高光辅助 ----
+// 与 WebGL2 端 `FRAGMENT_SHADER` 的同名函数逐项对应(见
+// `src/render/const.rs` 的 shade_direct 注释):金属 / 介电质对同一束
+// 光的响应完全不同,统一 Lambert 会把 34 个 PBR 材质退化成 base_color。
+const PBR_PI : f32 = 3.141592653589793;
+
+// Schlick 菲涅尔,`f0` 是法线方向上的反射率。
+fn fresnel_schlick(cos_theta : f32, f0 : vec3<f32>) -> vec3<f32> {
+    return f0 + (vec3<f32>(1.0) - f0)
+        * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+// GGX / Trowbridge-Reitz 法线分布项,决定高光形状。
+fn distribution_ggx(n : vec3<f32>, h : vec3<f32>, roughness : f32) -> f32 {
+    let a : f32 = roughness * roughness;
+    let a2 : f32 = a * a;
+    let n_dot_h : f32 = max(dot(n, h), 0.0);
+    let denominator : f32 = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / max(PBR_PI * denominator * denominator, 1e-6);
+}
+
+// Smith 几何项(GGX 高度相关版本),负责掠射角的自遮蔽。
+fn geometry_smith(n : vec3<f32>, v : vec3<f32>, l : vec3<f32>, roughness : f32) -> f32 {
+    let r : f32 = roughness + 1.0;
+    let k : f32 = (r * r) / 8.0;
+    let n_dot_v : f32 = max(dot(n, v), 0.0);
+    let n_dot_l : f32 = max(dot(n, l), 0.0);
+    let g_v : f32 = n_dot_v / (n_dot_v * (1.0 - k) + k);
+    let g_l : f32 = n_dot_l / (n_dot_l * (1.0 - k) + k);
+    return g_v * g_l;
+}
+
 @fragment
 fn fs_main(
     @location(0) normal : vec3<f32>,
@@ -1411,6 +1449,7 @@ fn fs_main(
     @location(4) world : vec3<f32>,
     @location(5) eye_distance : f32,
     @location(6) contact_ao : f32,
+    @location(7) rough_metal : vec2<f32>,
 ) -> FragOut {
     let n : vec3<f32> = normalize(normal);
     let n_dot_l : f32 = max(dot(n, shading.light_dir.xyz), 0.0);
@@ -1431,8 +1470,33 @@ fn fs_main(
     // 淡淡的接触暗部,物体才不至于「漂起来」。
     shadow = mix(1.0, shadow, shading.shadow_params.x);
 
+    // ---- GGX 高光 ----
+    // 与 WebGL2 端 `shade_direct` 的镜面项逐项一致(Schlick F + GGX D +
+    // Smith G)。漫反射**保持原 Lambert 不动**(城市亮度分布是按它调的),
+    // 高光只加不减:车漆(metallic≈0.85)出彩色镜面,玻璃 / 水面有
+    // 反射光斑,沥青(roughness≈0.92)是宽而淡的掠射光泽 —— 材质终于
+    // 分得开,不再是整屏一个亮度模型。
+    let roughness : f32 = clamp(rough_metal.x, 0.04, 1.0);
+    let metallic : f32 = clamp(rough_metal.y, 0.0, 1.0);
+    let view_dir : vec3<f32> = normalize(shading.eye.xyz - world);
+    let half_dir : vec3<f32> = normalize(view_dir + shading.light_dir.xyz);
+    let n_dot_v : f32 = max(dot(n, view_dir), 0.0);
+    let f0 : vec3<f32> = mix(vec3<f32>(0.04), base, vec3<f32>(metallic));
+    let fres : vec3<f32> = fresnel_schlick(max(dot(half_dir, view_dir), 0.0), f0);
+    let dist_ggx : f32 = distribution_ggx(n, half_dir, roughness);
+    let geom : f32 = geometry_smith(n, view_dir, shading.light_dir.xyz, roughness);
+    let specular : vec3<f32> = (dist_ggx * geom * fres)
+        / max(4.0 * n_dot_v * n_dot_l, 1e-4);
+    // 掠射角的天空光泽(低成本「湿感」):菲涅尔⁵ × 天空色,粗糙面衰减。
+    // 路面 / 车顶在逆光角度出现一层环境反光,是「不像白模」的关键一步。
+    let sheen_gain : f32 = pow(clamp(1.0 - n_dot_v, 0.0, 1.0), 5.0)
+        * (1.0 - roughness) * 0.22 * (0.35 + 0.65 * metallic);
+    let sheen : vec3<f32> = shading.sky_color.xyz * sheen_gain;
+
     let lit : vec3<f32> = base * (ambient + shading.light_color.xyz * n_dot_l * shadow)
-        + base * emissive * shading.emissive_gain.x;
+        + specular * shading.light_color.xyz * n_dot_l * shadow
+        + base * emissive * shading.emissive_gain.x
+        + sheen;
     var mapped : vec3<f32> = tonemap(lit, shading.exposure_white.x, shading.exposure_white.y);
     mapped = mapped * contact_ao;
     mapped = mapped + shading.sky_color.xyz * 0.012;

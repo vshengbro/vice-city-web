@@ -208,6 +208,19 @@ pub fn apply(
     enemy.set_velocity([achieved[0] * inverse_dt, achieved[1] * inverse_dt]);
     enemy.set_position([resolved[0], here[1], resolved[1]]);
     enemy.set_state(decision.get_next());
+    // 步态:与行人同一套 —— 幅度追「实际速度 / 满速」,相位按走过的
+    // 距离推进。不追的话四肢永远不摆,敌人像棋子一样贴着地滑。
+    let planar: f32 = (achieved[0] * achieved[0] + achieved[1] * achieved[1]).sqrt() * inverse_dt;
+    let gait_relaxed: f32 = (1.0 - (-GAIT_RELAX_RATE * dt).exp()).clamp(0.0, 1.0);
+    if planar > PLANAR_EPSILON {
+        let ratio: f32 = (planar / ENEMY_SPEED).clamp(0.0, 1.0);
+        enemy.set_gait_amount(
+            enemy.get_gait_amount() + (ratio - enemy.get_gait_amount()) * gait_relaxed,
+        );
+        enemy.set_gait_phase((enemy.get_gait_phase() + planar * PED_GAIT_RATE * dt) % TAU);
+    } else {
+        enemy.set_gait_amount(enemy.get_gait_amount() * (1.0 - gait_relaxed));
+    }
     // 开火:只有「要求开火 + 冷却结束 + 没在硬直」才真的打。
     if wants_fire && enemy.get_fire_cooldown() <= 0.0 && enemy.get_hurt_timer() <= 0.0 {
         enemy.set_fire_cooldown(1.0 / ENEMY_FIRE_RATE);

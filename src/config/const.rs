@@ -532,6 +532,10 @@ pub(crate) const FIXTURE_CAR_TAXI_JSON: &str = include_str!("../../assets/car_ta
 #[cfg(test)]
 pub(crate) const FIXTURE_CAR_POLICE_JSON: &str = include_str!("../../assets/car_police.json");
 
+/// 单元测试夹具:西装行人(玩家骨架与行人 / 敌人骨架共用这套 part 命名)。
+#[cfg(test)]
+pub(crate) const FIXTURE_PED_SUIT_JSON: &str = include_str!("../../assets/ped_suit.json");
+
 /// 单元测试断言文案:两辆车剪影几乎一样(只是换了漆)。
 pub(crate) const T_SILHOUETTE_TOO_SIMILAR: &str = "剪影与轿车几乎相同,只是换了漆";
 

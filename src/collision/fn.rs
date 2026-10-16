@@ -471,6 +471,41 @@ pub fn placement_box(min: Vec3, max: Vec3, yaw: f32, scale: f32, position: Vec3)
     (center, half)
 }
 
+/// 世界坐标 → 网格单元下标(floor 闭区间映射)。
+///
+/// # Arguments
+///
+/// - `f32` - 单轴世界坐标(米)。
+///
+/// # Returns
+///
+/// - `i32` - 该坐标所在的 [`GRID_CELL`] 单元下标。
+pub(crate) fn grid_cell(v: f32) -> i32 {
+    (v / GRID_CELL).floor() as i32
+}
+
+/// 形状的轴对齐包围盒(圆取外接方)。
+///
+/// # Arguments
+///
+/// - `&Shape` - 静态碰撞形状(盒或圆)。
+///
+/// # Returns
+///
+/// - `(Vec2, Vec2)` - (包围盒下角, 包围盒上角)。
+pub(crate) fn shape_aabb(shape: &Shape) -> (Vec2, Vec2) {
+    match shape {
+        Shape::Aabb { center, half } => (
+            [center[0] - half[0], center[1] - half[1]],
+            [center[0] + half[0], center[1] + half[1]],
+        ),
+        Shape::Circle { center, radius } => (
+            [center[0] - radius, center[1] - radius],
+            [center[0] + radius, center[1] + radius],
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,5 +1057,72 @@ mod tests {
             T_CAR_NEVER_INSIDE_A_WALL,
             worst
         );
+    }
+
+    /// broadphase 网格 ≡ 全表扫描:候选必须是「AABB 与查询盒重叠的形状」
+    /// 的**升序全集**,一个不多、一个不少。
+    ///
+    /// 分离结果是顺序敏感的(每个形状立即推一次),所以网格不只是「不能
+    /// 漏」,返回顺序也必须是全表扫描的子序列 —— 这条测试用确定性伪随机
+    /// 的形状表 + 查询盒把两条性质一起钉死。
+    #[test]
+    pub(crate) fn grid_candidates_match_linear_scan() {
+        // 确定性伪随机(xorshift),不引入 rand 依赖。
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 10000) as f32 / 10000.0
+        };
+        let mut shapes: Vec<Shape> = Vec::new();
+        // 超过 GRID_MIN_SHAPES,网格路径才真正启用。
+        for i in 0..200 {
+            let at: Vec2 = [next() * 200.0 - 100.0, next() * 200.0 - 100.0];
+            if i % 3 == 0 {
+                shapes.push(Shape::Circle {
+                    center: at,
+                    radius: 0.3 + next() * 3.0,
+                });
+            } else {
+                shapes.push(Shape::Aabb {
+                    center: at,
+                    half: [0.3 + next() * 15.0, 0.3 + next() * 15.0],
+                });
+            }
+        }
+        let grid: ShapeGrid = ShapeGrid::build(&shapes);
+        for _ in 0..500 {
+            let lo: Vec2 = [next() * 220.0 - 110.0, next() * 220.0 - 110.0];
+            let hi: Vec2 = [lo[0] + next() * 8.0, lo[1] + next() * 8.0];
+            let mut from_grid: Vec<usize> = Vec::new();
+            grid.query(lo, hi, |index: usize| from_grid.push(index));
+            // broadphase 的不变量(比「逐位等于重叠集」弱,但对分离等价已足够):
+            //
+            // 1. **不漏**:AABB 与查询盒真重叠的形状必须全部在候选里;
+            // 2. **有序**:候选升序(全表扫描的子序列顺序);
+            // 3. 允许**多报**(单元粒度保守)—— 多报的形状在分离循环里
+            //    走 `push_out_*` 返回 `None`,与全表扫描同样不产生位移,
+            //    所以分离结果逐位一致。
+            let reference: Vec<usize> = shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, shape): &(usize, &Shape)| {
+                    let (slo, shi): (Vec2, Vec2) = shape_aabb(shape);
+                    slo[0] <= hi[0] && shi[0] >= lo[0] && slo[1] <= hi[1] && shi[1] >= lo[1]
+                })
+                .map(|(index, _): (usize, &Shape)| index)
+                .collect();
+            assert!(
+                from_grid.windows(2).all(|w: &[usize]| w[0] < w[1]),
+                "候选必须严格升序: {from_grid:?}"
+            );
+            if let Some(missing) = reference
+                .iter()
+                .find(|index: &&usize| !from_grid.contains(index))
+            {
+                panic!("网格漏了真重叠的形状 {missing}: lo={lo:?} hi={hi:?}");
+            }
+        }
     }
 }

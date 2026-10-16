@@ -308,9 +308,15 @@ pub struct Game {
     #[set(pub(crate))]
     pub(crate) traffic: Traffic,
     /// 静态碰撞世界(玩家圆 vs 建筑 / 车 / 道具 + 世界边界)。
+    ///
+    /// 用 `Rc` 持有:车队 / 玩家 / 行人 / 敌人的解算每帧都要一份**快照**
+    /// 来绕开借用检查,直接克隆 `CollisionWorld` 是每帧 ~10 次、每次
+    /// ~2500 个 Shape(约 60 KB)的深拷贝 —— 实测是 CPU 侧最大的
+    /// 单帧开销之一。`Rc` 克隆是 O(1);世界只在换块时整体重建,
+    /// 重建路径直接 `set_world(Rc::new(新世界))`。
     #[get(pub(crate))]
     #[set(pub(crate))]
-    pub(crate) world: CollisionWorld,
+    pub(crate) world: Rc<CollisionWorld>,
     /// 室内碰撞世界(可进入楼的楼板 / 隔墙 / 楼梯)。
     ///
     /// 刻意与 [`Self::world`] 分开:后者是**纯二维**的,车行道、公交车
@@ -371,9 +377,15 @@ pub struct Game {
     #[get(pub(crate))]
     #[set(pub(crate))]
     pub(crate) peds: Vec<Pedestrian>,
-    /// 敌人每个实例对应的批次索引。
-    #[get(type(clone), pub(crate))]
-    pub(crate) enemy_batches: Vec<usize>,
+    /// 行人 / 敌人共享的骨架批次:模型 id → 该模型的骨骼批次组。
+    ///
+    /// 行人模型(4 套)与敌人模型(警 = `ped_suit`、匪 = `ped_streetwear`)
+    /// 的 part 命名与玩家骨架完全一致,于是渲染走同一套
+    /// [`crate::player::limb_chain_matrix`] 链式摆动 —— 行人不再是整具
+    /// 刚体上下颠(用户报的「NPC 蹦着走」),而是真的迈开腿。
+    #[get(pub(crate))]
+    #[set(pub(crate))]
+    pub(crate) ped_rigs: Vec<PedModelRig>,
     /// 手持武器的批次索引(`usize::MAX` 表示当前武器没有模型)。
     #[get(type(copy), pub(crate))]
     pub(crate) weapon_batch: usize,
@@ -384,9 +396,6 @@ pub struct Game {
     #[get(pub(crate))]
     #[set(pub(crate))]
     pub(crate) index_map: HashMap<String, usize>,
-    /// 行人每个实例对应的批次索引。
-    #[get(type(clone), pub(crate))]
-    pub(crate) ped_batches: Vec<usize>,
     /// 当前任务。
     #[get(pub(crate))]
     #[set(pub(crate))]
@@ -422,7 +431,7 @@ pub struct Game {
     pub(crate) aim_pitch: f32,
 }
 /// 玩家骨架的一个 part 批次:part 名 + 枢轴 + 批次索引。
-#[derive(Data, Clone, Debug)]
+#[derive(Clone, Data, Debug)]
 pub struct PlayerLimbBatch {
     /// part 名(与资产 JSON 的 `name` 一致)。
     #[get(pub(crate))]
@@ -442,11 +451,29 @@ pub struct PlayerLimbBatch {
     #[get(type(copy), pub(crate))]
     pub(crate) batch: usize,
 }
+/// 一个行人模型的整套渲染批次:刚性核心(躯干 / 头 / 配饰合并为一个
+/// mesh)+ 每个可动肢体一个批次。
+///
+/// 实例是**共享**的:同一模型的所有行人 / 敌人每帧把自己的实例矩阵
+/// 推进同一组批次,靠实例级色调区分(警 / 匪 / 市民 / 倒地)。
+#[derive(Clone, Data, Debug)]
+pub struct PedModelRig {
+    /// 模型资产 id(`ped_suit` 等)。
+    #[get(pub(crate))]
+    #[set(pub(crate))]
+    pub(crate) model: String,
+    /// 刚性核心批次的场景索引(躯干 + 头 + 发型 + 配饰)。
+    #[get(type(copy), pub(crate))]
+    pub(crate) core_batch: usize,
+    /// 可动肢体批次(与 [`crate::player::LIMB_PLAN`] 一一对应)。
+    #[get(type(clone), pub(crate))]
+    pub(crate) limbs: Vec<PlayerLimbBatch>,
+}
 /// 一辆车的四个可转车轮各占一个批次。
 ///
 /// 车身保持「整张车一个批次」不变(它不需要单独动画),只有轮子被切出来
 /// 独立变换 —— 与玩家肢体的 `PlayerLimbBatch` 同一套做法。
-#[derive(Data, Clone, Debug)]
+#[derive(Clone, Data, Debug)]
 pub struct CarWheelBatch {
     /// 对应的车辆索引。
     #[get(type(copy), pub(crate))]
@@ -462,7 +489,7 @@ pub struct CarWheelBatch {
     pub(crate) batch: usize,
 }
 /// 挂载到 canvas 上的事件驱动所需的共享引用。
-#[derive(Data, Clone)]
+#[derive(Clone, Data)]
 pub(crate) struct GameHandles {
     #[get(pub(crate))]
     #[set(pub(crate))]
@@ -540,7 +567,7 @@ pub(crate) struct Manifest {
     pub(crate) assets: Vec<ManifestEntry>,
 }
 /// manifest 里的一个资产条目。
-#[derive(Data, Clone, serde::Deserialize)]
+#[derive(Clone, Data, serde::Deserialize)]
 pub(crate) struct ManifestEntry {
     /// 资产 id。
     #[get(pub(crate))]
@@ -560,7 +587,7 @@ pub(crate) struct ManifestEntry {
 /// 抛投物必须**有自己的位置和计时**,而不是「按 G 立刻对射程内的
 /// 敌人造成一次伤害」:后者是范围攻击,不是投掷。手雷有 1.1 s 的滞空,
 /// 玩家在这段时间里还能跑开 —— 掩体因此有意义。
-#[derive(Data, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Data, Debug)]
 pub(crate) struct Grenade {
     /// 当前世界坐标(脚底高度)。
     #[get(type(copy), pub(crate))]

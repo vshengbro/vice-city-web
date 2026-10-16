@@ -1,6 +1,6 @@
 use super::*;
 /// 玩家当前的武器状态:选中哪把 + 各把剩多少子弹。
-#[derive(Data, Clone, Debug)]
+#[derive(Clone, Data, Debug)]
 pub struct Arsenal {
     /// 当前手持武器。
     #[get(type(copy), pub(crate))]
@@ -32,7 +32,7 @@ pub struct Arsenal {
     pub(crate) aim: Vec2,
 }
 /// 一个敌人 NPC。
-#[derive(Data, Clone, Debug)]
+#[derive(Clone, Data, Debug)]
 pub struct Enemy {
     /// 所属阵营。
     #[get(type(copy), pub(crate))]
@@ -83,6 +83,12 @@ pub struct Enemy {
     /// 已经开过的枪数(让每枪的散布不同)。
     #[get(type(copy), pub(crate))]
     pub(crate) shots: u32,
+    /// 步态相位(弧度):腿部摆动动画的时钟,按走过的距离推进。
+    #[get(type(copy), pub(crate))]
+    pub(crate) gait_phase: f32,
+    /// 步态幅度 0..1:站定时四肢垂落,走动时摆到满幅。
+    #[get(type(copy), pub(crate))]
+    pub(crate) gait_amount: f32,
 }
 // ===========================================================================
 // 通缉
@@ -93,7 +99,7 @@ pub struct Enemy {
 /// 还在容忍范围内,第四枪直接两星」这种非线性:热度累积 + 阈值升星
 /// 能自然表达它,而且让「一颗星掉下去」有明确的回落区间
 /// ([`WANTED_STEP_DOWN`]),不会出现 1 星掉到 0 星又要重新攒的抖动。
-#[derive(Data, Clone, Debug)]
+#[derive(Clone, Data, Debug)]
 pub struct Wanted {
     /// 当前热度。
     #[get(type(copy), pub(crate))]
@@ -112,7 +118,7 @@ pub struct Wanted {
 // 任务
 // ===========================================================================
 /// 一个任务的运行时状态。
-#[derive(Data, Clone, Debug)]
+#[derive(Clone, Data, Debug)]
 pub struct Mission {
     /// 当前处于第几个阶段(见 `MISSION_*` 常量)。
     #[get(type(copy), pub(crate))]
@@ -140,7 +146,7 @@ pub struct Mission {
 /// 战斗逻辑:他们的职责是让「开车撞人」有代价,以及给街道一点生气。
 /// 碰撞用的还是玩家那套「实际位移 / dt」速度回算,所以贴着墙走会
 /// 沿墙滑行而不是卡死。
-#[derive(Data, Clone, Debug)]
+#[derive(Clone, Data, Debug)]
 pub struct Pedestrian {
     /// 世界坐标。
     #[get(type(copy), pub(crate))]
@@ -196,7 +202,7 @@ pub struct Pedestrian {
 // 战斗总控
 // ===========================================================================
 /// 玩家受击后的短暂无敌,避免被一帧内多人集火打空。
-#[derive(Data, Clone, Copy, Debug)]
+#[derive(Clone, Copy, Data, Debug)]
 pub struct HurtState {
     /// 无敌剩余时间(秒)。
     #[get(type(copy), pub(crate))]

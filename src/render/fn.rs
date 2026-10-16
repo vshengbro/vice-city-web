@@ -133,6 +133,9 @@ pub fn build_gpu_mesh(mesh: &GpuMesh, part_emissive: &[Vec3]) -> MeshAssetGpu {
     out.get_mut_vertices()
         .reserve(mesh.vertex_count() * STRIDE_FLOATS);
     let vertex_count: usize = mesh.vertex_count();
+    // 包围球累积:AABB 中点 + 半对角线(保守球)。主 pass 视锥剔除用。
+    let mut bmin: [f32; 3] = [f32::MAX; 3];
+    let mut bmax: [f32; 3] = [f32::MIN; 3];
     for vertex in 0..vertex_count {
         let base: usize = vertex * 9;
         let pbr_base: usize = vertex * crate::mesh::FLOATS_PER_PBR_VERTEX;
@@ -141,6 +144,10 @@ pub fn build_gpu_mesh(mesh: &GpuMesh, part_emissive: &[Vec3]) -> MeshAssetGpu {
             mesh.get_vertices()[base + 1],
             mesh.get_vertices()[base + 2],
         ];
+        for axis in 0..3 {
+            bmin[axis] = bmin[axis].min(position[axis]);
+            bmax[axis] = bmax[axis].max(position[axis]);
+        }
         let normal: [f32; 3] = [
             mesh.get_vertices()[base + 3],
             mesh.get_vertices()[base + 4],
@@ -234,6 +241,19 @@ pub fn build_gpu_mesh(mesh: &GpuMesh, part_emissive: &[Vec3]) -> MeshAssetGpu {
             color,
             emissive,
         });
+    }
+    // AABB 中点 + 半对角线 = 保守包围球(空 mesh 保持半径 0 = 未初始化)。
+    if vertex_count > 0 {
+        let center: [f32; 3] = [
+            (bmin[0] + bmax[0]) * 0.5,
+            (bmin[1] + bmax[1]) * 0.5,
+            (bmin[2] + bmax[2]) * 0.5,
+        ];
+        let radius: f32 = ((bmax[0] - center[0]).powi(2)
+            + (bmax[1] - center[1]).powi(2)
+            + (bmax[2] - center[2]).powi(2))
+        .sqrt();
+        out.set_bounds_sphere([center[0], center[1], center[2], radius]);
     }
     out
 }

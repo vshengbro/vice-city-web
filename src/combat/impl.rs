@@ -441,6 +441,8 @@ impl Enemy {
             wander,
             velocity: [0.0, 0.0],
             shots: 0,
+            gait_phase: 0.0,
+            gait_amount: 0.0,
         }
     }
 
@@ -535,6 +537,9 @@ impl Enemy {
     pub fn step_death(&mut self, dt: f32) {
         self.set_death_timer((self.get_death_timer() - dt).max(0.0));
         self.set_flash((self.get_flash() - dt).max(0.0));
+        // 尸体不再摆四肢:幅度衰减到 0,否则倒地下沉时腿还在空中划。
+        let relaxed: f32 = (1.0 - (-GAIT_RELAX_RATE * dt).exp()).clamp(0.0, 1.0);
+        self.set_gait_amount(self.get_gait_amount() * (1.0 - relaxed));
     }
 
     /// 尸体是否该被回收。
