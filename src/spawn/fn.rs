@@ -97,7 +97,7 @@ pub fn deploy_police(
 pub fn spawn_thugs(player_at: Vec3, count: usize, phase: f32) -> Vec<Enemy> {
     let mut out: Vec<Enemy> = Vec::new();
     for slot in 0..count {
-        let angle: f32 = phase * TAU + slot as f32 * 1.618_034;
+        let angle: f32 = phase * TAU + slot as f32 * GOLDEN_RATIO;
         let radius: f32 =
             THUG_SPAWN_MIN + (THUG_SPAWN_MAX - THUG_SPAWN_MIN) * (0.5 + 0.5 * (angle * 2.3).cos());
         let at: Vec3 = [

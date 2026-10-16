@@ -59,8 +59,8 @@ pub(crate) use crate::{
 
 pub use std::{
     cell::Cell, cell::Ref, cell::RefCell, cell::RefMut, cmp::Ordering, f32::consts::FRAC_PI_2,
-    f32::consts::FRAC_PI_4, f32::consts::PI, f32::consts::TAU, fmt::Display, fs, iter::once,
-    mem::swap, mem::take, rc::Rc,
+    f32::consts::FRAC_PI_4, f32::consts::GOLDEN_RATIO, f32::consts::PI, f32::consts::TAU,
+    fmt::Display, fs, iter::once, mem::swap, mem::take, rc::Rc,
 };
 
 pub(crate) use std::{collections::HashMap, iter, sync::Mutex, sync::MutexGuard, sync::OnceLock};

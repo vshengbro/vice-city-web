@@ -3053,7 +3053,7 @@ impl GpuUnavailable {
 /// 这里的每条断言都对应一次真实故障:形状对了不代表下标对了。
 #[cfg(test)]
 mod tests {
-    use super::{INSTANCE_ATTRIBUTE_COUNT, VERTEX_ATTRIBUTE_COUNT, VERTEX_ATTRIBUTES};
+    use super::*;
 
     /// 顶点属性的**数组下标**与 `shaderLocation` 是两件事。
     ///
