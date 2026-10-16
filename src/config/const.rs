@@ -1695,6 +1695,21 @@ pub(crate) const PED_TALK_SLOT_STEP: f32 = 1.256_637_1;
 pub(crate) const ENEMY_RENDER_RANGE: f32 = 62.0;
 /// 行人剔除后不再写实例的距离(米)。
 pub(crate) const PED_RENDER_RANGE: f32 = 52.0;
+/// 演员淡入起始距离(米):比剔除半径更远,先淡入再进视野。
+///
+/// **行人 / 敌人原先是硬切换**:`distance > RENDER_RANGE` 就直接
+/// `continue`,于是人物在 52 m(行人)/ 62 m(敌人)处**凭空出现** —— 用户
+/// 报「角色会突然在视图里出现」。改成:进了淡入带就开始画,并把 tint
+/// 按距离往黑色压,走近才恢复原色。淡入带取剔除半径之外的这段,
+///
+/// - 1.0 = 完全显色(近处);
+/// - 0.0 = 与雾同色,看不出人(远处)。
+///
+/// 淡入宽度取剔除半径的 22%(行人 ≈ 11 m、敌人 ≈ 14 m):斜率约 0.09/m,
+/// 走/跑(3~7 m/s)时每秒变化 0.3~0.6,肉眼是"渐渐清晰"而不是"啪地出现"。
+pub(crate) const PED_FADE_START: f32 = PED_RENDER_RANGE * 1.22;
+/// 敌人淡入起点(米),规则同 [`PED_FADE_START`]。
+pub(crate) const ENEMY_FADE_START: f32 = ENEMY_RENDER_RANGE * 1.22;
 /// 行走时身体的上下起伏幅度(米)。
 pub(crate) const PED_BOB_HEIGHT: f32 = 0.045;
 /// 城市里的常驻混混数量。

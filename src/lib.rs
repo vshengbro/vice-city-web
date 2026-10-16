@@ -49,7 +49,9 @@ pub use euv::{
 };
 
 pub use serde::Deserialize;
-pub use serde_json::{self, Error};
+// `Value` 经这里转出:子文件只写 `use super::*;`,不能自己
+// `use serde_json::Value`(§6.4),也不能 `as` 重命名(§6.5)。
+pub use serde_json::{self, Error, Value};
 
 // §1.3d dedup: these constants are defined once and re-exported, so no two
 // modules may carry a second copy of the same value.

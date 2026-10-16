@@ -29,4 +29,6 @@ pub(crate) type ShowcaseSpecs = [ShowcaseSpec; 2];
 ///
 /// 从 [`street_axis`] 派生之后,车道永远贴着一条真实街道的沥青面;
 /// 街道网格再改,车队也不会开进街区。
+/// `Traffic::populate` 消费的车道表:资产 id、车道 X、起始 Z、行驶方向。
+pub(crate) type Lane = (&'static str, f32, f32, f32);
 pub(crate) type TrafficLane = (&'static str, i32, f32, f32, f32, f32);

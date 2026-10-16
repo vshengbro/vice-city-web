@@ -349,10 +349,16 @@ pub(crate) const BLOCK_VIEW_RADIUS: f32 = 300.0;
 pub(crate) const STREET_INDEX_LIMIT: i32 = 100_000;
 
 /// 街区内部沿道路方向的楼间距(米),留出巷子 / 后巷。
-pub(crate) const LOT_PITCH: f32 = 34.0;
+pub(crate) const LOT_PITCH: f32 = 20.0;
 
 /// 建筑围合的「内圈」半径(米):离街区中心多远开始放楼。
-pub(crate) const BLOCK_INNER: f32 = 11.0;
+///
+/// 原来 11.0 m 太大:楼要躲开整条沥青带(`STREET_HALF_WIDTH +
+/// SIDEWALK_WIDTH + guard ≈ 21.6 m`),于是**每条围合边几乎全被拒**——
+/// 实测 49 个程序化放置里 49 个都落在守卫半径内,环合街墙一栋都放不下,
+/// 城市密度全靠路口对角楼撑着(用户报「建筑太少」)。现在收到 4.5 m:
+/// 沥青带边缘之外还剩 17 m 楼位,环合街墙能立起来。
+pub(crate) const BLOCK_INNER: f32 = 4.5;
 
 /// 地面网格在每个方向上的分段数(整块一次,不是每街区一次)。
 pub(crate) const GROUND_SUBDIV: usize = 192;
@@ -655,6 +661,42 @@ pub(crate) const TRAFFIC_LANE_PLAN: &[TrafficLane] = &[
     ),
 ];
 
+/// 巡航车队覆盖的街道索引半径(米/街道格数)。
+///
+/// **原来只有 `TRAFFIC_LANE_PLAN` 里手写的 10 辆车**,而且全在街道
+/// −1 / 1 这两条街上,更远的街一条车都没有 —— 用户报「路面汽车太少」。
+/// 现在按这个半径程序化铺满:`(2R+1)² × 2` 辆车 × 每条街两侧车道。
+/// R = 3 时是 7×7×2 = 98 辆车,覆盖出生点周围 ±180 m。
+pub(crate) const TRAFFIC_SPREAD_STREETS: i32 = 3;
+/// 单条车道内的车距(米)—— 同一辆车道的车按这个间距顺次铺开。
+///
+/// 62 m 时 130 m 内只看得到 2~3 辆车(实测 `dense_traffic_lanes` 在
+/// ±600 m 循环轨道上给出 266 条车道,但玩家周围 130 m 半径只摊到
+/// 约 8 辆)。收到 34 m —— 一条街上同时能看见 7~8 辆,才有车流感。
+pub(crate) const TRAFFIC_LANE_PITCH: f32 = 34.0;
+/// 路边停放车离沥青边缘的外推距离(米)。
+///
+/// 7.0(沥青半宽)+ 0.6 = 7.6 m,落在沥青与人行道外沿(10.6 m)之间。
+/// 不能更靠里:`on_lane` 的车道缓冲带(车道中心 3.5 ± 余量)之外才
+/// 不进碰撞世界,但也不能靠到 10.6 以外 —— 那就骑在人行道上了。
+pub(crate) const PARKED_CAR_CURB_OFFSET: f32 = 0.6;
+/// 路边停放车沿街的站位间距(米)。
+///
+/// 24 m 时 130 m 内只有 9 辆停放车(实测),街上仍是空的。收到 13 m,
+/// 配合 `PARKED_CAR_CHANCE` 0.45 双边抽签,一格视野里大约 20 辆。
+pub(crate) const PARKED_CAR_PITCH: f32 = 13.0;
+/// 路边停放车沿街的错位幅度上限(米)。
+pub(crate) const PARKED_CAR_JITTER: f32 = 12.0;
+/// 路边停放车辆在街区里的覆盖率(0.0~1.0,按 `hash_unit` 取)。
+///
+/// 街边停着的车是「城市活着」的���强信号:车流再密,一格视野里也只有
+/// 正在开动的几辆;停着的车把街道两侧填满,密度感立刻不同。取 0.45。
+pub(crate) const PARKED_CAR_CHANCE: f32 = 0.45;
+/// 路边停放车辆的街区覆盖半径(米):以生成中心为中心多少米内铺停放车。
+///
+/// 与巡航车队同量级(±180 m),否则远处街区空得像郊区。
+pub(crate) const PARKED_CAR_RADIUS: f32 = 180.0;
+
 /// 地面拾取物蓝图:`(资产, HUD 名, 世界坐标)`。
 ///
 /// 全部落在 X = 30 这条街的人行道上(`30 ± (7 + 2.2)`),玩家出生点就在
@@ -676,6 +718,13 @@ pub(crate) const PICKUP_PLACEMENTS: &[(&str, &str, Vec3)] = &[
     (PICKUP_CASH_STACK, NOTICE_CASH, [35.4, 0.35, 52.0]),
     (MARKER_FLAME, NOTICE_MARKER, [26.5, 0.35, -60.0]),
 ];
+
+/// 巡航车队 / 路边停放车共用的车型池(按 `hash_unit` 确定性取车)。
+///
+/// 与 [`CAR_ASSET_IDS`] 的区别:那一份是「必须切车轮网格的资产」,
+/// 这一份是「可以上街的车」。两者内容相同但意图不同,分开写是因为
+/// 前者被车轮渲染的接线测试盯着,后者被车流密度的接线测试盯着。
+pub(crate) const CAR_POOL: &[&str] = &[CAR_SEDAN, CAR_TAXI, CAR_COUPE, CAR_POLICE, TRUCK_PICKUP];
 
 /// 需要按 part 切出可转车轮的车型资产 id。
 ///

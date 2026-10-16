@@ -1,5 +1,57 @@
 use super::*;
 
+/// 把一个世界点转成 OBB 的**局部坐标**(相对盒中心、沿盒自身轴)。
+///
+/// OBB 在自己的坐标系里就是 AABB,所以所有盒算法(解析 / 射线 / 分离)
+/// 都能复用现成代码,只多这一层世界 ↔ 局部的转换。`yaw` 的符号与
+/// [`placement_box`] 保持一致:局部 `(lx, lz)` → 世界
+/// `(cos·lx + sin·lz, −sin·lx + cos·lz)`,这里求逆。
+///
+/// # Arguments
+///
+/// - `Vec2` - 世界 XZ 坐标。
+/// - `Vec2` - 盒中心的世界 XZ 坐标。
+/// - `f32` - 盒的朝向(弧度)。
+///
+/// # Returns
+///
+/// - `Vec2` - 局部 XZ 偏移(米)。
+pub fn obb_to_local(point: Vec2, center: Vec2, yaw: f32) -> Vec2 {
+    let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+    let dx: f32 = point[0] - center[0];
+    let dz: f32 = point[1] - center[1];
+    [cos_yaw * dx - sin_yaw * dz, sin_yaw * dx + cos_yaw * dz]
+}
+
+/// 形状在世界坐标下的**外接轴对齐盒** —— 宽相位网格 / 快速剔除用。
+///
+/// 只作粗筛:对 OBB 它必然包住本体,所以拿它做「可能相交」判断不会漏;
+/// 精判必须回到局部坐标(见 [`obb_to_local`])。
+///
+/// # Arguments
+///
+/// - `&Shape` - 静态碰撞形状。
+///
+/// # Returns
+///
+/// - `(Vec2, Vec2)` - 世界轴对齐的 `(中心, 半尺寸)`。
+pub fn shape_world_box(shape: &Shape) -> (Vec2, Vec2) {
+    match shape {
+        Shape::Aabb { center, half } => (*center, *half),
+        Shape::Circle { center, radius } => (*center, [*radius, *radius]),
+        Shape::Obb { center, half, yaw } => {
+            let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+            (
+                *center,
+                [
+                    cos_yaw.abs() * half[0] + sin_yaw.abs() * half[1],
+                    sin_yaw.abs() * half[0] + cos_yaw.abs() * half[1],
+                ],
+            )
+        }
+    }
+}
+
 /// 一点到单个静态形状表面的最短距离(米);点落在形状内部时为 0。
 ///
 /// 公开它是为了让验收探针能回答「**我为什么走不动**」:玩家被挡住时
@@ -9,7 +61,7 @@ use super::*;
 ///
 /// # Arguments
 ///
-/// - `&Shape` - 静态碰撞体.
+/// - `&Shape` - 静态碰撞体。
 /// - `Vec2` - 世界 XZ 坐标。
 ///
 /// # Returns
@@ -26,6 +78,13 @@ pub fn shape_distance(shape: &Shape, point: Vec2) -> f32 {
             let dx: f32 = point[0] - center[0];
             let dz: f32 = point[1] - center[1];
             ((dx * dx + dz * dz).sqrt() - *radius).max(0.0)
+        }
+        // 转回局部坐标就是同一个 AABB 距离公式(见 obb_to_local)。
+        Shape::Obb { center, half, yaw } => {
+            let local: Vec2 = obb_to_local(point, *center, *yaw);
+            let dx: f32 = (local[0].abs() - half[0]).max(0.0);
+            let dz: f32 = (local[1].abs() - half[1]).max(0.0);
+            (dx * dx + dz * dz).sqrt()
         }
     }
 }
@@ -105,6 +164,30 @@ pub fn ray_to_shapes(world: &CollisionWorld, origin: Vec3, dir: Vec3) -> Option<
                 *center,
                 *radius + CAMERA_PROBE_RADIUS,
             ),
+            // OBB:把**射线起点和方向**一起转进局部空间,再打同一个
+            // `ray_into_box`,命中距离是旋转不变量,所以不用再转回来。
+            // 膨胀半径照旧加在盒的半长上。
+            Shape::Obb { center, half, yaw } => {
+                let local_origin: Vec2 = obb_to_local([origin[0], origin[2]], *center, *yaw);
+                let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+                let local_dir: Vec2 = [cos_yaw * ux - sin_yaw * uz, sin_yaw * ux + cos_yaw * uz];
+                ray_into_box(
+                    local_origin,
+                    local_dir,
+                    [0.0, 0.0],
+                    [half[0] + CAMERA_PROBE_RADIUS, half[1] + CAMERA_PROBE_RADIUS],
+                )
+                .map(|(distance, at_local): (f32, Vec2)| {
+                    // 命中点转回世界坐标(方向已归一化,距离不变)。
+                    (
+                        distance,
+                        [
+                            center[0] + cos_yaw * at_local[0] - sin_yaw * at_local[1],
+                            center[1] + sin_yaw * at_local[0] + cos_yaw * at_local[1],
+                        ],
+                    )
+                })
+            }
         };
         let Some((distance, at)) = candidate else {
             continue;
@@ -265,6 +348,86 @@ pub(crate) fn car_projection(axis: Vec2, forward: Vec2, side: Vec2, footprint: V
 /// # Returns
 ///
 /// - `Option<(Vec2, f32)>` - `(推出方向, 推出距离)`;不重叠时为 `None`。
+/// 把一个有朝向的车身推出一个 OBB(旋转过的楼)。
+///
+/// `push_out_box_aabb` 的 SAT 只需要换一个东西:**前两条候选轴**。
+/// 静止的 AABB 用世界 X / Z 当自己的两条边;旋转的 OBB 要用**它自己
+/// 的两条边**,否则判出来的分离轴是错的(斜楼会被当成轴对齐楼,
+/// 或者反过来在斜边上漏判)。
+///
+/// 深度仍是沿**世界方向**量的,所以把 SAT 返回的局部方向旋回世界即可
+/// —— 这里不需要重新解一次,轴换了之后 SAT 的最小重叠轴本来就带着
+/// 正确的法向。
+///
+/// # Arguments
+///
+/// - `Vec2` - 盒中心的世界 XZ 坐标。
+/// - `Vec2` - 盒的半尺寸(沿盒自身轴,米)。
+/// - `f32` - 盒的朝向(弧度)。
+/// - `Vec2` - 车心的世界 XZ 坐标。
+/// - `Vec2` - 车头方向的世界单位向量。
+/// - `Vec2` - 车身侧向的世界单位向量。
+/// - `Vec2` - 车身足迹 `[前, 侧]` 半尺寸(米)。
+///
+/// # Returns
+///
+/// - `Option<(Vec2, f32)>` - `(世界推出方向, 深度)`;没相交时 `None`。
+pub(crate) fn push_out_box_obb(
+    center: Vec2,
+    half: Vec2,
+    yaw: f32,
+    point: Vec2,
+    forward: Vec2,
+    side: Vec2,
+    footprint: Vec2,
+) -> Option<(Vec2, f32)> {
+    let local: Vec2 = obb_to_local(point, center, yaw);
+    let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+    // 车身的两个方向也转进局部空间,否则局部里的「车」朝向是错的。
+    let local_forward: Vec2 = [
+        cos_yaw * forward[0] - sin_yaw * forward[1],
+        sin_yaw * forward[0] + cos_yaw * forward[1],
+    ];
+    let local_side: Vec2 = [
+        cos_yaw * side[0] - sin_yaw * side[1],
+        sin_yaw * side[0] + cos_yaw * side[1],
+    ];
+    let (direction_local, depth): (Vec2, f32) = push_out_box_aabb(
+        [0.0, 0.0],
+        half,
+        local,
+        local_forward,
+        local_side,
+        footprint,
+    )?;
+    Some((
+        [
+            cos_yaw * direction_local[0] + sin_yaw * direction_local[1],
+            -sin_yaw * direction_local[0] + cos_yaw * direction_local[1],
+        ],
+        depth,
+    ))
+}
+
+/// 把一个**有朝向的车身**推出一个轴对齐盒(SAT)。
+///
+/// 候选轴取四条:车身的前 / 侧两条,加上静态盒的世界 X / Z 两条。
+/// 任一轴上分离即不相交(SAT 定理)。车心在任意方向轴上的投影半径是
+/// 车身矩形在该轴上的半长投影 —— 两端点各投一次取**绝对值之和**,
+/// 带符号相加会在 yaw 接近 45° 时抵消成 0。
+///
+/// # Arguments
+///
+/// - `Vec2` - 静态盒中心的世界 XZ 坐标。
+/// - `Vec2` - 静态盒的半尺寸(世界轴,米)。
+/// - `Vec2` - 车心的世界 XZ 坐标。
+/// - `Vec2` - 车头方向的世界单位向量。
+/// - `Vec2` - 车身侧向的世界单位向量。
+/// - `Vec2` - 车身足迹 `[前, 侧]` 半尺寸(米)。
+///
+/// # Returns
+///
+/// - `Option<(Vec2, f32)>` - `(推出方向, 推出深度)`;没相交时 `None`。
 pub(crate) fn push_out_box_aabb(
     center: Vec2,
     half: Vec2,
@@ -367,6 +530,59 @@ pub(crate) fn car_slide(pushed: Vec2, step: Vec2, wanted: Vec2) -> Vec2 {
 /// # Returns
 ///
 /// - `Option<(Vec2, f32)>` - `(推出方向, 推出距离)`;不重叠时为 `None`。
+/// 把一个带半径的圆推出一个 OBB(旋转过的楼)。
+///
+/// 全部在**局部坐标**里做完:`push_out_aabb` 算出的 `(方向, 深度)` 里
+/// 深度是旋转不变量,方向只需要把局部方向旋回世界。这比在世界里解
+/// 「点到斜边的最短距离」稳得多,也不会像外接 AABB 那样凭空多出 41%
+/// 的墙。
+///
+/// # Arguments
+///
+/// - `Vec2` - 盒中心的世界 XZ 坐标。
+/// - `Vec2` - 盒的半尺寸(沿盒自身轴,米)。
+/// - `f32` - 盒的朝向(弧度)。
+/// - `Vec2` - 圆心的世界 XZ 坐标。
+/// - `f32` - 圆半径(米)。
+///
+/// # Returns
+///
+/// - `Option<(Vec2, f32)>` - `(世界方向, 推出深度)`;没相交时 `None`。
+pub(crate) fn push_out_obb(
+    center: Vec2,
+    half: Vec2,
+    yaw: f32,
+    point: Vec2,
+    radius: f32,
+) -> Option<(Vec2, f32)> {
+    let local: Vec2 = obb_to_local(point, center, yaw);
+    let (direction_local, depth): (Vec2, f32) = push_out_aabb([0.0, 0.0], half, local, radius)?;
+    let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+    Some((
+        [
+            cos_yaw * direction_local[0] + sin_yaw * direction_local[1],
+            -sin_yaw * direction_local[0] + cos_yaw * direction_local[1],
+        ],
+        depth,
+    ))
+}
+
+/// 把一个带半径的圆推出一个**轴对齐**盒。
+///
+/// 圆心落在盒外时沿「圆心 → 最近边点」推;落在盒内时沿**最近的面**
+/// 推(那一支是 `separate_static` 里 12 m 一次弹飞的来源,所以
+/// `INSIDE_EPSILON` 判得很小)。
+///
+/// # Arguments
+///
+/// - `Vec2` - 盒中心的世界 XZ 坐标。
+/// - `Vec2` - 盒的半尺寸(世界轴,米)。
+/// - `Vec2` - 圆心的世界 XZ 坐标。
+/// - `f32` - 圆半径(米)。
+///
+/// # Returns
+///
+/// - `Option<(Vec2, f32)>` - `(推出方向, 推出深度)`;没相交时 `None`。
 pub(crate) fn push_out_aabb(
     center: Vec2,
     half: Vec2,
@@ -503,12 +719,99 @@ pub(crate) fn shape_aabb(shape: &Shape) -> (Vec2, Vec2) {
             [center[0] - radius, center[1] - radius],
             [center[0] + radius, center[1] + radius],
         ),
+        // OBB 的轴对齐包络:宽相位网格与快速剔除只需要这个(必然包含本体)。
+        Shape::Obb { .. } => {
+            let (center, half): (Vec2, Vec2) = shape_world_box(shape);
+            (
+                [center[0] - half[0], center[1] - half[1]],
+                [center[0] + half[0], center[1] + half[1]],
+            )
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 斜放的楼不许有空气墙(修「建筑斜着防止有空气墙」)。
+    ///
+    /// 同一个 OBB,三个方向上的半尺寸都必须等于**局部半尺寸**,而不是
+    /// 旋转后再包一次 AABB 的 1.414 倍。45° 时那条旧路径让
+    /// `bldg_cream_block` 的每条边多出 2.7 m —— 画面上空空如也,
+    /// 人和车却撞上一堵看不见的墙。
+    #[test]
+    fn an_obb_never_grows_air_around_a_rotated_building() {
+        let half: Vec2 = [10.26, 9.10];
+        let center: Vec2 = [0.0, 0.0];
+        let yaw: f32 = -FRAC_PI_4;
+        let mut world: CollisionWorld = CollisionWorld::new();
+        world.push_obb(center, half, yaw);
+        // (a) 四条边的中点:斜楼的每条边仍然只在局部半尺寸处。
+        for (local_point, _) in [
+            (Vec2::from([half[0], 0.0]), 0usize),
+            (Vec2::from([-half[0], 0.0]), 0),
+            (Vec2::from([0.0, half[1]]), 0),
+            (Vec2::from([0.0, -half[1]]), 0),
+        ] {
+            let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+            let world_point: Vec2 = [
+                center[0] + cos_yaw * local_point[0] + sin_yaw * local_point[1],
+                center[1] + -sin_yaw * local_point[0] + cos_yaw * local_point[1],
+            ];
+            assert!(
+                world.contains_point(world_point),
+                "斜楼自己的边上不该判为体外:local={local_point:?}"
+            );
+        }
+        // (b) **角外**的点:旧 AABB 会把它误判成墙内。
+        //
+        // 局部角点 (half.x, half.z) 之外再挪 1 m —— 对 OBB 在体外,
+        // 对 1.414 倍的外接 AABB 却在内。这就是用户撞到的空气墙。
+        let corner_push: Vec2 = [half[0] + 1.0, half[1] + 1.0];
+        let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+        let outside_corner: Vec2 = [
+            center[0] + cos_yaw * corner_push[0] + sin_yaw * corner_push[1],
+            center[1] + -sin_yaw * corner_push[0] + cos_yaw * corner_push[1],
+        ];
+        assert!(
+            !world.contains_point(outside_corner),
+            "斜楼角外 1 m 仍被判为墙内 —— 这就是空气墙(外接 AABB 没被换掉)"
+        );
+    }
+
+    /// OBB 与圆的推出必须落在**真实墙面上**,而不是外接盒上。
+    #[test]
+    fn an_obb_pushes_a_body_out_along_the_real_face() {
+        let half: Vec2 = [10.0, 4.0];
+        let yaw: f32 = FRAC_PI_4;
+        let center: Vec2 = [0.0, 0.0];
+        // 站在楼的一侧,身体半径 0.5。
+        let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+        // 沿局部 +X 的面中点,再往局部 +X 挪 0.3 m —— 圆心在墙外
+        // 0.3 m,半径 0.5 m,所以人被压进墙里 0.2 m,必须被推出。
+        let face_mid: Vec2 = [cos_yaw * half[0], -sin_yaw * half[0]];
+        let press: f32 = 0.3;
+        let point: Vec2 = [face_mid[0] + cos_yaw * press, face_mid[1] - sin_yaw * press];
+        let radius: f32 = 0.5;
+        let local: Vec2 = obb_to_local(point, center, yaw);
+        println!("TEST local point = {local:?} half = {half:?} radius = {radius}");
+        let Some((direction, depth)) = push_out_obb(center, half, yaw, point, radius) else {
+            panic!("人压在斜楼的面上,必须被推出");
+        };
+        assert!(depth > 0.0, "推出深度必须为正");
+        // 推出后圆心到墙面至少 radius。
+        let after: Vec2 = [
+            point[0] + direction[0] * depth,
+            point[1] + direction[1] * depth,
+        ];
+        assert!(
+            shape_distance(&Shape::Obb { center, half, yaw }, after) >= radius - 1.0e-3,
+            "推出后必须站在墙外,实际距离 {}",
+            shape_distance(&Shape::Obb { center, half, yaw }, after)
+        );
+    }
+
     /// 回归测试:车的碰撞足迹必须是真实车身尺寸,而不是 1.25 m 的圆。
     ///
     /// 圆只到 1.25 m 而车头在 2.283 m,车头就有 1.033 m 悬在碰撞边界之外。

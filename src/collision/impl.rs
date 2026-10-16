@@ -73,6 +73,27 @@ impl CollisionWorld {
     ///
     /// - `Vec2` - 圆柱中心的世界 XZ 坐标。
     /// - `f32` - 圆柱半径(米)。
+    /// 追加一个竖直有向盒(OBB)—— 斜放的楼。
+    ///
+    /// 局部半尺寸**不旋转**:朝向由 `yaw` 携带,在**局部坐标系**里它
+    /// 就是普通的 AABB,所有已有算法只需先把点转回局部(见
+    /// [`obb_to_local`](crate::collision::obb_to_local))。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 盒中心的世界 XZ 坐标。
+    /// - `Vec2` - 盒的半尺寸(沿盒自身轴,米)。
+    /// - `f32` - 盒的朝向(弧度)。
+    pub fn push_obb(&mut self, center: Vec2, half: Vec2, yaw: f32) {
+        self.get_shapes_mut().push(Shape::Obb { center, half, yaw });
+    }
+
+    /// 追加一个竖直圆柱。
+    ///
+    /// # Arguments
+    ///
+    /// - `Vec2` - 圆柱中心的世界 XZ 坐标。
+    /// - `f32` - 圆柱半径(米)。
     pub fn push_circle(&mut self, center: Vec2, radius: f32) {
         self.get_shapes_mut().push(Shape::Circle { center, radius });
     }
@@ -107,6 +128,9 @@ impl CollisionWorld {
                             center,
                             radius: other,
                         } => push_out_circle(*center, *other, current, radius),
+                        Shape::Obb { center, half, yaw } => {
+                            push_out_obb(*center, *half, *yaw, current, radius)
+                        }
                     };
                     if let Some((direction, depth)) = hit {
                         current[0] += direction[0] * depth;
@@ -253,7 +277,10 @@ impl CollisionWorld {
             // 进去,切向滑动被自己的接触测试冻住,于是又回到「有速度、
             // 无位移」。改用真距离后:贴着时距离恰为半径,减去一层皮后
             // 严格大于阈值,正常放行。
-            Shape::Aabb { center: _, half: _ } => distance_to_shape(shape, point) < reach,
+            // Aabb 和 Obb 都用「真距离」判:局部坐标里 OBB 就是 AABB。
+            Shape::Aabb { center: _, half: _ } | Shape::Obb { .. } => {
+                distance_to_shape(shape, point) < reach
+            }
             Shape::Circle {
                 center,
                 radius: other,
@@ -363,6 +390,9 @@ impl CollisionWorld {
                             center,
                             radius: other,
                         } => push_out_circle(*center, *other, current, radius),
+                        Shape::Obb { center, half, yaw } => {
+                            push_out_obb(*center, *half, *yaw, current, radius)
+                        }
                     };
                     if let Some((direction, depth)) = hit {
                         current[0] += direction[0] * depth;
@@ -479,6 +509,15 @@ impl CollisionWorld {
                             center,
                             radius: other,
                         } => push_out_circle(*center, *other, current, CAR_FOOTPRINT[1]),
+                        Shape::Obb { center, half, yaw } => push_out_box_obb(
+                            *center,
+                            *half,
+                            *yaw,
+                            current,
+                            forward,
+                            side,
+                            CAR_FOOTPRINT,
+                        ),
                     };
                     if let Some((direction, depth)) = hit {
                         current[0] += direction[0] * depth;
@@ -518,6 +557,11 @@ impl CollisionWorld {
                     let dx: f32 = point[0] - center[0];
                     let dy: f32 = point[1] - center[1];
                     (dx * dx + dy * dy).sqrt() <= *radius
+                }
+                // 局部坐标里 OBB 就是 AABB(见 obb_to_local)。
+                Shape::Obb { center, half, yaw } => {
+                    let local: Vec2 = obb_to_local(point, *center, *yaw);
+                    local[0].abs() <= half[0] && local[1].abs() <= half[1]
                 }
             };
         });
@@ -683,6 +727,9 @@ impl CollisionWorld {
                             center,
                             radius: other,
                         } => push_out_circle(*center, *other, current, footprint[1]),
+                        Shape::Obb { center, half, yaw } => push_out_box_obb(
+                            *center, *half, *yaw, current, forward, side, footprint,
+                        ),
                     };
                     if let Some((direction, depth)) = hit {
                         let allowed: f32 = depth.min(budget);

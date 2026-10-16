@@ -909,6 +909,13 @@ pub(crate) fn probe_nearby_shapes(game: &Game) {
             crate::collision::Shape::Circle { center, radius } => {
                 ([center[0], center[1]], [*radius, *radius], "C")
             }
+            // OBB 在世界里是斜的,这里报它的**世界外接盒** + 转角,
+            // 免得诊断输出把斜楼说成轴对齐楼。
+            crate::collision::Shape::Obb { center, half, yaw } => {
+                let (world_center, world_half): (Vec2, Vec2) =
+                    crate::collision::shape_world_box(shape);
+                (world_center, world_half, "O")
+            }
         };
         let dx: f32 = here[0] - center[0];
         let dz: f32 = here[1] - center[1];
@@ -987,7 +994,11 @@ pub(crate) fn build_city_buildings_with(guard: f32, cx: f32, cz: f32) -> Vec<Bui
         // 的窗口平移而整体错位,拿它当种子等于让同一栋楼在流式重建后原地
         // 换模型 —— 实测一次 60 m 重建里 60 栋楼有 44 栋换了模型。
         for (edge, (dx, dz, yaw)) in BLOCK_RING.iter().enumerate() {
-            let count: usize = 2
+            // 每条围合边 3~4 栋(原来 2~3)。`LOT_PITCH` 从 34 收到 20 之后,
+            // 一条边(街区边长 = 60 − 2·STREET_HALF_WIDTH ≈ 46 m)放得下
+            // 4 栋还剩 4~5 m 巷子;2 栋时空出 26 m 一段空墙,用户看到的是
+            //「建筑太少」而不是「有巷子」。
+            let count: usize = 3
                 + (hash2(
                     slot_seed(block.get_ix(), block.get_iz(), 0x5EED),
                     edge as u32,
@@ -1342,12 +1353,32 @@ pub(crate) fn build_city_palms(cx: f32, _cz: f32) -> PalmSpots {
 /// - `f32` - 生成中心的世界 Z(米),用于确定流式加载范围。
 pub(crate) fn build_city_vehicles(cx: f32, _cz: f32) -> Vec<Placement> {
     let mut out: Vec<(&'static str, [f32; 3], f32)> = Vec::new();
-    let lane: f32 = STREET_HALF_WIDTH - 2.6;
-    for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, 40.0) {
+    // **停放在人行道外沿,不是车道里。**
+    //
+    // 原实现是 `lane = STREET_HALF_WIDTH - 2.6 = 4.4 m`,而车道中心在
+    // `LANE_OFFSET_X = 3.5 m` —— 车正正好压在**车道缓冲带**里。
+    // `build_collision_world` 会跳过 `on_lane` 的道具,所以这几辆车
+    // 既不进碰撞世界(玩家能穿过它们),又会挡在巡航车路线上。这大概
+    // 就是它一直没有被接进场景的原因:接上去立刻就是「路中间停一排
+    // 看不见的隐形车」。
+    //
+    // 现在停在 `STREET_HALF_WIDTH + PARKED_CAR_CURB_OFFSET = 7.6 m`:
+    // 沥青(到 7.0)与人行道外沿(到 10.6)之间,视觉上就是贴着马路牙子。
+    let curb: f32 = STREET_HALF_WIDTH + PARKED_CAR_CURB_OFFSET;
+    for (line, strip_lo, strip_hi) in street_strips(cx, BLOCK_VIEW_RADIUS, curb) {
         let line_index: i32 = (line / STREET_PITCH).round() as i32;
-        for (slot, step) in street_slots(strip_lo, strip_hi, 44.0) {
+        for (slot, step) in street_slots(strip_lo, strip_hi, PARKED_CAR_PITCH) {
             let seed: u32 = slot_seed(line_index, slot, 0xABCD_1234);
-            if !hash2(seed, 1).is_multiple_of(3) {
+            // 覆盖率闸门:一条街的某一侧不一定停车。
+            if hash_unit(seed, 1) > PARKED_CAR_CHANCE {
+                continue;
+            }
+            // 沿街错位:车不贴着站位线,前后错开才像真停的。
+            let along: f32 = step + (hash_unit(seed, 5) - 0.5) * PARKED_CAR_JITTER;
+            // 路口让开:离街道中轴线 `STREET_HALF_WIDTH` 内不放车,
+            // 否则每个路口四角全是车头,路口直接堵死。
+            let to_axis: f32 = (along / STREET_PITCH).round() * STREET_PITCH;
+            if (along - to_axis).abs() < STREET_HALF_WIDTH {
                 continue;
             }
             let along_x: bool = hash2(seed, 2).is_multiple_of(2);
@@ -1357,9 +1388,9 @@ pub(crate) fn build_city_vehicles(cx: f32, _cz: f32) -> Vec<Placement> {
                 -1.0
             };
             let position: [f32; 3] = if along_x {
-                [step, 0.0, line + side * lane]
+                [along, 0.0, line + side * curb]
             } else {
-                [line + side * lane, 0.0, step]
+                [line + side * curb, 0.0, along]
             };
             out.push((
                 VEHICLE_POOL[hash2(seed, 4) as usize % VEHICLE_POOL.len()],
@@ -2561,11 +2592,28 @@ pub(crate) fn build_scene(
         );
     }
 
-    // 路边停放的车辆。
-    // 车辆**不在这里**摆放 —— 它们由交通系统(`spawn_player_traffic_pickups`)
-    // 在车道上循环行驶,每帧由 `sync_dynamic_instances` 写回实例。
-    // 如果这里再摆一套静态摆件车,同一辆车会出现两个实例,而且静态那批
-    // 还会在车道中间形成看不见的碰撞体,把动态车队顶死。
+    // 路边停放的车辆(修「路边停放的车辆太少」)。
+    //
+    // 这段注释原先写的是「车辆**不在这里**摆放」—— 理由只对了一半:
+    // `build_city_vehicles()` 铺的是**路边停着**的车,而交通系统
+    // (`sync_dynamic_instances`)写的是**车道上跑**的车,两批车从不重叠。
+    // 真正不能放进来的,是同一辆车同时被两套系统写实例。
+    //
+    // `build_city_vehicles()` 之前是**死代码**:整个仓库只有资产预载
+    // (`required_asset_ids`)和一条「不推进碰撞世界」的注释提到它,
+    // **没有任何地方把它写进场景**。所以街上除了巡航车和招手的那一辆
+    // hailer,一辆停着的车都没有。
+    //
+    // 停放车不推进碰撞世界(见 `build_collision_world` 里那段):它们贴着
+    // 马路牙子停,给玩家和巡航车当路障毫无意义,推一个 AABB 进去只会
+    // 在人行道上立一堵看不见的墙(和 `prop_trafficlight` 那次一样)。
+    for (asset, position, yaw) in &build_city_vehicles(cx, cz) {
+        let Some(&mesh_index) = index_map.get(*asset) else {
+            continue;
+        };
+        let batch: usize = find_or_create_batch(scene, mesh_index);
+        scene.push_instance(batch, Instance::new(*position, *yaw, 1.0, [1.0, 1.0, 1.0]));
+    }
 
     // 霓虹招牌:挂在临街楼的外墙上,自发光在夜里点亮。
     for (asset, position, yaw) in &build_city_signs(cx, cz) {
@@ -2854,6 +2902,15 @@ pub(crate) fn rebuild_static_batches(
             Instance::new(prop.get_position(), prop.get_yaw(), 1.0, prop.get_tint()),
         );
     }
+    // 路边停放的车辆(见首次构建处那段注释):两边都要铺,否则换块之后
+    // 停着的车会集体消失。
+    for (asset, position, yaw) in &build_city_vehicles(cx, cz) {
+        let Some(&mesh_index) = index_map.get(*asset) else {
+            continue;
+        };
+        let batch: usize = find_or_create_batch(scene, mesh_index);
+        scene.push_instance(batch, Instance::new(*position, *yaw, 1.0, [1.0, 1.0, 1.0]));
+    }
     for (index, spot) in build_city_palms(cx, cz).iter().enumerate() {
         let Some(&mesh_index) = index_map.get(if index.is_multiple_of(2) {
             PALM_TALL
@@ -3069,8 +3126,51 @@ pub(crate) fn push_box(
     scale: f32,
 ) {
     let (min, max) = local_bounds(bounds_map, asset);
-    let (center, half): (Vec2, Vec2) = placement_box(min, max, yaw, scale, position);
-    world.push_aabb(center, half);
+    if yaw_is_aligned(yaw) {
+        let (center, half): (Vec2, Vec2) = placement_box(min, max, yaw, scale, position);
+        world.push_aabb(center, half);
+        return;
+    }
+    // 斜放的楼推进 **OBB**,不是它的外接 AABB。
+    //
+    // 外接 AABB 在 45° 时每条边多出 `(√2 − 1) ≈ 41%`,`bldg_cream_block`
+    // 是 2.7 m × 2.7 m 的空气墙 —— 画面上空空如也,人和车却撞上一堵
+    // 看不见的墙(用户报「建筑斜着防止有空气墙」)。
+    //
+    // 局部半尺寸**只乘 scale 不旋转**:旋转由 `Obb.yaw` 承担,旋转过
+    // 之后再包一次 AABB 就白改了。
+    let local_center: Vec2 = [(min[0] + max[0]) * 0.5, (min[2] + max[2]) * 0.5];
+    let local_half: Vec2 = [(max[0] - min[0]) * 0.5, (max[2] - min[2]) * 0.5];
+    let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
+    world.push_obb(
+        [
+            position[0] + (cos_yaw * local_center[0] + sin_yaw * local_center[1]) * scale,
+            position[2] + (-sin_yaw * local_center[0] + cos_yaw * local_center[1]) * scale,
+        ],
+        [local_half[0] * scale, local_half[1] * scale],
+        yaw,
+    );
+}
+
+/// 这个朝向是不是轴对齐的(0 / π/2 / π / 3π/2)。
+///
+/// 轴对齐的东西继续用 `Aabb`:它在数学上完全等价,但 `Aabb` 的宽相位
+/// 与内联比较更便宜 —— 而轴对齐的楼占了绝大多数(围合街墙全是 0 或
+/// π/2,只有路口对角楼是 π/4)。
+///
+/// # Arguments
+///
+/// - `f32` - 绕 Y 轴的朝向(弧度)。
+///
+/// # Returns
+///
+/// - `bool` - `true` 表示可以当作轴对齐盒处理。
+pub(crate) fn yaw_is_aligned(yaw: f32) -> bool {
+    let quarter: f32 = FRAC_PI_2;
+    let steps: f32 = (yaw / quarter).round();
+    // 容差 1e-3 弧度:蓝图里的 yaw 都由 `0 / ±π/2 / ±π/4` 派生,
+    // 浮点误差不会超过这个量级。
+    (yaw - steps * quarter).abs() < 1.0e-3
 }
 
 /// 载入一个资产后登记它的碰撞足迹。
@@ -3217,14 +3317,66 @@ pub(crate) fn lane_x(street_index: i32, side: f32) -> f32 {
 ///
 /// - `Vec<(&'static str, f32, f32, f32)>` - 与输入同序的车道坐标。
 pub(crate) fn traffic_lanes() -> Vec<(&'static str, f32, f32, f32)> {
-    TRAFFIC_LANE_PLAN
+    // 手写蓝图当作「出生点那两条街的起步车队」—— 保留是为了上车测试
+    // 仍然确定(玩家出生街上有车),但**只占整个车队的一小部分**。
+    let mut out: Vec<(&'static str, f32, f32, f32)> = TRAFFIC_LANE_PLAN
         .iter()
         .map(
             |(asset, street, side, start_z, cruise, _direction): &TrafficLane| {
                 (*asset, lane_x(*street, *side), *start_z, *cruise)
             },
         )
-        .collect()
+        .collect();
+    out.extend(dense_traffic_lanes());
+    out
+}
+
+/// 按街道网格**程序化铺满**巡航车队(修「路面汽车太少」)。
+///
+/// 原实现只有 `TRAFFIC_LANE_PLAN` 里手写的 10 辆车,而且全在街道
+/// −1 / 1 这两条街上 —— 出生点往外的任何一条街都是空的,用户报
+/// 「路面汽车太少」。这里对 `±TRAFFIC_SPREAD_STREETS` 的每条街、
+/// 两侧车道各铺 `TRAFFIC_LANE_PITCH` 间隔的一串车。
+///
+/// 沿街起始 Z 取 `hash_unit` 打散而不是等距,否则整个城市的车队
+/// 步调完全一致(一眼假)。方向按 `TRAFFIC_LANE_PITCH` 奇偶交替,
+/// 让相邻车道的车迎面而行 —— 双向街道只有同向车流的话不像马路。
+///
+/// # Returns
+///
+/// - `Vec<(&'static str, f32, f32, f32)>` - 与 `traffic_lanes()` 同形状的车道表。
+pub(crate) fn dense_traffic_lanes() -> Vec<(&'static str, f32, f32, f32)> {
+    let mut out: Vec<(&'static str, f32, f32, f32)> = Vec::new();
+    let lanes_per_street: usize =
+        ((TRAFFIC_HALF * 2.0) / TRAFFIC_LANE_PITCH).floor().max(1.0) as usize;
+    for street in -TRAFFIC_SPREAD_STREETS..=TRAFFIC_SPREAD_STREETS {
+        for side in [-1.0f32, 1.0] {
+            for slot in 0..lanes_per_street {
+                // 种子用世界街道索引(不是枚举序号):车道表每帧重算,
+                // 枚举序号会随窗口平移整体错位,车会换车型。
+                let seed: u32 = slot_seed(street, side as i32, 0x7A11)
+                    ^ (slot as u32).wrapping_mul(0x0000_0100);
+                let asset: &'static str = CAR_POOL[hash2(seed, 0) as usize % CAR_POOL.len()];
+                let jitter: f32 = hash_unit(seed, 1);
+                let start_z: f32 = -TRAFFIC_HALF + slot as f32 * TRAFFIC_LANE_PITCH + jitter * 18.0;
+                // 第 4 个字段是**行驶方向**,不是巡航速度 —— `TrafficCar::new`
+                // 拿它去 `route_from_xz`,而那里用方向决定车走这条街的哪
+                // 一侧车道(`side = direction >= 0 ? +1 : -1`)。
+                //
+                // 原先这里写的是 `CRUISE_SPEED`(≈ 11.5,恒为正),于是**每条
+                // 街的车全被塞进同一条车道**:线上实测 500 辆车有 249 辆挤在
+                // 街道 1 的同一个侧向车道上,队伍一路排到 ±3300 m 外,而
+                // 街道 −3 / −2 一辆车都没有 —— 用户看到的是「路上一辆车都
+                // 没有」。
+                //
+                // 方向按 slot 奇偶交替:同一条街上正负方向各半,相邻车道
+                // 迎面而行,双向街道才像马路。
+                let direction: f32 = if slot.is_multiple_of(2) { 1.0 } else { -1.0 };
+                out.push((asset, lane_x(street, side), start_z, direction));
+            }
+        }
+    }
+    out
 }
 
 /// 从 `ped_suit` 的原始 JSON 里切出单个 part 的网格 + 枢轴,并挂成场景批次。
@@ -4970,6 +5122,10 @@ pub(crate) fn visibility_json(game: &Game, char_box: &str) -> String {
                     crate::r#collision::Shape::Circle { center, radius } => {
                         format!("CIR c=({:.2},{:.2}) r={:.2}", center[0], center[1], radius)
                     }
+                    crate::r#collision::Shape::Obb { center, half, yaw } => format!(
+                        "OBB c=({:.2},{:.2}) half=({:.2},{:.2}) yaw={:.3}",
+                        center[0], center[1], half[0], half[1], yaw
+                    ),
                 };
                 Some((distance, text))
             })
@@ -7455,38 +7611,74 @@ pub(crate) fn join_talk(
     ]);
 }
 
-/// 行人身体在起伏上的 Y 偏移。
+/// 演员(行人 / 敌人)的距离淡入系数:近处 1.0,远处 0.0。
+///
+/// 修的是「人物凭空出现」:原实现是 `distance > RENDER_RANGE` 直接
+/// `continue`,人走到剔除半径那一帧**整具模型突然出现在视野里**。
+/// 现在进了 `fade_start` 就开始画,乘数随距离线性压向雾色 ——
+///
+/// - `distance <= cull_range` → 1.0(与原色相同,近处观感零变化);
+/// - `distance >= fade_start` → 0.0(完全压成雾色,等于没画);
+/// - 之间线性过渡。
+///
+/// 线性而不是平滑步:平滑步在两端斜率为 0,人物会以"先卡住不动再突然
+/// 开始变清晰"的方式淡入,反而更扎眼。
 ///
 /// # Arguments
 ///
-/// - `&Pedestrian` - 行人。
+/// - `f32` - 演员到玩家的水平距离(米)。
+/// - `f32` - 剔除半径(米)。
+/// - `f32` - 淡入起点(米)。
 ///
 /// # Returns
 ///
-/// - `f32` - 世界 Y 偏移(米)。站定时是 0。
+/// - `f32` - 色调乘子 `[0.0, 1.0]`。
+pub(crate) fn actor_fade(distance: f32, cull_range: f32, fade_start: f32) -> f32 {
+    let span: f32 = (fade_start - cull_range).max(1.0e-3);
+    ((fade_start - distance) / span).clamp(0.0, 1.0)
+}
+
+/// 行人走路的重心起伏(米)—— 站定时恒为 0。
 ///
-/// 渲染与调试读数**共用这一个函数**:验收脚本判「起伏的波峰有没有和落脚
-/// 对齐」读的就是它,两边不可能算出不一样的数。
+/// 起伏必须**与落脚同相**:落脚每 `pi` 相位一次,重心每步起伏一次,
+/// 所以起伏是步态相位的两倍频,波峰必须落在 `0` 与 `pi` —— 也就是
+/// `cos(phase * 2.0)` 而不是 `sin`。`sin` 会把波峰落在 `pi/4 / 5pi/4`,
+/// 那是**脚还悬在半空摆动的中段**,身体在脚没落地时反而最高。错相位
+/// 就是用户报的「NPC 蹦蹦跳跳」。推导见 [`bob_offset`]。
 ///
-/// 起伏必须**与落脚同相**。肢体摆动是 `sin(phase)`,脚在
-/// `phase = 0 / pi` 时腿摆角为 0 —— 那正是腿伸直、脚踏实地的瞬间
-/// (见 `player::limb_swing` 与 `GAIT_PHASE_L/R`)。原来的
-/// `sin(phase * 2.0)` 把波峰落在 `phase = pi/4 / 5pi/4`,也就是
-/// **脚还悬在半空摆动的中段** —— 身体在脚没落地时反而最高,脚一落地
-/// 身体正好过零。每一个波峰都错开四分之一个步周期,叠起来就是弹簧,
-/// 这就是用户报的「NPC 蹦蹦跳跳」。
+/// # Arguments
 ///
-/// `* 2.0` 的**频率**是对的,别删:落脚每 `pi` 相位一次,而重心每一步
-/// 起伏一次,所以起伏确实是步态相位的两倍频。错的是相位 —— 要的是
-/// **每一步落地都抬到最高**,波峰必须落在 `0` 与 `pi`,也就是
-/// `cos(phase * 2.0)` 而不是 `sin(phase * 2.0)`。
+/// - `&Pedestrian` - 行人物理状态。
 ///
-/// # Panics
+/// # Returns
 ///
-/// 不会 panic。
+/// - `f32` - 垂直偏移(米)。站定时是 0。
 pub(crate) fn ped_bob(ped: &Pedestrian) -> f32 {
     bob_offset(ped.get_gait_phase(), ped.get_gait_amount())
 }
+
+/// 演员(行人 / 敌人)的距离淡入系数:近处 1.0,远处 0.0。
+///
+/// 修的是「人物凭空出现」:原实现是 `distance > RENDER_RANGE` 直接
+/// `continue`,人走到剔除半径那一帧**整具模型突然出现在视野里**。
+/// 现在进了 `fade_start` 就开始画,乘数随距离线性压向雾色 ——
+///
+/// - `distance <= cull_range` → 1.0(与原色相同,近处观感零变化);
+/// - `distance >= fade_start` → 0.0(完全压成雾色,等于没画);
+/// - 之间线性过渡。
+///
+/// 线性而不是平滑步:平滑步在两端斜率为 0,人物会以"先卡住不动再突然
+/// 开始变清晰"的方式淡入,反而更扎眼。
+///
+/// # Arguments
+///
+/// - `f32` - 演员到玩家的水平距离(米)。
+/// - `f32` - 剔除半径(米)。
+/// - `f32` - 淡入起点(米)。
+///
+/// # Returns
+///
+/// - `f32` - 色调乘子 `[0.0, 1.0]`。
 
 /// 步态起伏的核心算式:与 [`ped_bob`] 同一套,但按相位 / 幅度参数化,
 /// 让**敌人**(同样有两条腿,字段在 `Enemy::gait_phase`)与行人共用
@@ -7639,16 +7831,20 @@ pub(crate) fn sync_combat_instances(game: &mut Game) {
     for index in 0..game.get_enemies().len() {
         let enemy: Enemy = game.get_enemies()[index].clone();
         let at: Vec3 = enemy.get_position();
-        if flat_distance(at, here) > ENEMY_RENDER_RANGE {
+        let distance: f32 = flat_distance(at, here);
+        // 淡入而不是硬切换(同 actor_fade):敌人原先在 62 m 处整具突然出现。
+        if distance > ENEMY_FADE_START {
             continue;
         }
+        let fade: f32 = actor_fade(distance, ENEMY_RENDER_RANGE, ENEMY_FADE_START);
         // 死亡后尸体下沉:缩放随倒计时收缩,是最省事的「消失」表现。
         let sink: f32 = if enemy.is_alive() {
             1.0
         } else {
             (enemy.get_death_timer() / DEATH_FADE_TIME).clamp(0.0, 1.0)
         };
-        let tint: Vec3 = enemy_tint(&enemy);
+        let base: Vec3 = enemy_tint(&enemy);
+        let tint: Vec3 = [base[0] * fade, base[1] * fade, base[2] * fade];
         let bob: f32 = if enemy.is_alive() {
             bob_offset(enemy.get_gait_phase(), enemy.get_gait_amount())
         } else {
@@ -7693,19 +7889,24 @@ pub(crate) fn sync_combat_instances(game: &mut Game) {
     for index in 0..game.get_peds().len() {
         let ped: Pedestrian = game.get_peds()[index].clone();
         let at: Vec3 = ped.get_position();
-        if flat_distance(at, here) > PED_RENDER_RANGE {
+        let distance: f32 = flat_distance(at, here);
+        // 淡入而不是硬切换:人物在剔除半径处凭空出现(见 actor_fade)。
+        if distance > PED_FADE_START {
             continue;
         }
+        let fade: f32 = actor_fade(distance, PED_RENDER_RANGE, PED_FADE_START);
         // 行人走与玩家相同的逐部件骨架:核心 rigid + 四肢链式摆动,
         // 起伏只保留很轻的一层(见 [`ped_bob`] 的相位推导)。
         // 原来「整具一个矩阵 + ±4.5 cm 上下颠」就是用户报的「NPC 蹦着走」。
         let bob: f32 = if ped.is_down() { 0.0 } else { ped_bob(&ped) };
         let lift: Vec3 = [at[0], at[1] + bob, at[2]];
-        let tint: Vec3 = if ped.is_down() {
+        let base: Vec3 = if ped.is_down() {
             TINT_PED_DOWN
         } else {
             TINT_PED
         };
+        // 远处乘数趋 0 = 压成雾色(看着像没画),走近恢复原色。
+        let tint: Vec3 = [base[0] * fade, base[1] * fade, base[2] * fade];
         push_rig_instances(
             game,
             ped.get_model(),
@@ -9592,8 +9793,8 @@ mod tests {
         for asset in BUILDING_POOL {
             let raw: String =
                 crate::fs::read_to_string(format!("assets/{asset}.json")).expect("楼资产必须能读");
-            let json: serde_json::Value = serde_json::from_str(&raw).expect("楼资产必须可解析");
-            let b: &serde_json::Value = &json[ATTR_BOUNDS];
+            let json: Value = serde_json::from_str(&raw).expect("楼资产必须可解析");
+            let b: &Value = &json[ATTR_BOUNDS];
             let hx: f32 = {
                 let lo: f64 = b[ATTR_MIN][0].as_f64().expect("min.x");
                 let hi: f64 = b[ATTR_MAX][0].as_f64().expect("max.x");
@@ -13265,50 +13466,207 @@ mod tests {
         );
     }
 
+    /// 静态段长度是**重铺出来的实际值**,不是常量;重建必须如实报回。
+    ///
+    /// 这条测试原先钉的是「四个生成中心给出不同的长度」,用来证明
+    /// 「静态段长度会变」这个前提。建筑加密(`BLOCK_INNER` 11 → 4.5、
+    /// 每边 2~3 → 3~4 栋)之后这个前提**不再成立**:实测全城
+    /// (−3000..3000 每个 60 m 采样)静态段长度恒为 32 —— 32 种资产
+    /// 在任何一块都用全了。前提没了,但**报回逻辑仍然必须正确**:
+    /// 它是重建代码与调用方之间的契约,哪天某个远角街区用不满 32 种
+    /// 资产,按常量切就会把动态段切坏。
+    ///
+    /// 所以改成钉真正的不变量:**报回的长度 == 实际重铺出来的长度**。
+    /// 直接调重建函数而不是靠「长度会变」间接证明,任何改动下都成立。
     #[test]
-    pub(crate) fn streamed_rebuild_reports_a_varying_static_length() {
-        // 静态段长度 = 新中心周围真正用到的不同 mesh 数,不是常量。如果修复
-        // 依赖「静态段长度不变」,那下一次重建就会按旧长度切,等于把同一个
-        // bug 换个偏移再犯。这里钉住「长度真的会变」这个前提,让上面那条
-        // 断言的写回逻辑始终是必要的。
-        // 中心不能随手挑:沿同一条街平移(只换 X 或只换 Z)时窗口内容几乎
-        // 不变,长度会连着好几个中心都相同 —— 实测 (0,0)/(0,60)/(0,120)/
-        // (30,0) 四个全是 32。必须挑**两个轴都跨街**的中心,实测
-        // (90,90) 与 (120,90) 给 31、其余给 32,前提才立得住。
-        let lengths: Vec<usize> = [(0.0f32, 0.0f32), (90.0, 90.0), (120.0, 90.0), (30.0, 0.0)]
-            .iter()
-            .map(|center: &(f32, f32)| {
-                let mut used: Vec<&str> = Vec::new();
-                for building in build_city_buildings(center.0, center.1) {
-                    if !used.contains(&building.asset) {
-                        used.push(building.asset);
-                    }
-                }
-                for prop in build_city_props(center.0, center.1) {
-                    if !used.contains(&prop.asset) {
-                        used.push(prop.asset);
-                    }
-                }
-                for (asset, _, _) in build_city_signs(center.0, center.1).iter() {
-                    if !used.contains(asset) {
-                        used.push(asset);
-                    }
-                }
-                for (asset, _, _) in build_city_peds(center.0, center.1).iter() {
-                    if !used.contains(asset) {
-                        used.push(asset);
-                    }
-                }
-                used.len()
-            })
-            .collect();
+    pub(crate) fn streamed_rebuild_reports_the_actual_static_length() {
+        // 静态段长度是**重铺出来的实际值**,不是常量。
+        //
+        // 这条测试原先钉的是「四个生成中心给出不同的长度」,用来证明
+        // 「静态段长度会变」这个前提。建筑加密(`BLOCK_INNER` 11 → 4.5、
+        // 每边 2~3 → 3~4 栋)之后这个前提**不再成立**:实测全城
+        // (−3000..3000 每 60 m 采样)静态段长度恒为 32 —— 32 种资产在
+        // 任何一块都用全了。前提没了,但**报回逻辑仍然必须正确**:它是
+        // 重建代码与调用方之间的契约,哪天某个远角街区用不满 32 种资产,
+        // 按常量切就会把动态段切坏。
+        //
+        // 所以改成直接钉不变量:**报回的长度 == 实际重铺出来的长度**,
+        // 且动态段完整保留在它原来的下标上。任何改动下都成立。
+        // 真实静态资产表:从场景蓝图里收齐所有会用到的 mesh。
+        let mut index_map: HashMap<String, usize> = HashMap::new();
+        let mut assets: Vec<&str> = Vec::new();
+        for building in build_city_buildings(0.0, 0.0) {
+            assets.push(building.get_asset());
+        }
+        for prop in build_city_props(0.0, 0.0) {
+            assets.push(prop.get_asset());
+        }
+        for (asset, _, _) in build_city_vehicles(0.0, 0.0).iter() {
+            assets.push(asset);
+        }
+        for (asset, _, _) in build_city_signs(0.0, 0.0).iter() {
+            assets.push(asset);
+        }
+        for (asset, _, _) in build_city_peds(0.0, 0.0).iter() {
+            assets.push(asset);
+        }
+        assets.sort_unstable();
+        assets.dedup();
+        let mut index_map: HashMap<String, usize> = HashMap::new();
+        for (i, asset) in assets.iter().enumerate() {
+            index_map.insert(String::from(*asset), i);
+        }
+        // 先铺一次出生点当"旧世界"。
+        let mut scene: Scene = Scene::default();
+        // `rebuild_static_batches` 对 `static_batch_count == 0` 直接早退
+        // ("还没有静态段可切"),所以首次铺设走生产里的另一条路:
+        // `build_scene` 自己按尾插顺序铺,再把长度记进 Game。
+        // 测试复刻这一步:逐个资产 `push_batch_with_cull`,拿到初始长度。
+        let mut static_count: usize = 0;
+        for mesh_index in 0..index_map.len() {
+            scene.push_batch_with_cull(mesh_index, true, false);
+            static_count += 1;
+        }
+        assert!(static_count > 0, "静态段必须至少有若干批次");
+        // 动态段:挂 15 个批次在静态段之后。
+        for i in 0..15usize {
+            let batch: usize = scene.push_batch_with_cull(i, true, false);
+            assert_eq!(batch, static_count + i, "动态批次必须紧跟在静态段后面");
+        }
+        let before: usize = scene.get_batches().len();
+        // 换块重建:这次必须**报回新长度**。
+        let reported: usize =
+            rebuild_static_batches(&mut scene, &index_map, static_count, 1500.0, 1500.0);
+        assert_eq!(
+            reported,
+            scene.get_batches().len() - 15,
+            "报回的新静态段长度必须等于实际重铺出来的长度"
+        );
+        assert_eq!(
+            scene.get_batches().len(),
+            before,
+            "重建之后批次表长度必须不变:动态段被截掉了"
+        );
+        for i in 0..15usize {
+            assert_eq!(
+                scene.get_batches()[static_count + i].get_mesh_index(),
+                i,
+                "动态批次 {i} 的 mesh_index 被破坏 —— 下标语义乱了就找不到玩家骨架"
+            );
+        }
+    }
+
+    /// 路边停放车必须停**在车道之外**(修「路边停放的车辆太少」时的
+    /// 副产物风险:补车不能补到路中间把车队顶死)。
+    ///
+    /// 判据用生产里同一条规则 `on_lane` —— 停放车落在车道缓冲带内就
+    /// 会不进碰撞世界,于是玩家能穿过它走路,画面上却是一辆车。
+    /// 每条街道的**两侧车道都要有车**(修「路面汽车太少」的接线钉样)。
+    ///
+    /// `dense_traffic_lanes` 返回的元组第 4 项是**行驶方向**,而
+    /// `TrafficCar::new` → `route_from_xz` 用它决定车走哪一侧车道。
+    /// 把它写成巡航速度(恒正)会让每条街的车全挤进同一条车道:线上实测
+    /// 500 辆车有 249 辆排在街道 1 的一条车道上、一路排到 ±3300 m 外,
+    /// 街道 −3 / −2 一辆都没有,玩家出生点周围 200 m 内只有 1 辆车。
+    ///
+    /// 所以这里直接断言:**方向字段必须有正有负**,且两侧车道都被铺到。
+    #[test]
+    pub(crate) fn dense_traffic_covers_both_sides_of_every_street() {
+        let lanes: Vec<Lane> = dense_traffic_lanes();
         assert!(
-            lengths.iter().min() != lengths.iter().max(),
-            "{}",
-            fill(
-                T_STATIC_LEN_ASSUMED_CONSTANT,
-                &[("lengths", &format!("{lengths:?}"))]
-            )
+            lanes.len() > 50,
+            "程序化车队只有 {} 条车道 —— 路面汽车太少",
+            lanes.len()
+        );
+        // (a) 方向必须正负都有。
+        let positive: usize = lanes.iter().filter(|lane: &&Lane| lane.3 > 0.0).count();
+        let negative: usize = lanes.len() - positive;
+        assert!(
+            positive > 0 && negative > 0,
+            "行驶方向必须正负都有(实测 +{positive} / -{negative})—— 全是正的会让每条街的车挤进同一条车道"
+        );
+        // (b) 出生点所在街道(索引 1)两侧都要有车道。
+        let birth_x: f32 = lane_x(1, 1.0);
+        let birth_x_minus: f32 = lane_x(1, -1.0);
+        assert!(
+            lanes
+                .iter()
+                .any(|lane: &Lane| (lane.1 - birth_x).abs() < 0.01)
+                && lanes
+                    .iter()
+                    .any(|lane: &Lane| (lane.1 - birth_x_minus).abs() < 0.01),
+            "出生街两侧都要铺车道"
+        );
+    }
+
+    #[test]
+    pub(crate) fn parked_cars_never_stand_on_a_lane() {
+        let parked: Vec<Placement> = build_city_vehicles(0.0, 0.0);
+        assert!(
+            !parked.is_empty(),
+            "出生点附近必须有停放的车辆 —— 用户报「路边停放的车辆太少」"
+        );
+        for (_asset, position, _yaw) in &parked {
+            let px: f32 = position[0];
+            let pz: f32 = position[2];
+            // 南北向街道的车按 x 判,东西向的按 z 判 —— 两个都查,
+            // 任一落在缓冲带里就算违规。
+            assert!(
+                !on_lane(px),
+                "停放车 x={px:.2} 压在南北向车道上(位置 {px:.2},{pz:.2})"
+            );
+            assert!(
+                !on_lane(pz),
+                "停放车 z={pz:.2} 压在东西向车道上(位置 {px:.2},{pz:.2})"
+            );
+        }
+    }
+
+    /// 停放车不能堆在路口四角(否则每个路口都被车头堵死)。
+    #[test]
+    pub(crate) fn parked_cars_keep_the_junctions_clear() {
+        for (_asset, position, _yaw) in &build_city_vehicles(0.0, 0.0) {
+            let px: f32 = position[0];
+            let pz: f32 = position[2];
+            let to_x: f32 = (px / STREET_PITCH).round() * STREET_PITCH;
+            let to_z: f32 = (pz / STREET_PITCH).round() * STREET_PITCH;
+            let near_axis: bool =
+                (px - to_x).abs() < STREET_HALF_WIDTH && (pz - to_z).abs() < STREET_HALF_WIDTH;
+            assert!(!near_axis, "停放车 ({px:.2},{pz:.2}) 停在路口里");
+        }
+    }
+
+    /// 街区围合必须真的立起街墙(修「建筑太少」)。
+    ///
+    /// `BLOCK_INNER` 原来是 11 m,加上沥青守卫 21.6 m 之后每条围合边
+    /// 几乎全被拒 —— 实测 49 个程序化放置全部落在守卫半径内,环合街墙
+    /// 一栋都放不下。现在钉住「每个街区至少放下一栋围合楼」。
+    #[test]
+    pub(crate) fn every_block_keeps_at_least_one_street_wall_building() {
+        // 直接用生产函数拿到窗口内的全部街区,再要求每个街区都至少
+        // 有一栋**环合边**上的楼(对角楼不算 —— 它们在街区外侧)。
+        let blocks: Vec<BlockLayout> = blocks_near(0.0, 0.0, 200.0);
+        assert!(!blocks.is_empty(), "窗口内必须有街区");
+        let placed: Vec<BuildingPlacement> = build_city_buildings(0.0, 0.0);
+        let mut bare: Vec<(i32, i32)> = Vec::new();
+        for block in &blocks {
+            let cx: f32 = block.get_cx();
+            let cz: f32 = block.get_cz();
+            // 环合边的楼满足 |dx| == BLOCK_INNER 或 |dz| == BLOCK_INNER。
+            let has_wall: bool = placed.iter().any(|b: &BuildingPlacement| {
+                let dx: f32 = (b.get_position()[0] - cx).abs();
+                let dz: f32 = (b.get_position()[1] - cz).abs();
+                (dx - BLOCK_INNER).abs() < 1.0e-3 || (dz - BLOCK_INNER).abs() < 1.0e-3
+            });
+            if !has_wall {
+                bare.push((block.get_ix(), block.get_iz()));
+            }
+        }
+        assert!(
+            bare.is_empty(),
+            "{} 个街区一栋围合楼都没有(位置 {:?}等)—— 建筑太少",
+            bare.len(),
+            bare.first().unwrap_or(&(0, 0))
         );
     }
 
