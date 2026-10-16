@@ -256,12 +256,24 @@ impl TrafficCar {
     ///
     /// - `f32` - 绕 Y 轴的车身朝向(弧度)。
     fn lane_yaw(axis: i32, direction: f32) -> f32 {
-        // 本文件的 yaw 约定是 `fwd = [cos yaw, -sin yaw]`(见
-        // [`Self::get_yaw`]),所以沿 +Z 的车 yaw = -PI/2、沿 +X 的车 yaw = 0。
-        if axis == 0 {
-            -direction * FRAC_PI_2
-        } else {
-            direction * FRAC_PI_2
+        // 本文件的 yaw 约定是 `fwd = yaw_forward(yaw) = [sin yaw, cos yaw]`
+        // (见 [`Self::drive`] 第 3 步),所以**朝向就是 `fwd` 要指的方向**:
+        //
+        // - 沿 **+Z** 行进 → `fwd = (0, 1)` → `atan2(0, 1) = 0`。
+        // - 沿 **-Z** 行进 → `fwd = (0, -1)` → `atan2(0, -1) = PI`。
+        // - 沿 **+X** 行进 → `fwd = (1, 0)` → `atan2(1, 0) = PI/2`。
+        // - 沿 **-X** 行进 → `fwd = (-1, 0)` → `atan2(-1, 0) = -PI/2`。
+        //
+        // 旧写法 `-direction * FRAC_PI_2 / +direction * FRAC_PI_2` 是按
+        // `fwd = [cos yaw, -sin yaw]` 那套(90°错的)约定推导的,在新的前向
+        // 下会把沿 Z 行驶的车摆成沿 X —— 也就是**顺着车道横着开**。
+        // 逆向的分支同样重要:`yaw = 0` 与 `yaw = PI` 指向相反,写成 0 会让
+        // 一半的车倒着走(见 §负零号坑:`-0.0` 与 `0.0` 差的是 180°)。
+        match (axis, direction >= 0.0) {
+            (0, true) => 0.0,
+            (0, false) => PI,
+            (_, true) => FRAC_PI_2,
+            (_, false) => -FRAC_PI_2,
         }
     }
 
@@ -476,12 +488,6 @@ impl TrafficCar {
         // bicycle model 的核心:偏航角速度与**速度成正比**。所以低速几乎
         // 转不动(方向盘打满也只是慢慢挪),高速才敢打舵 —— 这就是为什么
         // 真车倒库要来回打好几把。
-        //
-        // `yaw_rate` 带一个负号,因为本文件的 yaw 约定是
-        // `fwd = [cos yaw, −sin yaw]`,于是 `d(fwd)/d(yaw)` = `[−sin, −cos]`
-        // —— 那是车头的**左**方���。也就是说 yaw 增大 = 车向左转,而 `steer`
-        // 的契约是「正 = 右转」。不取负号时按 D 会把车往左拐,这正是方向键
-        // 反向的根因;符号基准不是猜的,是从上面这个 `fwd` 定义推出来的。
         let steer: f32 = steer.clamp(-1.0, 1.0);
         let speed: f32 = self.get_speed();
         let grip_scale: f32 = 1.0 / (1.0 + speed.abs() * STEER_SPEED_FALLOFF);
@@ -489,16 +495,24 @@ impl TrafficCar {
         // 打方向(倒库全靠它)。写 `speed > STEER_MIN_SPEED` 会让整段倒车
         // 永远转不动 —— 速度为负时那个判断恒假。
         //
-        // 负号是转向符号的**根因修复**。本文件的 yaw 约定来自第 6 步的
-        // `fwd = [cos yaw, −sin yaw]`,于是
-        // `d(fwd)/d(yaw) = [−sin yaw, −cos yaw]` —— 那是车头的**左**方向。
-        // 也就是说 yaw 增大 = 车向左转,而 `steer` 的契约是「正 = 右转」
-        // (`steer_sign` 对 KEYD / ARROWRIGHT 返回 +1)。两边基准不同,所以
-        // `yaw_rate` 必须带一个负号才对齐;少了它,按 D 会把车往左拐 ——
-        // 这正是「方向键反向」的全部来源。符号不是从直觉定的,是从这个
-        // `fwd` 表达式推出来的。
+        // **这里不带负号,而负号正是上一版的取值 —— 符号随前向约定一起翻。**
+        //
+        // `steer` 的契约是「正 = 右转」(`steer_sign` 对 KEYD / ARROWRIGHT
+        // 返回 +1)。前向改成 [`yaw_forward`](crate::orient::yaw_forward)
+        // 即 `[sin yaw, cos yaw]` 之后:
+        //
+        //     d(fwd)/d(yaw) = [cos yaw, -sin yaw] = yaw_right(yaw)
+        //
+        // 也就是说 **yaw 增大 = 车向自己的右方转**,和 `steer` 的契约同号,
+        // 所以 `yaw_rate = +steer * K`。旧约定的 `fwd = [cos yaw, -sin yaw]`
+        // 给出的是 `d(fwd)/d(yaw) = [-sin, -cos]`,那才是车头的左方,当时
+        // 才需要负号去抵消。
+        //
+        // 两边的符号必须一起改:只把 `fwd` 换掉而保留负号,按 D 会立刻
+        // 变成往**左**拐 —— 正好复现这个缺陷历史上被误报成「方向键反向」
+        // 的现象。符号不是从直觉定的,是从上面这个 `fwd` 定义推出来的。
         let yaw_rate: f32 = if speed.abs() > STEER_MIN_SPEED {
-            -steer * STEER_RATE * grip_scale
+            steer * STEER_RATE * grip_scale
         } else {
             0.0
         };
@@ -510,8 +524,20 @@ impl TrafficCar {
         // 里多出一个侧向分量 —— 这就是「转向把车甩出去」的物理来源,
         // 不是额外加的人工外推力。
         let yaw: f32 = self.get_yaw();
-        let fwd: Vec2 = [yaw.cos(), -yaw.sin()];
-        let right: Vec2 = [fwd[1], -fwd[0]];
+        // **前向用 [`yaw_forward`](crate::orient::yaw_forward)。**
+        //
+        // 本文件过去在这里写 `fwd = [cos yaw, -sin yaw]`,而那正是**渲染
+        // 出来的资产本地 +X**:实测车辆资产的引擎盖 `z=+1.380`、前保险杠
+        // `z=+2.330`、前大灯 `z=+2.310`,车头在本地 **+Z**;而
+        // `Instance::new` 把本地 +Z 映射到世界 `(sin yaw, cos yaw)`。
+        // 两者点积恒为 0(`sin·cos + cos·(-sin) = 0`),也就是**物理前进
+        // 方向和画出来的车头差了整整 90°** —— 车横着开。
+        //
+        // `yaw_forward` 与渲染矩阵的 `model[8], model[10]` 是同一对分量,
+        // 与玩家的 `facing_yaw(atan2(vx, vz))` 也是同一个,所以物理、
+        // 渲染、角色三方终于指向同一个车头。
+        let fwd: Vec2 = crate::orient::yaw_forward(yaw);
+        let right: Vec2 = crate::orient::yaw_right(yaw);
         let rotated: f32 = yaw_rate * dt;
         // 旧车身系的速度投影 → 新车身系:前向多出 `speed * sin(rotated)`,
         // 侧向多出 `-speed * sin(rotated) * steer_sign`。

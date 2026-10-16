@@ -489,12 +489,18 @@ mod tests {
     /// 回归测试:斜着撞墙必须沿墙滑过去,而不是被弹到墙的另一侧。
     pub(crate) const T_CAR_SLIDES_ALONG_WALL: &str = "斜着撞墙必须沿墙滑过去";
 
-    /// 测试里代表「车头正对 −X 墙面」的朝向(游戏约定 forward = [cos, −sin])。
+    /// 测试里代表「车头正对 −X 墙面」的朝向。
     ///
-    /// 写成 π 的字面值而不是引用 `std::f32::consts::PI`:§6.1 要求子模块里
-    /// 不出现限定 std 路径,这里是 `#[cfg(test)]` 内的模块私有常量。
-    /// 取 `f32::consts::PI` 的 f32 最近值(clippy 的 excessive_precision)。
-    pub(crate) const YAW_FACING_NEG_X: f32 = 3.141_592_5;
+    /// **朝向由共享约定 [`crate::orient::yaw_forward`] 决定**:车头在资产
+    /// 本地 +Z、渲染成 `(sin yaw, cos yaw)`,所以「车头朝 −X」是
+    /// `atan2(-1, 0) = -π/2`,不是 π。旧值 π 在旧约定(`[cos yaw, -sin yaw]`)
+    /// 下确实朝 −X,但那个前向与渲染出来的车头差 90° —— 这几个测试正是
+    /// 在那个错误约定下写的,所以换约定后必须跟着换成同一个「车头」定义。
+    ///
+    /// 直接取模块里的 `FRAC_PI_2`(§6.1 要求子模块里不出现限定 std 路径),
+    /// 不要写 `-1.5707963` 这种字面值:那是 `clippy::approx_constant`
+    /// 认得的近似值,会直接报错。
+    pub(crate) const YAW_FACING_NEG_X: f32 = -FRAC_PI_2;
 
     /// 测试里代表 45° 斜向位移的分解系数(1.6 m / √2 ≈ 1.1313708)。
     pub(crate) const STRIDE_DIAGONAL: f32 = 1.131_370_8;
@@ -846,9 +852,10 @@ mod tests {
         let world: CollisionWorld = building_world();
         for yaw_deg in [0.0f32, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0] {
             let yaw: f32 = yaw_deg.to_radians();
-            let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
-            let forward: Vec2 = [cos_yaw, -sin_yaw];
-            let side: Vec2 = [forward[1], -forward[0]];
+            // 用共享约定取前 / 侧基向量,不自己再写一份 —— 测试里重算
+            // 公式只能验证自己那份副本,换约定时就会和真实实现错开。
+            let forward: Vec2 = crate::orient::yaw_forward(yaw);
+            let side: Vec2 = crate::orient::yaw_right(yaw);
             let mut at: Vec2 = [20.0, 0.0];
             // 满油门一帧 1.60 m,共 200 帧,一路撞到底。
             for frame in 0..200 {
@@ -975,11 +982,11 @@ mod tests {
         world.push_aabb([-6.0, 0.0], [6.0, 600.0]);
         let mut worst: f32 = f32::MAX;
         for step in 0..24 {
-            // yaw = π 让车头大致对着墙(游戏里 forward = [cos, −sin])。
+            // `YAW_FACING_NEG_X` 让车头大致对着墙(朝向由
+            // `crate::orient::yaw_forward` 定义,不是旧的那套 `[cos, -sin]`)。
             let yaw: f32 = YAW_FACING_NEG_X + step as f32 * YAW_STEP_RAD;
-            let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
-            let forward: Vec2 = [cos_yaw, -sin_yaw];
-            let side: Vec2 = [forward[1], -forward[0]];
+            let forward: Vec2 = crate::orient::yaw_forward(yaw);
+            let side: Vec2 = crate::orient::yaw_right(yaw);
             let (dir_x, dir_z): (f32, f32) = (forward[0], forward[1]);
             // 从墙外 30 m 处朝墙开,不给它停在接触点上的机会。
             let mut at: Vec2 = [30.0 + 30.0 * forward[0], 100.0 + 30.0 * forward[1]];

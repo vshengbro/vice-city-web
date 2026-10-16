@@ -2403,18 +2403,24 @@ pub(crate) const KEY_PART: &str = "part";
 
 /// 车轮滚动方向的回归测试:车前进时,轮底必须相对车体**向后**滑。
 ///
-/// 无滑滚动的运动学约束:接触点相对地面瞬时不动,所以车往 `+X` 走时,
-/// 接触点沿轮缘向 `-X` 退。轮轴是本地 `Z`(实测自 `car_coupe` 的
-/// `tyres` 顶点:每只轮子 `x 0.64 / y 0.64 / z 0.235`,最短轴是 Z)。
+/// 无滑滚动的运动学约束:接触点相对地面瞬时不动,所以车往 `+Z` 走时,
+/// 接触点沿轮缘向 `-Z` 退。轮轴是本地 `X`(实测自 `car_sedan` /
+/// `car_coupe` 的 `tyre_*` 顶点:每只轮子 `x 0.220 / y 0.680 / z 0.680`,
+/// 最短轴是 X)。
+///
+/// 模板里只能用 `{bottom}` 这种**纯名字**占位符:`fill()` 做的是字面
+/// 替换,`{bottom:+.4}` 里的 `:+.4` 会被原样留下,报错信息里就会出现
+/// 一句没被填上的 `{bottom:+.4}`(实测踩过)。精度由调用方 `format!` 好
+/// 再传进来。
 pub(crate) const T_WHEEL_ROLLS_FORWARD: &str =
-    "车轮滚动方向反了:spin={spin} 时轮底沿车体后退了 {bottom:+.4} m,应当为负(车往 +X 前进)";
+    "车轮滚动方向反了:spin={spin} 时轮底沿车体后退了 {bottom} m,应当为负(车往 +Z 前进)";
 
 /// 自转 90 度必须带动轮缘基向量(X / Y 之一)改变方向。
 pub(crate) const T_WHEEL_SPIN_MOVES_RIM: &str =
     "自转 90 度必须改变轮缘基向量:rest={axis} turned={turned}";
 
-/// 绕轮轴(Z)自转时,轮轴基向量本身不得改变。
-pub(crate) const T_WHEEL_AXLE_STILL: &str = "绕 Z 自转不得转动 Z 轴本身,变化量 {delta}";
+/// 绕轮轴(X)自转时,轮缘基向量(本地 Z)必须跟着转。
+pub(crate) const T_WHEEL_AXLE_STILL: &str = "绕 X 自转必须带动轮缘(Z)基向量,变化量 {delta}";
 
 /// 自转只绕轮心,不得把轮心挪走。
 pub(crate) const T_WHEEL_CENTRE_FIXED: &str = "自转不得移动轮心";

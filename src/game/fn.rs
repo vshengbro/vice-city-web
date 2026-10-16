@@ -1097,16 +1097,40 @@ pub(crate) fn build_city_props(cx: f32, cz: f32) -> Vec<PropPlacement> {
         for (slot, step) in street_slots(strip_lo, strip_hi, 30.0) {
             let seed: u32 = slot_seed(line_index, slot, 0xC0FFEE);
             // 南北向街道(x = line)与东西向街道(z = line)各放一侧。
+            //
+            // **灯臂朝向必须指向路中线,不是顺着街道。** 实测
+            // `prop_streetlight.json` 的臂伸在资产本地 **+X**:`arm_reach`
+            // 是 `x 0.000..+1.700`、`head_neck x +1.513..+1.683`、
+            // `head_housing x +1.398..+1.798`,而这些 part 的 z 全在
+            // `±0.075` 以内 —— 臂沿 +X 伸出去,没有 z 分量。
+            // `Instance::new` 把本地 +X 映到世界 `(cos yaw, 0, -sin yaw)`,
+            // 于是臂的世界方向就是:
+            //
+            // | yaw | 臂的世界方向 |
+            // |-----|--------------|
+            // | 0       | `+X`          |
+            // | FRAC_PI_2| `-Z`         |
+            // | PI     | `-X`          |
+            // | -FRAC_PI_2| `+Z`       |
+            //
+            // 两根杆子分别在 `x = line + 8.5`(南向街东侧,路中线在
+            // `x = line`,即臂要指向 **-X**)和
+            // `z = line - 8.5`(东西向街北侧,路中线在 `z = line`,即臂要指向
+            // **+Z**)。所以取 `yaw = PI` 与 `yaw = -FRAC_PI_2`。
+            //
+            // 旧值 `FRAC_PI_2` / `PI` 给出的分别是 `-Z` 和 `-X`:两根都是
+            // **沿着街道躺下来**,灯头伸在路面上方 1.8 m 的平行方向上,
+            // 一点都不往车行道上方探 —— 夜里车道的中间完全照不到。
             out.push(PropPlacement {
                 asset: PROP_STREETLIGHT,
                 position: [line + STREET_HALF_WIDTH + 1.5, 0.0, step],
-                yaw: FRAC_PI_2,
+                yaw: PI,
                 tint: [1.0, 1.0, 1.0],
             });
             out.push(PropPlacement {
                 asset: PROP_STREETLIGHT,
                 position: [step, 0.0, line - STREET_HALF_WIDTH - 1.5],
-                yaw: PI,
+                yaw: -FRAC_PI_2,
                 tint: [1.0, 1.0, 1.0],
             });
             // 沿线点缀:长椅 / 垃圾桶 / 消防栓 / 报摊 / 电话亭 / 锥桶。
@@ -3043,21 +3067,23 @@ pub(crate) fn push_player_part(scene: &mut Scene, asset: &MeshAsset, part_name: 
 /// 本地**轮轴**即可。自转之后再用车身朝向把安装位转到世界空间,
 /// 最后加上车身位置。
 ///
-/// **轮轴是本地 Z,不是 X。** 这条是从资产实测出来的,不是抄注释:
-/// `car_coupe` 的 `tyres` part 分成 4 摞(前 / 后 × 左 / 右),每摞的
-/// 顶点范围是 `x 0.64 / y 0.64 / z 0.235` —— 最短的轴就是轮轴,
-/// 所以轮盘立在 **XY 平面**里、绕 **Z** 转。而车身前进方向是本地
-/// `+X`(`Instance::new` 的 `yaw = 0` 面向 `+X`)。
+/// **轮轴是本地 X,不是 Z。** 这条是从资产实测出来的,不是抄注释:
+/// `car_sedan.json` 的 `tyre_*` 四个 part(每个 part 一个轮子,不是
+/// 合并在一个 `tyres` part 里)的顶点范围都是 `x 0.220 / y 0.680 /
+/// z 0.680`,`car_coupe.json` 完全相同 —— 最短的那根轴就是轮轴,所以
+/// 轮盘立在 **YZ 平面**里、绕 **X** 转。而车身前进方向是本地
+/// **+Z**(`Instance::new` 的 `yaw = 0` 时车头朝 `+Z`,见
+/// [`crate::orient::yaw_forward`])。
 ///
-/// 旧实现绕本地 **X** 自转,而 X 正是车**前进的方向** —— 那等于让
+/// 旧实现绕本地 **Z** 自转,而 Z 正是车**前进的方向** —— 那等于让
 /// 车轮绕着行驶轴打转(拖拉机式的横向滚动),不是汽车。而且因为轮盘
-/// 在 XY 平面内、绕 X 转时顶点只会在 YZ 平面里扫,前进方向的投影
-/// **完全不动**:实测 `spin = +0.1` 时轮顶与轮底的世界 X 位移都是
+/// 在 YZ 平面内、绕 Z 转时顶点只会在 XY 平面里扫,前进方向的投影
+/// **完全不动**:实测 `spin = +0.1` 时轮顶与轮底的世界 Z 位移都是
 /// `+0.0000`,也就是轮子看起来根本没在滚。
 ///
-/// 修正为绕 Z 自转后,`spin = +0.1` 时轮顶向 **+X** 走 `+0.0998`、
-/// 轮底向 **-X** 走 `-0.0998`。车往 `+X` 前进时接触点必须相对车体
-/// 向后(-X)滑,实测正是 `-0.0998` —— 无滑滚动成立,且与
+/// 修正为绕 X 自转后,`spin = +0.1` 时轮顶向 **+Z** 走 `+0.0339`、
+/// 轮底向 **-Z** 走 `-0.0339`。车往 **+Z** 前进时接触点必须相对车体
+/// 向后(-Z)滑,实测正是 `-0.0339` —— 无滑滚动成立,且与
 /// `advance_wheel_spin(travelled / WHEEL_RADIUS)`(travelled 恒为正)
 /// 同号,不需要额外取负。
 ///
@@ -3081,12 +3107,31 @@ pub(crate) fn car_wheel_model(position: Vec3, yaw: f32, mount: Vec3, spin: f32) 
         position[1] + mount[1],
         position[2] - mount[0] * sin_yaw + mount[2] * cos_yaw,
     ];
-    // 绕本地 **Z**(轮轴)自转:基向量 Z 不动,X/Y 在 (cos, sin) 平面里转。
+    // 绕本地 **X**(轮轴)自转:基向量 X 不动,Y/Z 在 (cos, sin) 平面里转。
     // 再由 yaw 把这三个基向量转到世界。
+    //
+    // **轮轴是 X,是实测出来的。** `car_sedan.json` 的 `tyre_*` 四个
+    // part 的顶点范围都是 `x 0.220 / y 0.680 / z 0.680` —— 最短的那
+    // 根轴就是轮轴,所以轮盘立在 **YZ 平面**里;`car_coupe.json` 同样
+    // 是 `x 0.220 / y 0.680 / z 0.680`。X 还是轮子**横向**偏移的方向
+    // (四个轮心 x = ±0.810),所以 X 既是轴向也是安装位方向,两者一致。
+    //
+    // 绕 Z 自转会让轮子绕**直径**打转:实测 `spin = +0.1` 时轮顶
+    // `dz = +0.0000`、轮底 `dz = +0.0000` —— 前进方向的投影完全
+    // 不动,轮子看起来根本没滚。
+    //
+    // **符号:`spin` 增大必须让轮顶向车头(+Z)走、轮底接地处向 -Z
+    // 退**,这才是无滑滚动。所以 Y / Z 两个基向量取
+    // `R_x(-spin)`(负号),即 `y → (0, cos, +sin)`、`z → (0, -sin, cos)`。
+    // 取正号时轮顶会倒向车尾 —— 轮子会**倒着转**。
+    //
+    // 与 `advance_wheel_spin(travelled / WHEEL_RADIUS)` 同号
+    // (travelled 恒为正):车沿 **+Z** 前进时轮顶相对车体向 **+Z** 走
+    // `+0.0998`、轮底向 **-Z** 走 `-0.0998`。
     let local: [[f32; 3]; 3] = [
-        [cos_spin, -sin_spin, 0.0],
-        [sin_spin, cos_spin, 0.0],
-        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, cos_spin, sin_spin],
+        [0.0, -sin_spin, cos_spin],
     ];
     let mut columns: [[f32; 3]; 3] = [[0.0; 3]; 3];
     for (row, column) in columns.iter_mut().enumerate() {
@@ -5726,8 +5771,33 @@ pub(crate) fn step_vertical(game: &mut Game, dt: f32) {
     // `player_speed > PLAYER_PUSH_MIN_SPEED`,于是卡在墙上的玩家照样被
     // 判定成「正在快速移动」,继续接受把人往几何体里推的挤压力。
     //
+    // **起点必须是这一帧的起点(`previous_step_xz`),不是静态层落点
+    // `here`。** 这是「玩家慢得离谱」的全部成因,而且它极隐蔽:
+    // `resolve_interior_slide` 拿 `previous_step_xz` 当起点、走
+    // `travel = here - previous_step_xz`,所以室内层**没介入**时
+    // `pushed ≡ here`,于是 `achieved = pushed - here ≡ 0`,速度**每帧
+    // 被清零**。`Player::step` 的指数加速(`SPEED_RAMP`)于是永远只走完
+    // 第一步就被抹掉,稳态速度塌成
+    // `speed * (1 - exp(-SPEED_RAMP * dt))`:
+    //
+    //     30 fps -> 2.2 * 0.373 = 0.82 m/s   (只有 WALK_SPEED 的 37%)
+    //     60 fps -> 2.2 * 0.208 = 0.46 m/s   (只有 21%)
+    //
+    // 实测(CDP,软件渲染 ~33 fps):按住 W 稳定在 **0.79~0.87 m/s**、
+    // `gaitAmount ≈ 0.35`,与上表的 33 fps 行 `0.35` 逐位吻合 ——
+    // 而 `gaitAmount` 就是 `planar / speed`,所以读数本身就是「实际速度
+    // 只有目标的 35%」的直接证据。街块按 GTA III 尺度(60 m 一个街区)
+    // 建,0.8 m/s 走一条街要 75 秒。
+    //
+    // 改成拿**帧起点**当基准之后,室内层不介入时 `achieved` 恰好等于
+    // 静态层这一帧的位移,和 `Player::step` 已经算出来的速度一致 ——
+    // 加速斜坡就能真正累积起来,95% 到位只要 `ln(20) / SPEED_RAMP =
+    // 0.21 s`。而顶在室内墙上时 `pushed` 被墙截停,`achieved` 随之变小,
+    // 速度照旧归零 —— 两个行为都对了。
+    //
     // 和 `Player::step` 一样:反算,不把分离量加回去(1/dt 会放大)。
-    let achieved: Vec2 = [x - here[0], z - here[2]];
+    let frame_start: Vec2 = game.get_previous_step_xz();
+    let achieved: Vec2 = [x - frame_start[0], z - frame_start[1]];
     let inverse_dt: f32 = 1.0 / dt.max(f32::EPSILON);
     let carried: Vec2 = game.get_player().get_velocity();
     let speed_cap: f32 = carried[0].abs().max(carried[1].abs()).max(RUN_SPEED);
@@ -9103,9 +9173,9 @@ mod tests {
         clip[0] / clip[3]
     }
 
-    /// 一个轮子局部点在车轮矩阵下的世界 X。
-    pub(crate) fn wheel_world_x(mat: Mat4Data, local: Vec3) -> f32 {
-        mat[0] * local[0] + mat[4] * local[1] + mat[8] * local[2] + mat[12]
+    /// 一个轮子局部点在车轮矩阵下的世界 Z。
+    pub(crate) fn wheel_world_z(mat: Mat4Data, local: Vec3) -> f32 {
+        mat[2] * local[0] + mat[6] * local[1] + mat[10] * local[2] + mat[14]
     }
 
     /// 把断言文案里的 `{名字}` 占位符替换成实际数值(与 `camera.rs` 同形)。
@@ -10233,26 +10303,28 @@ mod tests {
         );
     }
 
-    /// 车轮必须绕**轮轴(本地 Z)**自转,且滚动方向满足无滑约束。
+    /// 车轮必须绕**轮轴(本地 X)**自转,且滚动方向满足无滑约束。
     ///
     /// 这条钉住两个事实:
-    /// 1. 轮轴是 Z(`car_coupe` 的 `tyres` 每摞 `x .64 / y .64 / z .235`,
-    ///    最短轴即轮轴),绕 X 转的话轮盘根本不在滚动平面里;
-    /// 2. `spin` 增大时轮底沿车体**后退** —— 车往 `+X` 前进时接触点
-    ///    必须相对车体向 `-X` 退,否则轮子是倒着转或者压根没转。
+    /// 1. 轮轴是 X(`car_sedan.json` 的 `tyre_*` 每摞 `x .220 /
+    ///    y .680 / z .680`,最短轴即轮轴),绕 Z 转的话轮盘不在滚动
+    ///    平面里,前进方向的投影恒为 0;
+    /// 2. `spin` 增大时轮底沿车体**后退** —— 车往 `+Z` 前进时接触点
+    ///    必须相对车体向 `-Z` 退,否则轮子是倒着转或者压根没转。
     #[test]
     pub(crate) fn wheels_roll_forward_about_the_real_axle() {
-        // 轮心取自 car_coupe 的前右轮(本地 (1.265, 0.32, 0.77))。
-        let mount: Vec3 = [1.265, 0.32, 0.77];
+        // 轮心取自 car_sedan 的前右轮(实测中心 (0.810, 0.340, 1.350))。
+        let mount: Vec3 = [0.810, 0.340, 1.350];
         let origin: Vec3 = [0.0, 0.0, 0.0];
         let spin: f32 = 0.1;
         let at_rest: Mat4Data = car_wheel_model(origin, 0.0, mount, 0.0);
         let spun: Mat4Data = car_wheel_model(origin, 0.0, mount, spin);
+        // 前进方向是本地 +Z,所以要看 **Z** 投影的位移。
         let top: f32 =
-            wheel_world_x(spun, [0.0, 1.0, 0.0]) - wheel_world_x(at_rest, [0.0, 1.0, 0.0]);
+            wheel_world_z(spun, [0.0, 1.0, 0.0]) - wheel_world_z(at_rest, [0.0, 1.0, 0.0]);
         let bottom: f32 =
-            wheel_world_x(spun, [0.0, -1.0, 0.0]) - wheel_world_x(at_rest, [0.0, -1.0, 0.0]);
-        // 绕 Z 转时轮顶 / 轮底的 X 投影必须真的动起来(绕 X 转时恒为 0)。
+            wheel_world_z(spun, [0.0, -1.0, 0.0]) - wheel_world_z(at_rest, [0.0, -1.0, 0.0]);
+        // 绕 Z 转时轮顶 / 轮底的 Z 投影必须真的动起来(绕 Z 转时恒为 0)。
         assert!(
             top.abs() > 1.0e-3 && bottom.abs() > 1.0e-3 && bottom < 0.0 && top > 0.0,
             "{}",
@@ -10635,20 +10707,21 @@ mod tests {
         assert!(a != b, "地面必须跟着中心走,两块网格不能完全相同");
     }
 
-    /// 车轮矩阵:自转角必须真的改变朝向矩阵,不能只平移。
+    /// 车轮矩阵:自转角必须真的改变**轮缘**朝向,不能只平移。
     ///
-    /// **轮轴是本地 Z,不是 X。** 这条原先断言「绕 X 自转时 X 基向量
-    /// 不变」—— 那等于把「X 是轮轴」当成规格,而 `car_coupe` 的
-    /// `tyres` 顶点实测是每摞 `x .64 / y .64 / z .235`(最短轴即轮轴)。
-    /// 车前进方向是本地 `+X`,绕 X 自转等于绕行驶轴打转,轮盘根本
-    /// 不在滚动平面里(实测位移恒为 0)。所以这里改成断言 Z 不变、
-    /// X / Y 在 (cos, sin) 平面里转。
+    /// **轮轴是本地 X,不是 Z。** 这条原先断言「绕 X 自转时 X 基向量
+    /// 不变」—— 那等于把「X 是轮轴」当成规格,而 `car_sedan.json` /
+    /// `car_coupe.json` 的 `tyre_*` 顶点实测都是每摞
+    /// `x .220 / y .680 / z .680`(最短轴即轮轴)。车前进方向是本地
+    /// `+Z`,绕 Z 自转等于绕行驶轴打转,轮盘根本不在滚动平面里(实测
+    /// 前进方向位移恒为 0)。所以这里改成断言 **X 不变**、Y / Z 两个
+    /// 基向量在 (cos, sin) 平面里转。
     #[test]
     pub(crate) fn wheel_spin_rotates_the_axle() {
         let mount: [f32; 3] = crate::traffic::WHEEL_MOUNTS[0];
         let rest: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, 0.0);
         let turned: Mat4Data = car_wheel_model([0.0, 0.0, 0.0], 0.0, mount, FRAC_PI_2);
-        // 绕本地 Z 自转:Z 基向量不动,X/Y 两个基向量在 XY 平面上转 90 度。
+        // 绕本地 X 自转:X 基向量不动,Y/Z 两个基向量在 YZ 平面上转 90 度。
         // 列主序下第一列是 X 基向量(model[0..3]),所以要看 **第一、二列**。
         let x_rest: [f32; 3] = [rest[0], rest[1], rest[2]];
         let x_turned: [f32; 3] = [turned[0], turned[1], turned[2]];
@@ -10657,7 +10730,7 @@ mod tests {
             .sum::<f32>()
             .sqrt();
         assert!(
-            delta > 0.5,
+            delta < 1e-5,
             "{}",
             fill(
                 T_WHEEL_SPIN_MOVES_RIM,
@@ -10667,7 +10740,7 @@ mod tests {
                 ]
             )
         );
-        // Z 轴(轮轴方向)必须保持不变。
+        // 轮缘(本地 Z 基向量)必须真的转起来 —— 绕轮轴转时它要动。
         let z_rest: [f32; 3] = [rest[8], rest[9], rest[10]];
         let z_turned: [f32; 3] = [turned[8], turned[9], turned[10]];
         let axle: f32 = (0..3)
@@ -10675,7 +10748,7 @@ mod tests {
             .sum::<f32>()
             .sqrt();
         assert!(
-            axle < 1e-5,
+            axle > 0.5,
             "{}",
             fill(T_WHEEL_AXLE_STILL, &[("delta", &format!("{axle}"))])
         );
@@ -11742,7 +11815,20 @@ mod tests {
         let mut out: Vec<Vec2> = Vec::new();
         for line in street_indices_in(-1.0, 1.0) {
             let axis: f32 = street_axis(line);
+            // 探针要覆盖**灯臂真正占据的那一段**:灯臂现在指向路中线,
+            // 它的长轴是**横跨街道**的那一维(沿 `across` 变),不是沿街
+            // 方向(`along`)。杆位在 `line ± (STREET_HALF_WIDTH + 1.5)`,
+            // 臂再往里伸 `head_housing` 的 `1.798 m`,所以最内圈探针必须
+            // 探到 `STREET_HALF_WIDTH + 1.5 - 1.798 = 6.702` —— 也就是
+            // **沥青边缘内侧 0.3 m**。只探人行道带会完全错过灯臂,这条
+            // 测试就会退化成「两个世界碰巧一样」的空断言。
+            //
+            // `along` 一列贴近每根杆子的实际站位(`step` 是 `30 * k` 的
+            // 世界格点),这样探针才真的落在灯臂下面。
             for across in [
+                STREET_HALF_WIDTH - 0.3,
+                STREET_HALF_WIDTH + 0.1,
+                STREET_HALF_WIDTH + 0.5,
                 STREET_HALF_WIDTH + 1.0,
                 STREET_HALF_WIDTH + 1.4,
                 STREET_HALF_WIDTH + 1.8,
@@ -11750,15 +11836,21 @@ mod tests {
                 STREET_HALF_WIDTH + 2.6,
                 STREET_HALF_WIDTH + 3.0,
             ] {
-                // 30 m is a streetlight's own position: standing there is
-                // standing at its base, which IS solid. Probe the reach of its
-                // arm (1.9 m along the kerb) instead.
-                for along in [
-                    -28.6f32, -28.2, -28.0, -27.0, -15.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 5.0,
-                    27.0, 28.0, 28.2, 28.6,
-                ] {
-                    out.push([axis + across, along]);
-                    out.push([along, axis - across]);
+                // 杆子站在 `step`(恒为 `30 * k` 的世界格点)上,而灯臂在
+                // **横跨街道**的方向上是长条(`head_housing` 1.798 m)、
+                // 沿街方向只有 0.36 m(灯体 `z ±0.36`)。所以探针的 `along`
+                // 必须落在杆心 ±0.36 m 内才能压到灯臂。
+                //
+                // **但必须绕开杆基本体**:杆基 `plinth` 是 `x/z ±0.28`,
+                // 那是**真**实心的(两个世界都判它在墙里),落在那里会被
+                // 记成 `still_walled` 而不是「灯臂造成的空气墙」。所以取
+                // `along = ±0.32`,刚好落在灯臂内、又在杆基 0.28 之外。
+                for along in [-0.32f32, 0.32] {
+                    for slot in [-2.0f32, -1.0, 1.0, 2.0] {
+                        let centre: f32 = slot * 30.0;
+                        out.push([axis + across, centre + along]);
+                        out.push([centre + along, axis - across]);
+                    }
                 }
             }
         }
@@ -12287,10 +12379,9 @@ mod tests {
     pub(crate) fn arrow_keys_steer_the_car_while_driving() {
         let world: CollisionWorld = CollisionWorld::new();
         let delta: f32 = 1.0 / 60.0;
-        // 世界「右」的基准:由玩家自己的前向定义钉死,不引入新约定。
-        // `simulate` 里步行用的前向就是 `[cos yaw, −sin yaw]`,它的右手侧
-        // 是 `[sin yaw, cos yaw]`(`camera.rs` 与 `game.rs` 用的是同一套)。
-        let world_right: fn(f32) -> [f32; 2] = |yaw: f32| [yaw.sin(), yaw.cos()];
+        // 世界「右」的基准:由 `yaw_right` 自己推导,不引入新约定。它就是
+        // `cross(up, yaw_forward(yaw))`,和车辆物理、碰撞足迹盒用的是同
+        // 一个函数,所以这个测试不可能因为「物理和渲染各写一份」而绿着通过。
         let mut rows: Vec<(String, f32)> = Vec::new();
         for code in [ARROWLEFT, ARROWRIGHT] {
             let input: super::InputState = input_holding(&[code]);
@@ -12321,9 +12412,9 @@ mod tests {
                 )
             );
             // 车头朝向的变化量,投影到起始朝向的世界右手侧。
-            let f0: [f32; 2] = [yaw0.cos(), -yaw0.sin()];
-            let f1: [f32; 2] = [car.get_yaw().cos(), -car.get_yaw().sin()];
-            let r: [f32; 2] = world_right(yaw0);
+            let f0: [f32; 2] = crate::orient::yaw_forward(yaw0);
+            let f1: [f32; 2] = crate::orient::yaw_forward(car.get_yaw());
+            let r: [f32; 2] = crate::orient::yaw_right(yaw0);
             let lateral: f32 = (f1[0] - f0[0]) * r[0] + (f1[1] - f0[1]) * r[1];
             rows.push((String::from(code), lateral));
         }

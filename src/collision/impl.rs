@@ -403,13 +403,17 @@ impl CollisionWorld {
     ///
     /// - `Vec2` - 分离后的世界 XZ 坐标。
     pub fn resolve_car_box(&self, point: Vec2, yaw: f32) -> Vec2 {
-        let (sin_yaw, cos_yaw): (f32, f32) = yaw.sin_cos();
         // 车身基向量,和 `TrafficCar::drive` 的第 3 步完全同一套:
-        // `fwd = [cos yaw, -sin yaw]`、`right = [fwd[1], -fwd[0]]`。
+        // `fwd = yaw_forward(yaw)`、`right = yaw_right(yaw)`。
         // 符号必须一模一样 —— 这里的 `right` 若取成 `[−fwd[1], fwd[0]]`,
         // 车身盒就成了左右翻转的镜像,斜着靠墙时会被判到墙的另一侧去。
-        let forward: Vec2 = [cos_yaw, -sin_yaw];
-        let side: Vec2 = [forward[1], -forward[0]];
+        //
+        // **两处必须同步改。** 足迹盒的长轴是**车头方向**(`CAR_FOOTPRINT`
+        // 的 2.283 m 对应车身 4.566 m),而车头在资产本地 +Z、渲染成
+        // `yaw_forward`。沿用旧的 `[cos, -sin]` 会让碰撞盒的 4.566 m 长边
+        // 横过来,车会「侧着」被墙挡住 —— 而玩家看到的是车头朝前。
+        let forward: Vec2 = crate::orient::yaw_forward(yaw);
+        let side: Vec2 = crate::orient::yaw_right(yaw);
         let mut current: Vec2 = point;
         for _ in 0..RESOLVE_ITERATIONS {
             let mut moved: bool = false;

@@ -197,6 +197,124 @@ mod tests {
         );
     }
 
+    /// **回归:渲染出来的车头必须和实际位移同向。**
+    ///
+    /// 这条钉住的就是「车横着开」那个缺陷。判据是纯几何的:
+    /// `dot(rendered_forward(yaw), displacement) > 0.999`,即渲染矩阵
+    /// 的车头方向和这一帧真正走出来的位移几乎完全平行(夹角 < 2.6°)。
+    ///
+    /// **为什么这条能抓到那个 bug:** 资产实测(`car_sedan.json` 引擎盖
+    /// `z=+1.380`、前保险杠 `z=+2.330`)说明车头在资产本地 **+Z**,
+    /// 而 `Instance::new` 把本地 +Z 映射到世界 `(sin yaw, cos yaw)`;
+    /// 物理当时用的却是 `[cos yaw, -sin yaw]`(本地 +X)。两者点积恒为
+    /// **0.0000** —— 位移与画出来的车头正好差 90°,所以车是横着开的。
+    ///
+    /// `rendered_forward` 取自 [`crate::render::Instance`] 用的同一对
+    /// 分量(`model[8], model[10]`),而不是在测试里另抄一份公式 ——
+    /// 抄一份的话,生产代码改了约定测试照样绿。
+    #[test]
+    pub(crate) fn the_rendered_nose_points_where_the_car_actually_drives() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        for yaw0 in [0.0f32, 0.4, FRAC_PI_2, 2.2, PI, 4.1, -FRAC_PI_2, -2.9] {
+            let mut c: TrafficCar = TrafficCar::new(CAR_SEDAN, 0.0, 0.0, 8.0, 1.0);
+            c.set_yaw(yaw0);
+            let start: Vec3 = c.get_position();
+            for _ in 0..90 {
+                c.drive(0.7, 0.0, 1.0 / 60.0, &world);
+            }
+            let end: Vec3 = c.get_position();
+            let delta: Vec2 = [end[0] - start[0], end[2] - start[2]];
+            let travelled: f32 = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+            assert!(
+                travelled > 1.0,
+                "yaw0={} 时车几乎没动(仅 {:.3} m),这条断言没意义",
+                yaw0,
+                travelled
+            );
+            // 渲染出来的车头:资产本地 +Z 经 `Instance::new` 之后的世界方向。
+            let nose: Vec2 = crate::orient::yaw_forward(yaw0);
+            let align: f32 = (nose[0] * delta[0] + nose[1] * delta[1]) / travelled;
+            assert!(
+                align > 0.999,
+                "yaw0={} 时渲染车头和实际位移差了 {:.1}°:车头 ({:.4},{:.4}),位移 ({:.4},{:.4})",
+                yaw0,
+                (1.0 - align).acos().to_degrees(),
+                nose[0],
+                nose[1],
+                delta[0],
+                delta[1]
+            );
+        }
+    }
+
+    /// **回归:`steer` 的契约「正 = 右转」必须在新的前向约定下成立。**
+    ///
+    /// 前向从 `[cos yaw, -sin yaw]` 换成 `[sin yaw, cos yaw]` 之后,
+    /// `d(fwd)/d(yaw)` 从车头**左方**变成了车头**右方** —— 所以偏航率
+    /// 的负号必须跟着去掉,否则按 D 会往左拐。只改 `fwd` 不改这个符号,
+    /// 就是「换完约定方向键立刻反向」的那个坑。
+    #[test]
+    pub(crate) fn steering_right_turns_toward_the_noses_own_right() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        let mut c: TrafficCar = car();
+        let yaw0: f32 = c.get_yaw();
+        for _ in 0..120 {
+            c.drive(0.7, 1.0, 1.0 / 60.0, &world);
+        }
+        let right: Vec2 = crate::orient::yaw_right(yaw0);
+        let yaw_delta: f32 = c.get_yaw() - yaw0;
+        // 正的 `steer` 必须让车头朝**自己的右方**偏:新约定下
+        // `d(fwd)/d(yaw) = yaw_right(yaw)`,所以偏航角增量必须为正。
+        assert!(
+            yaw_delta > 0.1,
+            "正 steer(右转)后偏航角增量应为正(yaw 右转),实际 {:.4}",
+            yaw_delta
+        );
+        let moved: Vec2 = crate::orient::yaw_forward(c.get_yaw());
+        let lateral: f32 = moved[0] * right[0] + moved[1] * right[1];
+        assert!(
+            lateral > 0.0,
+            "车头没有偏向自己的右方,与 yaw_right 的内积 {:.4}",
+            lateral
+        );
+    }
+
+    /// **回归:倒车必须相对车头往后走。**
+    ///
+    /// `throttle < 0` 把速度推到负值,位移方向应与 `yaw_forward` 反向。
+    /// 这条和上面两条一起把「速度符号」也钉住:只翻前向不翻倒车,车会
+    /// 挂着倒挡往前冲。
+    #[test]
+    pub(crate) fn reversing_moves_backwards_relative_to_the_nose() {
+        let world: crate::collision::CollisionWorld = empty_world();
+        let mut c: TrafficCar = TrafficCar::new(CAR_SEDAN, 0.0, 0.0, 8.0, 1.0);
+        c.set_yaw(0.0);
+        for _ in 0..120 {
+            c.drive(-0.7, 0.0, 1.0 / 60.0, &world);
+        }
+        assert!(
+            c.get_speed() < -0.5,
+            "挂倒挡后速度应为负,实际 {:.4}",
+            c.get_speed()
+        );
+        let start: Vec3 = c.get_position();
+        for _ in 0..60 {
+            c.drive(-0.7, 0.0, 1.0 / 60.0, &world);
+        }
+        let end: Vec3 = c.get_position();
+        let delta: Vec2 = [end[0] - start[0], end[2] - start[2]];
+        let travelled: f32 = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        let nose: Vec2 = crate::orient::yaw_forward(c.get_yaw());
+        let align: f32 = (nose[0] * delta[0] + nose[1] * delta[1]) / travelled;
+        assert!(
+            align < -0.999,
+            "倒车位移应与车头反向,实际内积 {:.4}(位移 ({:.3},{:.3}))",
+            align,
+            delta[0],
+            delta[1]
+        );
+    }
+
     /// 转向必须产生侧向速度(漂移),且不给舵时侧向速度衰减回 0。
     #[test]
     pub(crate) fn steering_produces_lateral_slip() {
@@ -303,9 +421,16 @@ mod tests {
             pos[0],
             c.get_lane_x()
         );
+        // 朝向必须与**行驶方向**一致,而不是与某个写死的角度表达式一致。
+        // 判据是几何:车头(`yaw_forward`)必须指向 `direction` 说的方向。
+        // 轴 0 = 沿 Z 行驶,所以 `direction` 就是 z 的符号。
+        let heading: [f32; 2] = [0.0, c.get_direction()];
+        let fwd: [f32; 2] = crate::orient::yaw_forward(c.get_yaw());
         assert!(
-            (c.get_yaw() - c.get_direction() * -FRAC_PI_2).abs() < 1e-5,
-            "AI 巡航的朝向必须仍由行驶方向推出"
+            (fwd[0] - heading[0]).abs() < 1e-5 && (fwd[1] - heading[1]).abs() < 1e-5,
+            "AI 巡航的车头必须指向行驶方向,实得车头 {:?} 行驶方向 {:?}",
+            fwd,
+            heading
         );
     }
 
@@ -346,7 +471,7 @@ mod tests {
         assert!(moved > 0.5, "倒车必须真的把车往后挪,实际只挪了 {} m", moved);
         // 倒车的位移必须与车头**相反**:点积为负。
         let yaw: f32 = c.get_yaw();
-        let forward: [f32; 2] = [yaw.cos(), -yaw.sin()];
+        let forward: [f32; 2] = crate::orient::yaw_forward(yaw);
         let delta: [f32; 2] = [end[0] - start[0], end[2] - start[2]];
         let along: f32 = forward[0] * delta[0] + forward[1] * delta[1];
         assert!(

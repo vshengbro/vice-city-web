@@ -26,6 +26,7 @@ mod r#enemy;
 mod r#game;
 mod r#interior;
 mod r#mesh;
+mod r#orient;
 mod r#player;
 mod r#render;
 mod r#spawn;
