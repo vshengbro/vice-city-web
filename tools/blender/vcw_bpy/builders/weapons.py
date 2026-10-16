@@ -113,6 +113,28 @@ def _bevel(width: float) -> float:
     return max(BEVEL_MIN, min(width, BEVEL_MAX))
 
 
+def _safe_bevel(width: float, size: Sequence[float]) -> float:
+    """Clamp a chamfer so it cannot exceed the geometry it is cut into.
+
+    `_bevel` alone is the bug this function exists to fix. It clamps only
+    into an absolute 8-25 mm band, which is right for a 30 cm receiver and
+    catastrophic for a 4 mm serration rib: a bevel wider than the part's own
+    smallest dimension collapses the whole edge ring onto a plane, and the
+    next `transform_apply` quantises those coincident verts into literally
+    identical positions. The mesh then carries zero-area quads, which
+    triangulate into zero-area triangles — the "scattered pale fragments" on
+    `wep_tank` and the "detached magazine" on `wep_smg`.
+
+    Measured on `wep_pistol`: 402 zero-area faces across 25 parts, every one
+    of them a `_block` thinner than 2x its own chamfer. Capping the chamfer at
+    40% of the smallest dimension (a normal manufacturing rule — you cannot
+    chamfer more than half an edge without destroying it) removes the cause
+    rather than welding the symptom afterwards.
+    """
+    smallest = min(abs(float(a)) for a in size) or BEVEL_MIN
+    return max(1e-4, min(_bevel(width), smallest * 0.4))
+
+
 # ---------------------------------------------------------------------------
 # geometry helpers on top of the kernel primitives
 # ---------------------------------------------------------------------------
@@ -144,7 +166,7 @@ def _rbox(
     negative one.)
     """
     obj = K.cube(name, size=size, location=(0.0, 0.0, 0.0), material=material,
-                 bevel=_bevel(bevel), bevel_segments=bevel_segments)
+                 bevel=_safe_bevel(bevel, size), bevel_segments=bevel_segments)
     obj.rotation_euler = tuple(math.radians(a) for a in rot)
     K.transform_apply(obj)
     obj.location = location
@@ -332,6 +354,7 @@ def _radial_bar(
     phi_deg: float,
     material: bpy.types.Material | None,
     bevel: float = 0.008,
+    z: float = 0.0,
 ) -> bpy.types.Object:
     """A bar running parallel to Y at angular station `phi_deg` around Y.
 
@@ -344,14 +367,24 @@ def _radial_bar(
     The bar is built at the world origin, swung about the Y axis to its
     station, and only then pushed out to `offset`; translating first and
     rotating after would swing it through the tube's own axis and bury it.
+
+    **`z` is the axis height and it defaults to 0, which is a trap.** This
+    helper builds in a plane through the WORLD ORIGIN, so a caller with a tube
+    whose axis sits at bore height gets a ring of bars down at z=0 unless it
+    passes `z` explicitly. `build_tank`'s 16 bell gussets were built that way
+    and ended up scattered around the origin at radii of 0.006-0.174 m,
+    reading in the preview as loose pale chips falling off the launcher.
+    Every caller passes `z` now; the default stays 0 so the existing
+    z-at-origin callers keep working unchanged.
     """
     phi = math.radians(phi_deg)
     obj = K.cube(name, size=(thickness, length, width),
                  location=(0.0, 0.0, 0.0), material=material,
-                 bevel=_bevel(bevel), bevel_segments=1)
+                 bevel=_safe_bevel(bevel, (thickness, length, width)),
+                 bevel_segments=1)
     obj.rotation_euler = (0.0, -phi, 0.0)
     K.transform_apply(obj)
-    obj.location = (offset * math.cos(phi), y, offset * math.sin(phi))
+    obj.location = (offset * math.cos(phi), y, z + offset * math.sin(phi))
     K.transform_apply(obj)
     return obj
 
@@ -641,7 +674,7 @@ def build_smg(
         parts.append(_radial_bar(
             f"{asset_id}_shroud_rib{i}", offset=0.0190, y=-0.199,
             length=0.112, thickness=0.008, width=0.015,
-            phi_deg=30.0 * i, material=steel))
+            phi_deg=30.0 * i, material=steel, z=bh))
     for tag, yy in (("front", -0.258), ("rear", -0.140)):
         parts.append(_tube(f"{asset_id}_shroud_band_{tag}", 0.0212, 0.010,
                            (0.0, yy, bh), bright, vertices=36))
@@ -1082,7 +1115,16 @@ def build_tank(
     parts.append(_tube(f"{asset_id}_bell_bore", 0.0880, 0.010,
                        (0.0, bell_front + 0.012, bh), rubber, vertices=44))
     # gusset rings on the flare: offset = the cone's LOCAL radius there, so
-    # each block bites into the cone instead of floating off it
+    # each block bites into the cone instead of floating off it.
+    #
+    # `_radial_bar` builds around the origin, and the bell's axis is at
+    # z = bh — so every gusset MUST be raised to the bore height afterwards.
+    # It was not, and the result was 16 loose blocks scattered around the
+    # world origin at radii of 0.006-0.174 m instead of a ring at 0.078 m:
+    # in the preview they read as detached pale chips raining off the
+    # launcher ("scattered pale fragments", 887 zero-area faces nearby).
+    # Every other radial detail in this module goes through `_radial_bar`
+    # too, so the fix belongs in the helper — see its own docstring.
     for station, y_local in enumerate((bell_front + 0.095, bell_front + 0.165)):
         frac = (y_local - bell_rear) / (bell_front - bell_rear)
         r_local = tube_r + (bell_r - tube_r) * frac
@@ -1091,7 +1133,7 @@ def build_tank(
                 f"{asset_id}_bell_gusset{station}_{i}",
                 offset=r_local + 0.004, y=y_local, length=0.030,
                 thickness=0.010, width=0.020, phi_deg=45.0 * i,
-                material=bell, bevel=0.010))
+                material=bell, bevel=0.010, z=bh))
     for tag, yy in (("front", -0.200), ("rear", 0.240)):
         parts.append(_tube(f"{asset_id}_tube_band_{tag}", 0.0500, 0.018,
                            (0.0, yy, bh), bell, vertices=44))
@@ -1103,7 +1145,7 @@ def build_tank(
         parts.append(_radial_bar(
             f"{asset_id}_vent_block{i}", offset=vent_local_r + 0.005,
             y=vent_local, length=0.026, thickness=0.014, width=0.020,
-            phi_deg=60.0 * i, material=steel))
+            phi_deg=60.0 * i, material=steel, z=bh))
 
     # --- blast deflector: wedge plate plus two canted wings --------------
     parts.append(_rbox(f"{asset_id}_blast_plate", (0.104, 0.018, 0.132),

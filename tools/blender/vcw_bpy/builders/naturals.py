@@ -82,6 +82,15 @@ GROUND_TOLERANCE = 1e-6
 # of bevelling. 12 is therefore the smallest ring that behaves.
 BEVEL_SAFE_RING = 12
 
+# Which local axis a primitive is authored along, for `_frame`'s `track`.
+#
+# `K.cone` is `primitive_cone_add`, which builds along local +Z.  The scaled
+# spheres and cubes in this module are authored long-axis-X on purpose, so that
+# `reach`/`span` reads as a length rather than a half-length.  Both exist, which
+# is why `track` is passed per call site instead of being a module-wide guess.
+AXIS_Z = "Z"
+AXIS_X = "X"
+
 
 # --- deterministic variation ------------------------------------------------
 #
@@ -112,32 +121,59 @@ def _unit(v: Sequence[float] | Vector) -> Vector:
 # --- orientation ------------------------------------------------------------
 
 
-def _frame(direction: Vector, flat_axis: Vector | None = None) -> Matrix:
-    """An orthonormal frame whose local +X runs along `direction`.
+def _frame(direction: Vector, flat_axis: Vector | None = None,
+           track: str = AXIS_Z) -> Matrix:
+    """An orthonormal frame that aims the requested local axis along `direction`.
 
-    `mathutils`' `to_track_quat` degenerates when the tracked axis points along
-    its own up reference (a near-vertical grass blade tracked against world +Z),
-    so the frame is built explicitly: project the requested reference into the
-    plane perpendicular to the direction, and take Y as Z cross X so the basis is
-    right-handed (X cross Y == Z) and therefore a pure rotation, determinant +1.
+    WHICH local axis matters, and there is no single right answer in this
+    module, because the primitives disagree about the axis they are authored
+    along:
 
-    `flat_axis` is the world direction the returned local +Z should lean toward.
-    It is what makes a frond face the sky.
+    * `K.cone` is `bpy.ops.mesh.primitive_cone_add`, whose axis is local **+Z**.
+    * every scaled sphere and cube below is authored long-axis-**X** --
+      `scale=(span * 0.5, w, w * 0.22)` for a frond blade,
+      `size=(span, width * taper, width * 0.20)` for a grass plate.
+
+    So `track` is an explicit argument at each call site rather than a
+    module-wide guess.  Guessing it once, wrongly, is what laid every palm
+    stem segment on its side: a palm built as a chain of `K.cone` frustums
+    aimed at +X is a chain of cylinders lying down, and the whole boulevard
+    reads as a pile of crossbars.  Guessing the other way shrank
+    flower_cluster's spread from 0.93 m to 0.53 m, because its leaves and
+    petals are spheres.  Neither mistake is caught by the pipeline's
+    count/volume/winding checks -- a rotation is a rotation either way -- so
+    each caller has to state which axis its own primitive is built along.
+
+    `mathutils`' `to_track_quat` degenerates when the tracked axis points
+    along its own up reference (a near-vertical grass blade tracked against
+    world +Z), so the frame is built explicitly: project the requested
+    reference into the plane perpendicular to the direction, and take Y as Z
+    cross X so the basis is right-handed (X cross Y == Z) and therefore a pure
+    rotation, determinant +1.
+
+    `flat_axis` is the world direction the non-tracked "thin" local axis should
+    lean toward.  It is what makes a frond face the sky.
     """
-    x_axis = _unit(direction)
+    aim = _unit(direction)
 
     ref = _unit(flat_axis) if flat_axis is not None else Vector((0.0, 0.0, 1.0))
-    if abs(x_axis.dot(ref)) > 0.98:
+    if abs(aim.dot(ref)) > 0.98:
         # Perpendicular fallback: the reference has collapsed onto the blade's
         # own axis, so pick any axis that has not.
         for candidate in (Vector((1.0, 0.0, 0.0)), Vector((0.0, 1.0, 0.0)),
                           Vector((1.0, 1.0, 0.0))):
-            if abs(x_axis.dot(candidate)) < 0.98:
+            if abs(aim.dot(candidate)) < 0.98:
                 ref = _unit(candidate)
                 break
 
-    z_axis = _unit(ref - x_axis * ref.dot(x_axis))
-    y_axis = _unit(z_axis.cross(x_axis))
+    # `across` becomes whichever local axis is NOT the tracked one, and Y is
+    # then forced to aim cross across so X cross Y == Z holds for both choices.
+    across = _unit(ref - aim * ref.dot(aim))
+    y_axis = _unit(aim.cross(across))
+    if track == AXIS_X:
+        x_axis, z_axis = aim, across
+    else:
+        x_axis, z_axis = across, aim
     return Matrix((
         (x_axis.x, y_axis.x, z_axis.x),
         (x_axis.y, y_axis.y, z_axis.y),
@@ -158,25 +194,31 @@ def _move(obj: bpy.types.Object, location: Sequence[float] | Vector) -> bpy.type
 
 
 def _place(obj: bpy.types.Object, direction: Vector, location: Sequence[float] | Vector,
-           flat_axis: Vector | None = None) -> bpy.types.Object:
+           flat_axis: Vector | None = None, track: str = AXIS_X) -> bpy.types.Object:
     """Orient `obj` along `direction` and put its ORIGIN at `location`, baked.
+
+    `track` is the local axis `obj` is authored along -- see [`AXIS_X`].
 
     Every part is constructed at (0, 0, 0) first, rotated about its own origin
     and only then translated. Setting world location and rotation together would
     spin the part around its own offset instead of around its own axis, which
     throws petals and fronds metres away.
     """
-    obj.rotation_euler = _frame(direction, flat_axis).to_euler()
+    obj.rotation_euler = _frame(direction, flat_axis, track).to_euler()
     K.transform_apply(obj)
     return _move(obj, location)
 
 
 def _aim(obj: bpy.types.Object, direction: Vector, anchor: Vector, reach: float,
-         flat_axis: Vector | None = None) -> bpy.types.Object:
+         flat_axis: Vector | None = None, track: str = AXIS_Z) -> bpy.types.Object:
     """Orient `obj` along `direction` and stretch it forward FROM `anchor`.
 
     `anchor` lands on the object's own **near cap** (radius1) and the geometry
     then runs `reach` further along `direction`.
+
+    `track` is the local axis `obj` is authored along -- see [`AXIS_X`].  The
+    default is +Z because the default caller is a `K.cone` frustum; the
+    scaled-sphere and cube callers pass `AXIS_X`.
 
     `K.cone`/`K.cylinder` build their mesh **centred on `location`** and then
     bake the transform, so the object's centre is its mid-depth, not its
@@ -192,9 +234,9 @@ def _aim(obj: bpy.types.Object, direction: Vector, anchor: Vector, reach: float,
     # lay the part on its side, turning a 1.28 x 1.28 x 0.399 flare into
     # 0.399 x 1.28 x 1.28 and driving half of it below the anchor. Only rotate
     # when the direction genuinely differs from local +Z.
-    if d.dot(Vector((0.0, 0.0, 1.0))) > 0.9999:
+    if track == AXIS_Z and d.dot(Vector((0.0, 0.0, 1.0))) > 0.9999:
         return _move(obj, Vector(anchor) + d * (reach * 0.5))
-    return _place(obj, d, Vector(anchor) + d * (reach * 0.5), flat_axis)
+    return _place(obj, d, Vector(anchor) + d * (reach * 0.5), flat_axis, track)
 
 
 def _soften(obj: bpy.types.Object, angle: float = 35.0) -> bpy.types.Object:
@@ -331,7 +373,7 @@ def _frond(asset_id: str, index: int, origin: Vector, azimuth: float,
             location=(0.0, 0.0, 0.0), material=mat,
             scale=(span * 0.5, w, w * 0.22),
         )
-        parts.append(_aim(blade, chord, base, span, flat_axis=sky))
+        parts.append(_aim(blade, chord, base, span, flat_axis=sky, track=AXIS_X))
         prev = along
     return parts
 
@@ -586,7 +628,7 @@ def build_flower_cluster(
             scale=(reach * 0.5, spread * 0.072, spread * 0.015),
         )
         direction = out * math.cos(elev) + Vector((0.0, 0.0, 1.0)) * math.sin(elev)
-        parts.append(_aim(leaf, direction, anchor, reach))
+        parts.append(_aim(leaf, direction, anchor, reach, track=AXIS_X))
 
     for i in range(blossoms):
         azimuth = math.radians(
@@ -609,7 +651,7 @@ def build_flower_cluster(
             depth=(head - root).length * 1.15, vertices=BEVEL_SAFE_RING,
             location=(0.0, 0.0, 0.0), material=green, smooth=False,
         )
-        _place(stem, head - root, (head + root) * 0.5)
+        _place(stem, head - root, (head + root) * 0.5, track=AXIS_Z)
         K.add_bevel(stem, width=stem_r * 0.32, segments=1)
         _soften(stem, 38.0)
         parts.append(stem)
@@ -634,7 +676,8 @@ def build_flower_cluster(
                 segments=6, ring_count=3, location=(0.0, 0.0, 0.0), material=mat,
                 scale=(petal_len * 0.62, petal_len * 0.30, petal_len * 0.11),
             )
-            parts.append(_place(petal, out, head + out * (petal_len * 0.72)))
+            parts.append(_place(petal, out, head + out * (petal_len * 0.72),
+                                track=AXIS_X))
 
     _assert_rests_on_zero(parts, asset_id)
     return P.finish(parts)
@@ -751,7 +794,8 @@ def build_grass_patch(
                 location=(0.0, 0.0, 0.0), material=green,
                 bevel=width * 0.05, bevel_segments=1,
             )
-            parts.append(_aim(plate, chord, anchor, span, flat_axis=outward))
+            parts.append(_aim(plate, chord, anchor, span, flat_axis=outward,
+                              track=AXIS_X))
             prev = along
 
     _assert_rests_on_zero(parts, asset_id)

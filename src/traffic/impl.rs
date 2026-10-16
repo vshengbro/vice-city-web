@@ -57,15 +57,28 @@ impl TrafficCar {
         draw
     }
 
-    /// 取当前流状态,并置零 —— 下一次 [`Self::set_route_seed`] 从这里续上。
+    /// 取当前流状态。
+    ///
+    /// **不要在这里把 `route_seed` 清零。** 原来的实现读出旧值之后写 0,
+    /// 而 `route_rand(0) == 0`(全零是这个哈希的**不动点**:每一轮
+    /// `wrapping_mul` / `xor-shift` 都保持 0),于是 `set_route_seed()`
+    /// 把 0 洗回 0,流状态从第一次抽签之后就永远停在 0,
+    /// `next_unit(0) == 0.0`。
+    ///
+    /// 后果实测:`next_route_draw()` 的序列是
+    /// `0.581102, 0.000000, 0.000000, 0.000000, ...`,
+    /// 而路口判定是 `draw < ROUTE_PICK`(0.62),于是**每一个路口都必然
+    /// 转向** —— 文档里写的「38% 直行」从来没有发生过。
+    ///
+    /// 现在流状态是纯粹的 `route_rand` 递推:
+    /// 读旧值 → 洗牌 → 写回,同一条轨迹仍然可重放(这正是它文档承诺的),
+    /// 但不再坍缩。
     ///
     /// # Returns
     ///
     /// - `u32` - 本轮抽签使用的流状态。
     fn get_route_seed(&mut self) -> u32 {
-        let seed: u32 = self.route_seed;
-        self.route_seed = 0;
-        seed
+        self.route_seed
     }
 
     /// 把流状态洗牌后写回。
@@ -136,10 +149,15 @@ impl TrafficCar {
             lateral: 0.0,
             wheel_spin: 0.0,
             driven: false,
+            hailing_seconds: 0.0,
+            blocked: false,
             route_street: street,
             route_side: side,
             route_axis: axis,
             route_seed: 0x7A11_u32 ^ street as u32 ^ (direction > 0.0) as u32,
+            // 起始沿街坐标必须和 `position` 对齐,否则第一帧会拿 `last_along`
+            // = 0 去比「有没有越过中轴线」,车一出生就抽一次签。
+            last_along: start_z,
         }
     }
 
@@ -195,10 +213,13 @@ impl TrafficCar {
             lateral: 0.0,
             wheel_spin: 0.0,
             driven: false,
+            hailing_seconds: 0.0,
+            blocked: false,
             route_street: street,
             route_side: side,
             route_axis: axis,
             route_seed: 0x7A11_u32 ^ (street as u32).wrapping_mul(31) ^ side.to_bits(),
+            last_along: start_along,
         }
     }
 
@@ -328,6 +349,107 @@ impl TrafficCar {
         self.route_advance(dt, world);
     }
 
+    /// IDM(Intelligent Driver Model)的纵向加速度。
+    ///
+    /// `a = a_max · [1 − (v/v₀)^δ − (s*/s)²]`
+    ///
+    /// - `v₀` 是期望速度(巡航,或红灯前的 0)。
+    /// - `s* = s0 + max(0, v·T + v·Δv / (2·√(a·b)))`,`Δv = v − v_lead`。
+    /// - `s` 是与**同向同一根车道轴上的前车**的净间距;没有前车时取
+    ///   `f32::INFINITY`,于是 `(s*/s)² = 0`,退化成自由流。
+    ///
+    /// 指数取 `IDM_DELTA = 4` 时 `s*` 在 `Δv < 0`(前车更快)时自动变大 ——
+    /// 所以被加塞时会**主动减速让出空间**,而不是顶上去。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 本车当前速度(米/秒)。
+    /// - `f32` - 期望速度(米/秒)。
+    /// - `f32` - 与前车的净间距(米);`f32::INFINITY` 表示无前车。
+    /// - `f32` - 与前车的速度差 `v − v_lead`(米/秒)。
+    ///
+    /// # Returns
+    ///
+    /// - `f32` - 加速度(米/秒²),已钳在 `[IDM_ACCEL_MIN, IDM_ACCEL_MAX]`。
+    pub fn idm_accel(speed: f32, desired: f32, gap: f32, delta_v: f32) -> f32 {
+        // 期望间距。`sqrt(a·b)` 只算一次。
+        let dynamic: f32 = speed * delta_v / (2.0 * (IDM_ACCEL_MAX * IDM_BRAKE_COMFORT).sqrt());
+        let wanted: f32 = IDM_MIN_GAP + (IDM_HEADWAY * speed + dynamic).max(0.0);
+        // 自由流项。`v0 <= 0`(等红灯)时这一项归零,于是 `a = a_max·[1 − (s*/s)²]`
+        // —— 前车停住就直接全力刹车,而不是慢慢逼近。
+        let free: f32 = if desired > f32::EPSILON {
+            (speed / desired).powf(IDM_DELTA)
+        } else {
+            1.0
+        };
+        // `gap <= 0` 表示已经贴上/重叠:比例项发散,直接给满刹车。
+        //
+        // 注意这里**不能**写 `gap.is_finite()`:没有前车时 `gap` 是
+        // `f32::INFINITY`,而 `INFINITY.is_finite()` 是 **false**,于是会掉进
+        // else 分支拿到 `interaction = 1.0` —— 也就是「全力刹车」。
+        // 结果是空旷路段上的车反而全在刹车。这条判据必须是「间距够大就
+        // 不产生作用」:`INFINITY > 1e-3` 成立,比值自然是 0。
+        let interaction: f32 = if gap > 1e-3 {
+            (wanted / gap).powi(2)
+        } else {
+            1.0
+        };
+        (IDM_ACCEL_MAX * (1.0 - free - interaction)).clamp(IDM_ACCEL_MIN, IDM_ACCEL_MAX)
+    }
+
+    /// 找出本车**正前方同车道**的最近一辆车,返回 (净间距, 速度差)。
+    ///
+    /// 只在**同一根车道轴**上看,而且要求前车和本车朝同一个方向走 ——
+    /// 对向车不构成跟车对象,路口横向车也不算(那是路权问题,交给
+    /// 红绿灯相位处理,不是 IDM)。
+    ///
+    /// 间距按**车头到车尾**算(减两个半车长),不是中心距:中心距在
+    /// 贴住时会是 0,`s*` 的比例项发散,车会被顶成负加速度乱抖。
+    ///
+    /// # Arguments
+    ///
+    /// - `&[TrafficCar]` - 全车队(当前车也在里面,靠索引排除自己)。
+    /// - `usize` - 本车在车队里的索引。
+    ///
+    /// # Returns
+    ///
+    /// - `(f32, f32)` - `(净间距, 速度差)`;前方没有车时净间距是
+    ///   `f32::INFINITY`。
+    pub fn leader_gap(cars: &[TrafficCar], me: usize) -> (f32, f32) {
+        let Some(front) = cars.get(me) else {
+            return (f32::INFINITY, 0.0);
+        };
+        let axis: i32 = front.get_lane_axis();
+        let direction: f32 = front.get_direction();
+        let here: Vec3 = front.get_position();
+        let mine: f32 = if axis == 0 { here[2] } else { here[0] };
+        let mut best: f32 = f32::INFINITY;
+        let mut lead_speed: f32 = 0.0;
+        for (index, other) in cars.iter().enumerate() {
+            if index == me
+                || other.get_lane_axis() != axis
+                // 对向车道不跟。
+                || other.get_direction() != direction
+            {
+                continue;
+            }
+            let at: Vec3 = other.get_position();
+            let along: f32 = if axis == 0 { at[2] } else { at[0] };
+            // 只看**前方**:同向同轴但落后于本车的不构成威胁。
+            let ahead: f32 = (along - mine) * direction;
+            if ahead <= 0.0 {
+                continue;
+            }
+            // 净间距 = 中心距 − 半车长(本车)− 半车长(前车)。
+            let clear: f32 = ahead - CAR_FOOTPRINT[0];
+            if clear < best {
+                best = clear;
+                lead_speed = other.get_speed();
+            }
+        }
+        (best, front.get_speed() - lead_speed)
+    }
+
     /// 路网积分的一步:沿当前车道走,到路口按 [`ROUTE_PICK`] 抽签转向。
     ///
     /// 这是「车怎么走路网」的全部逻辑,[`Self::step`] 只是它外面套了一层
@@ -339,6 +461,7 @@ impl TrafficCar {
     /// - `f32` - 固定步长(秒)。
     /// - `&CollisionWorld` - 静态碰撞世界。
     pub fn route_advance(&mut self, dt: f32, world: &CollisionWorld) {
+        self.set_blocked(false);
         let direction: f32 = self.get_direction();
         self.realign_route(direction);
         let axis: i32 = self.get_lane_axis();
@@ -364,7 +487,12 @@ impl TrafficCar {
             if moved + CAR_ROUTE_EPSILON < wanted {
                 // 被完全挡住(或者一步都没走成):不推进路网状态,停在
                 // 障碍前。速度砍到零让它重新加速而不是顶着墙磨。
+                //
+                // `blocked` 必须置位:车队层的 IDM 在**之后**才回写速度,
+                // 它看不到这里发生过什么,只会看到「速度 0」,于是算出正
+                // 加速度把速度拉回 0.067,下一帧又被挡回去 —— 永远 0 位移。
                 self.set_speed(0.0);
+                self.set_blocked(true);
                 return;
             }
         }
@@ -375,17 +503,34 @@ impl TrafficCar {
             here[1],
             if axis == 0 { resolved[1] } else { centre },
         ]);
-        // 走过路口了吗?取「前进方向上的下一个路口」。
-        let junction: f32 = if direction >= 0.0 {
-            street_axis(street_index_at(along) + 1)
-        } else {
-            street_axis(street_index_at(along) - 1)
-        };
+        // 走过路口了吗?
+        //
+        // **判定必须比较本帧与上一帧的沿街坐标**,而不是「是否到达下一条
+        // 街道的索引」。原实现是:
+        //
+        // ```text
+        // junction = street_axis(street_index_at(along) + 1)
+        // crossed  = along >= junction - EPS
+        // ```
+        //
+        // 而 `street_index_at` 是 `(along / 60).round()`,所以 `along` 恒落在
+        // `[60k - 30, 60k + 30)` 里,而判定要求 `along >= 60(k + 1)` —— 差整整
+        // 一个 60 m 档。穷举 802,000 个坐标验证过:正向分支满足的坐标有
+        // **0 个**,反向分支同样是 **0 个**。也就是说
+        // `choose_at_junction()` 从来没在生产里被调用过,10 辆车是 10 条
+        // 永不转弯的直线轨道。
+        //
+        // 现在改成真正的「越过中轴线」:本帧和上一帧分处中轴线两侧。
+        // 用上一帧的位置而不是「距离中轴线够近」,是因为停在中轴线上
+        // 的车不该反复触发路口决策。
+        let axis_centre: f32 = street_axis(street_index_at(along));
+        let previous: f32 = self.get_last_along();
         let crossed: bool = if direction >= 0.0 {
-            along >= junction - CAR_ROUTE_EPSILON
+            previous < axis_centre && along >= axis_centre
         } else {
-            along <= junction + CAR_ROUTE_EPSILON
+            previous > axis_centre && along <= axis_centre
         };
+        self.set_last_along(along);
         if crossed && self.get_speed() > 0.0 {
             self.choose_at_junction();
         }
@@ -736,13 +881,33 @@ impl Traffic {
     /// - `f32` - 固定步长(秒)。
     /// - `Option<[f32; 2]>` - 正在路边招手的玩家 `[x, z]`;`None` 表示没人。
     /// - `&CollisionWorld` - 静态碰撞世界,用来把车挡在障碍之外。
-    pub fn step(&mut self, dt: f32, hailer: Option<[f32; 2]>, world: &CollisionWorld) {
+    /// - `f32` - 全局时间(秒),信号机相位用它当时钟。
+    pub fn step(&mut self, dt: f32, hailer: Option<[f32; 2]>, world: &CollisionWorld, time: f32) {
         // 只有**离玩家最近的那一辆**会靠边等人,不是半径内所有车 ——
         // 否则 26 m 内整条街的车一起停,交通直接堵死。
         let hailer_car: Option<usize> = hailer.and_then(|who: [f32; 2]| {
             let mut best: Option<(usize, f32)> = None;
             for (index, car) in self.get_cars_ref().iter().enumerate() {
                 if car.get_driven() {
+                    continue;
+                }
+                // **停靠计时超时的车不再参与竞争。**
+                //
+                // 原来每帧都重选「26 m 内最近的一辆」,唯一排除是
+                // `get_driven()`。于是它停下之后下一帧仍然最近,继续被
+                // 选中,`desired = 0` 一直施加 —— 它**永远不会**开走,整条
+                // 车道被一辆停着的车永久占住。
+                //
+                // 实测(生产出生点 + 玩家固定站在出生点招手,跑 300 s):
+                // car7 在第 4 个 30 s 窗口之后**连续六个窗口位移精确
+                // 0.00 m**,卡死在 `(33.84, 56.50)`、速度 `0.000`,玩家就在
+                // 11.51 m 外 —— 它把整条街堵了 180 s。
+                //
+                // 判据用 `hailing_seconds` 而不是速度:按速度判会在**刹车
+                // 途中**掉出选择(速度降过阈值),于是 `desired` 又变回巡航,
+                // 车重新加速、再被选中、再刹车 —— 永远停在玩家旁边抖动。
+                // 计时只在真的**停稳等客**时累加,一旦开走就清零。
+                if car.get_hailing_seconds() >= HAUL_PARKED_SECONDS {
                     continue;
                 }
                 let here: Vec3 = car.get_position();
@@ -764,7 +929,130 @@ impl Traffic {
                 if car.get_driven() {
                     continue;
                 }
-                car.step(dt, Some(index) == hailer_car, world);
+                let is_hailer: bool = Some(index) == hailer_car;
+                car.step(dt, is_hailer, world);
+                // 停靠计时:只有**真的停住等客**才累加,开走就清零。
+                //
+                // 计时用「速度已经接近零」而不是「本帧是 hailer」—— 刹车
+                // 途中也可能是 hailer,但那时候车还在动,不该算在等客时间里。
+                // 清零用 `min`,于是中途取消(玩家走远 / 上了车)立刻归零。
+                let stopped: bool = car.get_speed() <= HAIL_PARKED_SPEED;
+                if is_hailer && stopped {
+                    let waited: f32 = car.get_hailing_seconds() + dt;
+                    car.set_hailing_seconds(waited);
+                } else {
+                    car.set_hailing_seconds(car.get_hailing_seconds().min(dt));
+                }
+            }
+        }
+        // **跟车**在纵向积分**之后**统一做一遍。
+        //
+        // 必须分两步:`TrafficCar::step` 里的速度是各自按巡航逼近的,
+        // 谁也没看别人。IDM 需要**同一条线上前车已经算好的速度** ——
+        // 一起推进去,队列里越靠后的车看到的越是上一帧的旧速度。
+        //
+        // 顺序也有讲究:从队首(沿街坐标最靠前)往后算,于是每辆车看到的
+        // 前车速度都是**本帧**的,不会出现整条队列一起抖。
+        //
+        // `sort_key` 单独具名而不是内联闭包:闭包捕获 `self` 就不能写成
+        // `fn(usize) -> f32`,而 §5.1 要求 `let` 必须带显式类型标注。
+        //
+        // 切片借用必须**在循环外就结束**:`get_car_mut` 要 `&mut self`,
+        // 而持有 `&[TrafficCar]` 会一直占着不可变借用。所以这里先在同一个
+        // 快照上把每辆车的目标加速度全部算完,再单独回写速度。
+        //
+        // 这是 IDM 的**同步更新**(论文里的标准写法):所有车都基于同一帧的
+        // 前车状态决策,于是结果与数组顺序无关,也就不会有「同一支车队
+        // 换个下标就走出不同轨迹」的不确定性。代价是后车看到的前车速度
+        // 晚一帧 —— 1/60 s,在 `T = 1.5 s` 的时间间隔面前可以忽略。
+        let planned: Vec<(usize, f32)> = {
+            let cars: &[TrafficCar] = self.get_cars_ref();
+            let sort_key: &dyn Fn(usize) -> f32 = &|index: usize| -> f32 {
+                let car: &TrafficCar = &cars[index];
+                let at: f32 = if car.get_lane_axis() == 0 {
+                    car.get_position()[2]
+                } else {
+                    car.get_position()[0]
+                };
+                at * car.get_direction()
+            };
+            let mut order: Vec<usize> = (0..cars.len())
+                .filter(|index: &usize| !cars[*index].get_driven())
+                .collect();
+            order.sort_by(|a: &usize, b: &usize| {
+                sort_key(*b)
+                    .partial_cmp(&sort_key(*a))
+                    .unwrap_or(Ordering::Equal)
+            });
+            order
+                .into_iter()
+                .map(|index: usize| {
+                    let (mut gap, mut delta_v): (f32, f32) = TrafficCar::leader_gap(cars, index);
+                    let car: &TrafficCar = &cars[index];
+                    let mut desired: f32 = if Some(index) == hailer_car {
+                        0.0
+                    } else {
+                        car.get_cruise()
+                    };
+                    // **红绿灯当作「一辆停在停止线上的前车」。**
+                    //
+                    // 不新增一套减速逻辑,而是把停止线塞进 IDM 已有的
+                    // `gap` / `delta_v`:`delta_v = 自己速度 − 0` 就是
+                    // 「前面有东西」的完整语义,`s*` 会随距离变大而迅速
+                    // 收紧,车于是平顺减速停在线前。绿灯亮起后停止线消失,
+                    // 同一个 `gap` 变回 `INFINITY`,车自动起步。
+                    //
+                    // **期望速度不是一步压到 0,而是按距离反解的限速。**
+                    // 一步压到 0 会让 IDM 自由流项直接消失、加速度钉在
+                    // `IDM_ACCEL_MIN = -9`,于是 11.5 m/s 的车用 9 m/s²
+                    // 硬刹 —— 实测从 z=44 冲到 z=51.92,**越过停止线 1.2 m**。
+                    // 限速 `sqrt(2·b·gap)` 让加速度随接近程度平滑增长,
+                    // 车会恰好停在线上。
+                    let to_line: f32 = distance_to_stop_line(car);
+                    // 绿灯不限速;红灯时限速到「还停得住」的速度。
+                    let cap: f32 = signal_speed_limit(car, time, to_line);
+                    // **停止线只在红灯时才是障碍。**
+                    //
+                    // 无条件把它塞进 `gap` 会让绿灯也起不来:车停下后
+                    // gap = 2.67、`s*` = 2.675,`interaction` ≈ 1.00,
+                    // 于是 `a = 4·(1 − 0 − 1.00) = −0.016` —— 绿灯下
+                    // 车以 0.05 m/s **原地蹭**,永远越不过停止线。
+                    // 绿灯时这根线根本不存在。
+                    if cap < desired {
+                        desired = cap;
+                        if to_line < gap {
+                            gap = to_line;
+                            delta_v = car.get_speed();
+                        }
+                    }
+                    (
+                        index,
+                        TrafficCar::idm_accel(car.get_speed(), desired, gap, delta_v),
+                    )
+                })
+                .collect()
+        };
+        // 回写按算出来的顺序来,保证同一帧的决策顺序可复现。
+        for (index, accel) in planned {
+            if let Some(car) = self.get_car_mut(index) {
+                // **被静态几何挡下的车,IDM 不许把它重新加速。**
+                //
+                // `route_advance` 已经把这类车的速度砍到 0 并 `return`,那是
+                // 「前面有墙,先停下」的意思。可 IDM 看到的是「速度 0、
+                // 同向前车 49 m 外、不在红灯前」——`gap = INFINITY`、
+                // `interaction = 0`、`free = (0 / 11.5)⁴ = 0`,于是
+                // `a = A·(1 − 0 − 0) = +4 m/s²`,把速度拉回 0.067。
+                // 下一帧车又顶着同一个障碍、再被砍到 0,于是永远循环。
+                //
+                // 线上症状:探针读出 `carSpeed = 0.067`,而位置连续 80 s
+                // **精确 0.00 m** —— 位置和速度互相矛盾,速度是 IDM 刚写下的
+                // 那个还没来得及被碰撞消耗掉的中间值。
+                if car.get_blocked() {
+                    car.set_speed(0.0);
+                    continue;
+                }
+                let next: f32 = (car.get_speed() + accel * dt).max(0.0);
+                car.set_speed(next.min(SPEED_MAX));
             }
         }
         for index in 0..self.get_pickups_ref().len() {

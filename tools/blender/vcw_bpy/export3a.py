@@ -365,9 +365,21 @@ def write_pbr_glb(asset_id: str, objects: Sequence[bpy.types.Object], pbr_dir: s
 
 
 def write_manifest(assets: Sequence[dict], assets_dir: str, generator: str) -> str:
-    """Manifest the renderer reads first to plan memory and culling."""
-    import collections
+    """Manifest the renderer reads first to plan memory and culling.
 
+    `assets` MUST be a JSON **array** of `{id, category, file}` objects.
+
+    The Rust loader deserialises it into `Manifest { assets: Vec<ManifestEntry> }`
+    (`src/game/struct.rs`), so a flat `{"<id>": <tri_count>}` map fails to
+    parse: every entry is skipped, the scene builds empty, and the failure
+    surfaces only as a silently blank city with no error in the console
+    beyond "manifest parse failed".
+
+    History: commit `bfac59a` corrected the schema **in the committed
+    JSON** but left this generator emitting the old map, so the bug was
+    latent until the next `build_all3a.py` run silently reverted it. This
+    function is now the single source of truth for the shape.
+    """
     categories: dict[str, dict] = {}
     for a in assets:
         cat = a.get("category", "unknown")
@@ -383,7 +395,14 @@ def write_manifest(assets: Sequence[dict], assets_dir: str, generator: str) -> s
         "asset_count": len(assets),
         "tri_count": sum(int(a.get("tri_count", 0)) for a in assets),
         "categories": categories,
-        "assets": {a["id"]: int(a.get("tri_count", 0)) for a in assets},
+        "assets": [
+            {
+                "id": a["id"],
+                "category": a.get("category", "unknown"),
+                "file": a["file"],
+            }
+            for a in assets
+        ],
     }
     path = os.path.join(assets_dir, "manifest.json")
     with open(path, "w", encoding="utf-8") as fh:

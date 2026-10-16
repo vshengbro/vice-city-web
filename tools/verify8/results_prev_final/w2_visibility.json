@@ -1,0 +1,60 @@
+{
+  "worker": "w2_visibility",
+  "results": [
+    {
+      "name": "boot 基线",
+      "ok": null,
+      "note": "frames=27 画布=512x263 (截图 1280x657) sceneMeshes=80 gpu={'meshes': 80, 'oob': 0, 'lastIndexCount': 2256} charVisible=True charBox=[256, 160.6, 256, 125.3, 1]"
+    },
+    {
+      "name": "基线角色框内容",
+      "ok": null,
+      "note": "框 45x88px=3960px | luma min=73.8 max=250.7 极差=176.9 非黑(>4)=3960(100.0%) | charVisible=True 高占比=13.430815141917181%"
+    },
+    {
+      "name": "反向实验机制有效",
+      "ok": true,
+      "note": "只留 limbs 时角色框外变化 581861px(69.52%,最大差190) 阈值>5000px | 隐藏了 38 个批次,只留 38-50 | 噪声底参考:全屏隐藏 limbs 批次只有 ~1308px"
+    },
+    {
+      "name": "只留 limbs 时框内是角色(对比判据)",
+      "ok": false,
+      "note": "框 45x88=3960px:框内 均值 193.6 标准差 38.5 min=75.9 max=254.9 | 紧邻框外 均值 193.3 标准差 39.0 | **均值差 0.3(门限>12)**、**框内比框外更杂 -0.4(门限>+4)** -> 框内与背景在统计上不可区分,看不到物体 | 框内相对基线变化 3272px(82.63%) | charVisible=True 高占比=13.4%"
+    },
+    {
+      "name": "绝对亮度不作判据(已记录的陷阱)",
+      "ok": null,
+      "note": "框内 luma 75.9..254.9,非黑 3960/3960(100%)。初版 worker 拿「极差>40 且非黑>15%」判过 —— **那是假通过**:全图亮度直方图 88% 的像素在同一档,角色区域均值 193.6 与框外 193.3 几乎相同。字符长什么样要 vision 看,亮度算不出来。"
+    },
+    {
+      "name": "框内 vs 框外亮度",
+      "ok": null,
+      "note": "只留 limbs 后:框内非黑 3960px(占框 100%),框外非黑 837000px(占框外 100%)。 **框外非黑占比高说明清屏色本身不是黑的**(天空/雾),所以「隐藏是否生效」只能靠上面的框外**变化** 581861px 来判,不能靠绝对亮度。"
+    },
+    {
+      "name": "limbState 每节有实例",
+      "ok": true,
+      "note": "13 节,n==0 的有 0 节 | torso(b38) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; head(b39) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; hair(b40) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; upper_arm_L(b41) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; lower_arm_L(b42) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; upper_arm_R(b43) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; lower_arm_R(b44) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; upper_leg_L(b45) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; lower_leg_L(b46) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; upper_leg_R(b47) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; lower_leg_R(b48) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; shoe_L(b49) n=1 t=[33.5, 0, 45]|t-玩家=0.00m ; shoe_R(b50) n=1 t=[33.5, 0, 45]|t-玩家=0.00m"
+    },
+    {
+      "name": "limbState 平移对齐玩家",
+      "ok": null,
+      "note": "玩家=(33.5,45);平移与玩家位置的偏差逐节如上 —— n>0 且偏差 <1m 才说明模型矩阵跟着角色走了"
+    },
+    {
+      "name": "limbExtents 顶点盒",
+      "ok": null,
+      "note": "None"
+    },
+    {
+      "name": "只留 limbs vs 只留其余",
+      "ok": false,
+      "note": "角色框内变化 3736px(94.34%,最大差127) 阈值>5000px —— 两种隐藏策略的框内差异,证明框里的东西确实来自 limbs 批次(只留 limbs 时非黑 3960px,只留其余时 3960px)"
+    },
+    {
+      "name": "截图(待 vision 描述)",
+      "ok": null,
+      "note": "baseline=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w2_visibility_baseline.png only_limbs=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w2_visibility_only_limbs.png hide_limbs_only=/Users/sqs/.hermes/cache/scratch/vcw-v8/shots/w2_visibility_hide_limbs_only.png —— 这三个文件要交给 vision_analyze 用文字描述:角色朝哪个方向、四肢是否可见、是不是一个完整人形。数字判据过不了这一关。"
+    }
+  ]
+}

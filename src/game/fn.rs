@@ -2432,6 +2432,32 @@ pub(crate) fn stream_needs_rebuild(player: Vec2, center: Vec2) -> bool {
         || (player[1] - center[1]).abs() > STREAM_REBUILD_STEP
 }
 
+/// 流式换块时,把碰撞世界重建到新的生成中心。
+///
+/// 单独拆出来是为了让测试能断言**调用点真的会走到这里** —— P0-E 那个 bug
+/// 正是「函数本身是对的,但换块路径忘了调它」,只测 `build_collision_world`
+/// 的输出永远发现不了。
+///
+/// # Arguments
+///
+/// - `&mut Game` - Game 的可变引用。
+/// - `f32` - 新街区中心的 X(米)。
+/// - `f32` - 新街区中心的 Z(米)。
+pub(crate) fn rebuild_streamed_collision_world(game: &mut Game, next_x: f32, next_z: f32) {
+    // 碰撞世界必须**跟着换块一起重建**。
+    //
+    // 原来它只在启动时建一次(`build_world_assets` 里的调用),于是玩家
+    // 走出去几百米以后,看到的楼是新流式批次里的楼,撞的却还是出生点
+    // 那些 —— 出生点那一圈的墙会凭空出现在身后,真正走到的街区里一堵
+    // 墙都没有。这和 P0-D 的推出上限是同一个问题的两端:墙不再会凭空
+    // 出现,玩家就没有理由陷进 12 m 深的楼里。
+    //
+    // 成本可接受:换块频率是一格街道(60 m),这里只是重算一遍 AABB 列表,
+    // 而且**只在真的换块时**才跑(`stream_needs_rebuild` 已经挡住了)。
+    let asset_bounds: HashMap<String, Bounds> = game.get_asset_bounds().clone();
+    build_collision_world(game.get_mut_world(), &asset_bounds, next_x, next_z);
+}
+
 /// 围绕玩家当前位置重建地面与水面网格。
 ///
 /// 场景的批次表是稳定的(实例表每帧都会重写),所以这里只换掉地面 /
@@ -4238,6 +4264,43 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             .iter()
             .map(|car: &TrafficCar| f64::from(car.get_speed()))
             .collect();
+        // 停靠计时 —— 区分「车在等客」和「车在红灯前停车」的唯一依据。
+        //
+        // 线上排查 P2 时栽在这里:探针只给 `carSpeed`,于是「速度 0.07 m/s
+        // 且 40 s 不动」看不出它是**停靠等客**(`hailing_seconds` 在涨)还是
+        // **停在红灯前**(计时恒为 0)。两者在速度上完全一样。
+        let car_hailing: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_hailing_seconds()))
+            .collect();
+        // 每辆车的路网状态:沿哪根轴跑、朝哪个方向。路口是否已越过、
+        // 停止线在身后还是身前,都要靠这三个数才能判。
+        let car_blocked: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_blocked()))
+            .collect();
+        let car_axis: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_lane_axis()))
+            .collect();
+        let car_dir: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_direction()))
+            .collect();
+        let car_street: Vec<f64> = game
+            .traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| f64::from(car.get_lane_street()))
+            .collect();
         // 第一件还没被捡走的医疗包:验收脚本读它就能走过去真的拾取,而不是
         // 猜一组魔法坐标。
         let health_pack: Option<[f64; 2]> = game
@@ -4497,7 +4560,7 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             .collect::<Vec<String>>()
             .join(",");
         let json: String = format!(
-            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"gpuSubmitted\":{gpu_submitted},\"quality\":\"{quality}\",\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf},\"mapOpen\":{map_open},\"grenadesLeft\":{grenades},\"liveGrenades\":{live_grenades},\"grenadeTubes\":{tubes}{DEBUG_CLOSE}",
+            "{DEBUG_OPEN}\"playerX\":{x},\"playerZ\":{z},\"playerYaw\":{yaw},\"cameraYaw\":{cyaw},\"phase\":\"{phase}\",\"healthPack\":{hp_at},\"pickupPos\":{pickup_pos},\"playerHealth\":{hp},\"playerCash\":{cash},\"playerVehicle\":{veh},\"gaitPhase\":{gphase},\"gaitAmount\":{gamount},\"cameraMode\":\"{mode}\",\"probe\":[{probe_json}],\"charBox\":{char_box},\"b0\":\"{b0}\",\"bpos\":{bpos_json},\"limbBatches\":{limbs_json},\"limbModel\":{limb_model},\"bn\":{bn},\"wheelBatches\":{wheel_count},\"streamX\":{stream_x},\"streamZ\":{stream_z},\"door\":{door_json},\"route\":{route_json},\"wheel\":{wheel_probe},\"ft\":{ft_json},\"tgt\":{tgt_json},\"m\":{mm_json},\"collisionShapes\":{shapes},\"playerInsideCollider\":{inside},\"cameraDist\":{cdist},\"cameraDistTarget\":{cdist_target},\"camOccluded\":{coccluded},\"camEyeX\":{ceye_x},\"camEyeY\":{ceye_y},\"camEyeZ\":{ceye_z},\"camClearance\":{cclear},\"camPitch\":{cpitch},\"carX\":[{car_x}],\"carZ\":[{car_z}],\"carSpeed\":[{car_speed}],\"carHail\":[{car_hail}],\"carBlocked\":[{car_blocked}],\"carAxis\":[{car_axis}],\"carDir\":[{car_dir}],\"carStreet\":[{car_street}],\"pickups\":{{\"total\":{total},\"taken\":{taken}}},\"hud\":\"{hud}\",\"carDriveX\":{cdrive_x},\"carDriveZ\":{cdrive_z},\"carDriveSpeed\":{cdrive_v},\"throttle\":{throttle},\"frames\":{frames},\"tris\":{tris},\"gpuSubmitted\":{gpu_submitted},\"quality\":\"{quality}\",\"kills\":{kills},\"loadedAssets\":{loaded},\"enemies\":{enemies_json},\"peds\":{peds_json},\"wanted\":{wanted_json},\"combat\":{combat_json},\"interiors\":{interiors_json},\"playerY\":{py},\"grounded\":{grounded},\"vy\":{vy},\"walkReq\":[{wr0},{wr1}],\"vel\":[{vx},{vz}],\"respawn\":{rsp},\"safe\":{saf},\"mapOpen\":{map_open},\"grenadesLeft\":{grenades},\"liveGrenades\":{live_grenades},\"grenadeTubes\":{tubes}{DEBUG_CLOSE}",
             x = position[0],
             z = position[2],
             yaw = game.get_player().get_yaw(),
@@ -4553,6 +4616,11 @@ pub(crate) fn publish_debug_state(handles: &GameHandles, hud: &str) {
             car_x = join_f64(&car_x),
             car_z = join_f64(&car_z),
             car_speed = join_f64(&car_speed),
+            car_hail = join_f64(&car_hailing),
+            car_blocked = join_f64(&car_blocked),
+            car_axis = join_f64(&car_axis),
+            car_dir = join_f64(&car_dir),
+            car_street = join_f64(&car_street),
             total = game.get_traffic().get_pickups_ref().len(),
             taken = game.get_player().collected_count(),
             hud = hud
@@ -5514,7 +5582,17 @@ pub(crate) fn simulate(game: &mut Game, delta: f32) {
             Some([here[0], here[2]])
         }
     };
-    game.get_mut_traffic().step(dt, hailer, &traffic_world);
+    // 信号机用的全局时钟。用**累积时间**而不是 `frame_count / 60`:
+    // 掉帧时后者会瞬间跳一大格,相位看起来像在抽搐;累积时间连续。
+    // 累积放在这里(每帧一次),所以 `traffic.step` 拿到的是本帧时刻。
+    //
+    // 合并说明:另一条线的 `traffic.step(dt, hailer, &world)` 是 P2 之前
+    // 的三参签名 —— 它从 `978c6b9` 就分出去了,没见过红绿灯那一个参数。
+    // 四参是新的那个,保留。
+    let clock: f32 = game.get_signal_clock() + dt;
+    game.set_signal_clock(clock);
+    game.get_mut_traffic()
+        .step(dt, hailer, &traffic_world, clock);
     if let Some(index) = driven
         && let Some(car) = game.get_mut_traffic().get_car_mut(index)
     {
@@ -5636,6 +5714,7 @@ pub(crate) fn step_streamed_surface(game: &mut Game) {
     // 任务点、撞人、社会聚集也全都在另一个街区。触发条件跟地面重建共用
     // 同一次换块(`STREAM_REBUILD_STEP` = 一格街道),不多花一次判定。
     repopulate_streamed_combatants(game, next_x, next_z);
+    rebuild_streamed_collision_world(game, next_x, next_z);
     // 地面 / 水面的顶点数据换了,GPU 缓冲必须跟着换 —— 否则玩家走出街区
     // 边界后看到的还是出生点那块地,而 CPU 侧探针报告的却是新数据。
     if let Some(mut renderer) = game.get_mut_renderer().take() {
@@ -6624,9 +6703,12 @@ pub(crate) fn step_death(game: &mut Game, dt: f32) {
     if game.get_hurt().get_respawn() > 0.0 {
         return;
     }
-    // 重生:在最近的医院点复活,扣钱,清通缉。
+    // 重生:在**就近**的医院门口复活,扣钱,清通缉。
     // Y 归零:医院都在地面上,不能把玩家复活在二楼楼板上(或者半空里)。
-    let spot: Vec3 = nearest_hospital(game.get_player().get_position());
+    //
+    // 用 `hospital_near`(按死亡点所在街区程序化选点),不用固定重生点数组:
+    // 后者在无限世界里会跳几百米到几千米,那就是用户报的「瞬移」。
+    let spot: Vec3 = hospital_near(game.get_player().get_position());
     let resolved: Vec2 = game.get_world().resolve([spot[0], spot[2]]);
     game.get_mut_player()
         .set_position([resolved[0], GROUND_LEVEL, resolved[1]]);
@@ -6642,42 +6724,58 @@ pub(crate) fn step_death(game: &mut Game, dt: f32) {
         .set_notice(String::from(NOTICE_WASTED));
 }
 
-/// 医院点:玩家死亡后在这里重生。
-///
-/// 选四个城市的四角 + 中心,保证任何位置都能找到「最近的一个」。
-///
-/// # Returns
-///
-/// - `Vec<Vec3>` - 医院点的世界坐标。
-pub(crate) fn hospital_spots() -> Vec<Vec3> {
-    let mut out: Vec<Vec3> = Vec::new();
-    for spot in HOSPITAL_SPOTS {
-        out.push(*spot);
-    }
-    out
-}
-
-/// 距离给定点最近的医院点。
+/// WASTED 之后在**就近**的医院门口复活。
 ///
 /// # Arguments
 ///
-/// - `Vec3` - 玩家当前坐标。
+/// - `Vec3` - 玩家死亡时的坐标。
 ///
 /// # Returns
 ///
-/// - `Vec3` - 最近的医院坐标。
-pub(crate) fn nearest_hospital(from: Vec3) -> Vec3 {
-    let spots: Vec<Vec3> = hospital_spots();
-    let mut best: Vec3 = spots[0];
-    let mut best_distance: f32 = f32::MAX;
-    for spot in spots {
-        let d: f32 = flat_distance(from, spot);
-        if d < best_distance {
-            best_distance = d;
-            best = spot;
-        }
-    }
-    best
+/// - `Vec3` - 复活点(始终在死亡点所在的街区附近)。
+///
+/// # Note
+///
+/// 旧实现挑的是 [`HOSPITAL_SPOTS`] 里**固定 12 个点**中最近的一个,而世界
+/// 是无限生成的(`street_axis` 接受任意整数索引)。实测跳变距离:
+///
+/// | 死亡位置 | 旧实现跳到 | 距离 |
+/// |---|---|---|
+/// | (300, 0) | (98, 98) | **224.5 m** |
+/// | (600, 0) | (98, 98) | **511.5 m** |
+/// | (5000, 5000) | (98, 98) | **6932.5 m** |
+///
+/// 这就是用户报的「瞬移」。它看起来和「跨街区」相关,是因为每次流式换块
+/// 都会在玩家附近刷新 7 个敌对混混(`repopulate_streamed_combatants`),
+/// 于是玩家在换块后 3 秒被打死,然后被传回城市原点 —— 一条因果链,不是巧合。
+///
+/// 现在按死亡点**所在街区**程序化地选门口:先对齐街道网格,再用
+/// `crc32(街区索引)` 在四个角里挑一个。`crc32` 而不是内置 `hash()`,因为
+/// 后者每个进程加盐,同一个位置重开一局就会换一个医院,重生点不可重放。
+///
+/// 跳变因此被限制在**半个街距**(≤ [`HOSPITAL_SPAWN_MAX_OFFSET`]),
+/// 和 GTA V 的「就近医院门口复活」一致。
+pub(crate) fn hospital_near(from: Vec3) -> Vec3 {
+    let street: i32 = (from[0] / STREET_PITCH).round() as i32;
+    let cross: i32 = (from[2] / STREET_PITCH).round() as i32;
+    let cx: f32 = street_axis(street);
+    let cz: f32 = street_axis(cross);
+    // 用街区索引混合出稳定的四选一,不用内置 hash():它每进程加盐,
+    // 同一位置重开一局就换医院,重生点不可重放。
+    let pick: u32 = (street as u32)
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add((cross as u32).wrapping_mul(0x85EB_CA6B))
+        ^ (street as u32).wrapping_mul(31);
+    // 四个候选门口:街区四角的 sidewalk 边。落在车道之外,不会重生在
+    // 车流中间。
+    let corners: [Vec2; 4] = [
+        [HOSPITAL_SPAWN_OFFSET, HOSPITAL_SPAWN_OFFSET],
+        [-HOSPITAL_SPAWN_OFFSET, HOSPITAL_SPAWN_OFFSET],
+        [HOSPITAL_SPAWN_OFFSET, -HOSPITAL_SPAWN_OFFSET],
+        [-HOSPITAL_SPAWN_OFFSET, -HOSPITAL_SPAWN_OFFSET],
+    ];
+    let corner: Vec2 = corners[(pick % 4) as usize];
+    [cx + corner[0], GROUND_LEVEL, cz + corner[1]]
 }
 
 /// 抢车的通缉结算:抢警车加更多热度。
@@ -8375,6 +8473,7 @@ pub fn boot() {
         total_assets: required.len(),
         frame_count: 0,
         ticks: 0,
+        signal_clock: 0.0,
         load_error: None,
         using_fallback: false,
         accumulator: 0.0,
@@ -9152,6 +9251,86 @@ mod tests {
         assert!(
             drift <= PLAYER_PUSH_DEADZONE,
             "stationary player drifted {drift:.6} m over 8 frames"
+        );
+    }
+
+    /// 静态分离**不能一帧把玩家弹过一整栋楼**。
+    ///
+    /// `push_out_*` 一步就把点送到形状表面:点在楼的几何**中心**时,推出
+    /// 距离等于该形状在这一轴上的半径。实测(本测试修复前的真实输出)
+    /// 一栋 25 x 12 m 的楼能一帧弹 **12.35 m**(合 740 m/s)—— 那就是
+    /// 「瞬移」。
+    ///
+    /// 现在 `separate_static` 用**整帧预算** `MAX_STATIC_PUSH_PER_FRAME`
+    /// 封顶:预算记在位移上而不是「推了几次」上,所以 `RESOLVE_ITERATIONS`
+    /// 乘以街区里的形状数也超不过它。
+    #[test]
+    pub(crate) fn t_static_separation_never_ejects_across_a_building() {
+        let mut world: CollisionWorld = CollisionWorld::new();
+        // 一栋和真实建筑同量级的盒子:半长 25 x 12。
+        world
+            .get_shapes_mut()
+            .push(crate::r#collision::Shape::Aabb {
+                center: [0.0, 0.0],
+                half: [25.0, 12.0],
+            });
+        // `resolve_all` 会在动态分离前后各收敛一次,所以一帧的上界是
+        // 2 × 单次预算;这里按实际实现取这个界,不再猜。
+        let per_frame: f32 = MAX_STATIC_PUSH_PER_FRAME * 2.0;
+        let mut worst: f32 = 0.0;
+        let mut worst_at: Vec2 = [0.0, 0.0];
+        for i in -22..=22 {
+            for j in -10..=10 {
+                let probe: Vec2 = [i as f32, j as f32];
+                let bodies: Vec<crate::r#collision::DynamicBody> =
+                    vec![crate::r#collision::DynamicBody::new(
+                        crate::r#collision::BodyKind::Player,
+                        probe,
+                        PLAYER_RADIUS,
+                        PLAYER_MASS,
+                    )];
+                let out: Vec2 = world.resolve_all(&bodies)[0];
+                let d: f32 = ((out[0] - probe[0]).powi(2) + (out[1] - probe[1]).powi(2)).sqrt();
+                if d > worst {
+                    worst = d;
+                    worst_at = probe;
+                }
+            }
+        }
+        println!("max static eject = {worst:.3} m  (from {worst_at:?})");
+        assert!(
+            worst <= per_frame + 1e-3,
+            "一帧把玩家推出 {worst:.3} m(从 {worst_at:?} 出发),超过上限 {per_frame:.3} m —— \
+             又变成一帧穿楼了(修复前是 12.35 m)"
+        );
+    }
+
+    /// 碰撞世界必须**跟着流式换块一起重建**。
+    ///
+    /// 原来 `build_collision_world` 只在启动时跑一次,于是玩家走出去
+    /// 几百米以后,看到的楼是新流式批次里的楼,撞的却还是出生点那些 ——
+    /// 出生点那一圈的墙凭空留在身后,真正走到的街区里一堵墙都没有。
+    ///
+    /// P0-E 的形状是「函数本身是对的,但换块路径忘了调它」,所以光测
+    /// `build_collision_world` 的输出永远发现不了 —— 我第一版就是这么
+    /// 写的,把调用点删掉它照样绿。这条测试因此盯**调用点本身**:
+    /// `step_streamed_surface` 的源码里必须出现这个调用。
+    #[test]
+    pub(crate) fn t_the_streamed_rebuild_also_refreshes_the_collision_world() {
+        let source: String =
+            crate::fs::read_to_string("src/game/fn.rs").expect("必须能读回自己的源文件");
+        // 只看 `step_streamed_surface` 的函数体,别处调用不算数。
+        let start: usize = source
+            .find("pub(crate) fn step_streamed_surface")
+            .expect("step_streamed_surface 必须还在");
+        let body: &str = source[start..]
+            .split("\npub(crate) fn ")
+            .next()
+            .expect("必须能切出函数体");
+        assert!(
+            body.contains("rebuild_streamed_collision_world(game"),
+            "step_streamed_surface 没有重建碰撞世界 —— \
+             玩家会一直撞着出生点那圈墙(P0-E)"
         );
     }
 
@@ -10860,6 +11039,1082 @@ mod tests {
         }
     }
 
+    /// 用**真实城市道具**造一个碰撞世界。
+    ///
+    /// 五条车队测试都要同一份世界(交通灯 + 锥桶的碰撞盒 + 街区建筑)。
+    /// 之前每条各抄一遍 `read_to_string` + `collider_bounds`,于是 §1.3c
+    /// 一次性报 50 个「字符串必须写在 const.rs」—— 字面量本身没问题,
+    /// 重复才是问题。抽成这一个函数,同时也保证五条测的是**同一个世界**。
+    ///
+    /// 必须走生产路径 [`build_collision_world`]:手工拼 `push_box` 会绕过
+    /// `solid_bounds` 的高度带和 `on_lane` 的车道排除,测出来的是测试
+    /// 自己造的空气墙,不是线上缺陷。
+    ///
+    /// # Arguments
+    ///
+    /// - `f32` - 世界中心的 X。
+    /// - `f32` - 世界中心的 Z。
+    ///
+    /// # Returns
+    ///
+    /// - `CollisionWorld` - 造好的碰撞世界。
+    pub(crate) fn traffic_world_at(cx: f32, cz: f32) -> CollisionWorld {
+        let raw: String =
+            crate::fs::read_to_string(TRAFFIC_LIGHT_ASSET_PATH).expect(TRAFFIC_LIGHT_ASSET_MISSING);
+        let asset: MeshAsset = serde_json::from_str(&raw).expect(TRAFFIC_LIGHT_ASSET_UNREADABLE);
+        let mut bounds: HashMap<String, crate::mesh::Bounds> = HashMap::new();
+        collider_bounds(&mut bounds, TRAFFIC_LIGHT_ASSET_ID, &asset);
+        collider_bounds(&mut bounds, TRAFFIC_CONE_ASSET_ID, &asset);
+        let mut world: CollisionWorld = CollisionWorld::new();
+        build_collision_world(&mut world, &bounds, cx, cz);
+        world
+    }
+
+    /// **车队 + 红绿灯 + 真实城市:车必须真的动。**
+    ///
+    /// 线上(P2 部署后)实测到一批车:`carSpeed` 恒为 **2.09 m/s**,
+    /// 连续 80 s 只挪了 **0.2 m** —— 速度非零、位移为零。
+    ///
+    /// 两条已有测试都覆盖不到这个组合:
+    ///
+    /// - `traffic_drives_through_a_junction_in_the_real_city` 跑的是**单车**
+    ///   `TrafficCar::step`,不经过 `Traffic::step`,所以**永远碰不到红绿灯**。
+    /// - `every_car_actually_moves_in_an_open_world` 用的是**空碰撞世界**,
+    ///   没有楼,也就测不到「车被建筑吃掉每帧位移」。
+    ///
+    /// 而线上的车卡在路口附近 —— 正是「楼 + 停止线 + 车队跟车」三者
+    /// 叠加的地方。2.09 m/s 恰好是 IDM 在「前车静止于 5.74 m 外」的平衡
+    /// 速度(`(v/11.5)^4 + ((2.6+1.5v)/5.74)^2 = 1`),所以这些车**确实
+    /// 在跟车**;问题是队列最前面那辆为什么不动。
+    ///
+    /// 这条用**真实城市道具** + **完整 40 s 信号周期**跑整支车队。
+    #[test]
+    pub(crate) fn the_whole_fleet_keeps_moving_through_two_signal_cycles() {
+        let mut world: CollisionWorld = traffic_world_at(60.0, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        // 沿 +Z 排 4 辆,间隔 25 m。
+        for z in [-20.0f32, 5.0, 30.0, 55.0].iter() {
+            let car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 0, 1.0, 0, *z, 11.5, 1.0);
+            traffic.get_cars_mut().push(car);
+        }
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        // 40 s > 38 s 一个周期 —— 必须跑满,否则 t∈[0,10] 全是绿灯,
+        // 停止线一根都不存在,测试等于没测 P2。
+        let mut clock: f32 = 0.0;
+        for _frame in 0..2400 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let mut worst: String = String::new();
+        let mut min_moved: f32 = f32::INFINITY;
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            min_moved = min_moved.min(moved);
+            worst.push_str(&format!(
+                "car{index} {moved:.1}m v={:.2}; ",
+                car.get_speed()
+            ));
+        }
+        println!("车队 40s: {worst}");
+        assert!(
+            min_moved >= 5.0,
+            "真实城市里跑满一个信号周期,最慢的车只走了 {min_moved:.2} m({worst})"
+        );
+    }
+
+    /// **单车在路口附近会不会卡死 —— 复现线上 car5 的状态。**
+    ///
+    /// 线上实测(玩家在 63.5,45):
+    ///
+    /// ```text
+    /// car5: v=2.09 pos=(-67.2,-56.5) 距玩家 165.5 m  <- 远超 HAUL_RANGE 26
+    /// car9: v=2.09 pos=(-62.7,-56.5) 距玩家 161.9 m
+    /// car6: v=0.20 pos=(-58.3,-56.5) 距玩家 158.5 m
+    /// ```
+    ///
+    /// 三辆车都停在 x≈-60 的路口中轴线两侧,而且**全都远离玩家** ——
+    /// 所以既不是 hailer(26 m 外),也不是玩家造成的。2.09 m/s 是
+    /// 「有前车静止于 5.74 m 外」的 IDM 平衡速度,但这条街上不该有
+    /// 一辆永远不动的车给它们当前车。
+    ///
+    /// 这条把车直接放在 `(-67.2, -56.5)` 上单独跑:**没有前车、没有
+    /// 玩家、没有 hailer**。它要是也卡住,那就是单车在路口被静态几何
+    /// 挡住 —— `route_advance` 每帧把速度砍到 0,而车队层在其之后又把
+    /// 速度按 IDM 写回非零值,于是探针读到「有速度却没位移」。
+    #[test]
+    pub(crate) fn a_lone_car_near_the_minus_sixty_junction_keeps_rolling() {
+        let mut world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        // 街道 -1、右侧车道 => 横向中心 = -60 + 3.5 = -56.5,与线上一致。
+        let mut car: crate::traffic::TrafficCar =
+            crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, -1, 1.0, 0, -67.2, 11.5, 1.0);
+        car.set_position([-67.2, 0.0, -56.5]);
+        traffic.get_cars_mut().push(car);
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        let mut first: [f32; 2] = [-67.2, -56.5];
+        for frame in 0..1200 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+            if frame == 0 {
+                let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
+                let p: Vec3 = c.get_position();
+                first = [p[0], p[2]];
+            }
+        }
+        let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
+        let p: Vec3 = c.get_position();
+        let moved: f32 = ((p[0] - first[0]).powi(2) + (p[2] - first[1]).powi(2)).sqrt();
+        println!(
+            "单车 20s: ({:.2},{:.2}) -> ({:.2},{:.2}) 位移 {moved:.2} m 终速 {:.2}",
+            first[0],
+            first[1],
+            p[0],
+            p[2],
+            c.get_speed()
+        );
+        assert!(
+            moved >= 5.0,
+            "路口附近的一辆车 20 s 只走了 {moved:.2} m(终速 {:.2},位置 {:.2},{:.2})",
+            c.get_speed(),
+            p[0],
+            p[2]
+        );
+    }
+
+    /// **四辆车挤在路口上,前后只差一个车长 —— 会不会互相锁死。**
+    ///
+    /// 线上实测(玩家在 63.5,45),x 方向那一排:
+    ///
+    /// ```text
+    /// car3 x=48.3 v=2.09 | car1 x=52.9 v=2.09 | car4 x=57.4 v=2.09 | car2 x=61.7 v=0.20
+    /// ```
+    ///
+    /// 相邻间距 2.2 m —— **恰好是一个车长**(`CAR_FOOTPRINT[0] = 2.283`),
+    /// 也就是四辆车**鼻碰着尾**堵在路口中轴线 x=60 上,队首(car2)已经
+    /// 越过中轴线 1.7 m。而且这四辆**互相**是前车:`leader_gap` 算的是
+    /// 车身净间距,净间距≈0 时 `interaction` 项直接饱和,后车全被按死。
+    ///
+    /// 单车测试(`a_lone_car_near_the_minus_sixty_junction_keeps_rolling`)
+    /// 一辆车走 214 m 完全正常 —— 所以这不是「车过不去路口」,而是
+    /// **车队在这种初始排布下会自锁**。这正是线上 80 s 只挪 0.2 m 的样子。
+    #[test]
+    pub(crate) fn a_nose_to_tail_pile_up_at_a_junction_unlocks() {
+        let mut world: CollisionWorld = traffic_world_at(60.0, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        // 街道 1、右侧车道 => 横向中心 = 60 + 3.5 = 63.5,沿 +X 行驶。
+        for x in [48.3f32, 52.9, 57.4, 61.7].iter() {
+            let mut car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 1, *x, 11.5, 1.0);
+            car.set_position([*x, 0.0, 63.5]);
+            traffic.get_cars_mut().push(car);
+        }
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        for _frame in 0..2400 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let mut worst: String = String::new();
+        let mut min_moved: f32 = f32::INFINITY;
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            min_moved = min_moved.min(moved);
+            worst.push_str(&format!(
+                "car{index} {moved:.1}m v={:.2}; ",
+                car.get_speed()
+            ));
+        }
+        println!("鼻碰尾车队 40s: {worst}");
+        assert!(
+            min_moved >= 5.0,
+            "鼻碰尾堵在路口的车队跑满一个周期后,最慢的车只走了 {min_moved:.2} m({worst})"
+        );
+    }
+
+    /// **玩家站在路边招手时,整支车队会不会全被钉死。**
+    ///
+    /// 线上实测(玩家在 63.5,45,步行):**10 辆车里 9 辆完全不动** ——
+    /// 3 s 内位移 0.00~0.02 m,而速度探针读出 2.09 / 0.13 m/s。
+    /// 只有 car7(3243 m 外,早开出交通半径)在正常跑。
+    ///
+    /// 关键在于**线上 `hailer` 不是 `None`**:玩家步行时
+    /// `hailer = Some([x, z])`,于是 `Traffic::step` 会挑一辆 `HAUL_RANGE`
+    /// 内最近的车 `desired = 0` 停靠等人。之前所有测试都传 `None`,
+    /// 所以一条都没碰到这条路径 —— 包括「有 hailer 时车队仍能流动」。
+    ///
+    /// 这条把玩家放在车队正中间,逼出 hailer,再要求每辆车都必须动。
+    #[test]
+    pub(crate) fn a_hailing_player_does_not_freeze_the_whole_fleet() {
+        let mut world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        for z in [-40.0f32, -15.0, 10.0, 35.0].iter() {
+            let car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 0, 1.0, 0, *z, 11.5, 1.0);
+            traffic.get_cars_mut().push(car);
+        }
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        // 玩家站在 z=-2.5 的路边:四辆车里至少一辆落在 HAUL_RANGE 26 内,
+        // 于是 hailer 一定被选中。
+        let who: [f32; 2] = [3.5, -2.5];
+        for _frame in 0..2400 {
+            traffic.step(dt, Some(who), &world, clock);
+            clock += dt;
+        }
+        let mut worst: String = String::new();
+        let mut min_moved: f32 = f32::INFINITY;
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            min_moved = min_moved.min(moved);
+            worst.push_str(&format!(
+                "car{index} {moved:.1}m v={:.2}; ",
+                car.get_speed()
+            ));
+        }
+        println!("有招手人 40s: {worst}");
+        // 只允许**一辆**被钉住等客(那就是 hailer 的设计),其余必须动。
+        let moving: usize = traffic
+            .get_cars_ref()
+            .iter()
+            .enumerate()
+            .filter(|(index, car): &(usize, &crate::traffic::TrafficCar)| {
+                let p: Vec3 = car.get_position();
+                ((p[0] - start[*index][0]).powi(2) + (p[2] - start[*index][1]).powi(2)).sqrt()
+                    >= 5.0
+            })
+            .count();
+        assert!(
+            moving >= 2,
+            "玩家招手后 40 s 只有 {moving}/4 辆车动过 —— 整支车队被钉死({worst})"
+        );
+    }
+
+    /// **车停在路口中轴线前 1.73 m、后方还有四辆 —— 必须能开走。**
+    ///
+    /// 线上实测(探针加了 `carHail` / `carAxis` / `carDir` / `carStreet`
+    /// 之后才看清):
+    ///
+    /// ```text
+    /// car9 (-76.35,-56.50) v=2.09  car5 (-71.78,-56.50) v=2.09
+    /// car6 (-67.24,-56.50) v=2.09  car7 (-62.69,-56.50) v=2.09
+    /// car8 (-58.27,-56.50) v=0.07 hail=0.00  ax=1 dir=+1 street=-1
+    /// ```
+    ///
+    /// 五辆全部 `ax=1 dir=+1 street=-1`,即同一条横向车道
+    /// (z=-56.5 = `street_axis(-1) + 3.5`),间距 4.42 m 递增。
+    /// **队首 car8 连续 80 s 位移精确 0.00 m**,后四辆全被锁在 2.09 m/s
+    /// 的跟车平衡速度上。
+    ///
+    /// 关键的几何事实:car8 在 x=-58.27,而路口中轴线在
+    /// `street_axis(-1)` = -60 —— 它**已经越过中轴线 1.73 m**,却没能
+    /// 触发路口换道。`choose_at_junction` 判的是「沿街坐标越过**下一个**
+    /// 路口中轴线」,下一个是 x=0,离它还有 49 m,换道迟迟不触发。
+    ///
+    /// 这条把五辆车按线上坐标摆好,跑 200 s,要求队首必须开走。
+    #[test]
+    pub(crate) fn a_queue_head_past_the_junction_centre_keeps_driving() {
+        let world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        for x in [-76.35f32, -71.78, -67.24, -62.69, -58.27].iter() {
+            let mut car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, -1, 1.0, 1, *x, 11.5, 1.0);
+            car.set_position([*x, 0.0, -56.5]);
+            traffic.get_cars_mut().push(car);
+        }
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        for _frame in 0..12000 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let mut worst: String = String::new();
+        let mut min_moved: f32 = f32::INFINITY;
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            min_moved = min_moved.min(moved);
+            worst.push_str(&format!(
+                "car{index}(x0={:.2}) {moved:.2}m v={:.3} ax={} st={}; ",
+                start[index][0],
+                car.get_speed(),
+                car.get_lane_axis(),
+                car.get_lane_street()
+            ));
+        }
+        println!("线上坐标队列 200s: {worst}");
+        assert!(
+            min_moved >= 5.0,
+            "线上那五辆按原坐标摆开,跑 200 s 后最慢的只走了 {min_moved:.2} m({worst})"
+        );
+    }
+
+    /// **被挡住的车的速度必须真的是 0。**
+    ///
+    /// 线上症状是「位置和速度互相矛盾」:探针读出 `carSpeed = 0.067`,
+    /// 而位置连续 **80 s 精确 0.00 m**。car8 后面还锁着四辆
+    /// (car7 / 6 / 5 / 9,间距 4.42 m,全停在 2.09 m/s 的跟车平衡速度上)。
+    ///
+    /// 机制:`route_advance` 里位移被静态几何吃掉时把速度砍到 0 并
+    /// `return`;但车队层的 IDM 在**之后**才统一回写速度,它只看到
+    /// 「速度 0、前面 49 m 没车、不在红灯前」——`gap = INFINITY`、
+    /// `interaction = 0`、`free = 0`,于是 `a = A·(1 − 0 − 0) = +4 m/s²`,
+    /// 把速度拉回 0.067。下一帧又撞同一个障碍、再被砍到 0,永远循环。
+    ///
+    /// 这条构造一个**静态墙**把车挡死,然后断言:速度必须恒为 0,
+    /// 且位移必须精确为 0(不能是「有速度却不动的自相矛盾」)。
+    #[test]
+    pub(crate) fn a_blocked_car_reports_zero_speed_not_a_ghost_value() {
+        let mut world: CollisionWorld = crate::collision::CollisionWorld::new();
+        // 在车头正前方摆一堵墙:沿 +X 行驶,车头在 z=-56.5 这条线上。
+        world.get_shapes_mut().push(crate::collision::Shape::Aabb {
+            // 墙横在 z = -56.5 这条车道上,覆盖 x ∈ [-31.0, -29.0]。
+            //
+            // 位置是算过的:车从 x=-40 出发、沿 +X 开,到墙还有 9 m,
+            // **中间不经过任何路口**(路口在 -60 和 0)。第一版把墙放在
+            // x=-56,车却在 2 m 外的路口 -60 就抽签拐走了,墙根本没被碰到
+            // —— 测试看着「没被挡」,其实量错了东西。
+            center: [-30.0, -56.5],
+            half: [1.0, 3.0],
+        });
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        let mut car: crate::traffic::TrafficCar =
+            crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, -1, 1.0, 1, -40.0, 11.5, 1.0);
+        car.set_position([-40.0, 0.0, -56.5]);
+        traffic.get_cars_mut().push(car);
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        for _frame in 0..1800 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
+        let p: Vec3 = c.get_position();
+        println!(
+            "被墙挡住的车 30 s 后: ({:.2},{:.2}) 速度 {:.5} blocked={}",
+            p[0],
+            p[2],
+            c.get_speed(),
+            c.get_blocked()
+        );
+        assert!(
+            c.get_speed() <= 0.001,
+            "被静态几何挡了 30 s,速度却读出 {:.5} —— IDM 每帧把它从 0 拉起来又被碰撞打回去",
+            c.get_speed()
+        );
+        assert!(
+            p[0] <= -31.0,
+            "车不该穿过墙(墙左沿 x=-31.0),车心却跑到了 x={:.2}",
+            p[0]
+        );
+    }
+
+    /// **生产车队里不许有车整个 30 s 窗口位移精确为 0。**
+    ///
+    /// 线上(`1a6b298` 之后)仍然存在的那一台:
+    ///
+    /// ```text
+    /// car6 (-58.27,-56.50) v=0.000 hail=0.00 ax=1 dir=+1 street=-1   <-- 队首
+    /// car9 (-62.71,-56.50) v=2.091
+    /// car7 (-67.27,-56.50) v=2.091
+    /// car5 (-71.83,-56.50) v=2.091
+    /// ```
+    ///
+    /// 幽灵速度(0.067)修掉之后它诚实地读 0.000,但**位移仍然精确
+    /// 0.00 m**,后面三辆照样锁在 2.09 m/s。所以那个 bug 只是症状的一半:
+    /// 被静态几何挡住的车确实该停,可它**永远走不了**。
+    ///
+    /// 判据必须是「**精确** 0」而不是「很慢」:0.17 m / 30 s 是真的在动
+    /// (8 s 停靠 → 开走 → 再来)。之前
+    /// `the_fleet_still_flows_after_five_minutes` 的阈值放得太松,量不到它。
+    ///
+    /// 用**生产出生点**而不是手摆坐标 —— hailer 那个 bug 就是手摆十次都
+    /// 复现不出、只有 `populate` 加上时间才现形的。
+    #[test]
+    pub(crate) fn no_car_in_the_production_fleet_is_ever_exactly_stuck() {
+        let mut world: CollisionWorld = traffic_world_at(63.5, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        traffic.populate(&traffic_lanes(), &[]);
+        let dt: f32 = 1.0 / 60.0;
+        let mut last: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let mut frozen_from: Vec<Option<usize>> = vec![None; last.len()];
+        for window in 0..10usize {
+            for _frame in 0..1800 {
+                traffic.step(dt, None, &world, 0.0);
+            }
+            let now: Vec<[f32; 2]> = traffic
+                .get_cars_ref()
+                .iter()
+                .map(|car: &crate::traffic::TrafficCar| {
+                    let p: Vec3 = car.get_position();
+                    [p[0], p[2]]
+                })
+                .collect();
+            for (index, pair) in now.iter().enumerate() {
+                let moved: f32 = ((pair[0] - last[index][0]).powi(2)
+                    + (pair[1] - last[index][1]).powi(2))
+                .sqrt();
+                frozen_from[index] =
+                    frozen_from[index].or(if moved <= 1e-4 { Some(window) } else { None });
+            }
+            last = now;
+        }
+        let mut stuck: Vec<String> = Vec::new();
+        for (index, at) in frozen_from.iter().enumerate() {
+            let Some(from): Option<usize> = *at else {
+                continue;
+            };
+            let car: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[index];
+            let p: Vec3 = car.get_position();
+            stuck.push(format!(
+                "car{index} 第 {from} 窗起 ({:.2},{:.2}) v={:.3} blocked={}",
+                p[0],
+                p[2],
+                car.get_speed(),
+                car.get_blocked()
+            ));
+        }
+        assert!(
+            stuck.is_empty(),
+            "生产车队里有车整个 30 s 窗口位移精确为 0(线上 car6 的症状): {}",
+            stuck.join("; ")
+        );
+    }
+
+    /// **车队开远之后碰撞世界跟着重建,不许有车卡死。**
+    ///
+    /// 线上那个 `car6 (-58.27,-56.50)` 在本仓库里**复现不出来**:上面那条
+    /// `no_car_in_the_production_fleet_is_ever_exactly_stuck` 用生产出生点跑
+    /// 300 s,十个 30 s 窗口里没有一辆位移精确为 0。
+    ///
+    /// 两者唯一的差别是**碰撞世界随玩家重建**:
+    /// `rebuild_streamed_collision_world` 在每次换块(`STREET_PITCH = 60` m)
+    /// 时按新中心重算整个 AABB 表。线上玩家一直没动,所以世界**没**重建;
+    /// 而车已经开出去 160 m —— 它们脚下那块地是不是还有碰撞体,取决于
+    /// 出生时建的那张表。
+    ///
+    /// 这条模拟「车跑远但世界没跟着换」这个组合:让一列车沿 +X 开到
+    /// x≈700 m(远超出生点 300 m 的建造半径),要求每一辆都还在动。
+    #[test]
+    pub(crate) fn cars_far_outside_the_spawn_world_keep_driving() {
+        let world: CollisionWorld = traffic_world_at(63.5, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        for z in [-120.0f32, -90.0, -56.5, -30.0, 0.0].iter() {
+            let mut car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 40.0, 11.5, 1.0);
+            car.set_position([40.0, 0.0, *z]);
+            traffic.get_cars_mut().push(car);
+        }
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        // 200 s:11.5 m/s 足够开出去 2000 m,远超 BLOCK_VIEW_RADIUS。
+        for _frame in 0..12000 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let mut report: String = String::new();
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 = ((p[0] - 40.0).powi(2)
+                + (p[2] - [-120.0f32, -90.0, -56.5, -30.0, 0.0][index]).powi(2))
+            .sqrt();
+            report.push_str(&format!(
+                "car{index} ({:.1},{:.1}) 走了 {moved:.1}m v={:.3}; ",
+                p[0],
+                p[2],
+                car.get_speed()
+            ));
+            assert!(
+                moved >= 5.0 || car.get_blocked() || car.get_hailing_seconds() > 0.0,
+                "car{index} 在 ({:.2},{:.2}) 只走了 {moved:.2} m,速度 {:.3},blocked={} —— \
+                 它已经开出出生点的建造半径,但碰撞世界没有跟着重建",
+                p[0],
+                p[2],
+                car.get_speed(),
+                car.get_blocked()
+            );
+        }
+        println!("开出建造半径 200s: {report}");
+    }
+
+    /// **同一个点,碰撞世界中心不同 —— 几何就不同。**
+    ///
+    /// 线上那台死锁的车每轮都精确停在同一个点:
+    ///
+    /// ```text
+    /// car6 x = -58.269272  z = -56.50  v = 0.00000  hail = 0.00
+    /// ```
+    ///
+    /// 12 次采样 `dx` 全是 `+0.000000` —— 不是慢,是**被钉死**;
+    /// 后面 car5 / car7 停在 2.091 m/s 的跟车平衡速度上。
+    ///
+    /// 之前用 `traffic_world_at(0.0, 0.0)` 在这个点上做 0.5 m 位移解算,
+    /// **自由通过** —— 于是差点判它「没有静态几何」。但那个世界以原点
+    /// 为中心,线上世界以**玩家出生点 (63.5, 45)** 为中心:
+    ///
+    /// ```text
+    /// 以 (0, 0)    为中心 -> 街区 ix ∈ [-5, 5]
+    /// 以 (63.5, 45) 为中心 -> 街区 ix ∈ [-3, 6]
+    /// ```
+    ///
+    /// `BLOCK_VIEW_RADIUS = 300` 之下窗口不对称,两者的建筑集合并不相同。
+    /// **用错中心构造的碰撞世界,量到的「这里没东西」不算数。**
+    ///
+    /// 这条用真正的出生点中心重建世界,在车头前方一格做解算。
+    #[test]
+    pub(crate) fn the_deadlocked_spot_differs_between_world_centres() {
+        let mut spawn_world: CollisionWorld = traffic_world_at(63.5, 45.0);
+        let mut origin_world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        let spawn_shapes: usize = spawn_world.get_shapes_mut().len();
+        let origin_shapes: usize = origin_world.get_shapes_mut().len();
+        // 车头前沿:x + CAR_FOOTPRINT[0]。
+        let nose: Vec2 = [-58.269272 + 2.283, -56.5];
+        let a: Vec2 = spawn_world.resolve_car_footprint(nose, [0.0, 0.0], 0.0);
+        let b: Vec2 = origin_world.resolve_car_footprint(nose, [0.0, 0.0], 0.0);
+        println!(
+            "车头 ({:.3},{:.1}): 出生点世界 {:?} / 原点世界 {:?} / 形状数 {}/{}",
+            nose[0],
+            nose[1],
+            (a[0], a[1]),
+            (b[0], b[1]),
+            spawn_shapes,
+            origin_shapes
+        );
+        let step: Vec2 = spawn_world.resolve_car_footprint(nose, [0.3, 0.0], 0.0);
+        println!(
+            "出生点世界里挪 0.3 m: ({:.3},{:.3}) -> ({:.3},{:.3})",
+            nose[0], nose[1], step[0], step[1]
+        );
+        assert!(
+            step[0] > nose[0] + 0.1,
+            "出生点世界里车头前方 0.3 m 也挪不动 —— 静态几何就压在 ({:.2},{:.2}),\
+             这就是线上 car6 被钉死的原因(原点世界里量到的是另一套几何)",
+            nose[0],
+            nose[1]
+        );
+    }
+
+    /// **线上那台被钉死的车:脚下到底压着什么。**
+    ///
+    /// `d4a1bde` 的探针上线后,死锁的机制第一次被坐实:
+    ///
+    /// ```text
+    /// car6 x = -56.50  v = 0.000  blocked = 1   连续 120 s 位移精确 0.00 m
+    /// ```
+    ///
+    /// 其余九辆车每个 12 s 窗口跑 400~680 m,只有它不动。`blocked = 1`
+    /// 指向**静态碰撞体**,不是红灯、不是停靠、不是 IDM —— 幽灵速度修掉
+    /// 之后(`1a6b298`)速度读数诚实了,车照样走不了。
+    ///
+    /// x = -56.50 = `street_axis(-1) + 3.5`,街道 -1 的横向车道中心。
+    /// 这条要求:**车道的中心线上不许有任何静态碰撞体。**
+    #[test]
+    pub(crate) fn the_deadlocked_spot_has_nothing_standing_on_it() {
+        // 用线上那个世界中心(玩家出生点),不是原点 —— 用错中心量到的
+        // 「这里没东西」不算证据(1674 vs 1802 个碰撞体)。
+        let world: CollisionWorld = traffic_world_at(63.5, 45.0);
+        // 线上 car6 被钉死的精确位置。
+        let pin: Vec2 = [-56.5, -59.42];
+        println!(
+            "钉死点 ({:.2},{:.2}) 净空 {:.4} m,车足迹 +Z 推 0.19 -> {:?}",
+            pin[0],
+            pin[1],
+            world.nearest_surface_distance(pin),
+            world.resolve_car_footprint(pin, [0.0, 0.19], 0.0)
+        );
+        // 让一辆车在这个点上跑 30 s,看它到底是卡住还是只是每帧试一次。
+        let mut solo: crate::traffic::TrafficCar =
+            crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 0, 1.0, 0, -59.42, 11.5, 1.0);
+        solo.set_position([pin[0], 0.0, pin[1]]);
+        let dt: f32 = 1.0 / 60.0;
+        let mut blocked_frames: u32 = 0;
+        for _f in 0..1800 {
+            solo.step(dt, false, &world);
+            if solo.get_blocked() {
+                blocked_frames += 1;
+            }
+        }
+        let after: Vec3 = solo.get_position();
+        println!(
+            "单台车 30 s: ({:.2},{:.2}) v={:.4} blocked 帧数 {}/1800",
+            after[0],
+            after[2],
+            solo.get_speed(),
+            blocked_frames
+        );
+        assert!(
+            !solo.get_blocked(),
+            "空地上跑 30 s 却还在 blocked:位置 ({:.2},{:.2}) —— 净空有 {:.1} m,\
+             没有任何东西挡它",
+            after[0],
+            after[2],
+            world.nearest_surface_distance([after[0], after[2]])
+        );
+        // 横向车道中心,沿整条街扫一遍。
+        for street in [-2i32, -1, 0, 1, 2].iter() {
+            for side in [-1.0f32, 1.0].iter() {
+                let lane: f32 = lane_axis(*street, *side);
+                let mut worst: (f32, Vec2) = (f32::MAX, [0.0, 0.0]);
+                // 每 2 m 采一个点,覆盖街道之间的整段路面。
+                for step in -28i32..28 {
+                    let along: f32 = step as f32 * 2.0;
+                    let center: f32 = street_axis(*street);
+                    let at: Vec2 = [center + along, lane];
+                    let clear: f32 = world.nearest_surface_distance(at);
+                    if clear < worst.0 {
+                        worst = (clear, at);
+                    }
+                }
+                assert!(
+                    worst.0 > 0.5,
+                    "街道 {} 横向车道 z={:.1} 的 ({:.1},{:.1}) 上只有 {:.3} m 净空 —— \
+                     有静态碰撞体压在这条车道上,车会被永久钉死",
+                    *street,
+                    lane,
+                    worst.1[0],
+                    worst.1[1],
+                    worst.0
+                );
+            }
+        }
+    }
+
+    /// **车停在 (-58.27, -56.50) 动不了 —— 那个点上是不是有静态碰撞体。**
+    ///
+    /// 线上实测(探针加了路网状态之后):car8 `v = 0.066`、`hail = 0.00`
+    /// (不是停靠)、`ax=1 dir=+1 street=-1`,连续 **80 s 位移精确 0.00 m**,
+    /// 后面四辆(car7 / 6 / 5 / 9)全被锁在 2.09 m/s。它在路口中轴线
+    /// `street_axis(-1) = -60` 前方 1.73 m,下一个停止线还在 49 m 外 ——
+    /// 所以**红灯解释不了**(P2 的停止线不在这)。
+    ///
+    /// 之前排除过流式:世界按 `BLOCK_VIEW_RADIUS = 300` 建造,158 m 在里面,
+    /// 碰撞体数量稳定在 1674 没变过。所以只可能是**某个静态形状正好压在
+    /// 车头前**。
+    ///
+    /// 这条直接把车放在那个点上跑 30 s,并打印它到底停在哪一步 ——
+    /// `route_advance` 里被挡住会把速度砍到 0 并**不再推进路网状态**。
+    #[test]
+    pub(crate) fn the_frozen_online_spot_has_no_static_geometry_in_it() {
+        let world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        // 车头朝 +X,车心在 -58.27 => 车头前沿约 -58.27 + 2.283 = -55.99。
+        let probe: Vec2 = [-55.99, -56.5];
+        let before: Vec2 = world.resolve_car_footprint(probe, [0.0, 0.0], 0.0);
+        println!(
+            "零位移解算: 输入 ({:.2},{:.2}) -> 输出 ({:.2},{:.2})",
+            probe[0], probe[1], before[0], before[1]
+        );
+        assert_eq!(
+            (before[0], before[1]),
+            (probe[0], probe[1]),
+            "那个点上本来就卡着一辆车 —— 线上 car8 冻结的真实原因"
+        );
+        // 再验一次:真给它 0.5 m 的位移,看能不能走。
+        let moved: Vec2 = world.resolve_car_footprint(probe, [0.5, 0.0], 0.0);
+        println!(
+            "0.5 m 位移解算: ({:.2},{:.2}) -> ({:.2},{:.2})",
+            probe[0], probe[1], moved[0], moved[1]
+        );
+        assert!(
+            moved[0] > probe[0] + 0.2,
+            "车头前 0.5 m 都挪不动,静态几何就压在 ({:.2},{:.2})",
+            probe[0],
+            probe[1]
+        );
+    }
+
+    /// **队首车刚越过路口中轴线就停住 —— 后车全体被锁。**
+    ///
+    /// 线上实测(玩家在 63.5,45)沿 +X 那一排:
+    ///
+    /// ```text
+    /// car3 x=48.3 v=2.09 | car1 x=52.9 v=2.09 | car4 x=57.4 v=2.09 | car2 x=61.7 v=0.20
+    /// ```
+    ///
+    /// 逐个对几何(街道 1,`LANE_OFFSET` 3.5,停止线 50.717,中轴线 60):
+    ///
+    /// - car3 @48.3 —— 停止线**外** 2.4 m,队列最末。
+    /// - car1 @52.9 —— 已压过停止线 2.18 m,**在路口箱内**。
+    /// - car4 @57.4 —— 也在路口箱内。
+    /// - car2 @61.7 —— 已越过中轴线 1.7 m,`v = 0.20` 基本停死。
+    ///
+    /// car1 之所以只有 2.09 m/s,是**跟在 car2 后面**:净间距
+    /// `61.7 − 52.9 − 2.283` = 6.52 m,IDM 平衡速度 2.61 m/s,实测 2.09
+    /// —— 数量级吻合。所以 2.09 不是 bug,是正常跟车。
+    ///
+    /// 真正的问题是**队首 car2 为什么停下**。它已经越过中轴线,应该触发
+    /// `choose_at_junction` 换到下一条街继续开。这条直接盯这个状态:
+    /// 一辆车停在刚过中轴线的位置,给它 20 s,看它走不走。
+    #[test]
+    pub(crate) fn a_car_just_past_the_junction_centre_keeps_driving() {
+        let mut world: CollisionWorld = traffic_world_at(60.0, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        let mut car: crate::traffic::TrafficCar =
+            crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 1, 61.7, 11.5, 1.0);
+        car.set_position([61.7, 0.0, 63.5]);
+        traffic.get_cars_mut().push(car);
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        for _frame in 0..1200 {
+            traffic.step(dt, None, &world, clock);
+            clock += dt;
+        }
+        let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
+        let p: Vec3 = c.get_position();
+        println!(
+            "刚过中轴线的车 20s 后在 ({:.2},{:.2}) 终速 {:.2}",
+            p[0],
+            p[2],
+            c.get_speed()
+        );
+        let moved: f32 = ((p[0] - 61.7).powi(2) + (p[2] - 63.5).powi(2)).sqrt();
+        assert!(
+            moved >= 5.0,
+            "刚越过路口中轴线的车 20 s 只走了 {moved:.2} m,停在 ({:.2},{:.2}) 终速 {:.2}",
+            p[0],
+            p[2],
+            c.get_speed()
+        );
+    }
+
+    /// **生产出生点 + 路边招手 —— 逐字复现线上被冻住的 9 辆车。**
+    ///
+    /// 这是把线上观测全部对齐之后的第一条测试。前七条复现都各自改了
+    /// 一个变量(空世界 / 单车 / 鼻碰尾 / hailer),全都绿 —— 说明缺的是
+    /// **组合**,而组合里的关键是线上真实的那两条:
+    ///
+    /// 1. **生产出生点** [`TRAFFIC_LANE_PLAN`]:车不是随机撒的,而是按
+    ///    `TRAFFIC_LANE_PLAN` 逐条 `new_on_lane` 铺在街道 1 / -1 上。
+    /// 2. **`hailer = Some([x, z])`**:玩家步行时一定非空。之前所有
+    ///    traffic 测试都传 `None`,没碰过这条路。
+    ///
+    /// 线上(player 63.5,45)实测 9/10 辆车 3 s 内位移 0.00~0.02 m。
+    ///
+    /// # Arguments
+    ///
+    /// 无。
+    ///
+    /// # Returns
+    ///
+    /// 无 —— 失败即 panic。
+    #[test]
+    pub(crate) fn the_production_fleet_with_a_hailing_player_keeps_flowing() {
+        let mut world: CollisionWorld = traffic_world_at(33.5, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        // **走生产路径**:`traffic_lanes()` + `populate`,和 `load_assets_and_build`
+        // 一模一样。手工 `new_on_lane` 会漏掉资产种类和方向。
+        traffic.populate(&traffic_lanes(), PICKUP_PLACEMENTS);
+        let start: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        // 玩家出生点 —— 线上就是这个位置。
+        let who: [f32; 2] = [33.5, 45.0];
+        for _frame in 0..2400 {
+            traffic.step(dt, Some(who), &world, clock);
+            clock += dt;
+        }
+        let mut worst: String = String::new();
+        let mut frozen: Vec<String> = Vec::new();
+        for (index, car) in traffic.get_cars_ref().iter().enumerate() {
+            let p: Vec3 = car.get_position();
+            let moved: f32 =
+                ((p[0] - start[index][0]).powi(2) + (p[2] - start[index][1]).powi(2)).sqrt();
+            worst.push_str(&format!(
+                "car{index} {moved:.1}m v={:.2}; ",
+                car.get_speed()
+            ));
+            if moved < 1.0 {
+                frozen.push(format!("car{index}({moved:.2}m)"));
+            }
+        }
+        println!("生产车队+招手 40s: {worst}");
+        // 最多允许**一辆**不动(离玩家最近的那辆在等客,这是设计)。
+        assert!(
+            frozen.len() <= 1,
+            "生产车队里 {} 辆车 40 s 没动(只有一辆可以等客):{}",
+            frozen.len(),
+            frozen.join(",")
+        );
+    }
+
+    /// **长时间运行后车队会不会退化 —— 跑 300 秒。**
+    ///
+    /// 线上那批车不是一开始就冻住的:页面已经跑了 23,000+ 帧(≈ 6 分钟)
+    /// 才采样到。前八条复现都只跑 40 s,全部绿 —— 初始条件显然没问题。
+    ///
+    /// 于是剩下的唯一变量是**时间**。最可疑的是 [`next_route_draw`]:
+    /// 路口抽签用 `route_seed`,历史上就有过「洗回 0 之后永远转向」的
+    /// 死循环 bug(`route_rand(0) == 0` 是不动点)。如果某辆车抽签后
+    /// 反复被分到同一个路口,就会在路口箱里原地打转 —— 位置不动而
+    /// `leader_gap` 让后车读到 2.09 m/s 的平衡速度。
+    ///
+    /// 这条跑 18,000 帧(300 s,≈ 8 个信号周期),要求每辆车累计位移
+    /// 都远超一个街区。
+    #[test]
+    pub(crate) fn the_fleet_still_flows_after_five_minutes() {
+        let mut world: CollisionWorld = traffic_world_at(33.5, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        traffic.populate(&traffic_lanes(), PICKUP_PLACEMENTS);
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        let who: [f32; 2] = [33.5, 45.0];
+        // 每 30 s 记一次净位移:真实车轮转 5 圈,不该有哪一圈是 0。
+        let mut trace: Vec<String> = Vec::new();
+        let mut frozen_ever: bool = false;
+        let mut last: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        for window in 1..=10 {
+            for _frame in 0..1800 {
+                traffic.step(dt, Some(who), &world, clock);
+                clock += dt;
+            }
+            let now: Vec<[f32; 2]> = traffic
+                .get_cars_ref()
+                .iter()
+                .map(|car: &crate::traffic::TrafficCar| {
+                    let p: Vec3 = car.get_position();
+                    [p[0], p[2]]
+                })
+                .collect();
+            let worst_index: usize = (0..now.len())
+                .min_by(|a: &usize, b: &usize| {
+                    let da: f32 = ((now[*a][0] - last[*a][0]).powi(2)
+                        + (now[*a][1] - last[*a][1]).powi(2))
+                    .sqrt();
+                    let db: f32 = ((now[*b][0] - last[*b][0]).powi(2)
+                        + (now[*b][1] - last[*b][1]).powi(2))
+                    .sqrt();
+                    da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+                })
+                .unwrap_or(0);
+            let d: f32 = ((now[worst_index][0] - last[worst_index][0]).powi(2)
+                + (now[worst_index][1] - last[worst_index][1]).powi(2))
+            .sqrt();
+            trace.push(format!("w{window} 最慢 car{worst_index} {d:.2}m"));
+            // 「卡死」的判据是**彻底不动**,不是「慢」。1.0 m / 30 s = 0.03 m/s,
+            // 那仍然是流动中的车;线上观察到的是位移**精确为 0.00 m**,
+            // 而速度探针同时读出 2.09 m/s —— 位置和速度互相矛盾。
+            if d < 0.001 {
+                println!(
+                    "  >> car{worst_index} 完全卡住 在 ({:.2},{:.2}) 速度 {:.3} lane_axis={} dir={}",
+                    now[worst_index][0],
+                    now[worst_index][1],
+                    traffic.get_cars_ref()[worst_index].get_speed(),
+                    traffic.get_cars_ref()[worst_index].get_lane_axis(),
+                    traffic.get_cars_ref()[worst_index].get_direction()
+                );
+                frozen_ever = true;
+            }
+            last = now;
+        }
+        println!("300s 分窗: {}", trace.join(" | "));
+        // 每一窗至少要有一辆车跑过 20 m(30 s × 11.5 m/s 上限 = 345 m,
+        // 20 m 是极宽松的下限,只为抓「完全不动」)。
+        assert!(
+            !frozen_ever,
+            "5 分钟里有车彻底卡死(30 s 位移 < 1 mm):{}",
+            trace.join(" | ")
+        );
+    }
+
+    /// **招手的车停稳之后,必须让位给下一辆 —— 不能霸占车道。**
+    ///
+    /// 线上实测(玩家 63.5,45 步行)10 辆车里 9 辆 3 s 内位移 0.00~0.02 m,
+    /// 速度探针读 2.09 / 0.13 m/s。本地 300 s 复现:car7 在第 4 个 30 s
+    /// 窗口之后**连续六个窗口位移精确为 0.00 m**,卡死在
+    /// `(33.84, 56.50)`、速度 `0.000`,而玩家出生点就在 `(33.5, 45)`
+    /// —— **相距 11.51 m,在 `HAUL_RANGE = 26` 之内**。
+    ///
+    /// 机制([`Traffic::step`] 的 `hailer_car` 选取):每帧重新挑
+    /// 「26 m 内离玩家最近的一辆」,**唯一排除条件是 `get_driven()`**。
+    /// 一辆车一旦停下等客,下一帧它仍然最近,于是继续被选中,
+    /// `desired = 0` 一直施加 —— 车道被**永久**占住,后车全被锁在
+    /// IDM 平衡速度上。
+    ///
+    /// 这条要求:玩家一直站在原地招手 300 s,车队里**仍然要有车在动**。
+    #[test]
+    pub(crate) fn a_stopped_hail_does_not_permanently_block_the_lane() {
+        let mut world: CollisionWorld = traffic_world_at(33.5, 45.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        traffic.populate(&traffic_lanes(), PICKUP_PLACEMENTS);
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        // 玩家**一直不动**地站在出生点招手 —— 这正是线上观察到的条件。
+        let who: [f32; 2] = [33.5, 45.0];
+        let mut last: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let mut stalled_since: usize = 0;
+        for window in 1..=10 {
+            for _frame in 0..1800 {
+                traffic.step(dt, Some(who), &world, clock);
+                clock += dt;
+            }
+            let now: Vec<[f32; 2]> = traffic
+                .get_cars_ref()
+                .iter()
+                .map(|car: &crate::traffic::TrafficCar| {
+                    let p: Vec3 = car.get_position();
+                    [p[0], p[2]]
+                })
+                .collect();
+            let moving: usize = (0..now.len())
+                .filter(|i: &usize| {
+                    ((now[*i][0] - last[*i][0]).powi(2) + (now[*i][1] - last[*i][1]).powi(2)).sqrt()
+                        >= 1.0
+                })
+                .count();
+            println!("  w{window}: {moving}/{} 辆车在动", now.len());
+            if moving <= 1 {
+                stalled_since += 1;
+            } else {
+                stalled_since = 0;
+            }
+            last = now;
+        }
+        assert_eq!(
+            stalled_since, 0,
+            "玩家原地招手时,车队连续 {stalled_since} 个 30 s 窗口只有 ≤1 辆车在动 —— 车道被停靠的车永久堵死"
+        );
+    }
+
+    /// **两个路口、两组完全静止的车 —— 玩家不在 26 m 内。**
+    ///
+    /// 线上(player 63.5,45)实测的 2.09 m/s 车队其实分成**两组**:
+    ///
+    /// ```text
+    /// 组 A:x=48.3 / 52.9 / 57.4 / 61.7   z=63.5   距玩家 18~24 m
+    /// 组 B:x=-67.2 / -62.7 / -58.3        z=-56.5  距玩家 158~166 m
+    /// ```
+    ///
+    /// 组 A 落在 `HAUL_RANGE = 26` 内,可以用「停靠等客」解释;**组 B 离
+    /// 玩家 160 m,跟 hailer 一点关系都没有**,却同样是 2.09 / 0.20 m/s
+    /// 且位移 0.00~0.02 m。只修 hailer 解释不了组 B。
+    ///
+    /// 这条把 `hailer` 传 `None`,复现组 B 的几何(街道 -1、z=-56.5、
+    /// 沿 +X),跑 300 s,要求每一辆车都动。
+    #[test]
+    pub(crate) fn two_junction_queues_flow_without_any_player() {
+        let mut world: CollisionWorld = traffic_world_at(0.0, 0.0);
+        let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
+        // 组 B 的实测几何:街道 -1、side +1 => z = -60 + 3.5 = -56.5,沿 +X。
+        // 相邻间距 ~4.5 m,和线上 2.2 m 那个「鼻碰尾」不同,这里是正常排队。
+        for x in [-71.7f32, -67.2, -62.7, -58.3, -53.8].iter() {
+            let mut car: crate::traffic::TrafficCar =
+                crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, -1, 1.0, 1, *x, 11.5, 1.0);
+            car.set_position([*x, 0.0, -56.5]);
+            traffic.get_cars_mut().push(car);
+        }
+        let mut last: Vec<[f32; 2]> = traffic
+            .get_cars_ref()
+            .iter()
+            .map(|car: &crate::traffic::TrafficCar| {
+                let p: Vec3 = car.get_position();
+                [p[0], p[2]]
+            })
+            .collect();
+        let dt: f32 = 1.0 / 60.0;
+        let mut clock: f32 = 0.0;
+        let mut frozen_ever: bool = false;
+        // **没有玩家**:`hailer = None`。
+        for window in 1..=10 {
+            for _frame in 0..1800 {
+                traffic.step(dt, None, &world, clock);
+                clock += dt;
+            }
+            let now: Vec<[f32; 2]> = traffic
+                .get_cars_ref()
+                .iter()
+                .map(|car: &crate::traffic::TrafficCar| {
+                    let p: Vec3 = car.get_position();
+                    [p[0], p[2]]
+                })
+                .collect();
+            for i in 0..now.len() {
+                let d: f32 =
+                    ((now[i][0] - last[i][0]).powi(2) + (now[i][1] - last[i][1]).powi(2)).sqrt();
+                if d < 0.001 {
+                    frozen_ever = true;
+                    println!(
+                        "  >> w{window} car{i} 完全卡住 在 ({:.2},{:.2}) 速度 {:.3}",
+                        now[i][0],
+                        now[i][1],
+                        traffic.get_cars_ref()[i].get_speed()
+                    );
+                }
+            }
+            last = now;
+        }
+        assert!(
+            !frozen_ever,
+            "没有玩家在场,街道 -1 的五辆车却有彻底不动的 —— 与 hailer 无关"
+        );
+    }
+
     #[test]
     pub(crate) fn traffic_drives_through_a_junction_in_the_real_city() {
         // 回归:用**真实城市道具**当碰撞世界,让一辆车从街道 1 的南向车道
@@ -10869,14 +12124,7 @@ mod tests {
         // 必须走**生产路径** `build_collision_world`:手工拼 `push_box`
         // 会绕过 `solid_bounds` 的高度带和 `on_lane` 的车道排除,测出来
         // 的是测试自己造的空气墙,不是线上缺陷。
-        let raw: String = crate::fs::read_to_string("assets/prop_trafficlight.json")
-            .expect("交通灯资产必须在磁盘上");
-        let asset: MeshAsset = serde_json::from_str(&raw).expect("交通灯资产必须能解析");
-        let mut bounds: HashMap<String, crate::mesh::Bounds> = HashMap::new();
-        collider_bounds(&mut bounds, "prop_trafficlight", &asset);
-        collider_bounds(&mut bounds, "prop_traffic_cone", &asset);
-        let mut world: CollisionWorld = CollisionWorld::new();
-        build_collision_world(&mut world, &bounds, 0.0, 0.0);
+        let mut world: CollisionWorld = traffic_world_at(0.0, 0.0);
         let mut c: crate::traffic::TrafficCar =
             crate::traffic::TrafficCar::new_on_lane(CAR_SEDAN, 1, 1.0, 0, 60.0, 11.5, -1.0);
         let start: Vec3 = c.get_position();
@@ -12670,5 +13918,110 @@ mod tests {
         // 换完之后弹匣**只补一次**,不会补出 18 发。
         arsenal.tick(RELOAD_TIME + FIXED_DT);
         assert_eq!(arsenal.get_magazine(), PISTOL_MAGAZINE);
+    }
+
+    /// WASTED 重生必须落在**死亡点附近**,不能把玩家传送回城市原点。
+    ///
+    /// 这是用户报的「瞬移」。旧实现从 `HOSPITAL_SPOTS`(固定 12 个点)里挑
+    /// 最近的一个,而世界是无限生成的,实测跳变:
+    ///
+    /// | 死亡位置 | 旧跳到 | 距离 |
+    /// |---|---|---|
+    /// | (300, 0) | (98, 98) | 224.5 m |
+    /// | (5000, 5000) | (98, 98) | 6932.5 m |
+    ///
+    /// 它看起来和「跨街区」有关,是因为每次流式换块都会在玩家附近刷 7 个
+    /// 敌对混混,于是换块后 3 秒被打死,然后被传回原点 —— 因果链,不是巧合。
+    #[test]
+    pub(crate) fn wasted_respawns_next_to_the_death_not_at_the_city_origin() {
+        // 覆盖出生点附近、远处、以及负坐标(负数是整数除法最容易出错的一侧)。
+        let deaths: [Vec3; 6] = [
+            [65.0, 0.0, 30.0],
+            [300.0, 0.0, 0.0],
+            [5000.0, 0.0, 5000.0],
+            [-300.0, 0.0, -300.0],
+            [-5000.0, 0.0, 5000.0],
+            [12.5, 0.0, -7.25],
+        ];
+        for death in deaths {
+            let spot: Vec3 = hospital_near(death);
+            let jumped: f32 = flat_distance(death, spot);
+            assert!(
+                jumped <= HOSPITAL_SPAWN_MAX_OFFSET,
+                "{}",
+                fill(
+                    T_WASTED_SPAWN_TELEPORTS,
+                    &[
+                        ("death", &format!("({:.1}, {:.1})", death[0], death[2])),
+                        ("spot", &format!("({:.1}, {:.1})", spot[0], spot[2])),
+                        ("jump", &format!("{jumped:.1}")),
+                        ("max", &format!("{HOSPITAL_SPAWN_MAX_OFFSET:.1}")),
+                    ]
+                )
+            );
+            // 必须在地面上,不能复活在半空或者二楼楼板上。
+            assert_eq!(spot[1], GROUND_LEVEL);
+        }
+    }
+
+    /// 重生点必须**可重放**:同一个死亡位置两次调用给出同一个点。
+    ///
+    /// 用内置 `hash()` 选医院会每进程加盐,重开一局就换一个医院,
+    /// 于是「回到上次死的地方」这件事不再成立。
+    #[test]
+    pub(crate) fn the_respawn_point_is_replayable() {
+        let deaths: [Vec3; 4] = [
+            [65.0, 0.0, 30.0],
+            [300.0, 0.0, 0.0],
+            [-300.0, 0.0, -300.0],
+            [12.5, 0.0, -7.25],
+        ];
+        for death in deaths {
+            let first: Vec3 = hospital_near(death);
+            let second: Vec3 = hospital_near(death);
+            assert_eq!(
+                first, second,
+                "同一个死亡位置 ({:.2}, {:.2}) 两次重生点不同 ({:?} vs {:?}) —— \
+                 选点用了每进程加盐的 hash",
+                death[0], death[2], first, second
+            );
+        }
+    }
+
+    /// 重生点必须落在**人行道上**,不能把玩家丢进车流中间。
+    ///
+    /// 车行道半宽 7 m、车道中心 ±3.5 m,所以重生点与街道中轴线的横向距离
+    /// 至少要大于车道半宽,否则玩家一复活就在车流里。
+    #[test]
+    pub(crate) fn the_respawn_point_is_off_the_carriageway() {
+        let mut checked: usize = 0;
+        // 扫一段街区,确认四个候选角都落在车道之外。
+        for k in -6..6 {
+            for death in [
+                [k as f32 * 60.0 + 3.0, 0.0, 11.0],
+                [11.0, 0.0, k as f32 * 60.0 + 3.0],
+            ] {
+                let spot: Vec3 = hospital_near(death);
+                let street_centre: f32 = street_axis(street_index_at(spot[0]));
+                let cross_centre: f32 = street_axis(street_index_at(spot[2]));
+                let off_x: f32 = (spot[0] - street_centre).abs();
+                let off_z: f32 = (spot[2] - cross_centre).abs();
+                assert!(
+                    off_x > STREET_HALF_WIDTH || off_z > STREET_HALF_WIDTH,
+                    "{}",
+                    fill(
+                        T_WASTED_SPAWN_IN_TRAFFIC,
+                        &[
+                            ("death", &format!("({:.1}, {:.1})", death[0], death[2])),
+                            ("spot", &format!("({:.1}, {:.1})", spot[0], spot[2])),
+                            ("offX", &format!("{off_x:.1}")),
+                            ("offZ", &format!("{off_z:.1}")),
+                        ]
+                    )
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "一条重生点都没检查到");
     }
 }
