@@ -308,6 +308,143 @@ pub(crate) fn signal_speed_cap(gap: f32) -> f32 {
     }
 }
 
+/// 某条街道的**车流密度权重**(0.0~1.0)。
+///
+/// 移植 GTA 的 `CPathFind::CalcRoadDensity`。GTA 的密度是这么算的:取
+/// 玩家周围 [`ROAD_DENSITY_WINDOW`] 见方的窗口,把窗口内每个路径节点的每条
+/// 连接按 `numLeftLanes + numRightLanes` 乘路段长度累加,最后除以
+/// [`ROAD_DENSITY_NORM`]。也就是**密度正比于这个区域里车道总长** ——
+/// 路网密的地方车多。
+///
+/// 本项目的街道网格是均匀的,每条街的车道数和路长都相等,所以 GTA 那个
+/// 公式算出来处处相同(每条街都是 2 条车道 × 60 m ÷ 2500 = 0.048)。要做
+/// 出 GTA 的效果 —— 「市中心热闹、边缘冷清」—— 必须显式给街道一个权重,
+/// 否则整座城市车密度一模一样,像一张均匀的渔网。
+///
+/// 形状是 `距离 → 线性衰减 → 夹到下限`。下限不能设 0:权重归零意味着玩家
+/// 一开出城区就撞上完全静止的空城,那是「另一个极端的空」,比均匀铺开更假。
+///
+/// # Arguments
+///
+/// - `f32` - 街道中心到市中心的距离(米)。
+///
+/// # Returns
+///
+/// - `f32` - 密度权重,范围 `[DENSITY_FLOOR, 1.0]`。
+pub(crate) fn road_density(distance_from_centre: f32) -> f32 {
+    let falloff: f32 = distance_from_centre / (DENSITY_FALLOFF_STREETS * STREET_PITCH);
+    (1.0 - falloff * 0.35).max(DENSITY_FLOOR)
+}
+
+/// 玩家的**生成半径倍率**(GTA `PedCreationDistMultiplier`)。
+///
+/// GTA 原值:`return Clamp(vehSpeed - 0.1f + 1.0f, 1.0f, 1.5f);`
+///
+/// 它乘的是**生成半径**,不是速度:玩家开得越快,视野内容换得越快,必须
+/// 把远处提前填满,不然一眼就能看出街上是空的。步行时 1.0,开满 1.5。
+///
+/// 本项目把自变量换成「速度先归一化到 0..1」,这样改 [`SPEED_MAX`] 不会
+/// 顺带改坏这个公式 —— GTA 那式子里 `1.5` 是写死的,跟着车速上限漂移。
+///
+/// # Arguments
+///
+/// - `f32` - 玩家水平速度(米/秒);步行与倒车也走这个函数。
+///
+/// # Returns
+///
+/// - `f32` - 半径倍率,范围 `[1.0, CREATION_RADIUS_MAX]`。
+pub(crate) fn creation_speed_gain(player_speed: f32) -> f32 {
+    let normalised: f32 = (player_speed / SPEED_MAX).clamp(0.0, 1.0);
+    (1.0 + normalised * CREATION_SPEED_GAIN * 0.5).clamp(1.0, CREATION_RADIUS_MAX)
+}
+
+/// 车是否值得在这个方向上生成(GTA 的 `angleLimit` 门)。
+///
+/// GTA 的 `GenerateCarCreationCoors` 在圆周交点处判定
+/// `dot(视线方向, 玩家朝向) > angleLimit`,**只从玩家前方这一半视野生成车**,
+/// 侧方与后方不生成。
+///
+/// 这条门是「78 辆车只看得见 6 辆」的真正答案:车确实有 78 辆,但它们均匀
+/// 铺在 7 条街 × 2 侧车道上,一次能看见的只有视野正中那一条。生成位置收进
+/// 前方扇形之后,同样数量的车全部落在你看得见的那片路上。
+///
+/// # Arguments
+///
+/// - `[f32; 2]` - 候选点减玩家位置的 `(dx, dz)`。
+/// - `f32` - 玩家面朝方向的偏航角(弧度,绕 Y 轴)。
+///
+/// # Returns
+///
+/// - `bool` - 视线与朝向的点积是否过门;`true` = 值得生成。
+pub(crate) fn spawn_faces_player(offset: [f32; 2], player_yaw: f32) -> bool {
+    let (dx, dz): (f32, f32) = (offset[0], offset[1]);
+    let length: f32 = (dx * dx + dz * dz).sqrt();
+    if length <= 1.0e-3 {
+        return true;
+    }
+    // 偏航为 0 时车头朝 +Z,所以正前方方向是 `(sin, cos)`。
+    let (fx, fz): (f32, f32) = (player_yaw.sin(), player_yaw.cos());
+    (dx / length) * fx + (dz / length) * fz > SPAWN_ANGLE_LIMIT
+}
+
+/// **弯道减速系数**(GTA `CCarAI::ModifySpeed`)。
+///
+/// GTA 调 `CCurves::CalcSpeedScaleFactor(当前车道点, 下一车道点, 当前方向, 下一方向)`,
+/// 按**当前路段与下一路段的夹角**缩放通过时间 —— 直路全速,进弯前收油。
+///
+/// 本项目没有节点图,但路口转向同样是 90° 折,所以用**转向瞬间甩出的横向
+/// 速度**当夹角代理 —— 它已经是车身上现成的量,不必再加一个「下一次是否
+/// 转向」的预判字段。
+///
+/// 这是「车流看起来自然」的关键:没有它,所有车以同一个巡航速度冲进路口
+/// 再瞬间换向,整支车队像被人用遥控器摆位。
+///
+/// # Arguments
+///
+/// - `f32` - 车身横向速度(米/秒,取绝对值)。
+///
+/// # Returns
+///
+/// - `f32` - 速度倍率,范围 `[CORNER_SPEED_FLOOR, 1.0]`。
+pub(crate) fn corner_speed_scale(lateral: f32) -> f32 {
+    let bend: f32 = (lateral.abs() / (SPEED_MAX * 0.5)).min(1.0);
+    // 直线 → 弯道插值,两端各自钉死:直路 1.0,满舵 [`CORNER_SPEED_FLOOR`]。
+    //
+    // 写成 `(1.0 - bend * SLOPE).max(FLOOR)` 是**错的**,而且错得很隐蔽:
+    // 那样算出来满舵是 `1 − 1 × 0.5 = 0.5`,永远大于地板 0.45,于是
+    // [`CORNER_SPEED_FLOOR`] 是个**从没生效过的死常量** —— 看起来限制了
+    // 弯道速度,实际谁来改都不会有任何影响。线性插值让地板成为真终点。
+    1.0 + (CORNER_SPEED_FLOOR - 1.0) * bend * CORNER_BRAKE_SLOPE * 2.0
+}
+
+/// 本帧应当被跟车逻辑处理的**车队下标**(GTA 的 32 帧分片)。
+///
+/// GTA 的 `CPopulation::ManagePopulation` 开头是
+/// `int frameMod32 = CTimer::GetFrameCounter() & 31;`,然后每帧只扫对象池的
+/// 1/32 —— 行人、车辆、dummy 对象、临时对象全部这样分片。跟车距离检查因此
+/// 从每帧 N 次降到每帧 N/32 次。
+///
+/// 本项目跟车是 `leader_gap()` 里对每辆车扫全车队,O(n²)。500 辆车时每帧
+/// 25 万次比较,分片后降到约 7800 次。代价是每辆车每 32 帧(60 fps 下
+/// 0.53 s)才跟一次前车,而 IDM 的车头时间间隔是 1.2 s —— 分片延迟只占
+/// 44%,不会看出后车反应变慢。
+///
+/// 分片键必须带 `index`:用 `frame % 32` 会让同一帧里**所有车都不更新
+/// 跟车**,车队整体「抖一下、再抖一下」。`(index + frame) % 32` 让每辆车落在
+/// 不同相位,任何一帧都只有均匀的 1/32 在跟车。
+///
+/// # Arguments
+///
+/// - `usize` - 本车在车队里的下标。
+/// - `u32` - 当前帧计数。
+///
+/// # Returns
+///
+/// - `bool` - 本帧是否需要处理这辆车的跟车。
+pub(crate) fn manage_shard(index: usize, frame: u32) -> bool {
+    (index + frame as usize) % MANAGE_SHARDS == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,7 +1133,7 @@ mod tests {
         let mut current_park: f32 = 0.0;
         let mut clock: f32 = 0.0;
         for _frame in 0..2400 {
-            traffic.step(dt, Some(who), &world, clock);
+            traffic.step(dt, Some(who), &world, clock, 0);
             clock += dt;
             let stopped: bool = traffic.get_cars_ref()[0].get_speed() <= HAIL_PARKED_SPEED;
             if stopped {
@@ -1067,7 +1204,7 @@ mod tests {
         // 测试根本碰不到 P2 的逻辑,自然全绿。
         let mut clock: f32 = 0.0;
         for _frame in 0..2400 {
-            traffic.step(dt, None, &world, clock);
+            traffic.step(dt, None, &world, clock, 0);
             clock += dt;
         }
         let mut stuck: Vec<String> = Vec::new();
@@ -1332,6 +1469,144 @@ mod tests {
             turn_rev,
             speed_fwd,
             speed_rev
+        );
+    }
+    /// **32 帧分片:每辆车每 [`MANAGE_SHARDS`] 帧跟一次前车,且不同车错开相位。**
+    ///
+    /// 钉两件事,缺一不可:
+    ///
+    /// 1. **每辆车恰好每 32 帧被分到一次** —— 少一次是丢更新,多一次是
+    ///    分片没生效(退化成全量,性能改动等于没做)。
+    /// 2. **同一帧内不同车落在不同相位** —— 这是分片键用
+    ///    `(index + frame) % 32` 而不是 `frame % 32` 的唯一理由。
+    #[test]
+    pub(crate) fn manage_shard_gives_every_car_its_own_phase() {
+        const CARS: usize = 8;
+        let mut per_car: Vec<usize> = vec![0; CARS];
+        for frame in 0..(MANAGE_SHARDS as u32) * 3 {
+            for index in 0..CARS {
+                if manage_shard(index, frame) {
+                    per_car[index] += 1;
+                }
+            }
+        }
+        for (index, hits) in per_car.iter().enumerate() {
+            assert_eq!(
+                *hits, 3,
+                "car{index} 在 3 个完整分片周期里应恰好被分到 3 次,实际 {hits}"
+            );
+        }
+        for frame in 0..MANAGE_SHARDS as u32 {
+            let together: usize = (0..CARS)
+                .filter(|i: &usize| manage_shard(*i, frame))
+                .count();
+            assert!(
+                together <= CARS / MANAGE_SHARDS + 1,
+                "帧 {frame} 有 {together} 辆车同时跟车,超过均匀分片的上限"
+            );
+        }
+    }
+
+    /// **生成方向门:正前方生成,正后方与侧方不生成。**
+    ///
+    /// GTA `GenerateCarCreationCoors` 里 `dot(视线, 朝向) > angleLimit` 那道门
+    /// 的等价物。钉死它是因为症状反直觉:加了门之后**总车数会明显下降**,
+    /// 不钉住就会有人拿「车变少了」当回归把门拆掉 —— 而那个门正是「78 辆车
+    /// 只看得见 6 辆」的解药(车全落在看不见的侧方与后方)。
+    #[test]
+    pub(crate) fn spawn_gate_keeps_cars_in_the_forward_fan() {
+        assert!(spawn_faces_player([0.0, 100.0], 0.0), "正前方该生成");
+        assert!(!spawn_faces_player([0.0, -100.0], 0.0), "正后方不该生成");
+        assert!(
+            !spawn_faces_player([100.0, 0.0], 0.0),
+            "正侧方不该生成 —— 门就是挡它的"
+        );
+        assert!(spawn_faces_player([50.0, 50.0], 0.0), "45° 在门内,该生成");
+        assert!(!spawn_faces_player([95.0, 17.0], 0.0), "80° 在门外,该挡");
+        assert!(spawn_faces_player([0.0, 0.0], 0.0), "零向量不该被门误杀");
+    }
+
+    /// **生成半径倍率:步行 1.0,满速 1.5,中间单调。**
+    ///
+    /// GTA 原值 `Clamp(vehSpeed - 0.1f + 1.0f, 1.0f, 1.5f)`。钉住两端是
+    /// 因为两端各有一次真实事故:下界写成 `< 1.0` 会让步行时把行人推到剔除
+    /// 圈之外(人凭空消失);上界忘了夹住会让高速时淡入带拉到 2 倍以上 ——
+    /// 多出来的那一半实例纯粹是浪费。
+    #[test]
+    pub(crate) fn creation_gain_spans_one_to_one_and_a_half() {
+        assert_eq!(creation_speed_gain(0.0), 1.0, "步行不该放大");
+        assert_eq!(
+            creation_speed_gain(SPEED_MAX),
+            CREATION_RADIUS_MAX,
+            "满速应正好取到 GTA 的上限"
+        );
+        assert_eq!(
+            creation_speed_gain(SPEED_MAX * 10.0),
+            CREATION_RADIUS_MAX,
+            "超速也必须夹在上限,不能无限放大"
+        );
+        assert_eq!(creation_speed_gain(-5.0), 1.0, "倒车不该缩小半径");
+        let mut previous: f32 = 0.0;
+        for step in 0..=10 {
+            let speed: f32 = SPEED_MAX * step as f32 / 10.0;
+            let gain: f32 = creation_speed_gain(speed);
+            assert!(
+                gain >= previous,
+                "speed {speed} 的倍率 {gain} 反而小于前一个"
+            );
+            previous = gain;
+        }
+    }
+
+    /// **密度分区:中心区比边缘区热闹,但边缘不归零。**
+    ///
+    /// GTA 的 `CalcRoadDensity` 让密度正比于区域车道总长,市中心路网密、车
+    /// 就多。本项目网格均匀,那个公式处处相同,所以用距离权重代替。钉住
+    /// 下界的理由:权重一旦能到 0,玩家开出城区就会撞上一座完全静止的空城。
+    #[test]
+    pub(crate) fn road_density_falls_off_but_never_reaches_zero() {
+        let centre: f32 = road_density(0.0);
+        let near: f32 = road_density(STREET_PITCH);
+        let far: f32 = road_density(STREET_PITCH * 100.0);
+        assert_eq!(centre, 1.0, "市中心权重应是满值");
+        assert!(near < centre, "出城一格就该降");
+        assert_eq!(
+            far, DENSITY_FLOOR,
+            "极远处应夹在下限,不能归零 —— 那会让玩家开出城区撞上空城"
+        );
+        let mut previous: f32 = f32::INFINITY;
+        for step in 0..20 {
+            let value: f32 = road_density(STREET_PITCH * step as f32);
+            assert!(value <= previous, "第 {step} 档不该比前一档更高");
+            previous = value;
+        }
+    }
+
+    /// **弯道减速:直路全速,满舵转向收到下限,且左右对称。**
+    ///
+    /// GTA `CCarAI::ModifySpeed` 按当前路段与下一路段的夹角缩放速度。这是
+    /// 「车流看起来自然」的关键 —— 没有它,所有车以同一个巡航速度冲进路口
+    /// 再瞬间换向,整支车队像被人用遥控器摆位。
+    /// `abs()` 一并钉住:左右转向的横向速度符号相反,但减速幅度必须相同。
+    /// 这条测试同时钉住 [`CORNER_SPEED_FLOOR`] 真的可达 —— 原实现写成
+    /// `(1 - bend * SLOPE).max(FLOOR)`,满舵算出 0.5 > 0.45,地板从来没生效过。
+    #[test]
+    pub(crate) fn corner_brake_slows_only_when_actually_turning() {
+        assert_eq!(corner_speed_scale(0.0), 1.0, "直路不该减速");
+        assert_eq!(
+            corner_speed_scale(SPEED_MAX * 0.5),
+            CORNER_SPEED_FLOOR,
+            "满舵转向应正好落到下限"
+        );
+        assert_eq!(
+            corner_speed_scale(-SPEED_MAX * 0.5),
+            corner_speed_scale(SPEED_MAX * 0.5),
+            "左右转向的减速幅度必须相同"
+        );
+        let beyond: f32 = corner_speed_scale(SPEED_MAX * 10.0);
+        assert!(
+            beyond >= CORNER_SPEED_FLOOR,
+            "极端横移不该把速度压到下限以下"
         );
     }
 }

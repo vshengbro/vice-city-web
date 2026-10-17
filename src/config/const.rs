@@ -1710,6 +1710,16 @@ pub(crate) const PED_RENDER_RANGE: f32 = 52.0;
 pub(crate) const PED_FADE_START: f32 = PED_RENDER_RANGE * 1.22;
 /// 敌人淡入起点(米),规则同 [`PED_FADE_START`]。
 pub(crate) const ENEMY_FADE_START: f32 = ENEMY_RENDER_RANGE * 1.22;
+
+/// **行车时的生成半径倍率上限**(GTA `PedCreationDistMultiplier`)。
+///
+/// GTA 原值:`return Clamp(vehSpeed - 0.1f + 1.0f, 1.0f, 1.5f);`
+/// 玩家开得越快,行人生成半径越大(最高 1.5 倍)—— 因为移动快则视野
+/// 内容换得快,远处必须提前填满,否则一眼就看出街上是空的。
+///
+/// 本项目乘的是 [`PED_FADE_START`] 与 [`ENEMY_FADE_START`]:靠近剔除
+/// 半径那一段的淡入带随车速一起拉长。步行时倍率 1.0,观察觉零变化。
+pub(crate) const CREATION_RADIUS_MAX: f32 = 1.5;
 /// 行走时身体的上下起伏幅度(米)。
 pub(crate) const PED_BOB_HEIGHT: f32 = 0.045;
 /// 城市里的常驻混混数量。

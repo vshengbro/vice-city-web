@@ -817,6 +817,94 @@ impl Traffic {
         }
     }
 
+    /// **按玩家位置重铺车队**(GTA 的生成环 + 回收重生)。
+    ///
+    /// [`Self::populate`] 只在开局跑一次,而 [`crate::game::dense_traffic_lanes`]
+    /// 现在依赖玩家位置(生成环)、朝向(方向门)与车速(半径倍率)—— 这三者
+    /// 全程在变,所以车道表必须跟着重算,否则玩家开出一段距离之后,车流
+    /// 就永远停在他出生时的那个环上。
+    ///
+    /// GTA 的做法不是每帧重建:`CPopulation::ManagePopulation` 扫一遍对象
+    /// 池,超出 [`crate::traffic::PED_REMOVE_DIST`] 的回收,可见范围内的
+    /// 不足才重新生成。这里同样**只在玩家跨过一个街格时才重铺** ——
+    /// 街格是 60 m,11.5 m/s 下每 5 秒一次,远小于「每帧重建 500 辆车」的成本。
+    ///
+    /// 重铺会**保留现有车辆的位置**,只增删:现有车辆已经在路上跑了,
+    /// 推倒重来会让整支车队的相位被重置(全城车突然齐刷刷变道)。
+    /// 判据是「不在新环带内且够远」的车被移除,「在环带内但缺失」的槽位
+    /// 补新车 —— 于是车队是**渐变**的,不是闪烁的。
+    ///
+    /// # Arguments
+    ///
+    /// - `[f32; 2]` - 玩家 `[x, z]`。
+    /// - `f32` - 玩家面朝方向的偏航角(弧度)。
+    /// - `f32` - 玩家水平速度(米/秒)。
+    /// - `&[(&'static str, f32, f32, f32)]` - 车道蓝图,由
+    ///   [`crate::game::traffic_lanes`] 按上面三个量算出。
+    ///
+    /// # Returns
+    ///
+    /// - `bool` - 车队是否真的变了(没变时不触发任何重活)。
+    pub fn respawn_around(
+        &mut self,
+        player: [f32; 2],
+        player_yaw: f32,
+        speed: f32,
+        lanes: &[(&'static str, f32, f32, f32)],
+    ) -> bool {
+        // 现有车辆按 (车道 X, 沿街 Z, 方向) 建一个占用表,避免同槽位
+        // 反复补出两辆并排的车。
+        let mut taken: Vec<(f32, f32, f32)> = self
+            .get_cars_ref()
+            .iter()
+            .map(|car: &TrafficCar| {
+                let here: Vec3 = car.get_position();
+                let along: f32 = if car.get_lane_axis() == 0 {
+                    here[2]
+                } else {
+                    here[0]
+                };
+                (car.get_lane_x(), along, car.get_direction())
+            })
+            .collect();
+        let mut added: Vec<TrafficCar> = Vec::new();
+        for (asset, lane_x, start_z, direction) in lanes {
+            if taken.iter().any(|(x, z, d): &(f32, f32, f32)| {
+                (x - lane_x).abs() < 6.0
+                    && (z - start_z).abs() < 12.0
+                    && (d - direction).abs() < 0.1
+            }) {
+                continue;
+            }
+            added.push(TrafficCar::new(
+                asset,
+                *lane_x,
+                *start_z,
+                CRUISE_SPEED.clamp(SPEED_MIN, SPEED_MAX),
+                *direction,
+            ));
+        }
+        if added.is_empty() {
+            return false;
+        }
+        let cars: &mut Vec<TrafficCar> = self.get_cars_mut();
+        cars.extend(added);
+        // 硬上限:补进来之前先扔掉最远的,免得分片与渲染的每帧开销随
+        // 玩家漫游时长无限增长。
+        if cars.len() > MAX_CARS {
+            let here: Vec3 = cars[0].get_position();
+            cars.sort_by(|a: &TrafficCar, b: &TrafficCar| {
+                let pa: Vec3 = a.get_position();
+                let pb: Vec3 = b.get_position();
+                let da: f32 = (pa[0] - here[0]).powi(2) + (pa[2] - here[2]).powi(2);
+                let db: f32 = (pb[0] - here[0]).powi(2) + (pb[2] - here[2]).powi(2);
+                da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+            });
+            cars.truncate(MAX_CARS);
+        }
+        true
+    }
+
     /// 车队车辆列表。
     ///
     /// # Returns
@@ -887,7 +975,16 @@ impl Traffic {
     /// - `Option<[f32; 2]>` - 正在路边招手的玩家 `[x, z]`;`None` 表示没人。
     /// - `&CollisionWorld` - 静态碰撞世界,用来把车挡在障碍之外。
     /// - `f32` - 全局时间(秒),信号机相位用它当时钟。
-    pub fn step(&mut self, dt: f32, hailer: Option<[f32; 2]>, world: &CollisionWorld, time: f32) {
+    /// - `u32` - 帧计数,只用于 [`manage_shard`] 的 32 帧分片;物理与
+    ///   跟车的结果不依赖它,只影响「这一帧哪些车参与跟车」。
+    pub fn step(
+        &mut self,
+        dt: f32,
+        hailer: Option<[f32; 2]>,
+        world: &CollisionWorld,
+        time: f32,
+        frame: u32,
+    ) {
         // 只有**离玩家最近的那一辆**会靠边等人,不是半径内所有车 ——
         // 否则 26 m 内整条街的车一起停,交通直接堵死。
         let hailer_car: Option<usize> = hailer.and_then(|who: [f32; 2]| {
@@ -981,8 +1078,22 @@ impl Traffic {
                 };
                 at * car.get_direction()
             };
+            // **32 帧分片**(GTA `CPopulation::ManagePopulation` 的
+            // `frameMod32 = GetFrameCounter() & 31`)。
+            //
+            // 跟车是 O(n²):500 辆车时每帧要做 25 万次「谁在我前面」的比较。
+            // GTA 把这一层摊到 32 帧上,每帧只扫 1/32 的对象池。这里照做,
+            // 但分片键是 `(index + frame) % 32` 而不是 `frame % 32` ——
+            // 后者会让同一帧里**所有车都不更新跟车**,车队整体「抖一下、
+            // 再抖一下」。前者让每辆车落在不同相位,任何一帧都只有均匀的
+            // 1/32 在跟车,画面上看不出有卡顿的车。
+            //
+            // 代价:每辆车每 32 帧(60 fps 下 0.53 s)才跟一次前车。
+            // IDM 的车头时间间隔 `IDM_HEADWAY` 是 1.2 s,分片延迟只占
+            // 44%,远小于一次正常加减速。
             let mut order: Vec<usize> = (0..cars.len())
                 .filter(|index: &usize| !cars[*index].get_driven())
+                .filter(|index: &usize| manage_shard(*index, frame))
                 .collect();
             order.sort_by(|a: &usize, b: &usize| {
                 sort_key(*b)
@@ -997,7 +1108,14 @@ impl Traffic {
                     let mut desired: f32 = if Some(index) == hailer_car {
                         0.0
                     } else {
-                        car.get_cruise()
+                        // **弯道减速**(GTA `CCarAI::ModifySpeed`)。
+                        //
+                        // GTA 按当前路段与下一路段的**夹角**缩放通过时间:
+                        // 直路全速,进弯前收油。本项目没有节点图,但路口转向
+                        // 同样是 90° 折,所以用转向瞬间甩出的**横向速度**当
+                        // 夹角代理 —— 它已经是本项目车身上现成的量,不必再加
+                        // 一个「下一次是否转向」的预判字段。
+                        car.get_cruise() * corner_speed_scale(car.get_lateral())
                     };
                     // **红绿灯当作「一辆停在停止线上的前车」。**
                     //

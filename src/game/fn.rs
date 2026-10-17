@@ -3313,10 +3313,21 @@ pub(crate) fn lane_x(street_index: i32, side: f32) -> f32 {
 
 /// 把车道蓝图解成 `Traffic::populate` 要的 `(资产, 车道 X, 起始 Z, 速度)`。
 ///
+/// # Arguments
+///
+/// - `[f32; 2]` - 玩家 `[x, z]`,定生成环的位置。
+/// - `f32` - 玩家面朝方向的偏航角(弧度),定生成方向门。
+/// - `f32` - 玩家水平速度(米/秒),定生成半径倍率(GTA
+///   `PedCreationDistMultiplier`)。
+///
 /// # Returns
 ///
 /// - `Vec<(&'static str, f32, f32, f32)>` - 与输入同序的车道坐标。
-pub(crate) fn traffic_lanes() -> Vec<(&'static str, f32, f32, f32)> {
+pub(crate) fn traffic_lanes(
+    player: [f32; 2],
+    player_yaw: f32,
+    speed: f32,
+) -> Vec<(&'static str, f32, f32, f32)> {
     // 手写蓝图当作「出生点那两条街的起步车队」—— 保留是为了上车测试
     // 仍然确定(玩家出生街上有车),但**只占整个车队的一小部分**。
     let mut out: Vec<(&'static str, f32, f32, f32)> = TRAFFIC_LANE_PLAN
@@ -3327,7 +3338,7 @@ pub(crate) fn traffic_lanes() -> Vec<(&'static str, f32, f32, f32)> {
             },
         )
         .collect();
-    out.extend(dense_traffic_lanes());
+    out.extend(dense_traffic_lanes(player, player_yaw, speed));
     out
 }
 
@@ -3342,35 +3353,86 @@ pub(crate) fn traffic_lanes() -> Vec<(&'static str, f32, f32, f32)> {
 /// 步调完全一致(一眼假)。方向按 `TRAFFIC_LANE_PITCH` 奇偶交替,
 /// 让相邻车道的车迎面而行 —— 双向街道只有同向车流的话不像马路。
 ///
+/// # Arguments
+///
+/// - `[f32; 2]` - 玩家 `[x, z]`,定生成环的位置。
+/// - `f32` - 玩家面朝方向的偏航角(弧度),定生成方向门。
+/// - `f32` - 玩家水平速度(米/秒),定生成半径倍率。
+///
 /// # Returns
 ///
-/// - `Vec<(&'static str, f32, f32, f32)>` - 与 `traffic_lanes()` 同形状的车道表。
-pub(crate) fn dense_traffic_lanes() -> Vec<(&'static str, f32, f32, f32)> {
+/// - `Vec<(&'static str, f32, f32, f32)>` - 与 `traffic_lanes([0.0, 0.0], 0.0, 0.0)` 同形状的车道表。
+pub(crate) fn dense_traffic_lanes(
+    player: [f32; 2],
+    player_yaw: f32,
+    speed: f32,
+) -> Vec<(&'static str, f32, f32, f32)> {
     let mut out: Vec<(&'static str, f32, f32, f32)> = Vec::new();
     let lanes_per_street: usize =
         ((TRAFFIC_HALF * 2.0) / TRAFFIC_LANE_PITCH).floor().max(1.0) as usize;
+    // **生成环半径**(GTA `GenerateCarCreationCoors` 的 `spawnDist`)。
+    //
+    // GTA 的算法不是「在附近找空地」,而是**找一条恰好横跨生成圆周的路段**:
+    // 在圆周上找路段的两个端点,用 `d1 * d2 < 0` 判定两端分居圆周两侧,再
+    // 线性插值出交点。所以车永远是「从视野边缘开进来」,不是凭空冒出来。
+    //
+    // 半径乘 [`crate::traffic::creation_speed_gain`]:玩家开得越快填得越远
+    // (GTA 的 `PedCreationDistMultiplier`,最高 1.5 倍)。
+    let gain: f32 = crate::traffic::creation_speed_gain(speed);
+    let ring: f32 = TRAFFIC_SPAWN_RADIUS * gain;
     for street in -TRAFFIC_SPREAD_STREETS..=TRAFFIC_SPREAD_STREETS {
+        let centre: f32 = street_axis(street);
         for side in [-1.0f32, 1.0] {
             for slot in 0..lanes_per_street {
-                // 种子用世界街道索引(不是枚举序号):车道表每帧重算,
+                // 种子用世界街道索引(不是枚举序号):车道表会随玩家重算,
                 // 枚举序号会随窗口平移整体错位,车会换车型。
                 let seed: u32 = slot_seed(street, side as i32, 0x7A11)
                     ^ (slot as u32).wrapping_mul(0x0000_0100);
+                // **生成环**:只在环带内的槽位生成,太近(玩家眼前)和太远
+                // (看不见还占性能)都不生成。
+                //
+                // 环带宽是一个车距 —— 比它更窄会在槽位之间漏出空档,更宽会把
+                // 环扩成一大片而失去「边缘进场」的意义。
+                let start_z: f32 =
+                    -TRAFFIC_HALF + slot as f32 * TRAFFIC_LANE_PITCH + hash_unit(seed, 1) * 18.0;
+                let along: f32 = (start_z - player[1]).abs();
+                if (along - ring).abs() > TRAFFIC_SPAWN_BAND * 0.5 {
+                    continue;
+                }
+                // **生成方向门**(GTA 的 `angleLimit`)。
+                //
+                // GTA 在圆周交点处判定 `dot(视线方向, 玩家朝向) > angleLimit`,
+                // 侧方与后方不生成。这一条是「78 辆车只看得见 6 辆」的真正
+                // 答案:车确实有 78 辆,但均匀铺在 7 条街上,一次只看得到视野
+                // 正中那一条。收进前方扇形之后,同样数量的车全部落在看得见的
+                // 那片路上。
+                if !crate::traffic::spawn_faces_player(
+                    [centre - player[0], start_z - player[1]],
+                    player_yaw,
+                ) {
+                    continue;
+                }
+                // **区域密度分区**(GTA `CPathFind::CalcRoadDensity`)。
+                //
+                // GTA 的密度正比于区域里车道总长。本项目网格均匀,那个公式
+                // 处处相同,所以显式给街道一个距离权重 —— 效果等价,让市中心
+                // 真的比边缘热闹。
+                let density: f32 = crate::traffic::road_density((centre - player[0]).abs());
+                if hash_unit(seed, 2) > density {
+                    continue;
+                }
                 let asset: &'static str = CAR_POOL[hash2(seed, 0) as usize % CAR_POOL.len()];
-                let jitter: f32 = hash_unit(seed, 1);
-                let start_z: f32 = -TRAFFIC_HALF + slot as f32 * TRAFFIC_LANE_PITCH + jitter * 18.0;
                 // 第 4 个字段是**行驶方向**,不是巡航速度 —— `TrafficCar::new`
-                // 拿它去 `route_from_xz`,而那里用方向决定车走这条街的哪
-                // 一侧车道(`side = direction >= 0 ? +1 : -1`)。
+                // 拿它去 `route_from_xz`,而那里用方向决定车走这条街的哪一侧
+                // 车道(`side = direction >= 0 ? +1 : -1`)。
                 //
                 // 原先这里写的是 `CRUISE_SPEED`(≈ 11.5,恒为正),于是**每条
                 // 街的车全被塞进同一条车道**:线上实测 500 辆车有 249 辆挤在
-                // 街道 1 的同一个侧向车道上,队伍一路排到 ±3300 m 外,而
-                // 街道 −3 / −2 一辆车都没有 —— 用户看到的是「路上一辆车都
-                // 没有」。
+                // 街道 1 的同一个侧向车道上,队伍一路排到 ±3300 m 外,而街道
+                // −3 / −2 一辆车都没有 —— 用户看到的是「路上一辆车都没有」。
                 //
-                // 方向按 slot 奇偶交替:同一条街上正负方向各半,相邻车道
-                // 迎面而行,双向街道才像马路。
+                // 方向按 slot 奇偶交替:同一条街上正负方向各半,相邻车道迎面
+                // 而行,双向街道才像马路。
                 let direction: f32 = if slot.is_multiple_of(2) { 1.0 } else { -1.0 };
                 out.push((asset, lane_x(street, side), start_z, direction));
             }
@@ -5986,8 +6048,31 @@ pub(crate) fn simulate(game: &mut Game, delta: f32) {
     // 四参是新的那个,保留。
     let clock: f32 = game.get_signal_clock() + dt;
     game.set_signal_clock(clock);
+    let frame: u32 = game.get_frame_count() as u32;
     game.get_mut_traffic()
-        .step(dt, hailer, &traffic_world, clock);
+        .step(dt, hailer, &traffic_world, clock, frame);
+    // **按玩家位置重铺车队**(GTA 的生成环 + 回收重生)。
+    //
+    // `traffic_lanes([0.0, 0.0], 0.0, 0.0)` 现在吃玩家位置、朝向与车速:位置定生成环,朝向定
+    // 方向门,车速定半径倍率。这三者全程在变,所以车道表得跟着走 ——
+    // 否则玩家开出一段距离之后,车流就永远停在他出生时的那个环上。
+    //
+    // 触发条件是**跨过一个街格**(60 m),不是每帧。11.5 m/s 下每 5 秒
+    // 一次,重铺本身只是查一张占用表加几个 `TrafficCar::new`,远不如
+    // 每帧重建 500 辆车贵。判据用街道索引而不是距离,是为了让站在格
+    // 边界上的静止玩家不会反复触发。
+    let here: Vec3 = game.get_player().get_position();
+    let cell: (i32, i32) = (street_index_at(here[0]), street_index_at(here[2]));
+    if game.get_traffic_cell() != cell {
+        game.set_traffic_cell(cell);
+        let yaw: f32 = game.get_player().get_yaw();
+        let moving: Vec2 = game.get_player().get_velocity();
+        let pace: f32 = (moving[0] * moving[0] + moving[1] * moving[1]).sqrt();
+        let lanes: Vec<(&'static str, f32, f32, f32)> =
+            traffic_lanes([here[0], here[2]], yaw, pace);
+        game.get_mut_traffic()
+            .respawn_around([here[0], here[2]], yaw, pace, &lanes);
+    }
     if let Some(index) = driven
         && let Some(car) = game.get_mut_traffic().get_car_mut(index)
     {
@@ -7828,15 +7913,28 @@ pub(crate) fn sync_combat_instances(game: &mut Game) {
             scene_batch.get_mut_instances().clear();
         }
     }
+    // 玩家水平速度(米/秒)—— 只喂给 [`crate::traffic::creation_speed_gain`]:
+    // 走得快 / 开得快就把行人与敌人的淡入带一起拉长(GTA 的
+    // `PedCreationDistMultiplier`)。步行时是 0,倍率恒为 1.0。
+    let moving: Vec2 = game.get_player().get_velocity();
+    let player_pace: f32 = (moving[0] * moving[0] + moving[1] * moving[1]).sqrt();
     for index in 0..game.get_enemies().len() {
         let enemy: Enemy = game.get_enemies()[index].clone();
         let at: Vec3 = enemy.get_position();
         let distance: f32 = flat_distance(at, here);
         // 淡入而不是硬切换(同 actor_fade):敌人原先在 62 m 处整具突然出现。
-        if distance > ENEMY_FADE_START {
+        //
+        // 生成半径随车速放大(GTA `PedCreationDistMultiplier`,最高 1.5 倍):
+        // 玩家开得快时视野内容换得快,淡入带必须一起拉长,否则远处的人会在
+        // 「已经看清」的距离上整具出现 —— 上一轮修掉的那个症状会在高速档
+        // 重新长出来。剔除界与淡入界用**同一个** `gain`:只放宽 `actor_fade`
+        // 而不放宽这里的 `continue`,倍率大于 1 时人会在淡入前就被剔掉,
+        // 等于白乘。
+        let gain: f32 = crate::traffic::creation_speed_gain(player_pace);
+        if distance > ENEMY_FADE_START * gain {
             continue;
         }
-        let fade: f32 = actor_fade(distance, ENEMY_RENDER_RANGE, ENEMY_FADE_START);
+        let fade: f32 = actor_fade(distance, ENEMY_RENDER_RANGE, ENEMY_FADE_START * gain);
         // 死亡后尸体下沉:缩放随倒计时收缩,是最省事的「消失」表现。
         let sink: f32 = if enemy.is_alive() {
             1.0
@@ -7891,10 +7989,12 @@ pub(crate) fn sync_combat_instances(game: &mut Game) {
         let at: Vec3 = ped.get_position();
         let distance: f32 = flat_distance(at, here);
         // 淡入而不是硬切换:人物在剔除半径处凭空出现(见 actor_fade)。
-        if distance > PED_FADE_START {
+        // 半径随车速放大,理由同上面的敌人分支(GTA `PedCreationDistMultiplier`)。
+        let gain: f32 = crate::traffic::creation_speed_gain(player_pace);
+        if distance > PED_FADE_START * gain {
             continue;
         }
-        let fade: f32 = actor_fade(distance, PED_RENDER_RANGE, PED_FADE_START);
+        let fade: f32 = actor_fade(distance, PED_RENDER_RANGE, PED_FADE_START * gain);
         // 行人走与玩家相同的逐部件骨架:核心 rigid + 四肢链式摆动,
         // 起伏只保留很轻的一层(见 [`ped_bob`] 的相位推导)。
         // 原来「整具一个矩阵 + ±4.5 cm 上下颠」就是用户报的「NPC 蹦着走」。
@@ -9055,6 +9155,8 @@ pub fn boot() {
         frame_count: 0,
         ticks: 0,
         signal_clock: 0.0,
+        // 初始取不可能命中的值,强制第一次进入时重铺一次车队。
+        traffic_cell: (i32::MIN, i32::MIN),
         load_error: None,
         using_fallback: false,
         accumulator: 0.0,
@@ -9570,7 +9672,9 @@ async fn load_assets_and_build(handles: GameHandles) {
         ));
         // 蓝图里的起始 Z 必须落在循环轨道内,否则车一出生就 wrap 一次,
         // 看起来像「凭空出现」。顺手做一次校验并打日志。
-        let lanes: Vec<(&'static str, f32, f32, f32)> = traffic_lanes();
+        // 出生点在原点、朝 +Z、速度 0:位置定生成环,朝向定方向门,车速定半径
+        // 倍率。开局玩家还没动,倍率必然是 1.0。
+        let lanes: Vec<(&'static str, f32, f32, f32)> = traffic_lanes([0.0, 0.0], 0.0, 0.0);
         let out_of_range: usize = lanes
             .iter()
             .filter(|lane: &&(&'static str, f32, f32, f32)| lane.2.abs() > TRAFFIC_HALF)
@@ -11904,7 +12008,7 @@ mod tests {
         // 停止线一根都不存在,测试等于没测 P2。
         let mut clock: f32 = 0.0;
         for _frame in 0..2400 {
-            traffic.step(dt, None, &world, clock);
+            traffic.step(dt, None, &world, clock, 0);
             clock += dt;
         }
         let mut worst: String = String::new();
@@ -11958,7 +12062,7 @@ mod tests {
         let mut clock: f32 = 0.0;
         let mut first: [f32; 2] = [-67.2, -56.5];
         for frame in 0..1200 {
-            traffic.step(dt, None, &world, clock);
+            traffic.step(dt, None, &world, clock, 0);
             clock += dt;
             if frame == 0 {
                 let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
@@ -12024,7 +12128,7 @@ mod tests {
         let dt: f32 = 1.0 / 60.0;
         let mut clock: f32 = 0.0;
         for _frame in 0..2400 {
-            traffic.step(dt, None, &world, clock);
+            traffic.step(dt, None, &world, clock, 0);
             clock += dt;
         }
         let mut worst: String = String::new();
@@ -12081,7 +12185,7 @@ mod tests {
         // 于是 hailer 一定被选中。
         let who: [f32; 2] = [3.5, -2.5];
         for _frame in 0..2400 {
-            traffic.step(dt, Some(who), &world, clock);
+            traffic.step(dt, Some(who), &world, clock, 0);
             clock += dt;
         }
         let mut worst: String = String::new();
@@ -12157,7 +12261,7 @@ mod tests {
         let dt: f32 = 1.0 / 60.0;
         let mut clock: f32 = 0.0;
         for _frame in 0..12000 {
-            traffic.step(dt, None, &world, clock);
+            traffic.step(dt, None, &world, clock, 0);
             clock += dt;
         }
         let mut worst: String = String::new();
@@ -12218,7 +12322,7 @@ mod tests {
         let dt: f32 = 1.0 / 60.0;
         let mut clock: f32 = 0.0;
         for _frame in 0..1800 {
-            traffic.step(dt, None, &world, clock);
+            traffic.step(dt, None, &world, clock, 0);
             clock += dt;
         }
         let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
@@ -12267,7 +12371,7 @@ mod tests {
     pub(crate) fn no_car_in_the_production_fleet_is_ever_exactly_stuck() {
         let mut world: CollisionWorld = traffic_world_at(63.5, 45.0);
         let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
-        traffic.populate(&traffic_lanes(), &[]);
+        traffic.populate(&traffic_lanes([0.0, 0.0], 0.0, 0.0), &[]);
         let dt: f32 = 1.0 / 60.0;
         let mut last: Vec<[f32; 2]> = traffic
             .get_cars_ref()
@@ -12280,7 +12384,7 @@ mod tests {
         let mut frozen_from: Vec<Option<usize>> = vec![None; last.len()];
         for window in 0..10usize {
             for _frame in 0..1800 {
-                traffic.step(dt, None, &world, 0.0);
+                traffic.step(dt, None, &world, 0.0, 0);
             }
             let now: Vec<[f32; 2]> = traffic
                 .get_cars_ref()
@@ -12349,7 +12453,7 @@ mod tests {
         let mut clock: f32 = 0.0;
         // 200 s:11.5 m/s 足够开出去 2000 m,远超 BLOCK_VIEW_RADIUS。
         for _frame in 0..12000 {
-            traffic.step(dt, None, &world, clock);
+            traffic.step(dt, None, &world, clock, 0);
             clock += dt;
         }
         let mut report: String = String::new();
@@ -12595,7 +12699,7 @@ mod tests {
         let dt: f32 = 1.0 / 60.0;
         let mut clock: f32 = 0.0;
         for _frame in 0..1200 {
-            traffic.step(dt, None, &world, clock);
+            traffic.step(dt, None, &world, clock, 0);
             clock += dt;
         }
         let c: &crate::traffic::TrafficCar = &traffic.get_cars_ref()[0];
@@ -12640,9 +12744,9 @@ mod tests {
     pub(crate) fn the_production_fleet_with_a_hailing_player_keeps_flowing() {
         let mut world: CollisionWorld = traffic_world_at(33.5, 45.0);
         let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
-        // **走生产路径**:`traffic_lanes()` + `populate`,和 `load_assets_and_build`
+        // **走生产路径**:`traffic_lanes([0.0, 0.0], 0.0, 0.0)` + `populate`,和 `load_assets_and_build`
         // 一模一样。手工 `new_on_lane` 会漏掉资产种类和方向。
-        traffic.populate(&traffic_lanes(), PICKUP_PLACEMENTS);
+        traffic.populate(&traffic_lanes([0.0, 0.0], 0.0, 0.0), PICKUP_PLACEMENTS);
         let start: Vec<[f32; 2]> = traffic
             .get_cars_ref()
             .iter()
@@ -12656,7 +12760,7 @@ mod tests {
         // 玩家出生点 —— 线上就是这个位置。
         let who: [f32; 2] = [33.5, 45.0];
         for _frame in 0..2400 {
-            traffic.step(dt, Some(who), &world, clock);
+            traffic.step(dt, Some(who), &world, clock, 0);
             clock += dt;
         }
         let mut worst: String = String::new();
@@ -12700,7 +12804,7 @@ mod tests {
     pub(crate) fn the_fleet_still_flows_after_five_minutes() {
         let mut world: CollisionWorld = traffic_world_at(33.5, 45.0);
         let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
-        traffic.populate(&traffic_lanes(), PICKUP_PLACEMENTS);
+        traffic.populate(&traffic_lanes([0.0, 0.0], 0.0, 0.0), PICKUP_PLACEMENTS);
         let dt: f32 = 1.0 / 60.0;
         let mut clock: f32 = 0.0;
         let who: [f32; 2] = [33.5, 45.0];
@@ -12717,7 +12821,7 @@ mod tests {
             .collect();
         for window in 1..=10 {
             for _frame in 0..1800 {
-                traffic.step(dt, Some(who), &world, clock);
+                traffic.step(dt, Some(who), &world, clock, 0);
                 clock += dt;
             }
             let now: Vec<[f32; 2]> = traffic
@@ -12788,7 +12892,7 @@ mod tests {
     pub(crate) fn a_stopped_hail_does_not_permanently_block_the_lane() {
         let mut world: CollisionWorld = traffic_world_at(33.5, 45.0);
         let mut traffic: crate::traffic::Traffic = crate::traffic::Traffic::new();
-        traffic.populate(&traffic_lanes(), PICKUP_PLACEMENTS);
+        traffic.populate(&traffic_lanes([0.0, 0.0], 0.0, 0.0), PICKUP_PLACEMENTS);
         let dt: f32 = 1.0 / 60.0;
         let mut clock: f32 = 0.0;
         // 玩家**一直不动**地站在出生点招手 —— 这正是线上观察到的条件。
@@ -12804,7 +12908,7 @@ mod tests {
         let mut stalled_since: usize = 0;
         for window in 1..=10 {
             for _frame in 0..1800 {
-                traffic.step(dt, Some(who), &world, clock);
+                traffic.step(dt, Some(who), &world, clock, 0);
                 clock += dt;
             }
             let now: Vec<[f32; 2]> = traffic
@@ -12876,7 +12980,7 @@ mod tests {
         // **没有玩家**:`hailer = None`。
         for window in 1..=10 {
             for _frame in 0..1800 {
-                traffic.step(dt, None, &world, clock);
+                traffic.step(dt, None, &world, clock, 0);
                 clock += dt;
             }
             let now: Vec<[f32; 2]> = traffic
@@ -13277,7 +13381,7 @@ mod tests {
         // `speed = (speed + DRIVE_ACCEL·dt) · 0.25 = 0.0611 m/s` 永久平衡。
         // 油门踩到底、车却一动不动 —— 用户报的「汽车无法操作」。
         // 倒车 20 m 再满油门,在 z = 2.543 处以同一个 0.061 m/s 再次冻住。
-        for (asset, lane, start_z, _cruise) in traffic_lanes() {
+        for (asset, lane, start_z, _cruise) in traffic_lanes([0.0, 0.0], 0.0, 0.0) {
             let on_road: bool = super::on_roadway(lane, start_z);
             assert!(
                 on_road,
@@ -13326,7 +13430,7 @@ mod tests {
             batches: Vec::new(),
             total_triangles: 0,
         };
-        let lanes: Vec<(&'static str, f32, f32, f32)> = traffic_lanes();
+        let lanes: Vec<(&'static str, f32, f32, f32)> = traffic_lanes([0.0, 0.0], 0.0, 0.0);
         let mut index_map: HashMap<String, usize> = HashMap::new();
         // 每个车型一份 mesh(模拟「同一车型的车共用一份几何」)。
         for (asset, _, _, _) in lanes.iter() {
@@ -13570,33 +13674,97 @@ mod tests {
     /// 街道 −3 / −2 一辆都没有,玩家出生点周围 200 m 内只有 1 辆车。
     ///
     /// 所以这里直接断言:**方向字段必须有正有负**,且两侧车道都被铺到。
+    /// **生成环:车只落在环带上,不铺满全城。**
+    ///
+    /// 移植 GTA `GenerateCarCreationCoors` 的 `spawnDist` 语义 —— 那个函数
+    /// 不是「在附近找空地」,而是**找一条恰好横跨生成圆周的路段**,所以车
+    /// 永远从视野边缘进来。
+    ///
+    /// 钉住「铺满全城」这一点是因为它是本条规则被拆掉时最容易被忽略的
+    /// 反面:没有环带时 `dense_traffic_lanes` 会给出 490 条车道(每条街 70
+    /// 辆),实测 500 辆车有 249 辆排在街道 1 的同一条车道上一路排到
+    /// ±3300 m 外 —— 那正是用户报「路上一辆车都没有」的状态。
+    ///
+    /// 同时钉住**环带宽度**:带宽窄到恰好一个车距时,整圈只生成 11 辆,
+    /// 街道照样是空的。所以要钉「至少能装下三排车」。
     #[test]
-    pub(crate) fn dense_traffic_covers_both_sides_of_every_street() {
-        let lanes: Vec<Lane> = dense_traffic_lanes();
+    pub(crate) fn dense_traffic_stays_inside_the_spawn_ring() {
+        let lanes: Vec<Lane> = dense_traffic_lanes([0.0, 0.0], 0.0, 0.0);
         assert!(
-            lanes.len() > 50,
-            "程序化车队只有 {} 条车道 —— 路面汽车太少",
+            lanes.len() > 20,
+            "环带上应至少有二十来辆车,实际只有 {}",
             lanes.len()
         );
-        // (a) 方向必须正负都有。
-        let positive: usize = lanes.iter().filter(|lane: &&Lane| lane.3 > 0.0).count();
-        let negative: usize = lanes.len() - positive;
         assert!(
-            positive > 0 && negative > 0,
-            "行驶方向必须正负都有(实测 +{positive} / -{negative})—— 全是正的会让每条街的车挤进同一条车道"
+            lanes.len() < 120,
+            "环带不该铺成全城(490 条),实际 {} 条",
+            lanes.len()
         );
-        // (b) 出生点所在街道(索引 1)两侧都要有车道。
-        let birth_x: f32 = lane_x(1, 1.0);
-        let birth_x_minus: f32 = lane_x(1, -1.0);
+        // 全部落在环带内。
+        for lane in lanes.iter() {
+            let along: f32 = (lane.2 - 0.0).abs();
+            assert!(
+                (along - TRAFFIC_SPAWN_RADIUS).abs() <= TRAFFIC_SPAWN_BAND * 0.5 + 1.0,
+                "车落在 {along:.0} m,超出环带"
+            );
+        }
+        // 环上至少能装下三排(密度分区在最边缘也该留住几辆)。
+        //
+        // 用 `Vec` 排序后数相邻差,不引 `BTreeSet`:§6.3 禁止子文件写
+        // `std::` 全路径,而为了这一个测试往 lib.rs 加一个 `collections`
+        // 转出不值当 —— 这里的槽位本来就是小整数,排序去重是三行的事。
+        let mut rows: Vec<i32> = lanes
+            .iter()
+            .map(|lane: &Lane| (lane.2 / TRAFFIC_LANE_PITCH).round() as i32)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        assert!(rows.len() >= 3, "环带宽度只够 {} 排车,太窄", rows.len());
+    }
+
+    /// **密度分区真的在起作用:近街的车比远街多。**
+    ///
+    /// GTA `CPathFind::CalcRoadDensity` 让密度正比于区域车道总长,市中心
+    /// 路网密、车就多。这条钉的是「分区存在」本身 —— 如果哪天有人把
+    /// `road_density()` 直接返回 1.0(退化成均匀铺开),测试会立刻报,
+    /// 而不是等到「整座城市车密度一模一样」被人看出来。
+    #[test]
+    pub(crate) fn dense_traffic_thins_out_toward_the_edge() {
+        let lanes: Vec<Lane> = dense_traffic_lanes([0.0, 0.0], 0.0, 0.0);
+        let near: usize = lanes
+            .iter()
+            .filter(|lane: &&Lane| {
+                (lane.1.abs() - 0.0).abs() < TRAFFIC_SPREAD_STREETS as f32 * STREET_PITCH * 0.5
+            })
+            .count();
+        let far: usize = lanes
+            .iter()
+            .filter(|lane: &&Lane| {
+                (lane.1.abs() - TRAFFIC_SPREAD_STREETS as f32 * STREET_PITCH).abs() < 1.0
+            })
+            .count();
         assert!(
-            lanes
-                .iter()
-                .any(|lane: &Lane| (lane.1 - birth_x).abs() < 0.01)
-                && lanes
-                    .iter()
-                    .any(|lane: &Lane| (lane.1 - birth_x_minus).abs() < 0.01),
-            "出生街两侧都要铺车道"
+            near > far,
+            "中心街({near} 辆)的车应多于边缘街({far} 辆)—— 密度分区没生效"
         );
+    }
+
+    /// **方向门:生成的车全在玩家朝向前方。**
+    ///
+    /// 这是 GTA `angleLimit` 那道门的回归保护。钉它是因为症状反直觉:加门
+    /// 之后**总车数会明显下降**,不钉住就会有人拿「车变少了」当回归把门
+    /// 拆掉 —— 而那正是「78 辆车只看得到 6 辆」的解药。
+    #[test]
+    pub(crate) fn dense_traffic_only_spawns_in_the_forward_fan() {
+        let lanes: Vec<Lane> = dense_traffic_lanes([0.0, 0.0], 0.0, 0.0);
+        assert!(!lanes.is_empty(), "环带上不该一辆车都没有");
+        for lane in lanes.iter() {
+            let offset: [f32; 2] = [lane.1 - 0.0, lane.2 - 0.0];
+            assert!(
+                crate::traffic::spawn_faces_player(offset, 0.0),
+                "车落在侧方或后方 {offset:?},方向门没生效"
+            );
+        }
     }
 
     #[test]

@@ -269,6 +269,15 @@ pub struct Game {
     /// 像在抽搐。累积量与真实经过时间一致。
     #[get(type(copy), pub(crate))]
     pub(crate) signal_clock: f32,
+    /// 车队重铺用的人物:玩家所在的**街道格**`(x 方向, z 方向)`。
+    ///
+    /// 用来做跨格判据 —— `traffic_lanes()` 吃玩家位置/朝向/车速生成车道
+    /// 表,但每帧重算 500 条车道太贵,所以只在玩家**跨过一个街格**
+    /// (60 m)时重铺一次。存索引而不是距离,是为了让站在格边界上的静止
+    /// 玩家不会反复触发(距离判据在边界附近会一帧一变)。
+    #[get(type(copy), pub(crate))]
+    #[set(pub(crate))]
+    pub(crate) traffic_cell: (i32, i32),
     /// 加载失败信息(有值时显示在遮罩上)。
     #[get(type(clone), pub(crate))]
     pub(crate) load_error: Option<String>,

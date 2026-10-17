@@ -266,3 +266,106 @@ pub(crate) const ROUTE_PICK: f32 = 0.62;
 /// 位移被碰撞吃掉时,判定为撞上障碍:车停下、速度归零、路网状态不推进。
 /// 余量必须小于单帧位移,否则正常行驶也会被误判成撞墙。
 pub(crate) const CAR_ROUTE_EPSILON: f32 = 0.001;
+
+// ---- GTA III / Vice City 逆向源码实证的五条规则 ------------------------
+//
+// 下面的常数不是拍脑袋定的,全部来自 reVC(Grand Theft Auto Vice City 的
+// 逆向工程实现)`miami` 分支的 `src/peds/Population.cpp` 与
+// `src/control/PathFind.cpp`。文件原值写在每条的括号里,改之前先看原值。
+/// **GTA 的 `PedCreationDistMultiplier` 上限**:玩家开车时生成半径放大到 1.5 倍。
+///
+/// GTA 原值:`return Clamp(vehSpeed - 0.1f + 1.0f, 1.0f, 1.5f);`
+/// 逻辑是玩家移动越快,视野内容换得越快,必须把远处提前填满才看不到空街。
+/// 开到 15 m/s(本项目的 [`SPEED_MAX`])时正好取到上限。
+pub(crate) const CREATION_SPEED_GAIN: f32 = 1.0;
+/// **GTA `MIN_CREATION_DIST`**:行人的内环半径 —— 比它近的地方**不生成**。
+///
+/// GTA 原值 40.0f。行人一出生就落在相机雾里,视觉上"看不见地出现"。
+/// 本项目取 34.0:比 GTA 的 40 略近,因为本项目的雾更弱,近处空缺更明显。
+pub(crate) const PED_MIN_CREATION_DIST: f32 = 34.0;
+/// **GTA `CREATION_RANGE`**:生成环的带宽。
+///
+/// GTA 原值 10.0f。内环外侧再往外铺这么宽的一条带,带内才尝试生成。
+pub(crate) const PED_CREATION_RANGE: f32 = 10.0;
+/// **GTA `OFFSCREEN_CREATION_MULT`**:离屏方向的生成带宽只有环带宽的一半。
+///
+/// GTA 原值 0.5f。屏幕内的人要密(否则看着空),屏幕外只要够"下一个人出现
+/// 时已经在那里"就行。这是 GTA 省掉大量行人实例的主要手段。
+pub(crate) const OFFSCREEN_CREATION_MULT: f32 = 0.5;
+/// **GTA `PED_REMOVE_DIST`**:超过这个距离就回收行人。
+///
+/// GTA 原值 `MIN_CREATION_DIST + CREATION_RANGE + 1.0f` = 51.0f。
+/// 必须严格大于生成外沿,否则远端行人生成后立刻被回收,永远走不到玩家面前。
+pub(crate) const PED_REMOVE_DIST: f32 = PED_MIN_CREATION_DIST + PED_CREATION_RANGE + 1.0;
+/// **GTA 的 `MANAGE_POPULATION_SHARDS`**:每帧只轮询 1/32 的车队。
+///
+/// GTA 原值:`int frameMod32 = CTimer::GetFrameCounter() & 31;` 行人、
+/// 车辆、dummy 对象、临时对象**全部**按 `& 31` 分片。500 辆车的跟车
+/// 距离检查因此从每帧 500 次降到每帧约 16 次,代价是每辆车每 32 帧才
+/// 跟一次前车 —— 在 11 m/s、1.2 s 车头距的尺度上,32 帧(0.53 s)的延迟
+/// 小于一次正常加减速,看不出差别。
+pub(crate) const MANAGE_SHARDS: usize = 32;
+/// **GTA `CCarAI::ModifySpeed` 的弯道减速**:按下一段路的转折角收油。
+///
+/// GTA 调 `CCurves::CalcSpeedScaleFactor(当前点, 下一点, 当前方向, 下一方向)`,
+/// 夹角越大允许的速度越低。本项目没有节点图,但路口转向时同样是 90° 折,
+/// 所以用转向瞬间的横向速度(车身甩出车道的量)当夹角代理:横移越大说明
+/// 转得越急,越该收油。`CORNER_BRAKE_SLOPE` 是横向速度每 1 m/s 折掉的
+/// 巡航比例 —— GTA 的曲线在 90° 处大约落到 0.45,这里取同量级。
+pub(crate) const CORNER_BRAKE_SLOPE: f32 = 0.5;
+/// **弯道减速后的速度下限比例**(占巡航速度)。
+///
+/// 取 0.45:再慢就变成蠕行,路口容易积压;不停到全停则保留了「转弯有减速、
+/// 但不��塞」的手感。
+pub(crate) const CORNER_SPEED_FLOOR: f32 = 0.45;
+/// **GTA `CPathFind::CalcRoadDensity` 的区域窗口边长**。
+///
+/// GTA 原值 80.0f(判定 `Abs(dx) < 80 && Abs(dy) < 80`)。密度按这个窗口内
+/// 的车道总长算,于是"路网密的地方车多"。
+pub(crate) const ROAD_DENSITY_WINDOW: f32 = 80.0;
+/// **GTA `CalcRoadDensity` 的归一化除数**。
+///
+/// GTA 原值 2500.0f(= 50×50)。窗口面积是 80×80 = 6400,除以 2500 相当于
+/// 按 50 m 见方归一,让不同窗口给出可比的密度值。
+pub(crate) const ROAD_DENSITY_NORM: f32 = 2500.0;
+/// **GTA 的车流密度分区权重**:每条街道的"车道总长权重"。
+///
+/// GTA 的密度来自路网本身(`numLeftLanes + numRightLanes` 乘路段长度)。
+/// 本项目的街道网格是均匀的,车道数也固定,所以密度天然处处相同 ——
+/// 要做出「市中心热闹、边缘冷清」的城市感,必须显式给街道一个密度权重。
+/// 这份权重按**离市中心的距离**衰减,形状是 GTA 的密度公式在均匀路网上
+/// 的等价物:中心区权重 1.0,每 [`DENSITY_FALLOFF_STREETS`] 条街衰减一档。
+pub(crate) const DENSITY_FALLOFF_STREETS: f32 = 2.0;
+/// **密度权重下限**。
+///
+/// 0.12 保证最远的街也留一点车 —— 权重归零会让玩家一开出城区就撞上
+/// 完全静止的空城,那是"另一个极端的空"。
+pub(crate) const DENSITY_FLOOR: f32 = 0.12;
+/// **生成方向门 `angleLimit`**:车只从玩家**前方**这个半角内生成。
+///
+/// GTA 原值在 `GenerateCarCreationCoors` 里由调用方传入(`angleLimit`),
+/// 判定是 `dot(视线方向, 玩家朝向) > angleLimit` 才接受。本项目取
+/// 0.35(约 69°)—— 侧方和后方不生成,于是"78 辆车只看得见 6 辆"的
+/// 浪费消失,而前方视野里始终有车持续开进来。
+pub(crate) const SPAWN_ANGLE_LIMIT: f32 = 0.35;
+/// **生成半径圆周的搜索上界倍数**(GTA 的 `Max(spawnDist + 70, spawnDist * 1.7)`)。
+///
+/// GTA 原值就是这两个表达式的较大者。圆周之外这条带是"候选路段"的搜索
+/// 范围:必须够大才能跨到一条路段的两端,又不能无限大(否则会挑到玩家
+/// 身后很远的街)。取 GTA 的两项折中。
+pub(crate) const SPAWN_RING_SLACK: f32 = 1.7;
+/// **GTA 的 `SPAWN_TRIES`**:挑不出合格路段时的重试上限。
+///
+/// GTA 原值 500(`for (i = 0; i < 500; i++)`)。找不到就这一帧不生成,
+/// 下帧再来 —— 绝不退化成"随便找个空地放一辆"。
+pub(crate) const SPAWN_TRIES: u32 = 500;
+
+/// **车队硬上限**(GTA `MaxNumberOfCarsInUse` 的等价物)。
+///
+/// GTA 原值是一条池分配约束:巡逻车 + 救护车 + 停放车 + 任务车 + 警车 +
+/// 随机车 加起来不得超过 `MaxNumberOfCarsInUse`。本项目的 [`Self::respawn_around`]
+/// 会随玩家漫游不断补车,没有上限就会无限增长 —— 上限是这条约束的对应物。
+///
+/// 取 420:比单次生成环能产生的数量(约 250)宽裕,留出玩家原地绕圈时
+/// 补车的余量;又远低于会让每帧分片与渲染实例数爆掉的数量。
+pub(crate) const MAX_CARS: usize = 420;
